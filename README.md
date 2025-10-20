@@ -11,7 +11,7 @@ A lightweight sandboxing tool for enforcing filesystem and network restrictions 
 ## Installation
 
 ```bash
-npm install @anthropic-ai/sandbox-runtime
+npm install -g @anthropic-ai/sandbox-runtime
 ```
 
 ## Basic Usage
