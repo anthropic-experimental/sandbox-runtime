@@ -1,5 +1,6 @@
 import shellquote from 'shell-quote'
 import { spawn } from 'child_process'
+import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
 import { hasRipgrepSync } from '../utils/ripgrep.js'
 import {
@@ -98,6 +99,28 @@ function generateLogTag(command: string): string {
 }
 
 /**
+ * Get all ancestor directories for a path, up to (but not including) root
+ * Example: /private/tmp/test/file.txt -> ["/private/tmp/test", "/private/tmp", "/private"]
+ */
+function getAncestorDirectories(pathStr: string): string[] {
+  const ancestors: string[] = []
+  let currentPath = path.dirname(pathStr)
+
+  // Walk up the directory tree until we reach root
+  while (currentPath !== '/' && currentPath !== '.') {
+    ancestors.push(currentPath)
+    const parentPath = path.dirname(currentPath)
+    // Break if we've reached the top (path.dirname returns the same path for root)
+    if (parentPath === currentPath) {
+      break
+    }
+    currentPath = parentPath
+  }
+
+  return ancestors
+}
+
+/**
  * Generate filesystem read rules for sandbox profile
  */
 function generateReadRules(
@@ -125,6 +148,39 @@ function generateReadRules(
         `  (regex ${escapePath(regexPattern)})`,
         `  (with message "${logTag}"))`,
       )
+
+      // Block moving/renaming files matching this pattern
+      rules.push(
+        `(deny file-write-unlink`,
+        `  (regex ${escapePath(regexPattern)})`,
+        `  (with message "${logTag}"))`,
+      )
+
+      // For glob patterns, extract the static prefix and block ancestor moves
+      // Remove glob characters to get the directory prefix
+      const staticPrefix = normalizedPath.split(/[*?\[]/)[ 0]
+      if (staticPrefix && staticPrefix !== '/') {
+        // Get the directory containing the glob pattern
+        const baseDir = staticPrefix.endsWith('/')
+          ? staticPrefix.slice(0, -1)
+          : path.dirname(staticPrefix)
+
+        // Block moves of the base directory itself
+        rules.push(
+          `(deny file-write-unlink`,
+          `  (literal ${escapePath(baseDir)})`,
+          `  (with message "${logTag}"))`,
+        )
+
+        // Block moves of ancestor directories
+        for (const ancestorDir of getAncestorDirectories(baseDir)) {
+          rules.push(
+            `(deny file-write-unlink`,
+            `  (literal ${escapePath(ancestorDir)})`,
+            `  (with message "${logTag}"))`,
+          )
+        }
+      }
     } else {
       // Use subpath matching for literal paths
       rules.push(
@@ -132,6 +188,22 @@ function generateReadRules(
         `  (subpath ${escapePath(normalizedPath)})`,
         `  (with message "${logTag}"))`,
       )
+
+      // Block moving/renaming the denied path itself
+      rules.push(
+        `(deny file-write-unlink`,
+        `  (subpath ${escapePath(normalizedPath)})`,
+        `  (with message "${logTag}"))`,
+      )
+
+      // Block moves of ancestor directories
+      for (const ancestorDir of getAncestorDirectories(normalizedPath)) {
+        rules.push(
+          `(deny file-write-unlink`,
+          `  (literal ${escapePath(ancestorDir)})`,
+          `  (with message "${logTag}"))`,
+        )
+      }
     }
   }
 

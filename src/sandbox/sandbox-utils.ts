@@ -87,8 +87,27 @@ export function normalizePathForSandbox(pathPattern: string): string {
     normalizedPath = path.resolve(cwd, pathPattern)
   }
 
-  // For glob patterns, don't try to resolve symlinks (they don't exist as literal paths)
+  // For glob patterns, resolve symlinks for the directory portion only
   if (containsGlobChars(normalizedPath)) {
+    // Extract the static directory prefix before glob characters
+    const staticPrefix = normalizedPath.split(/[*?\[]/)[ 0]
+    if (staticPrefix && staticPrefix !== '/') {
+      // Get the directory containing the glob pattern
+      // If staticPrefix ends with /, remove it to get the directory
+      const baseDir = staticPrefix.endsWith('/')
+        ? staticPrefix.slice(0, -1)
+        : path.dirname(staticPrefix)
+
+      // Try to resolve symlinks for the base directory
+      try {
+        const resolvedBaseDir = fs.realpathSync(baseDir)
+        // Reconstruct the pattern with the resolved directory
+        const patternSuffix = normalizedPath.slice(baseDir.length)
+        return resolvedBaseDir + patternSuffix
+      } catch {
+        // If directory doesn't exist or can't be resolved, keep the original pattern
+      }
+    }
     return normalizedPath
   }
 
