@@ -80,7 +80,7 @@ async function main(): Promise<void> {
     .description(
       'Run commands in a sandbox with network and filesystem restrictions',
     )
-    .version('1.0.0')
+    .version(process.env.npm_package_version || '1.0.0')
 
   // Default command - run command in sandbox
   program
