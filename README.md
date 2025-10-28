@@ -1,4 +1,6 @@
-# Anthropic Sandbox Runtime (srt)
+# srt
+
+> This fork adds Voratiq-specific extensions to the [Anthropic Sandbox Runtime (ASRT)](https://github.com/anthropic-experimental/sandbox-runtime) package.
 
 A lightweight sandboxing tool for enforcing filesystem and network restrictions on arbitrary processes at the OS level, without requiring a container.
 
@@ -11,7 +13,7 @@ A lightweight sandboxing tool for enforcing filesystem and network restrictions 
 ## Installation
 
 ```bash
-npm install -g @anthropic-ai/sandbox-runtime
+npm install -g @voratiq/sandbox-runtime
 ```
 
 ## Basic Usage
@@ -29,7 +31,7 @@ Connection blocked by network allowlist  # Request blocked
 # Filesystem restrictions
 $ srt "cat README.md"
 Running: cat README.md
-# Anthropic Sandb...  # Current directory access allowed
+# srt ...  # Current directory access allowed
 
 $ srt "cat ~/.ssh/id_rsa"
 Running: cat ~/.ssh/id_rsa
@@ -170,7 +172,7 @@ srt --settings /path/to/srt-settings.json npm install
 ### As a library
 
 ```typescript
-import { SandboxManager, type SandboxRuntimeConfig } from '@anthropic-ai/sandbox-runtime'
+import { SandboxManager, type SandboxRuntimeConfig } from '@voratiq/sandbox-runtime'
 import { spawn } from 'child_process'
 
 // Define your sandbox configuration
@@ -208,10 +210,10 @@ await SandboxManager.reset()
 
 ```typescript
 // Main sandbox manager
-export { SandboxManager } from '@anthropic-ai/sandbox-runtime'
+export { SandboxManager } from '@voratiq/sandbox-runtime'
 
 // Violation tracking
-export { SandboxViolationStore } from '@anthropic-ai/sandbox-runtime'
+export { SandboxViolationStore } from '@voratiq/sandbox-runtime'
 
 // TypeScript types
 export type {
@@ -223,7 +225,7 @@ export type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
   NetworkRestrictionConfig,
-} from '@anthropic-ai/sandbox-runtime'
+} from '@voratiq/sandbox-runtime'
 ```
 
 ## Configuration

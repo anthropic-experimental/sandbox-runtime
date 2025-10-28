@@ -1,7 +1,7 @@
 {
-  "name": "@anthropic-ai/sandbox-runtime",
+  "name": "@voratiq/sandbox-runtime",
   "version": "0.0.2",
-  "description": "Anthropic Sandbox Runtime (ASRT) - A general-purpose tool for wrapping security boundaries around arbitrary processes",
+  "description": "(Voratiq fork of the) Anthropic Sandbox Runtime (ASRT) - A general-purpose tool for wrapping security boundaries around arbitrary processes",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -58,21 +58,23 @@
     "sandbox",
     "seatbelt",
     "sandbox-exec",
-    "anthropic",
-    "claude",
+    "voratiq",
     "security",
     "bubblewrap",
     "network-filtering",
     "filesystem-restrictions"
   ],
-  "author": "Anthropic PBC",
+  "author": "Voratiq",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/anthropic-experimental/sandbox-runtime.git"
+    "url": "git+https://github.com/voratiq/sandbox-runtime.git"
   },
   "bugs": {
-    "url": "https://github.com/anthropic-experimental/sandbox-runtime/issues"
+    "url": "https://github.com/voratiq/sandbox-runtime/issues"
   },
-  "homepage": "https://github.com/anthropic-experimental/sandbox-runtime#readme"
+  "homepage": "https://github.com/voratiq/sandbox-runtime#readme",
+  "publishConfig": {
+    "access": "public"
+  }
 }
