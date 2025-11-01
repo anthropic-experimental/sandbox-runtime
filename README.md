@@ -109,7 +109,7 @@ The sandbox uses OS-level primitives to enforce restrictions that apply to the e
 
 ### Dual Isolation Model
 
-Both filesystem and network isolation are required for effective sandboxing. Without network isolation, a compromised process could exfiltrate SSH keys or other sensitive files. Without filesystem isolation, a process could escape the sandbox and gain unrestricted network access.
+Both filesystem and network isolation are required for effective sandboxing. Without file isolation, a compromised process could exfiltrate SSH keys or other sensitive files. Without network isolation, a process could escape the sandbox and gain unrestricted network access.
 
 **Filesystem Isolation** enforces read and write restrictions:
 
