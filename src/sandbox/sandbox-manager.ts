@@ -2,6 +2,7 @@ import { createHttpProxyServer } from './http-proxy.js'
 import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
 import { logForDebugging } from '../utils/debug.js'
+import { cloneDeep } from 'lodash-es'
 import { getPlatform, type Platform } from '../utils/platform.js'
 import * as fs from 'fs'
 import type { SandboxRuntimeConfig } from './sandbox-config.js'
@@ -560,7 +561,7 @@ function getConfig(): SandboxRuntimeConfig | undefined {
  */
 function updateConfig(newConfig: SandboxRuntimeConfig): void {
   // Deep clone the config to avoid mutations
-  config = JSON.parse(JSON.stringify(newConfig)) as SandboxRuntimeConfig
+  config = cloneDeep(newConfig)
   logForDebugging('Sandbox configuration updated')
 }
 
