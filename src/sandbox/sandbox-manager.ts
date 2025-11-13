@@ -49,8 +49,6 @@ let initializationPromise: Promise<HostNetworkManagerContext> | undefined
 let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
 const sandboxViolationStore = new SandboxViolationStore()
-let dependenciesCheckCache: boolean | undefined
-
 // ============================================================================
 // Private Helper Functions (not exported)
 // ============================================================================
@@ -312,53 +310,37 @@ function checkDependencies(ripgrepConfig?: {
   command: string
   args?: string[]
 }): boolean {
-  // Return cached result if available and no ripgrep config is provided
-  if (dependenciesCheckCache !== undefined && !ripgrepConfig) {
-    return dependenciesCheckCache
+  const platform = getPlatform()
+
+  // Check platform support
+  if (!isSupportedPlatform(platform)) {
+    return false
   }
 
-  function computeDependencies(): boolean {
-    const platform = getPlatform()
+  // Determine which ripgrep to check:
+  // 1. Parameter takes precedence
+  // 2. Then config from initialization
+  // 3. Finally default to 'rg'
+  const rgToCheck = ripgrepConfig ?? config?.ripgrep
 
-    // Check platform support
-    if (!isSupportedPlatform(platform)) {
+  // Check ripgrep - only check 'rg' if no custom command is configured
+  // If custom command is provided, we trust it exists (will fail naturally if not)
+  const hasCustomRipgrep = rgToCheck?.command !== undefined
+  if (!hasCustomRipgrep) {
+    // Only check for default 'rg' command
+    if (!hasRipgrepSync()) {
       return false
     }
-
-    // Determine which ripgrep to check:
-    // 1. Parameter takes precedence
-    // 2. Then config from initialization
-    // 3. Finally default to 'rg'
-    const rgToCheck = ripgrepConfig ?? config?.ripgrep
-
-    // Check ripgrep - only check 'rg' if no custom command is configured
-    // If custom command is provided, we trust it exists (will fail naturally if not)
-    const hasCustomRipgrep = rgToCheck?.command !== undefined
-    if (!hasCustomRipgrep) {
-      // Only check for default 'rg' command
-      if (!hasRipgrepSync()) {
-        return false
-      }
-    }
-
-    // Platform-specific dependency checks
-    if (platform === 'linux') {
-      const allowAllUnixSockets = config?.network?.allowAllUnixSockets ?? false
-      return hasLinuxSandboxDependenciesSync(allowAllUnixSockets)
-    }
-
-    // macOS only needs ripgrep (already checked above)
-    return true
   }
 
-  const result = computeDependencies()
-
-  // Only cache if no explicit ripgrep config was provided
-  if (!ripgrepConfig) {
-    dependenciesCheckCache = result
+  // Platform-specific dependency checks
+  if (platform === 'linux') {
+    const allowAllUnixSockets = config?.network?.allowAllUnixSockets ?? false
+    return hasLinuxSandboxDependenciesSync(allowAllUnixSockets)
   }
 
-  return result
+  // macOS only needs ripgrep (already checked above)
+  return true
 }
 
 function getFsReadConfig(): FsReadRestrictionConfig {
@@ -725,7 +707,6 @@ async function reset(): Promise<void> {
   socksProxyServer = undefined
   managerContext = undefined
   initializationPromise = undefined
-  dependenciesCheckCache = undefined
 }
 
 function getSandboxViolationStore() {
