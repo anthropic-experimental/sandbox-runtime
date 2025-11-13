@@ -200,7 +200,6 @@ export async function initializeLinuxNetworkBridge(
 
   const socksBridgeProcess = spawn('socat', socksSocatArgs, {
     stdio: 'ignore',
-    detached: false, // Keep attached to parent but unref to prevent blocking
   })
 
   if (!socksBridgeProcess.pid) {
@@ -214,9 +213,6 @@ export async function initializeLinuxNetworkBridge(
     }
     throw new Error('Failed to start SOCKS bridge process')
   }
-
-  // Unref so the process doesn't keep Node alive, but it stays running
-  socksBridgeProcess.unref()
 
   // Add error and exit handlers to monitor bridge health
   socksBridgeProcess.on('error', err => {
