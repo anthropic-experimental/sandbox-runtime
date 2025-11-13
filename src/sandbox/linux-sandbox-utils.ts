@@ -175,6 +175,17 @@ export async function initializeLinuxNetworkBridge(
     throw new Error('Failed to start HTTP bridge process')
   }
 
+  // Add error and exit handlers to monitor bridge health
+  httpBridgeProcess.on('error', err => {
+    logForDebugging(`HTTP bridge process error: ${err}`, { level: 'error' })
+  })
+  httpBridgeProcess.on('exit', (code, signal) => {
+    logForDebugging(
+      `HTTP bridge process exited with code ${code}, signal ${signal}`,
+      { level: code === 0 ? 'info' : 'error' },
+    )
+  })
+
   // Start SOCKS bridge
   const socksSocatArgs = [
     `UNIX-LISTEN:${socksSocketPath},fork,reuseaddr`,
@@ -198,6 +209,17 @@ export async function initializeLinuxNetworkBridge(
     }
     throw new Error('Failed to start SOCKS bridge process')
   }
+
+  // Add error and exit handlers to monitor bridge health
+  socksBridgeProcess.on('error', err => {
+    logForDebugging(`SOCKS bridge process error: ${err}`, { level: 'error' })
+  })
+  socksBridgeProcess.on('exit', (code, signal) => {
+    logForDebugging(
+      `SOCKS bridge process exited with code ${code}, signal ${signal}`,
+      { level: code === 0 ? 'info' : 'error' },
+    )
+  })
 
   // Wait for both sockets to be ready
   const maxAttempts = 5
@@ -548,6 +570,20 @@ export async function wrapCommandWithSandboxLinux(
       if (!httpSocketPath || !socksSocketPath) {
         throw new Error(
           'Linux network sandboxing was requested but bridge socket paths are not available',
+        )
+      }
+
+      // Verify socket files still exist before trying to bind them
+      if (!fs.existsSync(httpSocketPath)) {
+        throw new Error(
+          `Linux HTTP bridge socket does not exist: ${httpSocketPath}. ` +
+            'The bridge process may have died. Try reinitializing the sandbox.',
+        )
+      }
+      if (!fs.existsSync(socksSocketPath)) {
+        throw new Error(
+          `Linux SOCKS bridge socket does not exist: ${socksSocketPath}. ` +
+            'The bridge process may have died. Try reinitializing the sandbox.',
         )
       }
 
