@@ -29,7 +29,6 @@ import {
 import { hasRipgrepSync } from '../utils/ripgrep.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
 import { EOL } from 'node:os'
-import { cloneDeep } from 'lodash-es'
 
 interface HostNetworkManagerContext {
   httpProxyPort: number
@@ -560,8 +559,8 @@ function getConfig(): SandboxRuntimeConfig | undefined {
  * @param newConfig - The new configuration to use
  */
 function updateConfig(newConfig: SandboxRuntimeConfig): void {
-  // Update the config in place
-  config = cloneDeep(newConfig)
+  // Deep clone the config to avoid mutations
+  config = JSON.parse(JSON.stringify(newConfig)) as SandboxRuntimeConfig
   logForDebugging('Sandbox configuration updated')
 }
 
