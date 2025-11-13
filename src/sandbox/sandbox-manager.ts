@@ -2,6 +2,7 @@ import { createHttpProxyServer } from './http-proxy.js'
 import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
 import { logForDebugging } from '../utils/debug.js'
+import { cloneDeep } from 'lodash-es'
 import { getPlatform, type Platform } from '../utils/platform.js'
 import * as fs from 'fs'
 import type { SandboxRuntimeConfig } from './sandbox-config.js'
@@ -304,11 +305,15 @@ function isSandboxingEnabled(): boolean {
 
 /**
  * Check if all sandbox dependencies are available for the current platform
+ * @param ripgrepConfig - Optional ripgrep configuration to check. If not provided, uses config from initialization or defaults to 'rg'
  * @returns true if all dependencies are available, false otherwise
  */
-function checkDependencies(): boolean {
-  // Return cached result if available
-  if (dependenciesCheckCache !== undefined) {
+function checkDependencies(ripgrepConfig?: {
+  command: string
+  args?: string[]
+}): boolean {
+  // Return cached result if available and no ripgrep config is provided
+  if (dependenciesCheckCache !== undefined && !ripgrepConfig) {
     return dependenciesCheckCache
   }
 
@@ -320,9 +325,15 @@ function checkDependencies(): boolean {
       return false
     }
 
+    // Determine which ripgrep to check:
+    // 1. Parameter takes precedence
+    // 2. Then config from initialization
+    // 3. Finally default to 'rg'
+    const rgToCheck = ripgrepConfig ?? config?.ripgrep
+
     // Check ripgrep - only check 'rg' if no custom command is configured
     // If custom command is provided, we trust it exists (will fail naturally if not)
-    const hasCustomRipgrep = config?.ripgrep?.command !== undefined
+    const hasCustomRipgrep = rgToCheck?.command !== undefined
     if (!hasCustomRipgrep) {
       // Only check for default 'rg' command
       if (!hasRipgrepSync()) {
@@ -340,8 +351,14 @@ function checkDependencies(): boolean {
     return true
   }
 
-  dependenciesCheckCache = computeDependencies()
-  return dependenciesCheckCache
+  const result = computeDependencies()
+
+  // Only cache if no explicit ripgrep config was provided
+  if (!ripgrepConfig) {
+    dependenciesCheckCache = result
+  }
+
+  return result
 }
 
 function getFsReadConfig(): FsReadRestrictionConfig {
@@ -528,6 +545,24 @@ async function wrapWithSandbox(
         `Sandbox configuration is not supported on platform: ${platform}`,
       )
   }
+}
+
+/**
+ * Get the current sandbox configuration
+ * @returns The current configuration, or undefined if not initialized
+ */
+function getConfig(): SandboxRuntimeConfig | undefined {
+  return config
+}
+
+/**
+ * Update the sandbox configuration
+ * @param newConfig - The new configuration to use
+ */
+function updateConfig(newConfig: SandboxRuntimeConfig): void {
+  // Deep clone the config to avoid mutations
+  config = cloneDeep(newConfig)
+  logForDebugging('Sandbox configuration updated')
 }
 
 async function reset(): Promise<void> {
@@ -771,7 +806,10 @@ export interface ISandboxManager {
   ): Promise<void>
   isSupportedPlatform(platform: Platform): boolean
   isSandboxingEnabled(): boolean
-  checkDependencies(): boolean
+  checkDependencies(ripgrepConfig?: {
+    command: string
+    args?: string[]
+  }): boolean
   getFsReadConfig(): FsReadRestrictionConfig
   getFsWriteConfig(): FsWriteRestrictionConfig
   getNetworkRestrictionConfig(): NetworkRestrictionConfig
@@ -787,6 +825,8 @@ export interface ISandboxManager {
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
   getLinuxGlobPatternWarnings(): string[]
+  getConfig(): SandboxRuntimeConfig | undefined
+  updateConfig(newConfig: SandboxRuntimeConfig): void
   reset(): Promise<void>
 }
 
@@ -819,4 +859,6 @@ export const SandboxManager: ISandboxManager = {
   getSandboxViolationStore,
   annotateStderrWithSandboxFailures,
   getLinuxGlobPatternWarnings,
+  getConfig,
+  updateConfig,
 } as const
