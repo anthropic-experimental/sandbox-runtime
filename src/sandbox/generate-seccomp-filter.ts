@@ -54,8 +54,9 @@ function getVendorArchitecture(): string | null {
  * - vendor/seccomp/{x64,arm64}/unix-block.bpf
  *
  * Tries multiple paths for resilience:
- * 1. ../../vendor/seccomp/{arch}/unix-block.bpf (package root - standard npm installs)
- * 2. ../vendor/seccomp/{arch}/unix-block.bpf (dist/vendor - for bundlers)
+ * 1. vendor/seccomp/{arch}/unix-block.bpf (bundled - when bundled into consuming packages)
+ * 2. ../../vendor/seccomp/{arch}/unix-block.bpf (package root - standard npm installs)
+ * 3. ../vendor/seccomp/{arch}/unix-block.bpf (dist/vendor - for bundlers)
  */
 export function getPreGeneratedBpfPath(): string | null {
   // Determine architecture
@@ -76,6 +77,7 @@ export function getPreGeneratedBpfPath(): string | null {
 
   // Try paths in order of preference
   const pathsToTry = [
+    join(baseDir, relativePath), // bundled: same directory as bundle (e.g., when bundled into claude-cli)
     join(baseDir, '..', '..', relativePath), // package root: vendor/seccomp/...
     join(baseDir, '..', relativePath), // dist: dist/vendor/seccomp/...
   ]
@@ -103,8 +105,9 @@ export function getPreGeneratedBpfPath(): string | null {
  * - vendor/seccomp/{x64,arm64}/apply-seccomp
  *
  * Tries multiple paths for resilience:
- * 1. ../../vendor/seccomp/{arch}/apply-seccomp (package root - standard npm installs)
- * 2. ../vendor/seccomp/{arch}/apply-seccomp (dist/vendor - for bundlers)
+ * 1. vendor/seccomp/{arch}/apply-seccomp (bundled - when bundled into consuming packages)
+ * 2. ../../vendor/seccomp/{arch}/apply-seccomp (package root - standard npm installs)
+ * 3. ../vendor/seccomp/{arch}/apply-seccomp (dist/vendor - for bundlers)
  */
 export function getApplySeccompBinaryPath(): string | null {
   // Determine architecture
@@ -127,6 +130,7 @@ export function getApplySeccompBinaryPath(): string | null {
 
   // Try paths in order of preference
   const pathsToTry = [
+    join(baseDir, relativePath), // bundled: same directory as bundle (e.g., when bundled into claude-cli)
     join(baseDir, '..', '..', relativePath), // package root: vendor/seccomp/...
     join(baseDir, '..', relativePath), // dist: dist/vendor/seccomp/...
   ]
