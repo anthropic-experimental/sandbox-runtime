@@ -44,7 +44,7 @@ This package provides a standalone sandbox implementation that can be used as bo
 **Key capabilities:**
 
 - **Network restrictions**: Control which hosts/domains can be accessed via HTTP/HTTPS and other protocols
-- **Filesystem restrictions**: Control which files/directories can be read/written (defaulting to allowing writes to the current working directory)
+- **Filesystem restrictions**: Control which files/directories can be read/written
 - **Unix socket restrictions**: Control access to local IPC sockets
 - **Violation monitoring**: On macOS, tap into the system's sandbox violation log store for real-time alerts
 
@@ -113,10 +113,10 @@ Both filesystem and network isolation are required for effective sandboxing. Wit
 
 **Filesystem Isolation** enforces read and write restrictions:
 
-- **Read**: By default, read access is allowed everywhere. You can deny specific paths (e.g., `Read(~/.ssh)`)
-- **Write**: By default, write access is only allowed in the current working directory. You can allow additional paths (e.g., `Edit(/tmp)`), and deny within allowed paths (e.g., deny `Edit(./secret)` even though `.` is allowed)
+- **Read** (deny-only pattern): By default, read access is allowed everywhere. You can deny specific paths (e.g., `~/.ssh`). An empty deny list means full read access.
+- **Write** (allow-only pattern): By default, write access is denied everywhere. You must explicitly allow paths (e.g., `.`, `/tmp`). An empty allow list means no write access.
 
-**Network Isolation** routes all traffic through proxy servers running on the host:
+**Network Isolation** (allow-only pattern): By default, all network access is denied. You must explicitly allow domains. An empty allowedDomains list means no network access. Network traffic is routed through proxy servers running on the host:
 
 - **Linux**: Requests are routed via the filesystem over a Unix domain socket. The network namespace of the sandboxed process is removed entirely, so all network traffic must go through the proxies running on the host (listening on Unix sockets that are bind-mounted into the sandbox)
 
@@ -283,16 +283,23 @@ srt --settings /path/to/srt-settings.json <command>
 
 #### Network Configuration
 
-- `network.allowedDomains` - Array of allowed domains (supports wildcards like `*.example.com`)
-- `network.deniedDomains` - Array of denied domains (takes precedence over allowedDomains)
+Uses an **allow-only pattern** - all network access is denied by default.
+
+- `network.allowedDomains` - Array of allowed domains (supports wildcards like `*.example.com`). Empty array = no network access.
+- `network.deniedDomains` - Array of denied domains (checked first, takes precedence over allowedDomains)
 - `network.allowUnixSockets` - Array of Unix socket paths that can be accessed (macOS only)
 - `network.allowLocalBinding` - Allow binding to local ports (boolean, default: false)
 
 #### Filesystem Configuration
 
-- `filesystem.denyRead` - Array of paths to deny read access
-- `filesystem.allowWrite` - Array of paths to allow write access (default: current working directory only)
-- `filesystem.denyWrite` - Array of paths to deny write access (takes precedence over allowWrite)
+Uses two different patterns:
+
+**Read restrictions** (deny-only pattern) - all reads allowed by default:
+- `filesystem.denyRead` - Array of paths to deny read access. Empty array = full read access.
+
+**Write restrictions** (allow-only pattern) - all writes denied by default:
+- `filesystem.allowWrite` - Array of paths to allow write access. Empty array = no write access.
+- `filesystem.denyWrite` - Array of paths to deny write access within allowed paths (takes precedence over allowWrite)
 
 **Path Syntax (macOS):**
 
@@ -473,14 +480,16 @@ Filesystem restrictions are enforced at the OS level:
 
 **Default filesystem permissions:**
 
-- **Read**: Allowed everywhere by default. You can deny specific paths using `Read(path)` deny rules
-  - Example: Deny `Read(~/.ssh)` to block access to SSH keys
+- **Read** (deny-only): Allowed everywhere by default. You can deny specific paths.
+  - Example: `denyRead: ["~/.ssh"]` to block access to SSH keys
+  - Empty `denyRead: []` = full read access (nothing denied)
 
-- **Write**: Only allowed in the current working directory by default. You can:
-  - Allow additional paths using `Edit(path)` allow rules (e.g., `Edit(/tmp)`)
-  - Deny specific paths within allowed directories (e.g., deny `Edit(.env)` even though `.` is allowed)
+- **Write** (allow-only): Denied everywhere by default. You must explicitly allow paths.
+  - Example: `allowWrite: [".", "/tmp"]` to allow writes to current directory and /tmp
+  - Empty `allowWrite: []` = no write access (nothing allowed)
+  - `denyWrite` creates exceptions within allowed paths
 
-This model lets you start with broad read access but tightly controlled write access, then refine both as needed.
+This model lets you start with broad read access but maximally restricted write access, then explicitly open the holes you need.
 
 ### Unix Socket Restrictions (Linux)
 

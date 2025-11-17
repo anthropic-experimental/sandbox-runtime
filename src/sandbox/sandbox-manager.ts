@@ -476,6 +476,7 @@ async function waitForNetworkInitialization(): Promise<boolean> {
 async function wrapWithSandbox(
   command: string,
   binShell?: string,
+  customConfig?: Partial<SandboxRuntimeConfig>,
 ): Promise<string> {
   // If no config, return command as-is
   if (!config) {
@@ -484,18 +485,40 @@ async function wrapWithSandbox(
 
   const platform = getPlatform()
 
-  // Wait for network initialization
-  await waitForNetworkInitialization()
+  // Get configs - use custom if provided, otherwise fall back to main config
+  // Always include default system write paths (like /dev/null, /tmp/claude)
+  const userAllowWrite =
+    customConfig?.filesystem?.allowWrite ?? config.filesystem.allowWrite ?? []
+  const writeConfig = {
+    allowOnly: [...getDefaultWritePaths(), ...userAllowWrite],
+    denyWithinAllow:
+      customConfig?.filesystem?.denyWrite ?? config.filesystem.denyWrite ?? [],
+  }
+  const readConfig = {
+    denyOnly:
+      customConfig?.filesystem?.denyRead ?? config.filesystem.denyRead ?? [],
+  }
+
+  // Check if network proxy is needed based on allowed domains
+  // Unix sockets are local IPC and don't require the network proxy
+  const allowedDomains =
+    customConfig?.network?.allowedDomains ?? config.network.allowedDomains
+  const needsNetworkProxy = (allowedDomains?.length ?? 0) > 0
+
+  // Wait for network initialization only if proxy is actually needed
+  if (needsNetworkProxy) {
+    await waitForNetworkInitialization()
+  }
 
   switch (platform) {
     case 'macos':
       return await wrapCommandWithSandboxMacOS({
         command,
+        needsNetworkRestriction: needsNetworkProxy,
         httpProxyPort: getProxyPort(),
         socksProxyPort: getSocksProxyPort(),
-        readConfig: getFsReadConfig(),
-        writeConfig: getFsWriteConfig(),
-        needsNetworkRestriction: true,
+        readConfig,
+        writeConfig,
         allowUnixSockets: getAllowUnixSockets(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         allowLocalBinding: getAllowLocalBinding(),
@@ -507,14 +530,13 @@ async function wrapWithSandbox(
     case 'linux':
       return wrapCommandWithSandboxLinux({
         command,
-        hasNetworkRestrictions: true,
-        hasFilesystemRestrictions: true,
+        needsNetworkRestriction: needsNetworkProxy,
         httpSocketPath: getLinuxHttpSocketPath(),
         socksSocketPath: getLinuxSocksSocketPath(),
         httpProxyPort: managerContext?.httpProxyPort,
         socksProxyPort: managerContext?.socksProxyPort,
-        readConfig: getFsReadConfig(),
-        writeConfig: getFsWriteConfig(),
+        readConfig,
+        writeConfig,
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         binShell,
@@ -796,13 +818,18 @@ export interface ISandboxManager {
   getNetworkRestrictionConfig(): NetworkRestrictionConfig
   getAllowUnixSockets(): string[] | undefined
   getAllowLocalBinding(): boolean | undefined
+  getIgnoreViolations(): Record<string, string[]> | undefined
   getEnableWeakerNestedSandbox(): boolean | undefined
   getProxyPort(): number | undefined
   getSocksProxyPort(): number | undefined
   getLinuxHttpSocketPath(): string | undefined
   getLinuxSocksSocketPath(): string | undefined
   waitForNetworkInitialization(): Promise<boolean>
-  wrapWithSandbox(command: string, binShell?: string): Promise<string>
+  wrapWithSandbox(
+    command: string,
+    binShell?: string,
+    customConfig?: Partial<SandboxRuntimeConfig>,
+  ): Promise<string>
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
   getLinuxGlobPatternWarnings(): string[]
@@ -829,6 +856,7 @@ export const SandboxManager: ISandboxManager = {
   getNetworkRestrictionConfig,
   getAllowUnixSockets,
   getAllowLocalBinding,
+  getIgnoreViolations,
   getEnableWeakerNestedSandbox,
   getProxyPort,
   getSocksProxyPort,

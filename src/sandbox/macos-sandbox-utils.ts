@@ -18,9 +18,9 @@ import type { IgnoreViolationsConfig } from './sandbox-config.js'
 
 export interface MacOSSandboxParams {
   command: string
+  needsNetworkRestriction: boolean
   httpProxyPort?: number
   socksProxyPort?: number
-  needsNetworkRestriction: boolean
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
@@ -589,9 +589,9 @@ export async function wrapCommandWithSandboxMacOS(
 ): Promise<string> {
   const {
     command,
+    needsNetworkRestriction,
     httpProxyPort,
     socksProxyPort,
-    needsNetworkRestriction,
     allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,
@@ -601,8 +601,18 @@ export async function wrapCommandWithSandboxMacOS(
     ripgrepConfig = { command: 'rg' },
   } = params
 
+  // Determine if we have restrictions to apply
+  // Read: denyOnly pattern - empty array means no restrictions
+  // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
+  const hasReadRestrictions = readConfig && readConfig.denyOnly.length > 0
+  const hasWriteRestrictions = writeConfig !== undefined
+
   // No sandboxing needed
-  if (!needsNetworkRestriction && !readConfig && !writeConfig) {
+  if (
+    !needsNetworkRestriction &&
+    !hasReadRestrictions &&
+    !hasWriteRestrictions
+  ) {
     return command
   }
 

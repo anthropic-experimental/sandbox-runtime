@@ -18,8 +18,19 @@ export default [
   {
     languageOptions: {
       parserOptions: {
-        projectService: true,
+        projectService: {
+          allowDefaultProject: ['eslint.config.js'],
+        },
         tsconfigRootDir: import.meta.dirname,
+      },
+    },
+  },
+  {
+    files: ['test/**/*.ts'],
+    languageOptions: {
+      parserOptions: {
+        project: './tsconfig.test.json',
+        projectService: false,
       },
     },
   },

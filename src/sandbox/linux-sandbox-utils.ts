@@ -33,8 +33,7 @@ export interface LinuxNetworkBridgeContext {
 
 export interface LinuxSandboxParams {
   command: string
-  hasNetworkRestrictions: boolean
-  hasFilesystemRestrictions: boolean
+  needsNetworkRestriction: boolean
   httpSocketPath?: string
   socksSocketPath?: string
   httpProxyPort?: number
@@ -501,8 +500,7 @@ export async function wrapCommandWithSandboxLinux(
 ): Promise<string> {
   const {
     command,
-    hasNetworkRestrictions,
-    hasFilesystemRestrictions,
+    needsNetworkRestriction,
     httpSocketPath,
     socksSocketPath,
     httpProxyPort,
@@ -515,8 +513,18 @@ export async function wrapCommandWithSandboxLinux(
     ripgrepConfig = { command: 'rg' },
   } = params
 
+  // Determine if we have restrictions to apply
+  // Read: denyOnly pattern - empty array means no restrictions
+  // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
+  const hasReadRestrictions = readConfig && readConfig.denyOnly.length > 0
+  const hasWriteRestrictions = writeConfig !== undefined
+
   // Check if we need any sandboxing
-  if (!hasNetworkRestrictions && !hasFilesystemRestrictions) {
+  if (
+    !needsNetworkRestriction &&
+    !hasReadRestrictions &&
+    !hasWriteRestrictions
+  ) {
     return command
   }
 
@@ -559,7 +567,7 @@ export async function wrapCommandWithSandboxLinux(
     }
 
     // ========== NETWORK RESTRICTIONS ==========
-    if (hasNetworkRestrictions) {
+    if (needsNetworkRestriction) {
       // Only sandbox if we have network config and Linux bridges
       if (!httpSocketPath || !socksSocketPath) {
         throw new Error(
@@ -660,7 +668,7 @@ export async function wrapCommandWithSandboxLinux(
 
     // If we have network restrictions, use the network bridge setup with apply-seccomp for seccomp
     // Otherwise, just run the command directly with apply-seccomp if needed
-    if (hasNetworkRestrictions && httpSocketPath && socksSocketPath) {
+    if (needsNetworkRestriction && httpSocketPath && socksSocketPath) {
       // Pass seccomp filter to buildSandboxCommand for apply-seccomp application
       // This allows socat to start before seccomp is applied
       const sandboxCommand = buildSandboxCommand(
@@ -698,8 +706,9 @@ export async function wrapCommandWithSandboxLinux(
     const wrappedCommand = shellquote.quote(['bwrap', ...bwrapArgs])
 
     const restrictions = []
-    if (hasNetworkRestrictions) restrictions.push('network')
-    if (hasFilesystemRestrictions) restrictions.push('filesystem')
+    if (needsNetworkRestriction) restrictions.push('network')
+    if (hasReadRestrictions || hasWriteRestrictions)
+      restrictions.push('filesystem')
     if (seccompFilterPath) restrictions.push('seccomp(unix-block)')
 
     logForDebugging(
