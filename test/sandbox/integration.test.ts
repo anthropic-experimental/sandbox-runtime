@@ -18,7 +18,7 @@ import { generateSeccompFilter } from '../../src/sandbox/generate-seccomp-filter
 /**
  * Create a minimal test configuration for the sandbox with example.com allowed
  */
-function createTestConfig(): SandboxRuntimeConfig {
+function createTestConfig(testDir: string): SandboxRuntimeConfig {
   return {
     network: {
       allowedDomains: ['example.com'],
@@ -26,7 +26,7 @@ function createTestConfig(): SandboxRuntimeConfig {
     },
     filesystem: {
       denyRead: [],
-      allowWrite: [],
+      allowWrite: [testDir],
       denyWrite: [],
     },
   }
@@ -98,7 +98,7 @@ describe('Sandbox Integration Tests', () => {
     })
 
     // Initialize sandbox
-    await SandboxManager.initialize(createTestConfig())
+    await SandboxManager.initialize(createTestConfig(TEST_DIR))
   })
 
   afterAll(async () => {
@@ -852,7 +852,7 @@ describe('Sandbox Integration Tests', () => {
 
         // Restore original config
         await SandboxManager.reset()
-        await SandboxManager.initialize(createTestConfig())
+        await SandboxManager.initialize(createTestConfig(TEST_DIR))
       })
 
       it('should prevent creation of special file types that could bypass restrictions', async () => {
