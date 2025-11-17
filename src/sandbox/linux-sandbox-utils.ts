@@ -75,9 +75,6 @@ function registerSeccompCleanupHandler(): void {
 /**
  * Check if Linux sandbox dependencies are available (synchronous)
  * Returns true if bwrap and socat are installed.
- * Unless allowAllUnixSockets is enabled, also requires seccomp dependencies:
- * - On x64/arm64: Pre-generated BPF filters and apply-seccomp binaries available
- * - On other architectures: Not currently supported (no apply-seccomp binary available)
  */
 export function hasLinuxSandboxDependenciesSync(
   allowAllUnixSockets = false,
@@ -94,7 +91,7 @@ export function hasLinuxSandboxDependenciesSync(
 
     const hasBasicDeps = bwrapResult.status === 0 && socatResult.status === 0
 
-    // Also require seccomp dependencies unless allowAllUnixSockets is enabled
+    // Check for seccomp dependencies (optional security feature)
     if (!allowAllUnixSockets) {
       // Check if we have a pre-generated BPF filter for this architecture
       const hasPreGeneratedBpf = getPreGeneratedBpfPath() !== null
@@ -102,20 +99,15 @@ export function hasLinuxSandboxDependenciesSync(
       // Check if we have the apply-seccomp binary for this architecture
       const hasApplySeccompBinary = getApplySeccompBinaryPath() !== null
 
-      if (hasPreGeneratedBpf && hasApplySeccompBinary) {
-        // Pre-generated BPF and apply-seccomp binary available (x64/arm64)
-        return hasBasicDeps
-      } else {
-        // Architecture not supported - no pre-built apply-seccomp binary available
-        // Note: We cannot fall back to runtime BPF compilation because we need
-        // the apply-seccomp binary to actually apply the filter
+      if (!hasPreGeneratedBpf || !hasApplySeccompBinary) {
+        // Seccomp not available - log warning but continue with basic sandbox
+        // The sandbox will gracefully fall back to allowAllUnixSockets mode
         logForDebugging(
-          `[Sandbox Linux] Architecture ${process.arch} is not supported for seccomp filtering. ` +
-            `Only x64 and arm64 are currently supported. To disable Unix socket blocking, ` +
-            `set allowAllUnixSockets: true in your configuration.`,
+          `[Sandbox Linux] Seccomp filtering not available (missing binaries for ${process.arch}). ` +
+            `Sandbox will run without Unix socket blocking (allowAllUnixSockets mode). ` +
+            `This is less restrictive but still provides filesystem and network isolation.`,
           { level: 'warn' },
         )
-        return false
       }
     }
 
@@ -540,24 +532,26 @@ export async function wrapCommandWithSandboxLinux(
     if (!allowAllUnixSockets) {
       seccompFilterPath = generateSeccompFilter() ?? undefined
       if (!seccompFilterPath) {
-        // Fail loudly - seccomp filtering is required for security
-        throw new Error(
-          'Failed to generate seccomp filter for Unix socket blocking. ' +
-            'This may occur on unsupported architectures (only x64 and arm64 are currently supported). ' +
-            'To disable Unix socket blocking, set allowAllUnixSockets: true in your configuration.',
+        // Seccomp not available - log warning and continue without it
+        // This provides graceful degradation on systems without seccomp binaries
+        logForDebugging(
+          '[Sandbox Linux] Seccomp filter not available (missing binaries). ' +
+            'Continuing without Unix socket blocking - sandbox will still provide ' +
+            'filesystem and network isolation but Unix sockets will be allowed.',
+          { level: 'warn' },
+        )
+      } else {
+        // Track filter for cleanup and register exit handler
+        // Only track runtime-generated filters (not pre-generated ones from vendor/)
+        if (!seccompFilterPath.includes('/vendor/seccomp/')) {
+          generatedSeccompFilters.add(seccompFilterPath)
+          registerSeccompCleanupHandler()
+        }
+
+        logForDebugging(
+          '[Sandbox Linux] Generated seccomp BPF filter for Unix socket blocking',
         )
       }
-
-      // Track filter for cleanup and register exit handler
-      // Only track runtime-generated filters (not pre-generated ones from vendor/)
-      if (!seccompFilterPath.includes('/vendor/seccomp/')) {
-        generatedSeccompFilters.add(seccompFilterPath)
-        registerSeccompCleanupHandler()
-      }
-
-      logForDebugging(
-        '[Sandbox Linux] Generated seccomp BPF filter for Unix socket blocking',
-      )
     } else if (allowAllUnixSockets) {
       logForDebugging(
         '[Sandbox Linux] Skipping seccomp filter - allowAllUnixSockets is enabled',
