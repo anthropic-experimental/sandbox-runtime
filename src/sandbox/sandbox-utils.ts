@@ -141,7 +141,6 @@ export function getDefaultWritePaths(): string[] {
     '/private/tmp/claude',
     path.join(homeDir, '.npm/_logs'),
     path.join(homeDir, '.claude/debug'),
-    '.',
   ]
 
   return recommendedPaths
