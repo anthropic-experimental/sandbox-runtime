@@ -1,8 +1,6 @@
-import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
+import { describe, it, expect, beforeAll } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { existsSync, statSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { getPlatform } from '../../src/utils/platform.js'
 import {
   generateSeccompFilter,
@@ -52,7 +50,12 @@ describe('Pre-generated BPF Support', () => {
     const arch = process.arch
     const preGeneratedBpf = getPreGeneratedBpfPath()
 
-    if (arch === 'x64' || arch === 'x86_64' || arch === 'arm64' || arch === 'aarch64') {
+    if (
+      arch === 'x64' ||
+      arch === 'x86_64' ||
+      arch === 'arm64' ||
+      arch === 'aarch64'
+    ) {
       // Should have pre-generated BPF for these architectures
       expect(preGeneratedBpf).toBeTruthy()
       if (preGeneratedBpf) {
@@ -87,7 +90,11 @@ describe('Pre-generated BPF Support', () => {
     const socatResult = spawnSync('which', ['socat'], { stdio: 'ignore' })
     const hasApplySeccomp = getApplySeccompBinaryPath() !== null
 
-    if (bwrapResult.status === 0 && socatResult.status === 0 && hasApplySeccomp) {
+    if (
+      bwrapResult.status === 0 &&
+      socatResult.status === 0 &&
+      hasApplySeccomp
+    ) {
       // Basic deps available - on x64/arm64 this should be sufficient
       // (pre-built apply-seccomp binaries and BPF filters are included)
       const arch = process.arch
@@ -135,7 +142,12 @@ describe('Seccomp Filter (Pre-generated)', () => {
     }
 
     const arch = process.arch
-    if (arch !== 'x64' && arch !== 'arm64' && arch !== 'x86_64' && arch !== 'aarch64') {
+    if (
+      arch !== 'x64' &&
+      arch !== 'arm64' &&
+      arch !== 'x86_64' &&
+      arch !== 'aarch64'
+    ) {
       // Not a supported architecture
       return
     }
@@ -163,7 +175,12 @@ describe('Seccomp Filter (Pre-generated)', () => {
     }
 
     const arch = process.arch
-    if (arch !== 'x64' && arch !== 'arm64' && arch !== 'x86_64' && arch !== 'aarch64') {
+    if (
+      arch !== 'x64' &&
+      arch !== 'arm64' &&
+      arch !== 'x86_64' &&
+      arch !== 'aarch64'
+    ) {
       return
     }
 
@@ -183,7 +200,12 @@ describe('Seccomp Filter (Pre-generated)', () => {
     }
 
     const arch = process.arch
-    if (arch === 'x64' || arch === 'arm64' || arch === 'x86_64' || arch === 'aarch64') {
+    if (
+      arch === 'x64' ||
+      arch === 'arm64' ||
+      arch === 'x86_64' ||
+      arch === 'aarch64'
+    ) {
       // This test is for unsupported architectures only
       return
     }
@@ -199,7 +221,9 @@ describe('Seccomp Filter (Pre-generated)', () => {
 
     // Cleanup should not throw for any path (it's a no-op)
     expect(() => cleanupSeccompFilter('/tmp/test.bpf')).not.toThrow()
-    expect(() => cleanupSeccompFilter('/vendor/seccomp/x64/unix-block.bpf')).not.toThrow()
+    expect(() =>
+      cleanupSeccompFilter('/vendor/seccomp/x64/unix-block.bpf'),
+    ).not.toThrow()
     expect(() => cleanupSeccompFilter('')).not.toThrow()
   })
 })
@@ -211,7 +235,12 @@ describe('Apply Seccomp Binary', () => {
     }
 
     const arch = process.arch
-    if (arch !== 'x64' && arch !== 'arm64' && arch !== 'x86_64' && arch !== 'aarch64') {
+    if (
+      arch !== 'x64' &&
+      arch !== 'arm64' &&
+      arch !== 'x86_64' &&
+      arch !== 'aarch64'
+    ) {
       return
     }
 
@@ -231,7 +260,12 @@ describe('Apply Seccomp Binary', () => {
     }
 
     const arch = process.arch
-    if (arch === 'x64' || arch === 'arm64' || arch === 'x86_64' || arch === 'aarch64') {
+    if (
+      arch === 'x64' ||
+      arch === 'arm64' ||
+      arch === 'x86_64' ||
+      arch === 'aarch64'
+    ) {
       return
     }
 
@@ -288,8 +322,7 @@ describe('Architecture Support', () => {
     // This should NOT throw even on unsupported architecture (when allowAllUnixSockets=true)
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: testCommand,
-      hasNetworkRestrictions: false,
-      hasFilesystemRestrictions: false,
+      needsNetworkRestriction: false,
       allowAllUnixSockets: true, // Bypass seccomp
     })
 
@@ -312,8 +345,7 @@ describe('USER_TYPE Gating', () => {
     const testCommand = 'echo "test"'
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: testCommand,
-      hasNetworkRestrictions: false,
-      hasFilesystemRestrictions: false,
+      needsNetworkRestriction: false,
     })
 
     if (process.env.USER_TYPE === 'ant') {
@@ -346,8 +378,7 @@ describe('Socket Filtering Behavior', () => {
 
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: testCommand,
-      hasNetworkRestrictions: false,
-      hasFilesystemRestrictions: false,
+      needsNetworkRestriction: false,
     })
 
     const result = spawnSync('bash', ['-c', wrappedCommand], {
@@ -371,8 +402,7 @@ describe('Socket Filtering Behavior', () => {
 
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: testCommand,
-      hasNetworkRestrictions: false,
-      hasFilesystemRestrictions: false,
+      needsNetworkRestriction: false,
     })
 
     const result = spawnSync('bash', ['-c', wrappedCommand], {
@@ -396,8 +426,7 @@ describe('Socket Filtering Behavior', () => {
 
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: testCommand,
-      hasNetworkRestrictions: false,
-      hasFilesystemRestrictions: false,
+      needsNetworkRestriction: false,
     })
 
     const result = spawnSync('bash', ['-c', wrappedCommand], {
@@ -418,8 +447,7 @@ describe('Socket Filtering Behavior', () => {
 
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: testCommand,
-      hasNetworkRestrictions: false,
-      hasFilesystemRestrictions: false,
+      needsNetworkRestriction: false,
     })
 
     const result = spawnSync('bash', ['-c', wrappedCommand], {
@@ -440,8 +468,7 @@ describe('Socket Filtering Behavior', () => {
 
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: testCommand,
-      hasNetworkRestrictions: false,
-      hasFilesystemRestrictions: false,
+      needsNetworkRestriction: false,
     })
 
     const result = spawnSync('bash', ['-c', wrappedCommand], {
@@ -470,8 +497,7 @@ describe('Two-Stage Seccomp Application', () => {
 
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: testCommand,
-      hasNetworkRestrictions: false,
-      hasFilesystemRestrictions: false,
+      needsNetworkRestriction: false,
     })
 
     // Command should include both socat and the apply-seccomp binary
@@ -500,8 +526,7 @@ describe('Two-Stage Seccomp Application', () => {
 
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: testCommand,
-      hasNetworkRestrictions: false,
-      hasFilesystemRestrictions: false,
+      needsNetworkRestriction: false,
     })
 
     const result = spawnSync('bash', ['-c', wrappedCommand], {
@@ -527,8 +552,7 @@ describe('Sandbox Integration', () => {
     const testCommand = 'echo "hello world"'
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: testCommand,
-      hasNetworkRestrictions: false,
-      hasFilesystemRestrictions: false,
+      needsNetworkRestriction: false,
     })
 
     // Should still wrap the command even without restrictions
@@ -548,8 +572,11 @@ describe('Sandbox Integration', () => {
     const testCommand = 'ls /'
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: testCommand,
-      hasNetworkRestrictions: false,
-      hasFilesystemRestrictions: true,
+      needsNetworkRestriction: false,
+      writeConfig: {
+        allowOnly: ['/tmp'],
+        denyWithinAllow: [],
+      },
     })
 
     expect(wrappedCommand).toBeTruthy()
@@ -568,8 +595,7 @@ describe('Sandbox Integration', () => {
     const testCommand = 'echo "test"'
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: testCommand,
-      hasNetworkRestrictions: false,
-      hasFilesystemRestrictions: false,
+      needsNetworkRestriction: false,
     })
 
     const isAnt = process.env.USER_TYPE === 'ant'
@@ -592,6 +618,8 @@ describe('Error Handling', () => {
     expect(() => cleanupSeccompFilter('')).not.toThrow()
     expect(() => cleanupSeccompFilter('/invalid/path/filter.bpf')).not.toThrow()
     expect(() => cleanupSeccompFilter('/tmp/nonexistent.bpf')).not.toThrow()
-    expect(() => cleanupSeccompFilter('/vendor/seccomp/x64/unix-block.bpf')).not.toThrow()
+    expect(() =>
+      cleanupSeccompFilter('/vendor/seccomp/x64/unix-block.bpf'),
+    ).not.toThrow()
   })
 })

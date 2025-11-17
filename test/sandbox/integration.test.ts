@@ -1,9 +1,15 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
-import { spawnSync, spawn } from 'node:child_process'
-import { existsSync, unlinkSync, mkdirSync, rmSync, statSync, readFileSync, writeFileSync, readdirSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import {
+  existsSync,
+  unlinkSync,
+  mkdirSync,
+  rmSync,
+  readFileSync,
+} from 'node:fs'
+import type { Server } from 'node:net'
 import { tmpdir } from 'node:os'
-import { join, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
 import { getPlatform } from '../../src/utils/platform.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
@@ -55,7 +61,7 @@ describe('Sandbox Integration Tests', () => {
   const TEST_SOCKET_PATH = '/tmp/claude-test.sock'
   // Use a directory within the repository (which is the CWD)
   const TEST_DIR = join(process.cwd(), '.sandbox-test-tmp')
-  let socketServer: any = null
+  let socketServer: Server | null = null
 
   beforeAll(async () => {
     if (skipIfNotLinux()) {
@@ -77,18 +83,18 @@ describe('Sandbox Integration Tests', () => {
     }
 
     // Create Unix socket server
-    socketServer = net.createServer((socket) => {
-      socket.on('data', (data) => {
+    socketServer = net.createServer(socket => {
+      socket.on('data', data => {
         socket.write('Echo: ' + data.toString())
       })
     })
 
     await new Promise<void>((resolve, reject) => {
-      socketServer.listen(TEST_SOCKET_PATH, () => {
+      socketServer!.listen(TEST_SOCKET_PATH, () => {
         console.log(`Test socket server listening on ${TEST_SOCKET_PATH}`)
         resolve()
       })
-      socketServer.on('error', reject)
+      socketServer!.on('error', reject)
     })
 
     // Initialize sandbox
@@ -133,7 +139,6 @@ describe('Sandbox Integration Tests', () => {
       assertPrecompiledBpfInUse()
     })
 
-
     describe('Unix Socket Restrictions', () => {
       it('should block Unix socket connections with seccomp', async () => {
         if (skipIfNotLinux()) {
@@ -142,7 +147,7 @@ describe('Sandbox Integration Tests', () => {
 
         // Wrap command with sandbox
         const command = await SandboxManager.wrapWithSandbox(
-          `echo "Test message" | nc -U ${TEST_SOCKET_PATH}`
+          `echo "Test message" | nc -U ${TEST_SOCKET_PATH}`,
         )
 
         const result = spawnSync(command, {
@@ -154,8 +159,9 @@ describe('Sandbox Integration Tests', () => {
         // Should fail due to seccomp filter blocking socket creation
         const output = (result.stderr || result.stdout || '').toLowerCase()
         // Different netcat versions report the error differently
-        const hasExpectedError = output.includes('operation not permitted') ||
-                                 output.includes('create unix socket failed')
+        const hasExpectedError =
+          output.includes('operation not permitted') ||
+          output.includes('create unix socket failed')
         expect(hasExpectedError).toBe(true)
         expect(result.status).not.toBe(0)
       })
@@ -168,7 +174,7 @@ describe('Sandbox Integration Tests', () => {
         }
 
         const command = await SandboxManager.wrapWithSandbox(
-          'curl -s http://blocked-domain.example'
+          'curl -s http://blocked-domain.example',
         )
 
         const result = spawnSync(command, {
@@ -188,7 +194,7 @@ describe('Sandbox Integration Tests', () => {
 
         // Use --max-time to timeout quickly, and --show-error to see proxy errors
         const command = await SandboxManager.wrapWithSandbox(
-          'curl -s --show-error --max-time 2 https://www.anthropic.com'
+          'curl -s --show-error --max-time 2 https://www.anthropic.com',
         )
 
         const result = spawnSync(command, {
@@ -216,7 +222,7 @@ describe('Sandbox Integration Tests', () => {
 
         // Note: example.com should be in the allowlist via .claude/settings.json
         const command = await SandboxManager.wrapWithSandbox(
-          'curl -s http://example.com'
+          'curl -s http://example.com',
         )
 
         const result = spawnSync(command, {
@@ -246,7 +252,7 @@ describe('Sandbox Integration Tests', () => {
         }
 
         const command = await SandboxManager.wrapWithSandbox(
-          `echo "should fail" > ${testFile}`
+          `echo "should fail" > ${testFile}`,
         )
 
         const result = spawnSync(command, {
@@ -281,7 +287,7 @@ describe('Sandbox Integration Tests', () => {
         }
 
         const command = await SandboxManager.wrapWithSandbox(
-          `echo "${testContent}" > allowed-write.txt`
+          `echo "${testContent}" > allowed-write.txt`,
         )
 
         const result = spawnSync(command, {
@@ -322,7 +328,7 @@ describe('Sandbox Integration Tests', () => {
 
         // Try reading from home directory
         const command = await SandboxManager.wrapWithSandbox(
-          'head -n 5 ~/.bashrc'
+          'head -n 5 ~/.bashrc',
         )
 
         const result = spawnSync(command, {
@@ -346,7 +352,9 @@ describe('Sandbox Integration Tests', () => {
         }
 
         // Import wrapCommandWithSandboxLinux to call directly
-        const { wrapCommandWithSandboxLinux } = await import('../../src/sandbox/linux-sandbox-utils.js')
+        const { wrapCommandWithSandboxLinux } = await import(
+          '../../src/sandbox/linux-sandbox-utils.js'
+        )
 
         const testFile = join(TEST_DIR, 'seccomp-only-write.txt')
         const testContent = 'seccomp-only test content'
@@ -355,12 +363,12 @@ describe('Sandbox Integration Tests', () => {
         // This forces the seccomp-only code path (line 629 in linux-sandbox-utils.ts)
         const command = await wrapCommandWithSandboxLinux({
           command: `echo "${testContent}" > ${testFile}`,
-          hasNetworkRestrictions: false,  // No network - forces seccomp-only path
-          hasFilesystemRestrictions: true,
+          needsNetworkRestriction: false, // No network - forces seccomp-only path
           writeConfig: {
-            allowOnly: [TEST_DIR],  // Only allow writes to TEST_DIR
+            allowOnly: [TEST_DIR], // Only allow writes to TEST_DIR
+            denyWithinAllow: [],
           },
-          allowAllUnixSockets: false,  // Enable seccomp
+          allowAllUnixSockets: false, // Enable seccomp
         })
 
         const result = spawnSync(command, {
@@ -399,7 +407,9 @@ describe('Sandbox Integration Tests', () => {
           return
         }
 
-        const command = await SandboxManager.wrapWithSandbox('echo "Hello from sandbox"')
+        const command = await SandboxManager.wrapWithSandbox(
+          'echo "Hello from sandbox"',
+        )
 
         const result = spawnSync(command, {
           shell: true,
@@ -417,7 +427,7 @@ describe('Sandbox Integration Tests', () => {
         }
 
         const command = await SandboxManager.wrapWithSandbox(
-          'echo "line1\nline2\nline3" | grep line2'
+          'echo "line1\nline2\nline3" | grep line2',
         )
 
         const result = spawnSync(command, {
@@ -439,7 +449,10 @@ describe('Sandbox Integration Tests', () => {
         }
 
         // Check if zsh is available
-        const zshCheck = spawnSync('which zsh', { shell: true, encoding: 'utf8' })
+        const zshCheck = spawnSync('which zsh', {
+          shell: true,
+          encoding: 'utf8',
+        })
         if (zshCheck.status !== 0) {
           console.log('zsh not available, skipping test')
           return
@@ -448,7 +461,7 @@ describe('Sandbox Integration Tests', () => {
         // Use a zsh-specific feature: $ZSH_VERSION
         const command = await SandboxManager.wrapWithSandbox(
           'echo "Shell: $ZSH_VERSION"',
-          'zsh'
+          'zsh',
         )
 
         const result = spawnSync(command, {
@@ -468,7 +481,10 @@ describe('Sandbox Integration Tests', () => {
         }
 
         // Check if zsh is available
-        const zshCheck = spawnSync('which zsh', { shell: true, encoding: 'utf8' })
+        const zshCheck = spawnSync('which zsh', {
+          shell: true,
+          encoding: 'utf8',
+        })
         if (zshCheck.status !== 0) {
           console.log('zsh not available, skipping test')
           return
@@ -477,7 +493,7 @@ describe('Sandbox Integration Tests', () => {
         // Use zsh parameter expansion feature
         const command = await SandboxManager.wrapWithSandbox(
           'VAR="hello world" && echo ${VAR:u}',
-          'zsh'
+          'zsh',
         )
 
         const result = spawnSync(command, {
@@ -497,7 +513,7 @@ describe('Sandbox Integration Tests', () => {
 
         // Check for bash-specific variable
         const command = await SandboxManager.wrapWithSandbox(
-          'echo "Shell: $BASH_VERSION"'
+          'echo "Shell: $BASH_VERSION"',
         )
 
         const result = spawnSync(command, {
@@ -521,7 +537,7 @@ describe('Sandbox Integration Tests', () => {
         // Use /proc to check PID namespace isolation
         // Inside sandbox, should only see sandbox PIDs in /proc
         const command = await SandboxManager.wrapWithSandbox(
-          'ls /proc | grep -E "^[0-9]+$" | wc -l'
+          'ls /proc | grep -E "^[0-9]+$" | wc -l',
         )
 
         const result = spawnSync(command, {
@@ -534,8 +550,8 @@ describe('Sandbox Integration Tests', () => {
 
         // Should see very few PIDs (only sandbox processes)
         const pidCount = parseInt(result.stdout.trim())
-        expect(pidCount).toBeLessThan(30)  // Host would have 100+
-        expect(pidCount).toBeGreaterThan(0)  // But at least some processes
+        expect(pidCount).toBeLessThan(30) // Host would have 100+
+        expect(pidCount).toBeGreaterThan(0) // But at least some processes
       })
 
       it('should prevent symlink-based filesystem escape attempts', async () => {
@@ -550,7 +566,7 @@ describe('Sandbox Integration Tests', () => {
         // Try to create symlink inside allowed dir pointing to restricted location
         // Then try to write through it
         const command = await SandboxManager.wrapWithSandbox(
-          `ln -s ${targetOutside} ${linkInAllowed} 2>&1 && echo "escaped" > ${linkInAllowed} 2>&1`
+          `ln -s ${targetOutside} ${linkInAllowed} 2>&1 && echo "escaped" > ${linkInAllowed} 2>&1`,
         )
 
         const result = spawnSync(command, {
@@ -590,11 +606,16 @@ describe('Sandbox Integration Tests', () => {
 
         // Start a background process that writes every 0.5 second
         const command = await SandboxManager.wrapWithSandbox(
-          `(while true; do echo "alive" >> ${markerFile}; sleep 0.5; done) & sleep 2`
+          `(while true; do echo "alive" >> ${markerFile}; sleep 0.5; done) & sleep 2`,
         )
 
         const startTime = Date.now()
-        spawnSync(command, { shell: true, encoding: 'utf8', cwd: TEST_DIR, timeout: 5000 })
+        spawnSync(command, {
+          shell: true,
+          encoding: 'utf8',
+          cwd: TEST_DIR,
+          timeout: 5000,
+        })
         const endTime = Date.now()
 
         // Wait a bit to ensure background process would continue if not killed
@@ -628,7 +649,7 @@ describe('Sandbox Integration Tests', () => {
         const setuidTest = join(TEST_DIR, 'setuid-test')
 
         const command1 = await SandboxManager.wrapWithSandbox(
-          `cp /bin/bash ${setuidTest} 2>&1 && chmod u+s ${setuidTest} 2>&1 && ${setuidTest} -c "id -u" 2>&1`
+          `cp /bin/bash ${setuidTest} 2>&1 && chmod u+s ${setuidTest} 2>&1 && ${setuidTest} -c "id -u" 2>&1`,
         )
 
         const result1 = spawnSync(command1, {
@@ -640,11 +661,11 @@ describe('Sandbox Integration Tests', () => {
 
         // Should still run as the same UID (not root), proving setuid doesn't work
         const uid = result1.stdout.trim().split('\n').pop()
-        expect(parseInt(uid || '0')).toBeGreaterThan(0)  // Not root (0)
+        expect(parseInt(uid || '0')).toBeGreaterThan(0) // Not root (0)
 
         // Test 2: Cannot use sudo/su (should not be available or fail)
         const command2 = await SandboxManager.wrapWithSandbox(
-          'sudo -n echo "elevated" 2>&1 || su -c "echo elevated" 2>&1 || echo "commands blocked"'
+          'sudo -n echo "elevated" 2>&1 || su -c "echo elevated" 2>&1 || echo "commands blocked"',
         )
 
         const result2 = spawnSync(command2, {
@@ -655,9 +676,14 @@ describe('Sandbox Integration Tests', () => {
 
         // Should not successfully escalate
         const output = result2.stdout.toLowerCase()
-        if (output.includes('elevated') && !output.includes('commands blocked')) {
+        if (
+          output.includes('elevated') &&
+          !output.includes('commands blocked')
+        ) {
           // If "elevated" appears without "commands blocked", it should be in an error message
-          expect(output).toMatch(/not found|command not found|no such file|not permitted|password|cannot|no password/)
+          expect(output).toMatch(
+            /not found|command not found|no such file|not permitted|password|cannot|no password/,
+          )
         }
 
         // Cleanup
@@ -673,7 +699,7 @@ describe('Sandbox Integration Tests', () => {
 
         // Test 1: HTTPS to blocked domain (not just HTTP)
         const command1 = await SandboxManager.wrapWithSandbox(
-          'curl -s --show-error --max-time 2 --connect-timeout 2 https://blocked-domain.example 2>&1 || echo "curl_failed"'
+          'curl -s --show-error --max-time 2 --connect-timeout 2 https://blocked-domain.example 2>&1 || echo "curl_failed"',
         )
 
         const result1 = spawnSync(command1, {
@@ -685,16 +711,17 @@ describe('Sandbox Integration Tests', () => {
         // Should fail - curl should not succeed
         const output1 = result1.stdout.toLowerCase()
         // Should either timeout, fail to resolve, or curl should fail
-        const didNotSucceed = output1.includes('curl_failed') ||
-                              output1.includes('timeout') ||
-                              output1.includes('could not resolve') ||
-                              output1.includes('failed') ||
-                              output1.length === 0  // Timeout with no output
+        const didNotSucceed =
+          output1.includes('curl_failed') ||
+          output1.includes('timeout') ||
+          output1.includes('could not resolve') ||
+          output1.includes('failed') ||
+          output1.length === 0 // Timeout with no output
         expect(didNotSucceed).toBe(true)
 
         // Test 2: Non-standard port should also be blocked
         const command2 = await SandboxManager.wrapWithSandbox(
-          'curl -s --show-error --max-time 2 http://blocked-domain.example:8080 2>&1'
+          'curl -s --show-error --max-time 2 http://blocked-domain.example:8080 2>&1',
         )
 
         const result2 = spawnSync(command2, {
@@ -710,7 +737,7 @@ describe('Sandbox Integration Tests', () => {
         // Test 3: Direct IP addresses should also be blocked
         // The network allowlist blocks ALL domains/IPs not explicitly allowed
         const command3 = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 2 http://1.1.1.1 2>&1'  // Cloudflare DNS
+          'curl -s --max-time 2 http://1.1.1.1 2>&1', // Cloudflare DNS
         )
 
         const result3 = spawnSync(command3, {
@@ -726,7 +753,7 @@ describe('Sandbox Integration Tests', () => {
 
         // Test 4: Verify HTTPS to allowed domain still works
         const command4 = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 5 https://example.com 2>&1'
+          'curl -s --max-time 5 https://example.com 2>&1',
         )
 
         const result4 = spawnSync(command4, {
@@ -765,7 +792,7 @@ describe('Sandbox Integration Tests', () => {
 
         // Test 1: Subdomain should match wildcard
         const command1 = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 3 http://api.github.com 2>&1 | head -20'
+          'curl -s --max-time 3 http://api.github.com 2>&1 | head -20',
         )
 
         const result1 = spawnSync(command1, {
@@ -780,7 +807,7 @@ describe('Sandbox Integration Tests', () => {
 
         // Test 2: Base domain should NOT match wildcard (*.github.com doesn't match github.com)
         const command2 = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 2 http://github.com 2>&1'
+          'curl -s --max-time 2 http://github.com 2>&1',
         )
 
         const result2 = spawnSync(command2, {
@@ -795,7 +822,7 @@ describe('Sandbox Integration Tests', () => {
 
         // Test 3: Malicious lookalike domain should NOT match
         const command3 = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 2 http://malicious-github.com 2>&1'
+          'curl -s --max-time 2 http://malicious-github.com 2>&1',
         )
 
         const result3 = spawnSync(command3, {
@@ -810,7 +837,7 @@ describe('Sandbox Integration Tests', () => {
 
         // Test 4: Multiple subdomains should match
         const command4 = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 3 http://raw.githubusercontent.com 2>&1 | head -20'
+          'curl -s --max-time 3 http://raw.githubusercontent.com 2>&1 | head -20',
         )
 
         const result4 = spawnSync(command4, {
@@ -847,7 +874,7 @@ describe('Sandbox Integration Tests', () => {
 
         // Test 1: FIFO (named pipe) creation in allowed location should work
         const command1 = await SandboxManager.wrapWithSandbox(
-          `mkfifo ${fifoPath} && test -p ${fifoPath} && echo "FIFO created"`
+          `mkfifo ${fifoPath} && test -p ${fifoPath} && echo "FIFO created"`,
         )
 
         const result1 = spawnSync(command1, {
@@ -863,7 +890,7 @@ describe('Sandbox Integration Tests', () => {
         // Test 2: Hard link pointing outside allowed location should fail
         // First create a file in allowed location
         const command2a = await SandboxManager.wrapWithSandbox(
-          `echo "test content" > ${regularFile}`
+          `echo "test content" > ${regularFile}`,
         )
 
         spawnSync(command2a, {
@@ -874,7 +901,7 @@ describe('Sandbox Integration Tests', () => {
 
         // Try to create hard link to /etc/passwd (outside allowed location)
         const command2b = await SandboxManager.wrapWithSandbox(
-          `ln /etc/passwd ${hardlinkPath} 2>&1`
+          `ln /etc/passwd ${hardlinkPath} 2>&1`,
         )
 
         const result2b = spawnSync(command2b, {
@@ -887,11 +914,13 @@ describe('Sandbox Integration Tests', () => {
         // Note: May fail with "invalid cross-device link" due to mount namespaces
         expect(result2b.status).not.toBe(0)
         const output2 = result2b.stdout.toLowerCase()
-        expect(output2).toMatch(/read-only|permission denied|not permitted|operation not permitted|cross-device/)
+        expect(output2).toMatch(
+          /read-only|permission denied|not permitted|operation not permitted|cross-device/,
+        )
 
         // Test 3: Device node creation should fail (requires CAP_MKNOD which sandbox doesn't have)
         const command3 = await SandboxManager.wrapWithSandbox(
-          `mknod ${devicePath} c 1 3 2>&1`
+          `mknod ${devicePath} c 1 3 2>&1`,
         )
 
         const result3 = spawnSync(command3, {
@@ -903,7 +932,9 @@ describe('Sandbox Integration Tests', () => {
         // Should fail - mknod requires special privileges
         expect(result3.status).not.toBe(0)
         const output3 = result3.stdout.toLowerCase()
-        expect(output3).toMatch(/operation not permitted|permission denied|not permitted/)
+        expect(output3).toMatch(
+          /operation not permitted|permission denied|not permitted/,
+        )
         expect(existsSync(devicePath)).toBe(false)
 
         // Cleanup
