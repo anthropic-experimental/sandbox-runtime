@@ -478,32 +478,30 @@ async function wrapWithSandbox(
   binShell?: string,
   customConfig?: Partial<SandboxRuntimeConfig>,
 ): Promise<string> {
-  // If no config, return command as-is
-  if (!config) {
-    return command
-  }
-
   const platform = getPlatform()
 
   // Get configs - use custom if provided, otherwise fall back to main config
+  // If neither exists, defaults to empty arrays (most restrictive)
   // Always include default system write paths (like /dev/null, /tmp/claude)
   const userAllowWrite =
-    customConfig?.filesystem?.allowWrite ?? config.filesystem.allowWrite ?? []
+    customConfig?.filesystem?.allowWrite ?? config?.filesystem.allowWrite ?? []
   const writeConfig = {
     allowOnly: [...getDefaultWritePaths(), ...userAllowWrite],
     denyWithinAllow:
-      customConfig?.filesystem?.denyWrite ?? config.filesystem.denyWrite ?? [],
+      customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
   }
   const readConfig = {
     denyOnly:
-      customConfig?.filesystem?.denyRead ?? config.filesystem.denyRead ?? [],
+      customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
   }
 
   // Check if network proxy is needed based on allowed domains
   // Unix sockets are local IPC and don't require the network proxy
   const allowedDomains =
-    customConfig?.network?.allowedDomains ?? config.network.allowedDomains
-  const needsNetworkProxy = (allowedDomains?.length ?? 0) > 0
+    customConfig?.network?.allowedDomains ??
+    config?.network.allowedDomains ??
+    []
+  const needsNetworkProxy = allowedDomains.length > 0
 
   // Wait for network initialization only if proxy is actually needed
   if (needsNetworkProxy) {
