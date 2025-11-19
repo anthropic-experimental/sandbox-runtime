@@ -136,7 +136,6 @@ async function main(): Promise<void> {
           const sandboxedCommand = await SandboxManager.wrapWithSandbox(command)
 
           // Execute the sandboxed command
-          console.log(`Running: ${command}`)
           const child = spawn(sandboxedCommand, {
             shell: true,
             stdio: 'inherit',
