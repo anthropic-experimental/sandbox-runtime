@@ -32,8 +32,8 @@ import { SandboxViolationStore } from './sandbox-violation-store.js'
 import { EOL } from 'node:os'
 
 interface HostNetworkManagerContext {
-  httpProxyPort: number
-  socksProxyPort: number
+  httpProxyPort: number | undefined
+  socksProxyPort: number | undefined
   linuxBridge: LinuxNetworkBridgeContext | undefined
 }
 
@@ -237,30 +237,46 @@ async function initialize(
   // Initialize network infrastructure
   initializationPromise = (async () => {
     try {
-      // Conditionally start proxy servers based on config
-      let httpProxyPort: number
-      if (config.network.httpProxyPort !== undefined) {
-        // Use external HTTP proxy (don't start a server)
-        httpProxyPort = config.network.httpProxyPort
-        logForDebugging(`Using external HTTP proxy on port ${httpProxyPort}`)
-      } else {
-        // Start local HTTP proxy
-        httpProxyPort = await startHttpProxyServer(sandboxAskCallback)
-      }
+      // Only start proxy servers if network filtering is needed (allowedDomains has items)
+      // Three cases:
+      // 1. No domains: No proxy needed (deny all network)
+      // 2. Empty array: No proxy needed (deny all network)
+      // 3. Has domains: Proxy needed for filtering
+      const needsProxy = config.network.allowedDomains.length > 0
 
-      let socksProxyPort: number
-      if (config.network.socksProxyPort !== undefined) {
-        // Use external SOCKS proxy (don't start a server)
-        socksProxyPort = config.network.socksProxyPort
-        logForDebugging(`Using external SOCKS proxy on port ${socksProxyPort}`)
+      let httpProxyPort: number | undefined
+      let socksProxyPort: number | undefined
+
+      if (needsProxy) {
+        // Conditionally start proxy servers based on config
+        if (config.network.httpProxyPort !== undefined) {
+          // Use external HTTP proxy (don't start a server)
+          httpProxyPort = config.network.httpProxyPort
+          logForDebugging(`Using external HTTP proxy on port ${httpProxyPort}`)
+        } else {
+          // Start local HTTP proxy
+          httpProxyPort = await startHttpProxyServer(sandboxAskCallback)
+        }
+
+        if (config.network.socksProxyPort !== undefined) {
+          // Use external SOCKS proxy (don't start a server)
+          socksProxyPort = config.network.socksProxyPort
+          logForDebugging(
+            `Using external SOCKS proxy on port ${socksProxyPort}`,
+          )
+        } else {
+          // Start local SOCKS proxy
+          socksProxyPort = await startSocksProxyServer(sandboxAskCallback)
+        }
       } else {
-        // Start local SOCKS proxy
-        socksProxyPort = await startSocksProxyServer(sandboxAskCallback)
+        logForDebugging(
+          'Skipping proxy initialization - no allowed domains configured (network will be denied)',
+        )
       }
 
       // Initialize platform-specific infrastructure
       let linuxBridge: LinuxNetworkBridgeContext | undefined
-      if (getPlatform() === 'linux') {
+      if (getPlatform() === 'linux' && httpProxyPort && socksProxyPort) {
         linuxBridge = await initializeLinuxNetworkBridge(
           httpProxyPort,
           socksProxyPort,
@@ -495,13 +511,18 @@ async function wrapWithSandbox(
       customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
   }
 
-  // Check if network proxy is needed based on allowed domains
+  // Determine network restriction mode based on allowed domains
   // Unix sockets are local IPC and don't require the network proxy
   const allowedDomains =
-    customConfig?.network?.allowedDomains ??
-    config?.network.allowedDomains ??
-    []
-  const needsNetworkProxy = allowedDomains.length > 0
+    customConfig?.network?.allowedDomains ?? config?.network.allowedDomains
+
+  // Three cases:
+  // 1. undefined - no network config, allow all network access
+  // 2. [] - empty array, deny all network access (no proxy needed)
+  // 3. [...] - has domains, filter network access via proxy
+  const hasNetworkConfig = allowedDomains !== undefined
+  const needsNetworkProxy = hasNetworkConfig && allowedDomains.length > 0
+  const needsNetworkRestriction = hasNetworkConfig
 
   // Wait for network initialization only if proxy is actually needed
   if (needsNetworkProxy) {
@@ -512,7 +533,7 @@ async function wrapWithSandbox(
     case 'macos':
       return await wrapCommandWithSandboxMacOS({
         command,
-        needsNetworkRestriction: needsNetworkProxy,
+        needsNetworkRestriction,
         httpProxyPort: getProxyPort(),
         socksProxyPort: getSocksProxyPort(),
         readConfig,
@@ -528,7 +549,7 @@ async function wrapWithSandbox(
     case 'linux':
       return wrapCommandWithSandboxLinux({
         command,
-        needsNetworkRestriction: needsNetworkProxy,
+        needsNetworkRestriction,
         httpSocketPath: getLinuxHttpSocketPath(),
         socksSocketPath: getLinuxSocksSocketPath(),
         httpProxyPort: managerContext?.httpProxyPort,
