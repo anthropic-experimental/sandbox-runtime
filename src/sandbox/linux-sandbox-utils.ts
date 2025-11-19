@@ -568,64 +568,67 @@ export async function wrapCommandWithSandboxLinux(
 
     // ========== NETWORK RESTRICTIONS ==========
     if (needsNetworkRestriction) {
-      // Only sandbox if we have network config and Linux bridges
-      if (!httpSocketPath || !socksSocketPath) {
-        throw new Error(
-          'Linux network sandboxing was requested but bridge socket paths are not available',
+      // Network restrictions come in two forms:
+      // 1. Deny all (allowedDomains = []) - no proxy, just --unshare-net
+      // 2. Filter via proxy (allowedDomains has items) - proxy + --unshare-net
+      const hasNetworkProxy = httpSocketPath && socksSocketPath
+
+      if (hasNetworkProxy) {
+        // Verify socket files still exist before trying to bind them
+        if (!fs.existsSync(httpSocketPath)) {
+          throw new Error(
+            `Linux HTTP bridge socket does not exist: ${httpSocketPath}. ` +
+              'The bridge process may have died. Try reinitializing the sandbox.',
+          )
+        }
+        if (!fs.existsSync(socksSocketPath)) {
+          throw new Error(
+            `Linux SOCKS bridge socket does not exist: ${socksSocketPath}. ` +
+              'The bridge process may have died. Try reinitializing the sandbox.',
+          )
+        }
+
+        bwrapArgs.push('--unshare-net')
+
+        // Bind both sockets into the sandbox
+        bwrapArgs.push('--bind', httpSocketPath, httpSocketPath)
+        bwrapArgs.push('--bind', socksSocketPath, socksSocketPath)
+
+        // Add proxy environment variables
+        // HTTP_PROXY points to the socat listener inside the sandbox (port 3128)
+        // which forwards to the Unix socket that bridges to the host's proxy server
+        const proxyEnv = generateProxyEnvVars(
+          3128, // Internal HTTP listener port
+          1080, // Internal SOCKS listener port
         )
-      }
-
-      // Verify socket files still exist before trying to bind them
-      if (!fs.existsSync(httpSocketPath)) {
-        throw new Error(
-          `Linux HTTP bridge socket does not exist: ${httpSocketPath}. ` +
-            'The bridge process may have died. Try reinitializing the sandbox.',
-        )
-      }
-      if (!fs.existsSync(socksSocketPath)) {
-        throw new Error(
-          `Linux SOCKS bridge socket does not exist: ${socksSocketPath}. ` +
-            'The bridge process may have died. Try reinitializing the sandbox.',
-        )
-      }
-
-      bwrapArgs.push('--unshare-net')
-
-      // Bind both sockets into the sandbox
-      bwrapArgs.push('--bind', httpSocketPath, httpSocketPath)
-      bwrapArgs.push('--bind', socksSocketPath, socksSocketPath)
-
-      // Add proxy environment variables
-      // HTTP_PROXY points to the socat listener inside the sandbox (port 3128)
-      // which forwards to the Unix socket that bridges to the host's proxy server
-      const proxyEnv = generateProxyEnvVars(
-        3128, // Internal HTTP listener port
-        1080, // Internal SOCKS listener port
-      )
-      bwrapArgs.push(
-        ...proxyEnv.flatMap((env: string) => {
-          const firstEq = env.indexOf('=')
-          const key = env.slice(0, firstEq)
-          const value = env.slice(firstEq + 1)
-          return ['--setenv', key, value]
-        }),
-      )
-
-      // Add host proxy port environment variables for debugging/transparency
-      // These show which host ports the Unix socket bridges connect to
-      if (httpProxyPort !== undefined) {
         bwrapArgs.push(
-          '--setenv',
-          'CLAUDE_CODE_HOST_HTTP_PROXY_PORT',
-          String(httpProxyPort),
+          ...proxyEnv.flatMap((env: string) => {
+            const firstEq = env.indexOf('=')
+            const key = env.slice(0, firstEq)
+            const value = env.slice(firstEq + 1)
+            return ['--setenv', key, value]
+          }),
         )
-      }
-      if (socksProxyPort !== undefined) {
-        bwrapArgs.push(
-          '--setenv',
-          'CLAUDE_CODE_HOST_SOCKS_PROXY_PORT',
-          String(socksProxyPort),
-        )
+
+        // Add host proxy port environment variables for debugging/transparency
+        // These show which host ports the Unix socket bridges connect to
+        if (httpProxyPort !== undefined) {
+          bwrapArgs.push(
+            '--setenv',
+            'CLAUDE_CODE_HOST_HTTP_PROXY_PORT',
+            String(httpProxyPort),
+          )
+        }
+        if (socksProxyPort !== undefined) {
+          bwrapArgs.push(
+            '--setenv',
+            'CLAUDE_CODE_HOST_SOCKS_PROXY_PORT',
+            String(socksProxyPort),
+          )
+        }
+      } else {
+        // Deny all network - just use --unshare-net without proxy
+        bwrapArgs.push('--unshare-net')
       }
     }
 
@@ -706,7 +709,12 @@ export async function wrapCommandWithSandboxLinux(
     const wrappedCommand = shellquote.quote(['bwrap', ...bwrapArgs])
 
     const restrictions = []
-    if (needsNetworkRestriction) restrictions.push('network')
+    if (needsNetworkRestriction) {
+      const hasNetworkProxy = httpSocketPath && socksSocketPath
+      restrictions.push(
+        hasNetworkProxy ? 'network(proxy)' : 'network(deny-all)',
+      )
+    }
     if (hasReadRestrictions || hasWriteRestrictions)
       restrictions.push('filesystem')
     if (seccompFilterPath) restrictions.push('seccomp(unix-block)')

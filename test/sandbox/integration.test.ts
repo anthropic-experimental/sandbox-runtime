@@ -168,6 +168,46 @@ describe('Sandbox Integration Tests', () => {
     })
 
     describe('Network Restrictions', () => {
+      it('should deny all network when allowedDomains is empty array', async () => {
+        if (skipIfNotLinux()) {
+          return
+        }
+
+        // Reset and reinitialize with empty allowedDomains (deny all)
+        await SandboxManager.reset()
+        await SandboxManager.initialize({
+          network: {
+            allowedDomains: [], // Empty array = deny all network
+            deniedDomains: [],
+          },
+          filesystem: {
+            denyRead: [],
+            allowWrite: [TEST_DIR],
+            denyWrite: [],
+          },
+        })
+
+        // Try to make any network request - should fail completely (not via proxy)
+        const command = await SandboxManager.wrapWithSandbox(
+          'curl -m 3 https://example.com 2>&1',
+        )
+
+        const result = spawnSync(command, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 5000,
+        })
+
+        // Should fail with DNS resolution error (network completely isolated)
+        const output = (result.stderr || result.stdout || '').toLowerCase()
+        expect(output).toContain('could not resolve host')
+        expect(result.status).not.toBe(0)
+
+        // Restore original config
+        await SandboxManager.reset()
+        await SandboxManager.initialize(createTestConfig(TEST_DIR))
+      })
+
       it('should block HTTP requests to non-allowlisted domains', async () => {
         if (skipIfNotLinux()) {
           return
