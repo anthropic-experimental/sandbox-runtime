@@ -5,7 +5,7 @@ import * as fs from 'fs'
 import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, posix as pathPosix } from 'node:path'
 import {
   generateProxyEnvVars,
   normalizePathForSandbox,
@@ -14,6 +14,8 @@ import {
 import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
+  FsPathMappingRule,
+  UnixSocketMappingRule,
 } from './sandbox-schemas.js'
 import {
   generateSeccompFilter,
@@ -44,11 +46,123 @@ export interface LinuxSandboxParams {
   allowAllUnixSockets?: boolean
   binShell?: string
   ripgrepConfig?: { command: string; args?: string[] }
+  fsMappings?: FsPathMappingRule[]
+  unixSocketMappings?: UnixSocketMappingRule[]
+}
+
+type ResolvedFsPathMapping = {
+  hostPath: string
+  sandboxPath: string
+  mode: 'readwrite' | 'readonly'
+}
+
+type ResolvedUnixSocketMapping = {
+  hostPath: string
+  sandboxPath: string
 }
 
 // Track generated seccomp filters for cleanup on process exit
 const generatedSeccompFilters: Set<string> = new Set()
 let exitHandlerRegistered = false
+
+function normalizeSandboxDestinationPath(pathStr: string): string {
+  const trimmed = pathStr.trim()
+  if (!trimmed.startsWith('/')) {
+    throw new Error(
+      `Sandbox mapping paths must be absolute (received: ${pathStr})`,
+    )
+  }
+
+  const normalized = pathPosix.normalize(trimmed)
+  if (!normalized || !normalized.startsWith('/')) {
+    throw new Error(
+      `Sandbox mapping path resolved to an invalid destination: ${pathStr}`,
+    )
+  }
+
+  return normalized
+}
+
+function sanitizeFsMappings(
+  mappings: FsPathMappingRule[] | undefined,
+): ResolvedFsPathMapping[] {
+  if (!mappings || mappings.length === 0) {
+    return []
+  }
+
+  const resolved: ResolvedFsPathMapping[] = []
+  const seenSandboxPaths = new Set<string>()
+
+  for (const mapping of mappings) {
+    const hostPath = normalizePathForSandbox(mapping.hostPath)
+    if (!fs.existsSync(hostPath)) {
+      throw new Error(
+        `Filesystem mapping host path does not exist: ${mapping.hostPath}`,
+      )
+    }
+
+    const stats = fs.statSync(hostPath)
+    if (!stats.isDirectory()) {
+      throw new Error(
+        `Filesystem mapping host path must be a directory: ${mapping.hostPath}`,
+      )
+    }
+
+    const sandboxPath = normalizeSandboxDestinationPath(mapping.sandboxPath)
+    if (seenSandboxPaths.has(sandboxPath)) {
+      throw new Error(
+        `Duplicate filesystem mapping sandboxPath detected: ${sandboxPath}`,
+      )
+    }
+    seenSandboxPaths.add(sandboxPath)
+
+    resolved.push({
+      hostPath,
+      sandboxPath,
+      mode: mapping.mode ?? 'readwrite',
+    })
+  }
+
+  return resolved
+}
+
+function sanitizeUnixSocketMappings(
+  mappings: UnixSocketMappingRule[] | undefined,
+): ResolvedUnixSocketMapping[] {
+  if (!mappings || mappings.length === 0) {
+    return []
+  }
+
+  const resolved: ResolvedUnixSocketMapping[] = []
+  const seenSandboxPaths = new Set<string>()
+
+  for (const mapping of mappings) {
+    const hostPath = normalizePathForSandbox(mapping.hostPath)
+
+    // Verify the host socket exists (should be created by supervisor)
+    if (!fs.existsSync(hostPath)) {
+      throw new Error(
+        `Unix socket mapping host path does not exist: ${mapping.hostPath}. ` +
+          `The socket supervisor should have created this before sandbox launch.`,
+      )
+    }
+
+    const sandboxPath = normalizeSandboxDestinationPath(mapping.sandboxPath)
+    if (seenSandboxPaths.has(sandboxPath)) {
+      throw new Error(
+        `Duplicate Unix socket mapping sandboxPath detected: ${sandboxPath}`,
+      )
+    }
+    seenSandboxPaths.add(sandboxPath)
+
+    resolved.push({
+      hostPath,
+      sandboxPath,
+    })
+  }
+
+  return resolved
+}
 
 /**
  * Register cleanup handler for generated seccomp filters
@@ -338,6 +452,8 @@ async function generateFilesystemArgs(
   readConfig: FsReadRestrictionConfig | undefined,
   writeConfig: FsWriteRestrictionConfig | undefined,
   ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
+  pathMappings: ResolvedFsPathMapping[] = [],
+  socketMappings: ResolvedUnixSocketMapping[] = [],
 ): Promise<string[]> {
   const args: string[] = []
   // fs already imported
@@ -416,6 +532,23 @@ async function generateFilesystemArgs(
   } else {
     // No write restrictions: Allow all writes
     args.push('--bind', '/', '/')
+  }
+
+  for (const mapping of pathMappings) {
+    const bindFlag = mapping.mode === 'readonly' ? '--ro-bind' : '--bind'
+    args.push('--dir', mapping.sandboxPath)
+    args.push(bindFlag, mapping.hostPath, mapping.sandboxPath)
+    logForDebugging(
+      `[Sandbox Linux] Added filesystem mapping ${mapping.hostPath} -> ${mapping.sandboxPath} (${mapping.mode})`,
+    )
+  }
+
+  // Bind Unix socket mappings (created by supervisor on host)
+  for (const mapping of socketMappings) {
+    args.push('--bind', mapping.hostPath, mapping.sandboxPath)
+    logForDebugging(
+      `[Sandbox Linux] Added Unix socket mapping ${mapping.hostPath} -> ${mapping.sandboxPath}`,
+    )
   }
 
   // Handle read restrictions by mounting tmpfs over denied paths
@@ -511,6 +644,8 @@ export async function wrapCommandWithSandboxLinux(
     allowAllUnixSockets,
     binShell,
     ripgrepConfig = { command: 'rg' },
+    fsMappings,
+    unixSocketMappings,
   } = params
 
   // Determine if we have restrictions to apply
@@ -530,6 +665,8 @@ export async function wrapCommandWithSandboxLinux(
 
   const bwrapArgs: string[] = []
   let seccompFilterPath: string | undefined = undefined
+  const resolvedFsMappings = sanitizeFsMappings(fsMappings)
+  const resolvedSocketMappings = sanitizeUnixSocketMappings(unixSocketMappings)
 
   try {
     // ========== SECCOMP FILTER (Unix Socket Blocking) ==========
@@ -634,6 +771,8 @@ export async function wrapCommandWithSandboxLinux(
       readConfig,
       writeConfig,
       ripgrepConfig,
+      resolvedFsMappings,
+      resolvedSocketMappings,
     )
     bwrapArgs.push(...fsArgs)
 

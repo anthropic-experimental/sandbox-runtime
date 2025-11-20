@@ -50,12 +50,7 @@ describe('Pre-generated BPF Support', () => {
     const arch = process.arch
     const preGeneratedBpf = getPreGeneratedBpfPath()
 
-    if (
-      arch === 'x64' ||
-      arch === 'x86_64' ||
-      arch === 'arm64' ||
-      arch === 'aarch64'
-    ) {
+    if (arch === 'x64' || arch === 'arm64') {
       // Should have pre-generated BPF for these architectures
       expect(preGeneratedBpf).toBeTruthy()
       if (preGeneratedBpf) {
@@ -142,12 +137,7 @@ describe('Seccomp Filter (Pre-generated)', () => {
     }
 
     const arch = process.arch
-    if (
-      arch !== 'x64' &&
-      arch !== 'arm64' &&
-      arch !== 'x86_64' &&
-      arch !== 'aarch64'
-    ) {
+    if (arch !== 'x64' && arch !== 'arm64') {
       // Not a supported architecture
       return
     }
@@ -175,12 +165,7 @@ describe('Seccomp Filter (Pre-generated)', () => {
     }
 
     const arch = process.arch
-    if (
-      arch !== 'x64' &&
-      arch !== 'arm64' &&
-      arch !== 'x86_64' &&
-      arch !== 'aarch64'
-    ) {
+    if (arch !== 'x64' && arch !== 'arm64') {
       return
     }
 
@@ -200,12 +185,7 @@ describe('Seccomp Filter (Pre-generated)', () => {
     }
 
     const arch = process.arch
-    if (
-      arch === 'x64' ||
-      arch === 'arm64' ||
-      arch === 'x86_64' ||
-      arch === 'aarch64'
-    ) {
+    if (arch === 'x64' || arch === 'arm64') {
       // This test is for unsupported architectures only
       return
     }
@@ -235,12 +215,7 @@ describe('Apply Seccomp Binary', () => {
     }
 
     const arch = process.arch
-    if (
-      arch !== 'x64' &&
-      arch !== 'arm64' &&
-      arch !== 'x86_64' &&
-      arch !== 'aarch64'
-    ) {
+    if (arch !== 'x64' && arch !== 'arm64') {
       return
     }
 
@@ -260,12 +235,7 @@ describe('Apply Seccomp Binary', () => {
     }
 
     const arch = process.arch
-    if (
-      arch === 'x64' ||
-      arch === 'arm64' ||
-      arch === 'x86_64' ||
-      arch === 'aarch64'
-    ) {
+    if (arch === 'x64' || arch === 'arm64') {
       return
     }
 

@@ -2,10 +2,13 @@ import { createHttpProxyServer } from './http-proxy.js'
 import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
 import { logForDebugging } from '../utils/debug.js'
-import { cloneDeep } from 'lodash-es'
+import { cloneDeep, merge } from 'lodash-es'
 import { getPlatform, type Platform } from '../utils/platform.js'
 import * as fs from 'fs'
-import type { SandboxRuntimeConfig } from './sandbox-config.js'
+import {
+  validateSandboxRuntimePaths,
+  type SandboxRuntimeConfig,
+} from './sandbox-config.js'
 import type {
   SandboxAskCallback,
   FsReadRestrictionConfig,
@@ -30,12 +33,21 @@ import {
 import { hasRipgrepSync } from '../utils/ripgrep.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
 import { EOL } from 'node:os'
+import {
+  startUnixSocketSupervisor,
+  stopUnixSocketSupervisor,
+  type UnixSocketSupervisorContext,
+} from './unix-socket-supervisor.js'
+import { randomBytes } from 'node:crypto'
 
 interface HostNetworkManagerContext {
   httpProxyPort: number
   socksProxyPort: number
   linuxBridge: LinuxNetworkBridgeContext | undefined
 }
+
+// Track active Unix socket supervisors per run
+const activeSupervisors = new Map<string, UnixSocketSupervisorContext>()
 
 // ============================================================================
 // Private Module State
@@ -204,6 +216,7 @@ async function initialize(
   }
 
   // Store config for use by other functions
+  validateSandboxRuntimePaths(runtimeConfig)
   config = runtimeConfig
 
   // Check dependencies now that we have config with ripgrep info
@@ -343,13 +356,15 @@ function checkDependencies(ripgrepConfig?: {
   return true
 }
 
-function getFsReadConfig(): FsReadRestrictionConfig {
-  if (!config) {
+function createFsReadConfigFrom(
+  targetConfig: SandboxRuntimeConfig | undefined,
+): FsReadRestrictionConfig {
+  if (!targetConfig) {
     return { denyOnly: [] }
   }
 
   // Filter out glob patterns on Linux
-  const denyPaths = config.filesystem.denyRead
+  const denyPaths = targetConfig.filesystem.denyRead
     .map(path => removeTrailingGlobSuffix(path))
     .filter(path => {
       if (getPlatform() === 'linux' && containsGlobChars(path)) {
@@ -364,13 +379,19 @@ function getFsReadConfig(): FsReadRestrictionConfig {
   }
 }
 
-function getFsWriteConfig(): FsWriteRestrictionConfig {
-  if (!config) {
+function getFsReadConfig(): FsReadRestrictionConfig {
+  return createFsReadConfigFrom(config)
+}
+
+function createFsWriteConfigFrom(
+  targetConfig: SandboxRuntimeConfig | undefined,
+): FsWriteRestrictionConfig {
+  if (!targetConfig) {
     return { allowOnly: getDefaultWritePaths(), denyWithinAllow: [] }
   }
 
   // Filter out glob patterns on Linux for allowWrite
-  const allowPaths = config.filesystem.allowWrite
+  const allowPaths = targetConfig.filesystem.allowWrite
     .map(path => removeTrailingGlobSuffix(path))
     .filter(path => {
       if (getPlatform() === 'linux' && containsGlobChars(path)) {
@@ -381,7 +402,7 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
     })
 
   // Filter out glob patterns on Linux for denyWrite
-  const denyPaths = config.filesystem.denyWrite
+  const denyPaths = targetConfig.filesystem.denyWrite
     .map(path => removeTrailingGlobSuffix(path))
     .filter(path => {
       if (getPlatform() === 'linux' && containsGlobChars(path)) {
@@ -400,6 +421,10 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
   }
 }
 
+function getFsWriteConfig(): FsWriteRestrictionConfig {
+  return createFsWriteConfigFrom(config)
+}
+
 function getNetworkRestrictionConfig(): NetworkRestrictionConfig {
   if (!config) {
     return {}
@@ -412,30 +437,6 @@ function getNetworkRestrictionConfig(): NetworkRestrictionConfig {
     ...(allowedHosts.length > 0 && { allowedHosts }),
     ...(deniedHosts.length > 0 && { deniedHosts }),
   }
-}
-
-function getAllowUnixSockets(): string[] | undefined {
-  return config?.network?.allowUnixSockets
-}
-
-function getAllowAllUnixSockets(): boolean | undefined {
-  return config?.network?.allowAllUnixSockets
-}
-
-function getAllowLocalBinding(): boolean | undefined {
-  return config?.network?.allowLocalBinding
-}
-
-function getIgnoreViolations(): Record<string, string[]> | undefined {
-  return config?.ignoreViolations
-}
-
-function getEnableWeakerNestedSandbox(): boolean | undefined {
-  return config?.enableWeakerNestedSandbox
-}
-
-function getRipgrepConfig(): { command: string; args?: string[] } {
-  return config?.ripgrep ?? { command: 'rg' }
 }
 
 function getProxyPort(): number | undefined {
@@ -478,30 +479,33 @@ async function wrapWithSandbox(
   binShell?: string,
   customConfig?: Partial<SandboxRuntimeConfig>,
 ): Promise<string> {
+  if (!config) {
+    throw new Error('SandboxManager must be initialized before use')
+  }
+
   const platform = getPlatform()
 
-  // Get configs - use custom if provided, otherwise fall back to main config
-  // If neither exists, defaults to empty arrays (most restrictive)
-  // Always include default system write paths (like /dev/null, /tmp/claude)
-  const userAllowWrite =
-    customConfig?.filesystem?.allowWrite ?? config?.filesystem.allowWrite ?? []
-  const writeConfig = {
-    allowOnly: [...getDefaultWritePaths(), ...userAllowWrite],
-    denyWithinAllow:
-      customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
-  }
-  const readConfig = {
-    denyOnly:
-      customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
+  const effectiveConfig: SandboxRuntimeConfig = customConfig
+    ? (merge(cloneDeep(config), customConfig) as SandboxRuntimeConfig)
+    : config
+
+  if (customConfig) {
+    validateSandboxRuntimePaths(effectiveConfig)
   }
 
-  // Check if network proxy is needed based on allowed domains
-  // Unix sockets are local IPC and don't require the network proxy
-  const allowedDomains =
-    customConfig?.network?.allowedDomains ??
-    config?.network.allowedDomains ??
-    []
+  const readConfig = createFsReadConfigFrom(effectiveConfig)
+  const writeConfig = createFsWriteConfigFrom(effectiveConfig)
+
+  const allowedDomains = effectiveConfig.network.allowedDomains ?? []
   const needsNetworkProxy = allowedDomains.length > 0
+  const allowUnixSockets = effectiveConfig.network.allowUnixSockets
+  const allowAllUnixSockets = effectiveConfig.network.allowAllUnixSockets
+  const allowLocalBinding = effectiveConfig.network.allowLocalBinding
+  const ignoreViolations = effectiveConfig.ignoreViolations
+  const enableWeakerNestedSandbox = effectiveConfig.enableWeakerNestedSandbox
+  const ripgrepConfig = effectiveConfig.ripgrep ?? { command: 'rg' }
+  const fsMappings = effectiveConfig.filesystem.mappings ?? []
+  const unixSocketMappings = effectiveConfig.network.unixSocketMappings ?? []
 
   // Wait for network initialization only if proxy is actually needed
   if (needsNetworkProxy) {
@@ -517,29 +521,75 @@ async function wrapWithSandbox(
         socksProxyPort: getSocksProxyPort(),
         readConfig,
         writeConfig,
-        allowUnixSockets: getAllowUnixSockets(),
-        allowAllUnixSockets: getAllowAllUnixSockets(),
-        allowLocalBinding: getAllowLocalBinding(),
-        ignoreViolations: getIgnoreViolations(),
+        allowUnixSockets,
+        allowAllUnixSockets,
+        allowLocalBinding,
+        ignoreViolations,
         binShell,
-        ripgrepConfig: getRipgrepConfig(),
+        ripgrepConfig,
       })
 
-    case 'linux':
-      return wrapCommandWithSandboxLinux({
-        command,
-        needsNetworkRestriction: needsNetworkProxy,
-        httpSocketPath: getLinuxHttpSocketPath(),
-        socksSocketPath: getLinuxSocksSocketPath(),
-        httpProxyPort: managerContext?.httpProxyPort,
-        socksProxyPort: managerContext?.socksProxyPort,
-        readConfig,
-        writeConfig,
-        enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
-        allowAllUnixSockets: getAllowAllUnixSockets(),
-        binShell,
-        ripgrepConfig: getRipgrepConfig(),
-      })
+    case 'linux': {
+      // Start Unix socket supervisors if needed
+      let supervisorContext: UnixSocketSupervisorContext | undefined
+      const runId = randomBytes(8).toString('hex')
+
+      if (unixSocketMappings.length > 0 && allowAllUnixSockets !== true) {
+        try {
+          supervisorContext = await startUnixSocketSupervisor(
+            unixSocketMappings.map(m => ({
+              hostPath: m.hostPath,
+              sandboxPath: m.sandboxPath,
+            })),
+            runId,
+          )
+          activeSupervisors.set(runId, supervisorContext)
+          logForDebugging(
+            `[SandboxManager] Started Unix socket supervisor for run ${runId} (${unixSocketMappings.length} mappings)`,
+            { level: 'info' },
+          )
+        } catch (error) {
+          logForDebugging(
+            `[SandboxManager] Failed to start Unix socket supervisor for run ${runId}: ${error}`,
+            { level: 'error' },
+          )
+          throw error
+        }
+      }
+
+      try {
+        return wrapCommandWithSandboxLinux({
+          command,
+          needsNetworkRestriction: needsNetworkProxy,
+          httpSocketPath: getLinuxHttpSocketPath(),
+          socksSocketPath: getLinuxSocksSocketPath(),
+          httpProxyPort: managerContext?.httpProxyPort,
+          socksProxyPort: managerContext?.socksProxyPort,
+          readConfig,
+          writeConfig,
+          enableWeakerNestedSandbox,
+          allowAllUnixSockets,
+          binShell,
+          ripgrepConfig,
+          fsMappings,
+          unixSocketMappings,
+        })
+      } catch (error) {
+        // Clean up supervisor on error
+        if (supervisorContext) {
+          try {
+            await stopUnixSocketSupervisor(supervisorContext, runId)
+            activeSupervisors.delete(runId)
+          } catch (cleanupError) {
+            logForDebugging(
+              `[SandboxManager] Error cleaning up supervisor for run ${runId}: ${cleanupError}`,
+              { level: 'error' },
+            )
+          }
+        }
+        throw error
+      }
+    }
 
     default:
       // Unsupported platform - this should not happen since isSandboxingEnabled() checks platform support
@@ -562,6 +612,7 @@ function getConfig(): SandboxRuntimeConfig | undefined {
  * @param newConfig - The new configuration to use
  */
 function updateConfig(newConfig: SandboxRuntimeConfig): void {
+  validateSandboxRuntimePaths(newConfig)
   // Deep clone the config to avoid mutations
   config = cloneDeep(newConfig)
   logForDebugging('Sandbox configuration updated')
@@ -572,6 +623,28 @@ async function reset(): Promise<void> {
   if (logMonitorShutdown) {
     logMonitorShutdown()
     logMonitorShutdown = undefined
+  }
+
+  // Clean up all active Unix socket supervisors
+  if (activeSupervisors.size > 0) {
+    logForDebugging(
+      `[SandboxManager] Cleaning up ${activeSupervisors.size} active Unix socket supervisors`,
+    )
+    const supervisorCleanups: Promise<void>[] = []
+
+    for (const [runId, supervisorContext] of activeSupervisors.entries()) {
+      supervisorCleanups.push(
+        stopUnixSocketSupervisor(supervisorContext, runId).catch(error => {
+          logForDebugging(
+            `[SandboxManager] Error stopping supervisor ${runId}: ${error}`,
+            { level: 'error' },
+          )
+        }),
+      )
+    }
+
+    await Promise.all(supervisorCleanups)
+    activeSupervisors.clear()
   }
 
   if (managerContext?.linuxBridge) {
@@ -814,10 +887,6 @@ export interface ISandboxManager {
   getFsReadConfig(): FsReadRestrictionConfig
   getFsWriteConfig(): FsWriteRestrictionConfig
   getNetworkRestrictionConfig(): NetworkRestrictionConfig
-  getAllowUnixSockets(): string[] | undefined
-  getAllowLocalBinding(): boolean | undefined
-  getIgnoreViolations(): Record<string, string[]> | undefined
-  getEnableWeakerNestedSandbox(): boolean | undefined
   getProxyPort(): number | undefined
   getSocksProxyPort(): number | undefined
   getLinuxHttpSocketPath(): string | undefined
@@ -852,10 +921,6 @@ export const SandboxManager: ISandboxManager = {
   getFsReadConfig,
   getFsWriteConfig,
   getNetworkRestrictionConfig,
-  getAllowUnixSockets,
-  getAllowLocalBinding,
-  getIgnoreViolations,
-  getEnableWeakerNestedSandbox,
   getProxyPort,
   getSocksProxyPort,
   getLinuxHttpSocketPath,

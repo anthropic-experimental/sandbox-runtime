@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
+import { describe, it, expect, afterAll } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import * as http from 'node:http'
 import * as net from 'node:net'
@@ -25,11 +25,13 @@ describe('Configurable Proxy Ports Integration Tests', () => {
           deniedDomains: [],
           httpProxyPort: 8888, // External HTTP proxy
           // socksProxyPort not specified - should start locally
+          unixSocketMappings: [],
         },
         filesystem: {
           denyRead: [],
           allowWrite: [],
           denyWrite: [],
+          mappings: [],
         },
       }
 
@@ -55,6 +57,7 @@ describe('Configurable Proxy Ports Integration Tests', () => {
         network: {
           allowedDomains: ['example.com'],
           deniedDomains: [],
+          unixSocketMappings: [],
           // httpProxyPort not specified - should start locally
           socksProxyPort: 1080, // External SOCKS proxy
         },
@@ -62,6 +65,7 @@ describe('Configurable Proxy Ports Integration Tests', () => {
           denyRead: [],
           allowWrite: [],
           denyWrite: [],
+          mappings: [],
         },
       }
 
@@ -87,6 +91,7 @@ describe('Configurable Proxy Ports Integration Tests', () => {
         network: {
           allowedDomains: ['example.com'],
           deniedDomains: [],
+          unixSocketMappings: [],
           httpProxyPort: 9090, // External HTTP proxy
           socksProxyPort: 9091, // External SOCKS proxy
         },
@@ -94,6 +99,7 @@ describe('Configurable Proxy Ports Integration Tests', () => {
           denyRead: [],
           allowWrite: [],
           denyWrite: [],
+          mappings: [],
         },
       }
 
@@ -116,12 +122,13 @@ describe('Configurable Proxy Ports Integration Tests', () => {
         network: {
           allowedDomains: ['example.com'],
           deniedDomains: [],
-          // No httpProxyPort or socksProxyPort - both should start locally
+          unixSocketMappings: [],
         },
         filesystem: {
           denyRead: [],
           allowWrite: [],
           denyWrite: [],
+          mappings: [],
         },
       }
 
@@ -152,11 +159,13 @@ describe('Configurable Proxy Ports Integration Tests', () => {
         network: {
           allowedDomains: ['example.com'],
           deniedDomains: [],
+          unixSocketMappings: [],
         },
         filesystem: {
           denyRead: [],
           allowWrite: [],
           denyWrite: [],
+          mappings: [],
         },
       }
 
@@ -172,6 +181,7 @@ describe('Configurable Proxy Ports Integration Tests', () => {
         network: {
           allowedDomains: ['example.com'],
           deniedDomains: [],
+          unixSocketMappings: [],
           httpProxyPort: 7777,
           socksProxyPort: 7778,
         },
@@ -179,6 +189,7 @@ describe('Configurable Proxy Ports Integration Tests', () => {
           denyRead: [],
           allowWrite: [],
           denyWrite: [],
+          mappings: [],
         },
       }
 
@@ -192,12 +203,14 @@ describe('Configurable Proxy Ports Integration Tests', () => {
         network: {
           allowedDomains: ['example.com'],
           deniedDomains: [],
+          unixSocketMappings: [],
           httpProxyPort: 6666,
         },
         filesystem: {
           denyRead: [],
           allowWrite: [],
           denyWrite: [],
+          mappings: [],
         },
       }
 
@@ -216,6 +229,7 @@ describe('Configurable Proxy Ports Integration Tests', () => {
         network: {
           allowedDomains: ['example.com'],
           deniedDomains: [],
+          unixSocketMappings: [],
           httpProxyPort: 1,
           socksProxyPort: 65535,
         },
@@ -223,6 +237,7 @@ describe('Configurable Proxy Ports Integration Tests', () => {
           denyRead: [],
           allowWrite: [],
           denyWrite: [],
+          mappings: [],
         },
       }
 
@@ -237,6 +252,7 @@ describe('Configurable Proxy Ports Integration Tests', () => {
         network: {
           allowedDomains: ['example.com'],
           deniedDomains: [],
+          unixSocketMappings: [],
           httpProxyPort: 3128, // Standard HTTP proxy port
           socksProxyPort: 1080, // Standard SOCKS proxy port
         },
@@ -244,6 +260,7 @@ describe('Configurable Proxy Ports Integration Tests', () => {
           denyRead: [],
           allowWrite: [],
           denyWrite: [],
+          mappings: [],
         },
       }
 
@@ -260,6 +277,7 @@ describe('Configurable Proxy Ports Integration Tests', () => {
         network: {
           allowedDomains: ['example.com'],
           deniedDomains: [],
+          unixSocketMappings: [],
           httpProxyPort: 5555,
           socksProxyPort: 5556,
         },
@@ -267,6 +285,7 @@ describe('Configurable Proxy Ports Integration Tests', () => {
           denyRead: [],
           allowWrite: [],
           denyWrite: [],
+          mappings: [],
         },
       }
 
@@ -310,18 +329,22 @@ describe('Configurable Proxy Ports Integration Tests', () => {
           const { port, hostname } = new URL(`http://${req.url}`)
 
           // Connect to target (allow everything - no filtering)
-          const serverSocket = net.connect(parseInt(port) || 80, hostname, () => {
-            clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
-            serverSocket.write(head)
-            serverSocket.pipe(clientSocket)
-            clientSocket.pipe(serverSocket)
-          })
+          const serverSocket = net.connect(
+            parseInt(port) || 80,
+            hostname,
+            () => {
+              clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+              serverSocket.write(head)
+              serverSocket.pipe(clientSocket)
+              clientSocket.pipe(serverSocket)
+            },
+          )
 
-          serverSocket.on('error', (err) => {
+          serverSocket.on('error', _err => {
             clientSocket.end()
           })
 
-          clientSocket.on('error', (err) => {
+          clientSocket.on('error', _err => {
             serverSocket.end()
           })
         })
@@ -337,12 +360,12 @@ describe('Configurable Proxy Ports Integration Tests', () => {
             headers: req.headers,
           }
 
-          const proxyReq = http.request(options, (proxyRes) => {
+          const proxyReq = http.request(options, proxyRes => {
             res.writeHead(proxyRes.statusCode!, proxyRes.headers)
             proxyRes.pipe(res)
           })
 
-          proxyReq.on('error', (err) => {
+          proxyReq.on('error', _err => {
             res.writeHead(502)
             res.end('Bad Gateway')
           })
@@ -356,7 +379,9 @@ describe('Configurable Proxy Ports Integration Tests', () => {
             const addr = externalProxyServer!.address()
             if (addr && typeof addr === 'object') {
               externalProxyPort = addr.port
-              console.log(`External allow-all proxy started on port ${externalProxyPort}`)
+              console.log(
+                `External allow-all proxy started on port ${externalProxyPort}`,
+              )
               resolve()
             } else {
               reject(new Error('Failed to get proxy address'))
@@ -370,12 +395,14 @@ describe('Configurable Proxy Ports Integration Tests', () => {
           network: {
             allowedDomains: ['example.com'], // Only allow example.com
             deniedDomains: [],
+            unixSocketMappings: [],
             httpProxyPort: externalProxyPort, // Use our allow-all external proxy
           },
           filesystem: {
             denyRead: [],
             allowWrite: [],
             denyWrite: [],
+            mappings: [],
           },
         }
 
@@ -387,7 +414,7 @@ describe('Configurable Proxy Ports Integration Tests', () => {
         // Try to access example.com (in allowlist)
         // This verifies that requests are routed through the external proxy
         const command = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 5 http://example.com'
+          'curl -s --max-time 5 http://example.com',
         )
 
         const result = spawnSync(command, {
@@ -404,14 +431,15 @@ describe('Configurable Proxy Ports Integration Tests', () => {
         expect(output).not.toContain('blocked by network allowlist')
 
         console.log('✓ Request to example.com succeeded through external proxy')
-        console.log('✓ This verifies SRT used the external proxy on the configured port')
-
+        console.log(
+          '✓ This verifies SRT used the external proxy on the configured port',
+        )
       } finally {
         // Clean up
         await SandboxManager.reset()
 
         if (externalProxyServer) {
-          await new Promise<void>((resolve) => {
+          await new Promise<void>(resolve => {
             externalProxyServer!.close(() => {
               console.log('External proxy server closed')
               resolve()

@@ -6,6 +6,7 @@ import {
   mkdirSync,
   rmSync,
   readFileSync,
+  writeFileSync,
 } from 'node:fs'
 import type { Server } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -23,11 +24,13 @@ function createTestConfig(testDir: string): SandboxRuntimeConfig {
     network: {
       allowedDomains: ['example.com'],
       deniedDomains: [],
+      unixSocketMappings: [],
     },
     filesystem: {
       denyRead: [],
       allowWrite: [testDir],
       denyWrite: [],
+      mappings: [],
     },
   }
 }
@@ -782,11 +785,13 @@ describe('Sandbox Integration Tests', () => {
           network: {
             allowedDomains: ['*.github.com', 'example.com'],
             deniedDomains: [],
+            unixSocketMappings: [],
           },
           filesystem: {
             denyRead: [],
             allowWrite: [],
             denyWrite: [],
+            mappings: [],
           },
         })
 
@@ -943,6 +948,156 @@ describe('Sandbox Integration Tests', () => {
             unlinkSync(path)
           }
         })
+      })
+
+      // Filesystem mapping tests
+      it('should isolate different processes with same sandbox path mapped to different host paths', async () => {
+        if (skipIfNotLinux()) return
+
+        // Create two different host directories
+        const hostDir1 = join(tmpdir(), `srt-test-host1-${Date.now()}`)
+        const hostDir2 = join(tmpdir(), `srt-test-host2-${Date.now()}`)
+        mkdirSync(hostDir1, { recursive: true })
+        mkdirSync(hostDir2, { recursive: true })
+
+        try {
+          // Create a file in hostDir1
+          const testFile1 = join(hostDir1, 'test1.txt')
+          const testContent1 = 'Content from host dir 1'
+          writeFileSync(testFile1, testContent1)
+
+          // Create a file in hostDir2
+          const testFile2 = join(hostDir2, 'test2.txt')
+          const testContent2 = 'Content from host dir 2'
+          writeFileSync(testFile2, testContent2)
+
+          // Create config with mapping to hostDir1
+          const config1: SandboxRuntimeConfig = {
+            network: {
+              allowedDomains: [],
+              deniedDomains: [],
+              unixSocketMappings: [],
+            },
+            filesystem: {
+              denyRead: [],
+              allowWrite: [],
+              denyWrite: [],
+              mappings: [
+                {
+                  hostPath: hostDir1,
+                  sandboxPath: '/workspace',
+                  mode: 'readwrite',
+                },
+              ],
+            },
+          }
+
+          await SandboxManager.reset()
+          await SandboxManager.initialize(config1)
+
+          // Run command in first sandbox - should see test1.txt
+          const command1 = await SandboxManager.wrapWithSandbox('ls /workspace')
+          const result1 = spawnSync(command1, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 3000,
+          })
+
+          expect(result1.status).toBe(0)
+          expect(result1.stdout).toContain('test1.txt')
+          expect(result1.stdout).not.toContain('test2.txt')
+
+          // Reset and use config with mapping to hostDir2
+          await SandboxManager.reset()
+
+          const config2: SandboxRuntimeConfig = {
+            network: {
+              allowedDomains: [],
+              deniedDomains: [],
+              unixSocketMappings: [],
+            },
+            filesystem: {
+              denyRead: [],
+              allowWrite: [],
+              denyWrite: [],
+              mappings: [
+                {
+                  hostPath: hostDir2,
+                  sandboxPath: '/workspace',
+                  mode: 'readwrite',
+                },
+              ],
+            },
+          }
+
+          await SandboxManager.initialize(config2)
+
+          // Run command in second sandbox - should see test2.txt
+          const command2 = await SandboxManager.wrapWithSandbox('ls /workspace')
+          const result2 = spawnSync(command2, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 3000,
+          })
+
+          expect(result2.status).toBe(0)
+          expect(result2.stdout).toContain('test2.txt')
+          expect(result2.stdout).not.toContain('test1.txt')
+        } finally {
+          // Cleanup
+          rmSync(hostDir1, { recursive: true, force: true })
+          rmSync(hostDir2, { recursive: true, force: true })
+        }
+      })
+
+      it('should enforce readonly mode on filesystem mappings', async () => {
+        if (skipIfNotLinux()) return
+
+        const hostDir = join(tmpdir(), `srt-test-readonly-${Date.now()}`)
+        mkdirSync(hostDir, { recursive: true })
+
+        try {
+          const config: SandboxRuntimeConfig = {
+            network: {
+              allowedDomains: [],
+              deniedDomains: [],
+              unixSocketMappings: [],
+            },
+            filesystem: {
+              denyRead: [],
+              allowWrite: [],
+              denyWrite: [],
+              mappings: [
+                {
+                  hostPath: hostDir,
+                  sandboxPath: '/workspace',
+                  mode: 'readonly',
+                },
+              ],
+            },
+          }
+
+          await SandboxManager.reset()
+          await SandboxManager.initialize(config)
+
+          // Try to write to readonly mapping
+          const command = await SandboxManager.wrapWithSandbox(
+            'echo "test" > /workspace/test.txt 2>&1',
+          )
+          const result = spawnSync(command, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 3000,
+          })
+
+          // Should fail with permission error
+          expect(result.status).not.toBe(0)
+          const output =
+            result.stdout.toLowerCase() + result.stderr.toLowerCase()
+          expect(output).toMatch(/read-only|permission denied|not permitted/)
+        } finally {
+          rmSync(hostDir, { recursive: true, force: true })
+        }
       })
     })
   })

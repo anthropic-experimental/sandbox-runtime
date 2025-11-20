@@ -4,6 +4,7 @@ import { SandboxManager } from './index.js'
 import {
   SandboxRuntimeConfigSchema,
   type SandboxRuntimeConfig,
+  validateSandboxRuntimePaths,
 } from './sandbox/sandbox-config.js'
 import { spawn } from 'child_process'
 import { logForDebugging } from './utils/debug.js'
@@ -66,11 +67,13 @@ function getDefaultConfig(): SandboxRuntimeConfig {
     network: {
       allowedDomains: [],
       deniedDomains: [],
+      unixSocketMappings: [],
     },
     filesystem: {
       denyRead: [],
       allowWrite: [],
       denyWrite: [],
+      mappings: [],
     },
   }
 }
@@ -115,6 +118,8 @@ async function main(): Promise<void> {
             )
             runtimeConfig = getDefaultConfig()
           }
+
+          validateSandboxRuntimePaths(runtimeConfig)
 
           // Initialize sandbox with config
           logForDebugging('Initializing sandbox...')

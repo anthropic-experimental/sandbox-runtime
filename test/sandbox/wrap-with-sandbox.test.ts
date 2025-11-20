@@ -13,11 +13,13 @@ function createTestConfig(): SandboxRuntimeConfig {
     network: {
       allowedDomains: ['example.com', 'api.github.com'],
       deniedDomains: [],
+      unixSocketMappings: [],
     },
     filesystem: {
       denyRead: ['~/.ssh'],
       allowWrite: ['.', '/tmp'],
       denyWrite: ['.env'],
+      mappings: [],
     },
   }
 }
@@ -69,6 +71,7 @@ describe('wrapWithSandbox customConfig', () => {
           denyRead: [],
           allowWrite: [], // Override to block all writes
           denyWrite: [],
+          mappings: [],
         },
       })
 
@@ -88,6 +91,7 @@ describe('wrapWithSandbox customConfig', () => {
           denyRead: ['/etc/passwd'], // Block this specific file
           allowWrite: [],
           denyWrite: [],
+          mappings: [],
         },
       })
 
@@ -106,6 +110,7 @@ describe('wrapWithSandbox customConfig', () => {
         network: {
           allowedDomains: [], // Block all network
           deniedDomains: [],
+          unixSocketMappings: [],
         },
       })
 
@@ -128,6 +133,7 @@ describe('wrapWithSandbox customConfig', () => {
           denyRead: [],
           allowWrite: [],
           denyWrite: [],
+          mappings: [],
         },
         // network is not provided, should use main config
       })
@@ -149,11 +155,13 @@ describe('wrapWithSandbox customConfig', () => {
         network: {
           allowedDomains: [], // Block all network
           deniedDomains: [],
+          unixSocketMappings: [],
         },
         filesystem: {
           denyRead: [],
           allowWrite: [], // Block all writes
           denyWrite: [],
+          mappings: [],
         },
       }
 
@@ -183,6 +191,7 @@ describe('wrapWithSandbox customConfig', () => {
           denyRead: [], // Override denyRead
           allowWrite: ['/custom/path'], // Override allowWrite
           denyWrite: [], // Override denyWrite
+          mappings: [],
         },
       })
 
@@ -201,6 +210,7 @@ describe('wrapWithSandbox customConfig', () => {
         network: {
           allowedDomains: ['custom.example.com'],
           deniedDomains: [],
+          unixSocketMappings: [],
         },
       })
 

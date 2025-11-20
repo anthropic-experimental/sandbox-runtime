@@ -127,16 +127,12 @@ describe('Config Validation', () => {
   })
 
   test('should validate wildcard domains correctly', () => {
-    const validWildcards = [
-      '*.example.com',
-      '*.github.io',
-      '*.co.uk',
-    ]
+    const validWildcards = ['*.example.com', '*.github.io', '*.co.uk']
 
     const invalidWildcards = [
-      '*example.com',  // Missing dot after asterisk
-      '*.com',         // No subdomain
-      '*.',            // Invalid format
+      '*example.com', // Missing dot after asterisk
+      '*.com', // No subdomain
+      '*.', // Invalid format
     ]
 
     for (const domain of validWildcards) {

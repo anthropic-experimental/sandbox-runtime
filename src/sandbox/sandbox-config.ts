@@ -4,6 +4,8 @@
  */
 
 import { z } from 'zod'
+import * as fs from 'node:fs'
+import * as path from 'node:path'
 
 /**
  * Schema for domain patterns (e.g., "example.com", "*.npmjs.org")
@@ -55,6 +57,30 @@ const domainPatternSchema = z.string().refine(
  */
 const filesystemPathSchema = z.string().min(1, 'Path cannot be empty')
 
+const filesystemMappingSchema = z.object({
+  hostPath: filesystemPathSchema.describe(
+    'Host directory that should be exposed inside the sandbox',
+  ),
+  sandboxPath: filesystemPathSchema.describe(
+    'Path inside the sandbox where the host directory will appear',
+  ),
+  mode: z
+    .enum(['readwrite', 'readonly'])
+    .default('readwrite')
+    .describe(
+      'Whether the sandbox should see the path as readwrite or readonly (default: readwrite)',
+    ),
+})
+
+const unixSocketMappingSchema = z.object({
+  hostPath: filesystemPathSchema.describe(
+    'Host unix socket path owned by the supervisor',
+  ),
+  sandboxPath: filesystemPathSchema.describe(
+    'Sandbox-visible path that forwards to hostPath via the unix socket supervisor',
+  ),
+})
+
 /**
  * Network configuration schema for validation
  */
@@ -69,6 +95,12 @@ export const NetworkConfigSchema = z.object({
     .array(z.string())
     .optional()
     .describe('Unix socket paths that are allowed (macOS only)'),
+  unixSocketMappings: z
+    .array(unixSocketMappingSchema)
+    .default([])
+    .describe(
+      'Map sandbox unix socket paths to host unix sockets managed by the supervisor (Linux only)',
+    ),
   allowAllUnixSockets: z
     .boolean()
     .optional()
@@ -110,6 +142,12 @@ export const FilesystemConfigSchema = z.object({
   denyWrite: z
     .array(filesystemPathSchema)
     .describe('Paths denied for writing (takes precedence over allowWrite)'),
+  mappings: z
+    .array(filesystemMappingSchema)
+    .default([])
+    .describe(
+      'Map directories inside the sandbox to different host directories (Linux only)',
+    ),
 })
 
 /**
@@ -165,3 +203,27 @@ export type IgnoreViolationsConfig = z.infer<
 >
 export type RipgrepConfig = z.infer<typeof RipgrepConfigSchema>
 export type SandboxRuntimeConfig = z.infer<typeof SandboxRuntimeConfigSchema>
+
+function assertDirectoryExists(targetPath: string, label: string): void {
+  if (!fs.existsSync(targetPath)) {
+    throw new Error(`${label} does not exist: ${targetPath}`)
+  }
+
+  const stats = fs.statSync(targetPath)
+  if (!stats.isDirectory()) {
+    throw new Error(`${label} must be a directory: ${targetPath}`)
+  }
+}
+
+export function validateSandboxRuntimePaths(
+  config: SandboxRuntimeConfig,
+): void {
+  for (const mapping of config.filesystem.mappings ?? []) {
+    assertDirectoryExists(mapping.hostPath, 'filesystem mapping hostPath')
+  }
+
+  for (const socketMapping of config.network.unixSocketMappings ?? []) {
+    const parentDir = path.dirname(socketMapping.hostPath)
+    assertDirectoryExists(parentDir, 'unix socket mapping parent directory')
+  }
+}

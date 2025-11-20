@@ -50,6 +50,17 @@ export interface NetworkRestrictionConfig {
   deniedHosts?: string[]
 }
 
+export type FsPathMappingRule = {
+  hostPath: string
+  sandboxPath: string
+  mode: 'readwrite' | 'readonly'
+}
+
+export type UnixSocketMappingRule = {
+  hostPath: string
+  sandboxPath: string
+}
+
 export type NetworkHostPattern = {
   host: string
   port: number | undefined
