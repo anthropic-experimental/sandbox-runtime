@@ -155,6 +155,27 @@ export const SandboxRuntimeConfigSchema = z.object({
   ripgrep: RipgrepConfigSchema.optional().describe(
     'Custom ripgrep configuration (default: { command: "rg" })',
   ),
+  env: z
+    .record(z.string(), z.string())
+    .optional()
+    .describe('Custom environment variables to set inside the sandbox'),
+  preCommand: z
+    .string()
+    .optional()
+    .describe(
+      'Shell command to run inside the sandbox before the main command. ' +
+        'Runs after network bridges are established but before the user command. ' +
+        'Use for initialization tasks.',
+    ),
+  skipGitConfigProtection: z
+    .boolean()
+    .optional()
+    .describe(
+      'Skip the mandatory protection that blocks writes to .git/config and .git/hooks. ' +
+        'WARNING: Only enable this when using an external security proxy ' +
+        'that already provides protection against git config exploits (core.fsmonitor, etc.). ' +
+        'Without this protection, malicious code could achieve arbitrary code execution via git.',
+    ),
 })
 
 // Export inferred types

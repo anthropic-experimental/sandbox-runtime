@@ -1,10 +1,11 @@
-import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
+import { describe, it, expect, afterAll } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import * as http from 'node:http'
 import * as net from 'node:net'
 import { SandboxManager } from '../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../src/sandbox/sandbox-config.js'
 import { getPlatform } from '../src/utils/platform.js'
+import { generateProxyEnvVars } from '../src/sandbox/sandbox-utils.js'
 
 /**
  * Integration tests for configurable proxy ports feature
@@ -310,18 +311,22 @@ describe('Configurable Proxy Ports Integration Tests', () => {
           const { port, hostname } = new URL(`http://${req.url}`)
 
           // Connect to target (allow everything - no filtering)
-          const serverSocket = net.connect(parseInt(port) || 80, hostname, () => {
-            clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
-            serverSocket.write(head)
-            serverSocket.pipe(clientSocket)
-            clientSocket.pipe(serverSocket)
-          })
+          const serverSocket = net.connect(
+            parseInt(port) || 80,
+            hostname,
+            () => {
+              clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+              serverSocket.write(head)
+              serverSocket.pipe(clientSocket)
+              clientSocket.pipe(serverSocket)
+            },
+          )
 
-          serverSocket.on('error', (err) => {
+          serverSocket.on('error', _err => {
             clientSocket.end()
           })
 
-          clientSocket.on('error', (err) => {
+          clientSocket.on('error', _err => {
             serverSocket.end()
           })
         })
@@ -337,12 +342,12 @@ describe('Configurable Proxy Ports Integration Tests', () => {
             headers: req.headers,
           }
 
-          const proxyReq = http.request(options, (proxyRes) => {
+          const proxyReq = http.request(options, proxyRes => {
             res.writeHead(proxyRes.statusCode!, proxyRes.headers)
             proxyRes.pipe(res)
           })
 
-          proxyReq.on('error', (err) => {
+          proxyReq.on('error', _err => {
             res.writeHead(502)
             res.end('Bad Gateway')
           })
@@ -356,7 +361,9 @@ describe('Configurable Proxy Ports Integration Tests', () => {
             const addr = externalProxyServer!.address()
             if (addr && typeof addr === 'object') {
               externalProxyPort = addr.port
-              console.log(`External allow-all proxy started on port ${externalProxyPort}`)
+              console.log(
+                `External allow-all proxy started on port ${externalProxyPort}`,
+              )
               resolve()
             } else {
               reject(new Error('Failed to get proxy address'))
@@ -387,7 +394,7 @@ describe('Configurable Proxy Ports Integration Tests', () => {
         // Try to access example.com (in allowlist)
         // This verifies that requests are routed through the external proxy
         const command = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 5 http://example.com'
+          'curl -s --max-time 5 http://example.com',
         )
 
         const result = spawnSync(command, {
@@ -404,14 +411,15 @@ describe('Configurable Proxy Ports Integration Tests', () => {
         expect(output).not.toContain('blocked by network allowlist')
 
         console.log('✓ Request to example.com succeeded through external proxy')
-        console.log('✓ This verifies SRT used the external proxy on the configured port')
-
+        console.log(
+          '✓ This verifies SRT used the external proxy on the configured port',
+        )
       } finally {
         // Clean up
         await SandboxManager.reset()
 
         if (externalProxyServer) {
-          await new Promise<void>((resolve) => {
+          await new Promise<void>(resolve => {
             externalProxyServer!.close(() => {
               console.log('External proxy server closed')
               resolve()
@@ -419,6 +427,291 @@ describe('Configurable Proxy Ports Integration Tests', () => {
           })
         }
       }
+    })
+  })
+})
+
+/**
+ * Tests for custom environment variables feature
+ */
+describe('Custom Environment Variables Tests', () => {
+  afterAll(async () => {
+    await SandboxManager.reset()
+  })
+
+  describe('generateProxyEnvVars with customEnv', () => {
+    it('should include custom env vars when customEnv is provided', () => {
+      const customEnv = {
+        SSL_CERT_FILE: '/tmp/ca-bundle.crt',
+        MY_CUSTOM_VAR: 'my-value',
+      }
+
+      const envVars = generateProxyEnvVars(3128, 1080, customEnv)
+
+      // Should include standard proxy env vars
+      expect(envVars).toContain('HTTP_PROXY=http://localhost:3128')
+      expect(envVars).toContain('HTTPS_PROXY=http://localhost:3128')
+
+      // Should include custom env vars
+      expect(envVars).toContain('SSL_CERT_FILE=/tmp/ca-bundle.crt')
+      expect(envVars).toContain('MY_CUSTOM_VAR=my-value')
+    })
+
+    it('should include custom env vars even without proxy ports', () => {
+      const customEnv = {
+        SSL_CERT_FILE: '/tmp/ca-bundle.crt',
+      }
+
+      const envVars = generateProxyEnvVars(undefined, undefined, customEnv)
+
+      // Should include minimal env vars
+      expect(envVars).toContain('SANDBOX_RUNTIME=1')
+      expect(envVars).toContain('TMPDIR=/tmp/claude')
+
+      // Should include custom env vars
+      expect(envVars).toContain('SSL_CERT_FILE=/tmp/ca-bundle.crt')
+
+      // Should NOT include proxy env vars
+      expect(envVars.some(v => v.startsWith('HTTP_PROXY='))).toBe(false)
+    })
+
+    it('should allow custom env vars to override defaults', () => {
+      const customEnv = {
+        TMPDIR: '/my/custom/tmp', // Override the default
+      }
+
+      const envVars = generateProxyEnvVars(3128, 1080, customEnv)
+
+      // Custom TMPDIR should appear after the default, effectively overriding it
+      const tmpDirEntries = envVars.filter(v => v.startsWith('TMPDIR='))
+      expect(tmpDirEntries.length).toBe(2)
+      // The custom one should come last (later entries override earlier in most shells)
+      expect(tmpDirEntries[tmpDirEntries.length - 1]).toBe(
+        'TMPDIR=/my/custom/tmp',
+      )
+    })
+  })
+
+  describe('SandboxManager env config', () => {
+    it('should store and retrieve env config', async () => {
+      const config: SandboxRuntimeConfig = {
+        network: {
+          allowedDomains: [],
+          deniedDomains: [],
+        },
+        filesystem: {
+          denyRead: [],
+          allowWrite: ['/tmp'],
+          denyWrite: [],
+        },
+        env: {
+          SSL_CERT_FILE: '/tmp/ca-bundle.crt',
+          NODE_EXTRA_CA_CERTS: '/tmp/ca-bundle.crt',
+        },
+      }
+
+      await SandboxManager.initialize(config)
+
+      const env = SandboxManager.getEnv()
+      expect(env).toBeDefined()
+      expect(env?.SSL_CERT_FILE).toBe('/tmp/ca-bundle.crt')
+      expect(env?.NODE_EXTRA_CA_CERTS).toBe('/tmp/ca-bundle.crt')
+
+      await SandboxManager.reset()
+    })
+
+    it('should return undefined when env is not configured', async () => {
+      const config: SandboxRuntimeConfig = {
+        network: {
+          allowedDomains: [],
+          deniedDomains: [],
+        },
+        filesystem: {
+          denyRead: [],
+          allowWrite: ['/tmp'],
+          denyWrite: [],
+        },
+        // No env configured
+      }
+
+      await SandboxManager.initialize(config)
+
+      const env = SandboxManager.getEnv()
+      expect(env).toBeUndefined()
+
+      await SandboxManager.reset()
+    })
+  })
+})
+
+/**
+ * Tests for preCommand feature
+ */
+describe('PreCommand Tests', () => {
+  afterAll(async () => {
+    await SandboxManager.reset()
+  })
+
+  describe('SandboxManager preCommand config', () => {
+    it('should store and retrieve preCommand config', async () => {
+      const config: SandboxRuntimeConfig = {
+        network: {
+          allowedDomains: [],
+          deniedDomains: [],
+        },
+        filesystem: {
+          denyRead: [],
+          allowWrite: ['/tmp'],
+          denyWrite: [],
+        },
+        preCommand: 'echo "Initializing sandbox"',
+      }
+
+      await SandboxManager.initialize(config)
+
+      const preCommand = SandboxManager.getPreCommand()
+      expect(preCommand).toBe('echo "Initializing sandbox"')
+
+      await SandboxManager.reset()
+    })
+
+    it('should return undefined when preCommand is not configured', async () => {
+      const config: SandboxRuntimeConfig = {
+        network: {
+          allowedDomains: [],
+          deniedDomains: [],
+        },
+        filesystem: {
+          denyRead: [],
+          allowWrite: ['/tmp'],
+          denyWrite: [],
+        },
+        // No preCommand configured
+      }
+
+      await SandboxManager.initialize(config)
+
+      const preCommand = SandboxManager.getPreCommand()
+      expect(preCommand).toBeUndefined()
+
+      await SandboxManager.reset()
+    })
+  })
+
+  describe('preCommand execution in sandbox (Linux only)', () => {
+    it('should execute preCommand before main command', async () => {
+      // Skip if not on Linux
+      if (getPlatform() !== 'linux') {
+        console.log('Skipping preCommand execution test on non-Linux platform')
+        return
+      }
+
+      const config: SandboxRuntimeConfig = {
+        network: {
+          allowedDomains: ['example.com'], // Need network to trigger full sandbox wrapping
+          deniedDomains: [],
+        },
+        filesystem: {
+          denyRead: [],
+          allowWrite: ['/tmp'],
+          denyWrite: [],
+        },
+        preCommand: 'echo "PRE_COMMAND_EXECUTED" > /tmp/precommand-test.txt',
+        enableWeakerNestedSandbox: true, // Needed for containerized test environments
+      }
+
+      await SandboxManager.initialize(config)
+
+      // Wrap a command that reads the file created by preCommand
+      const command = await SandboxManager.wrapWithSandbox(
+        'cat /tmp/precommand-test.txt',
+      )
+
+      const result = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 10000,
+      })
+
+      // The preCommand should have created the file, and main command should read it
+      expect(result.stdout).toContain('PRE_COMMAND_EXECUTED')
+
+      await SandboxManager.reset()
+    })
+
+    it('should fail if preCommand fails', async () => {
+      // Skip if not on Linux
+      if (getPlatform() !== 'linux') {
+        console.log('Skipping preCommand failure test on non-Linux platform')
+        return
+      }
+
+      const config: SandboxRuntimeConfig = {
+        network: {
+          allowedDomains: ['example.com'],
+          deniedDomains: [],
+        },
+        filesystem: {
+          denyRead: [],
+          allowWrite: ['/tmp'],
+          denyWrite: [],
+        },
+        preCommand: 'exit 1', // This should cause the sandbox to fail
+        enableWeakerNestedSandbox: true, // Needed for containerized test environments
+      }
+
+      await SandboxManager.initialize(config)
+
+      const command = await SandboxManager.wrapWithSandbox(
+        'echo "Should not reach here"',
+      )
+
+      const result = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 10000,
+      })
+
+      // The command should fail because preCommand failed
+      expect(result.status).not.toBe(0)
+
+      await SandboxManager.reset()
+    })
+  })
+})
+
+/**
+ * Tests for combined env and preCommand features
+ */
+describe('Combined env and preCommand Tests', () => {
+  afterAll(async () => {
+    await SandboxManager.reset()
+  })
+
+  describe('Using both env and preCommand together', () => {
+    it('should support both env and preCommand in config', async () => {
+      const config: SandboxRuntimeConfig = {
+        network: {
+          allowedDomains: [],
+          deniedDomains: [],
+        },
+        filesystem: {
+          denyRead: [],
+          allowWrite: ['/tmp'],
+          denyWrite: [],
+        },
+        env: {
+          MY_VAR: 'my-value',
+        },
+        preCommand: 'echo "Setup complete"',
+      }
+
+      await SandboxManager.initialize(config)
+
+      expect(SandboxManager.getEnv()).toEqual({ MY_VAR: 'my-value' })
+      expect(SandboxManager.getPreCommand()).toBe('echo "Setup complete"')
+
+      await SandboxManager.reset()
     })
   })
 })

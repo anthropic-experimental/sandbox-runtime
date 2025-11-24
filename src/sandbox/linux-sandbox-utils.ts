@@ -44,6 +44,9 @@ export interface LinuxSandboxParams {
   allowAllUnixSockets?: boolean
   binShell?: string
   ripgrepConfig?: { command: string; args?: string[] }
+  env?: Record<string, string>
+  preCommand?: string
+  skipGitConfigProtection?: boolean
 }
 
 // Track generated seccomp filters for cleanup on process exit
@@ -280,6 +283,7 @@ function buildSandboxCommand(
   userCommand: string,
   seccompFilterPath: string | undefined,
   shell?: string,
+  preCommand?: string,
 ): string {
   // Default to bash for backward compatibility
   const shellPath = shell || 'bash'
@@ -289,12 +293,17 @@ function buildSandboxCommand(
     'trap "kill %1 %2 2>/dev/null; exit" EXIT',
   ]
 
+  // If preCommand is provided, run it after socat setup but before user command
+  // This is useful for initialization tasks like setting up certificates
+  const preCommandScript = preCommand ? [preCommand] : []
+
   // If seccomp filter is provided, use apply-seccomp to apply it
   if (seccompFilterPath) {
     // apply-seccomp approach:
     // 1. Outer bwrap/bash: starts socat processes (can use Unix sockets)
-    // 2. apply-seccomp: applies seccomp filter and execs user command
-    // 3. User command runs with seccomp active (Unix sockets blocked)
+    // 2. preCommand: runs initialization tasks (if provided)
+    // 3. apply-seccomp: applies seccomp filter and execs user command
+    // 4. User command runs with seccomp active (Unix sockets blocked)
     //
     // apply-seccomp is a simple C program that:
     // - Sets PR_SET_NO_NEW_PRIVS
@@ -318,12 +327,17 @@ function buildSandboxCommand(
       userCommand,
     ])
 
-    const innerScript = [...socatCommands, applySeccompCmd].join('\n')
+    const innerScript = [
+      ...socatCommands,
+      ...preCommandScript,
+      applySeccompCmd,
+    ].join('\n')
     return `${shellPath} -c ${shellquote.quote([innerScript])}`
   } else {
     // No seccomp filter - run user command directly
     const innerScript = [
       ...socatCommands,
+      ...preCommandScript,
       `eval ${shellquote.quote([userCommand])}`,
     ].join('\n')
 
@@ -338,6 +352,7 @@ async function generateFilesystemArgs(
   readConfig: FsReadRestrictionConfig | undefined,
   writeConfig: FsWriteRestrictionConfig | undefined,
   ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
+  skipGitConfigProtection = false,
 ): Promise<string[]> {
   const args: string[] = []
   // fs already imported
@@ -378,7 +393,10 @@ async function generateFilesystemArgs(
     // Deny writes within allowed paths (user-specified + mandatory denies)
     const denyPaths = [
       ...(writeConfig.denyWithinAllow || []),
-      ...(await getMandatoryDenyWithinAllow(ripgrepConfig)),
+      ...(await getMandatoryDenyWithinAllow(
+        ripgrepConfig,
+        skipGitConfigProtection,
+      )),
     ]
 
     for (const pathPattern of denyPaths) {
@@ -511,6 +529,9 @@ export async function wrapCommandWithSandboxLinux(
     allowAllUnixSockets,
     binShell,
     ripgrepConfig = { command: 'rg' },
+    env: customEnv,
+    preCommand,
+    skipGitConfigProtection = false,
   } = params
 
   // Determine if we have restrictions to apply
@@ -601,6 +622,7 @@ export async function wrapCommandWithSandboxLinux(
       const proxyEnv = generateProxyEnvVars(
         3128, // Internal HTTP listener port
         1080, // Internal SOCKS listener port
+        customEnv, // Custom environment variables from config
       )
       bwrapArgs.push(
         ...proxyEnv.flatMap((env: string) => {
@@ -627,6 +649,12 @@ export async function wrapCommandWithSandboxLinux(
           String(socksProxyPort),
         )
       }
+    } else if (customEnv) {
+      // No network restrictions, but custom env vars are provided
+      // Add them directly without proxy env vars
+      for (const [key, value] of Object.entries(customEnv)) {
+        bwrapArgs.push('--setenv', key, value)
+      }
     }
 
     // ========== FILESYSTEM RESTRICTIONS ==========
@@ -634,6 +662,7 @@ export async function wrapCommandWithSandboxLinux(
       readConfig,
       writeConfig,
       ripgrepConfig,
+      skipGitConfigProtection,
     )
     bwrapArgs.push(...fsArgs)
 
@@ -677,6 +706,7 @@ export async function wrapCommandWithSandboxLinux(
         command,
         seccompFilterPath,
         shell,
+        preCommand,
       )
       bwrapArgs.push(sandboxCommand)
     } else if (seccompFilterPath) {
@@ -690,16 +720,21 @@ export async function wrapCommandWithSandboxLinux(
         )
       }
 
+      // If preCommand is provided, prepend it to the user command
+      const commandWithPre = preCommand ? `${preCommand}\n${command}` : command
       const applySeccompCmd = shellquote.quote([
         applySeccompBinary,
         seccompFilterPath,
         shell,
         '-c',
-        command,
+        commandWithPre,
       ])
       bwrapArgs.push(applySeccompCmd)
     } else {
-      bwrapArgs.push(command)
+      // No network restrictions and no seccomp - run command directly
+      // If preCommand is provided, prepend it to the user command
+      const commandWithPre = preCommand ? `${preCommand}\n${command}` : command
+      bwrapArgs.push(commandWithPre)
     }
 
     // Build the outer bwrap command

@@ -438,6 +438,18 @@ function getRipgrepConfig(): { command: string; args?: string[] } {
   return config?.ripgrep ?? { command: 'rg' }
 }
 
+function getEnv(): Record<string, string> | undefined {
+  return config?.env
+}
+
+function getPreCommand(): string | undefined {
+  return config?.preCommand
+}
+
+function getSkipGitConfigProtection(): boolean {
+  return config?.skipGitConfigProtection ?? false
+}
+
 function getProxyPort(): number | undefined {
   return managerContext?.httpProxyPort
 }
@@ -495,13 +507,19 @@ async function wrapWithSandbox(
       customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
   }
 
-  // Check if network proxy is needed based on allowed domains
+  // Check if network proxy is needed based on allowed domains or external proxy config
   // Unix sockets are local IPC and don't require the network proxy
   const allowedDomains =
     customConfig?.network?.allowedDomains ??
     config?.network.allowedDomains ??
     []
-  const needsNetworkProxy = allowedDomains.length > 0
+  // Network sandboxing is needed if:
+  // 1. There are allowed domains (sandbox-runtime enforces allowlist), OR
+  // 2. External proxy ports are configured (external proxy enforces allowlist)
+  const hasExternalProxy =
+    config?.network.httpProxyPort !== undefined ||
+    config?.network.socksProxyPort !== undefined
+  const needsNetworkProxy = allowedDomains.length > 0 || hasExternalProxy
 
   // Wait for network initialization only if proxy is actually needed
   if (needsNetworkProxy) {
@@ -539,6 +557,9 @@ async function wrapWithSandbox(
         allowAllUnixSockets: getAllowAllUnixSockets(),
         binShell,
         ripgrepConfig: getRipgrepConfig(),
+        env: getEnv(),
+        preCommand: getPreCommand(),
+        skipGitConfigProtection: getSkipGitConfigProtection(),
       })
 
     default:
@@ -818,6 +839,8 @@ export interface ISandboxManager {
   getAllowLocalBinding(): boolean | undefined
   getIgnoreViolations(): Record<string, string[]> | undefined
   getEnableWeakerNestedSandbox(): boolean | undefined
+  getEnv(): Record<string, string> | undefined
+  getPreCommand(): string | undefined
   getProxyPort(): number | undefined
   getSocksProxyPort(): number | undefined
   getLinuxHttpSocketPath(): string | undefined
@@ -856,6 +879,8 @@ export const SandboxManager: ISandboxManager = {
   getAllowLocalBinding,
   getIgnoreViolations,
   getEnableWeakerNestedSandbox,
+  getEnv,
+  getPreCommand,
   getProxyPort,
   getSocksProxyPort,
   getLinuxHttpSocketPath,

@@ -151,9 +151,11 @@ export function getDefaultWritePaths(): string[] {
  * This uses ripgrep to scan the filesystem for dangerous files and directories
  * Returns absolute paths that must be blocked from writes
  * @param ripgrepConfig Ripgrep configuration (command and optional args)
+ * @param skipGitConfigProtection If true, skip blocking .git/config and .git/hooks
  */
 export async function getMandatoryDenyWithinAllow(
   ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
+  skipGitConfigProtection = false,
 ): Promise<string[]> {
   const denyPaths: string[] = []
   const cwd = process.cwd()
@@ -271,52 +273,55 @@ export async function getMandatoryDenyWithinAllow(
 
   // Special handling for dangerous .git paths
   // We block specific paths within .git that can be used for code execution
-  const dangerousGitPaths = [
-    '.git/hooks', // Block all hook files to prevent code execution via git hooks
-    '.git/config', // Block config file to prevent dangerous config options like core.fsmonitor
-  ]
+  // This can be skipped when using an external security proxy that handles these exploits
+  if (!skipGitConfigProtection) {
+    const dangerousGitPaths = [
+      '.git/hooks', // Block all hook files to prevent code execution via git hooks
+      '.git/config', // Block config file to prevent dangerous config options like core.fsmonitor
+    ]
 
-  for (const gitPath of dangerousGitPaths) {
-    // Add the path in the current working directory
-    const absoluteGitPath = path.resolve(cwd, gitPath)
-    denyPaths.push(absoluteGitPath)
+    for (const gitPath of dangerousGitPaths) {
+      // Add the path in the current working directory
+      const absoluteGitPath = path.resolve(cwd, gitPath)
+      denyPaths.push(absoluteGitPath)
 
-    // Also find .git directories in subdirectories and block their hooks/config
-    // This handles nested repositories (case-insensitive)
-    try {
-      // Find all .git directories by looking for .git/HEAD files (case-insensitive)
-      const gitHeadFiles = await ripGrep(
-        [
-          '--files',
-          '--hidden',
-          '--iglob',
-          '**/.git/HEAD',
-          '-g',
-          '!**/node_modules/**',
-        ],
-        cwd,
-        abortController.signal,
-        ripgrepConfig,
-      )
+      // Also find .git directories in subdirectories and block their hooks/config
+      // This handles nested repositories (case-insensitive)
+      try {
+        // Find all .git directories by looking for .git/HEAD files (case-insensitive)
+        const gitHeadFiles = await ripGrep(
+          [
+            '--files',
+            '--hidden',
+            '--iglob',
+            '**/.git/HEAD',
+            '-g',
+            '!**/node_modules/**',
+          ],
+          cwd,
+          abortController.signal,
+          ripgrepConfig,
+        )
 
-      for (const gitHeadFile of gitHeadFiles) {
-        // Get the .git directory path
-        const gitDir = path.dirname(gitHeadFile)
+        for (const gitHeadFile of gitHeadFiles) {
+          // Get the .git directory path
+          const gitDir = path.dirname(gitHeadFile)
 
-        // Add the dangerous path within this .git directory
-        if (gitPath === '.git/hooks') {
-          const hooksPath = path.join(gitDir, 'hooks')
-          denyPaths.push(hooksPath)
-        } else if (gitPath === '.git/config') {
-          const configPath = path.join(gitDir, 'config')
-          denyPaths.push(configPath)
+          // Add the dangerous path within this .git directory
+          if (gitPath === '.git/hooks') {
+            const hooksPath = path.join(gitDir, 'hooks')
+            denyPaths.push(hooksPath)
+          } else if (gitPath === '.git/config') {
+            const configPath = path.join(gitDir, 'config')
+            denyPaths.push(configPath)
+          }
         }
+      } catch (error) {
+        // If ripgrep fails, we cannot safely determine all .git repositories
+        throw new Error(
+          `Failed to scan for .git directories: ${error instanceof Error ? error.message : String(error)}`,
+        )
       }
-    } catch (error) {
-      // If ripgrep fails, we cannot safely determine all .git repositories
-      throw new Error(
-        `Failed to scan for .git directories: ${error instanceof Error ? error.message : String(error)}`,
-      )
     }
   }
 
@@ -330,11 +335,17 @@ export async function getMandatoryDenyWithinAllow(
 export function generateProxyEnvVars(
   httpProxyPort?: number,
   socksProxyPort?: number,
+  customEnv?: Record<string, string>,
 ): string[] {
   const envVars: string[] = [`SANDBOX_RUNTIME=1`, `TMPDIR=/tmp/claude`]
 
-  // If no proxy ports provided, return minimal env vars
+  // If no proxy ports provided, return minimal env vars (plus custom env)
   if (!httpProxyPort && !socksProxyPort) {
+    if (customEnv) {
+      for (const [key, value] of Object.entries(customEnv)) {
+        envVars.push(`${key}=${value}`)
+      }
+    }
     return envVars
   }
 
@@ -421,6 +432,13 @@ export function generateProxyEnvVars(
   // WARNING: Do not set HTTP_PROXY/HTTPS_PROXY to SOCKS URLs when only SOCKS proxy is available
   // Most HTTP clients do not support SOCKS URLs in these variables and will fail, and we want
   // to avoid overriding the client otherwise respecting the ALL_PROXY env var which points to SOCKS.
+
+  // Add custom environment variables (these can override the defaults above)
+  if (customEnv) {
+    for (const [key, value] of Object.entries(customEnv)) {
+      envVars.push(`${key}=${value}`)
+    }
+  }
 
   return envVars
 }
