@@ -26,6 +26,8 @@ import {
   getDefaultWritePaths,
   containsGlobChars,
   removeTrailingGlobSuffix,
+  getDefaultSystemReadPaths,
+  getSensitivePathsToExclude,
 } from './sandbox-utils.js'
 import { hasRipgrepSync } from '../utils/ripgrep.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
@@ -343,25 +345,105 @@ function checkDependencies(ripgrepConfig?: {
   return true
 }
 
-function getFsReadConfig(): FsReadRestrictionConfig {
+/**
+ * Normalize and filter paths for sandbox configuration.
+ * Removes trailing glob suffixes and filters out unsupported glob patterns on Linux.
+ */
+function normalizeAndFilterPaths(
+  paths: string[],
+  platform: Platform,
+): string[] {
+  return paths
+    ? paths
+        .map(path => removeTrailingGlobSuffix(path))
+        .filter(path => {
+          if (platform === 'linux' && containsGlobChars(path)) {
+            logForDebugging(`Skipping glob pattern on Linux: ${path}`)
+            return false
+          }
+          return true
+        })
+    : []
+}
+
+function getFsReadConfig(): FsReadRestrictionConfig | undefined {
   if (!config) {
-    return { denyOnly: [] }
+    return undefined
   }
 
-  // Filter out glob patterns on Linux
-  const denyPaths = config.filesystem.denyRead
-    .map(path => removeTrailingGlobSuffix(path))
-    .filter(path => {
-      if (getPlatform() === 'linux' && containsGlobChars(path)) {
-        logForDebugging(`Skipping glob pattern on Linux: ${path}`)
-        return false
+  const filesystem = config.filesystem
+  const platform = getPlatform()
+
+  // Check if user specified denyRead (deny-only mode) or allowRead (allow-only mode)
+  const hasDenyRead = filesystem.denyRead && filesystem.denyRead.length > 0
+  const hasAllowRead = filesystem.allowRead && filesystem.allowRead.length > 0
+
+  // Validate: can't use both modes at once
+  if (hasDenyRead && hasAllowRead) {
+    throw new Error(
+      'Cannot use both denyRead and allowRead at the same time. ' +
+        'Choose either deny-only mode (denyRead) or allow-only mode (allowRead).',
+    )
+  }
+
+  if (platform === 'linux') {
+    // Linux supports both deny-only and allow-only modes
+    if (hasDenyRead) {
+      // Deny-only mode: user specified denyRead
+      return {
+        mode: 'deny-only',
+        denyPaths: normalizeAndFilterPaths(filesystem.denyRead, platform),
       }
-      return true
-    })
+    } else if (hasAllowRead) {
+      // Allow-only mode: user specified allowRead
+      let allowPaths = normalizeAndFilterPaths(
+        filesystem.allowRead || [],
+        platform,
+      )
 
-  return {
-    denyOnly: denyPaths,
+      // Auto-include system paths if enabled (default: true)
+      const autoAllowSystem = filesystem.autoAllowSystemPaths !== false
+      if (autoAllowSystem) {
+        const systemPaths = getDefaultSystemReadPaths('linux')
+        allowPaths = [...allowPaths, ...systemPaths]
+        logForDebugging(
+          `Auto-included ${systemPaths.length} system paths for reading`,
+        )
+      }
+
+      // Get sensitive paths to exclude (denyWithinAllow)
+      const sensitivePaths = getSensitivePathsToExclude()
+
+      return {
+        mode: 'allow-only',
+        allowPaths,
+        denyWithinAllow: sensitivePaths,
+      }
+    } else {
+      // No read restrictions specified
+      return undefined
+    }
+  } else if (platform === 'macos') {
+    // macOS only supports deny-only mode
+    if (hasAllowRead) {
+      throw new Error(
+        'macOS sandbox does not support allow-only mode (allowRead). ' +
+          'Please use deny-only mode (denyRead) instead.',
+      )
+    }
+
+    if (hasDenyRead) {
+      return {
+        mode: 'deny-only',
+        denyPaths: normalizeAndFilterPaths(filesystem.denyRead, platform),
+      }
+    }
+
+    // No read restrictions
+    return undefined
   }
+
+  return undefined
 }
 
 function getFsWriteConfig(): FsWriteRestrictionConfig {
@@ -480,20 +562,9 @@ async function wrapWithSandbox(
 ): Promise<string> {
   const platform = getPlatform()
 
-  // Get configs - use custom if provided, otherwise fall back to main config
-  // If neither exists, defaults to empty arrays (most restrictive)
-  // Always include default system write paths (like /dev/null, /tmp/claude)
-  const userAllowWrite =
-    customConfig?.filesystem?.allowWrite ?? config?.filesystem.allowWrite ?? []
-  const writeConfig = {
-    allowOnly: [...getDefaultWritePaths(), ...userAllowWrite],
-    denyWithinAllow:
-      customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
-  }
-  const readConfig = {
-    denyOnly:
-      customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
-  }
+  // Get configs - use getFsReadConfig() and getFsWriteConfig() for proper type handling
+  const readConfig = getFsReadConfig()
+  const writeConfig = getFsWriteConfig()
 
   // Check if network proxy is needed based on allowed domains
   // Unix sockets are local IPC and don't require the network proxy
@@ -774,7 +845,8 @@ function getLinuxGlobPatternWarnings(): string[] {
 
   // Check filesystem paths for glob patterns
   const allPaths = [
-    ...config.filesystem.denyRead,
+    ...(config.filesystem.denyRead || []),
+    ...(config.filesystem.allowRead || []),
     ...config.filesystem.allowWrite,
     ...config.filesystem.denyWrite,
   ]
@@ -811,7 +883,7 @@ export interface ISandboxManager {
     command: string
     args?: string[]
   }): boolean
-  getFsReadConfig(): FsReadRestrictionConfig
+  getFsReadConfig(): FsReadRestrictionConfig | undefined
   getFsWriteConfig(): FsWriteRestrictionConfig
   getNetworkRestrictionConfig(): NetworkRestrictionConfig
   getAllowUnixSockets(): string[] | undefined

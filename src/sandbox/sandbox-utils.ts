@@ -440,3 +440,48 @@ export function encodeSandboxedCommand(command: string): string {
 export function decodeSandboxedCommand(encodedCommand: string): string {
   return Buffer.from(encodedCommand, 'base64').toString('utf8')
 }
+
+/**
+ * Get system paths that must be readable for commands to execute in allow-only mode.
+ * These paths contain system binaries, libraries, and essential runtime files.
+ *
+ * IMPORTANT: This function is ONLY used by Linux allow-only mode.
+ * - Linux: Uses allow-only mode, needs explicit system path list
+ * - macOS: Uses deny-only mode (allows all reads by default), doesn't need this
+ *
+ * @param platform The platform to get system paths for
+ * @returns Array of system paths that should be allowed for reading
+ */
+export function getDefaultSystemReadPaths(
+  platform: 'macos' | 'linux' | 'unknown',
+): string[] {
+  if (platform === 'linux') {
+    return [
+      // Command-line binaries
+      '/usr',
+      '/bin',
+      '/sbin',
+      // System libraries
+      '/lib',
+      '/lib64',
+    ]
+  }
+
+  return []
+}
+
+/**
+ * Get sensitive paths that should be denied within allowed paths in allow-only mode.
+ * These paths contain credentials, secrets, and other sensitive data.
+ *
+ * Note: This function currently returns an empty array because:
+ * - On macOS: allow-only mode is not supported (automatically falls back to deny-only)
+ * - On Linux: Sensitive directories (/home, /root, /etc) are already blocked at the
+ *   base level in linux-sandbox-utils.ts, so additional denyWithinAllow paths are
+ *   not needed for the current implementation
+ *
+ * @returns Array of sensitive paths to exclude from read access
+ */
+export function getSensitivePathsToExclude(): string[] {
+  return []
+}

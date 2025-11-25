@@ -1,11 +1,20 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdirSync,
+  rmSync,
+  writeFileSync,
+  readFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getPlatform } from '../../src/utils/platform.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
-import type { FsReadRestrictionConfig, FsWriteRestrictionConfig } from '../../src/sandbox/sandbox-schemas.js'
+import type {
+  FsReadRestrictionConfig,
+  FsWriteRestrictionConfig,
+} from '../../src/sandbox/sandbox-schemas.js'
 
 /**
  * Tests for macOS Seatbelt read bypass vulnerability
@@ -73,7 +82,8 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
 
       // Use actual read restriction config with literal path
       const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [TEST_DENIED_DIR]
+        mode: 'deny-only',
+        denyPaths: [TEST_DENIED_DIR],
       }
 
       // Generate actual sandbox command using our production code
@@ -111,7 +121,8 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
 
       // Use actual read restriction config
       const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [TEST_DENIED_DIR]
+        mode: 'deny-only',
+        denyPaths: [TEST_DENIED_DIR],
       }
 
       // Generate actual sandbox command
@@ -147,7 +158,8 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
 
       // Use actual read restriction config
       const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [TEST_DENIED_DIR]
+        mode: 'deny-only',
+        denyPaths: [TEST_DENIED_DIR],
       }
 
       // Generate actual sandbox command
@@ -185,7 +197,8 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
 
       // Deny reading a specific file deep in the hierarchy
       const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [TEST_SECRET_FILE]
+        mode: 'deny-only',
+        denyPaths: [TEST_SECRET_FILE],
       }
 
       const movedBaseDir = join(tmpdir(), 'moved-base-' + Date.now())
@@ -226,7 +239,8 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       const globPattern = join(TEST_GLOB_DIR, '*.txt')
 
       const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [globPattern]
+        mode: 'deny-only',
+        denyPaths: [globPattern],
       }
 
       // Try to move a .txt file that matches the pattern
@@ -266,7 +280,8 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       const globPattern = join(TEST_GLOB_DIR, '*.txt')
 
       const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [globPattern]
+        mode: 'deny-only',
+        denyPaths: [globPattern],
       }
 
       // Try to read a file matching the glob
@@ -302,7 +317,8 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       const globPattern = join(TEST_GLOB_DIR, '*.txt')
 
       const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [globPattern]
+        mode: 'deny-only',
+        denyPaths: [globPattern],
       }
 
       const movedGlobDir = join(TEST_BASE_DIR, 'moved-glob-dir')
@@ -349,7 +365,8 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       const globPattern = join(TEST_GLOB_DIR, '**/*.txt')
 
       const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [globPattern]
+        mode: 'deny-only',
+        denyPaths: [globPattern],
       }
 
       const movedNested = join(TEST_BASE_DIR, 'moved-nested.txt')
@@ -391,7 +408,6 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
 
   // Additional test paths
   const TEST_RENAMED_DIR = join(TEST_BASE_DIR, 'renamed-secrets')
-  const TEST_RENAMED_FILE = join(TEST_RENAMED_DIR, 'secret.txt')
 
   // Glob pattern test paths
   const TEST_GLOB_DIR = join(TEST_ALLOWED_DIR, 'glob-test')
@@ -434,7 +450,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
       // Allow writing to TEST_ALLOWED_DIR but deny TEST_DENIED_DIR
       const writeConfig: FsWriteRestrictionConfig = {
         allowOnly: [TEST_ALLOWED_DIR],
-        denyWithinAllow: [TEST_DENIED_DIR]
+        denyWithinAllow: [TEST_DENIED_DIR],
       }
 
       // Step 1: Try to rename the denied directory
@@ -468,7 +484,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
 
       const writeConfig: FsWriteRestrictionConfig = {
         allowOnly: [TEST_ALLOWED_DIR],
-        denyWithinAllow: [TEST_DENIED_DIR]
+        denyWithinAllow: [TEST_DENIED_DIR],
       }
 
       // Try to write directly to the denied file
@@ -504,7 +520,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
 
       const writeConfig: FsWriteRestrictionConfig = {
         allowOnly: [TEST_ALLOWED_DIR],
-        denyWithinAllow: [TEST_DENIED_FILE]
+        denyWithinAllow: [TEST_DENIED_FILE],
       }
 
       const movedAllowedDir = join(TEST_BASE_DIR, 'moved-allowed')
@@ -540,7 +556,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
 
       const writeConfig: FsWriteRestrictionConfig = {
         allowOnly: [TEST_ALLOWED_DIR],
-        denyWithinAllow: [TEST_DENIED_FILE]
+        denyWithinAllow: [TEST_DENIED_FILE],
       }
 
       const movedBaseDir = join(tmpdir(), 'moved-write-base-' + Date.now())
@@ -581,7 +597,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
 
       const writeConfig: FsWriteRestrictionConfig = {
         allowOnly: [TEST_ALLOWED_DIR],
-        denyWithinAllow: [globPattern]
+        denyWithinAllow: [globPattern],
       }
 
       // Try to move a .txt file
@@ -616,7 +632,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
 
       const writeConfig: FsWriteRestrictionConfig = {
         allowOnly: [TEST_ALLOWED_DIR],
-        denyWithinAllow: [globPattern]
+        denyWithinAllow: [globPattern],
       }
 
       // Try to write to a glob-matched file
@@ -652,7 +668,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
 
       const writeConfig: FsWriteRestrictionConfig = {
         allowOnly: [TEST_ALLOWED_DIR],
-        denyWithinAllow: [globPattern]
+        denyWithinAllow: [globPattern],
       }
 
       // Try to move the parent directory
@@ -697,7 +713,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
 
       const writeConfig: FsWriteRestrictionConfig = {
         allowOnly: [TEST_ALLOWED_DIR],
-        denyWithinAllow: [globPattern]
+        denyWithinAllow: [globPattern],
       }
 
       const movedNested = join(TEST_BASE_DIR, 'moved-nested.txt')

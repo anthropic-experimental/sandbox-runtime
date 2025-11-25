@@ -191,6 +191,13 @@ function generateMoveBlockingRules(
 
 /**
  * Generate filesystem read rules for sandbox profile
+ *
+ * macOS ONLY supports deny-only mode:
+ * - deny-only: Allow all reads, deny specific paths
+ * - allow-only mode is NOT supported on macOS (sandbox-exec limitation)
+ *
+ * If allow-only config somehow reaches this function, it will throw an error.
+ * SandboxManager.getFsReadConfig() should prevent this by converting to deny-only.
  */
 function generateReadRules(
   config: FsReadRestrictionConfig | undefined,
@@ -200,13 +207,23 @@ function generateReadRules(
     return [`(allow file-read*)`]
   }
 
+  if (config.mode === 'allow-only') {
+    throw new Error(
+      [
+        'FATAL: allow-only read mode reached macOS sandbox generator.',
+        'This should have been converted to deny-only in SandboxManager.getFsReadConfig().',
+        'This indicates a bug in the sandbox runtime.',
+      ].join(' '),
+    )
+  }
+
   const rules: string[] = []
 
   // Start by allowing everything
   rules.push(`(allow file-read*)`)
 
   // Then deny specific paths
-  for (const pathPattern of config.denyOnly || []) {
+  for (const pathPattern of config.denyPaths) {
     const normalizedPath = normalizePathForSandbox(pathPattern)
 
     if (containsGlobChars(normalizedPath)) {
@@ -228,7 +245,7 @@ function generateReadRules(
   }
 
   // Block file movement to prevent bypass via mv/rename
-  rules.push(...generateMoveBlockingRules(config.denyOnly || [], logTag))
+  rules.push(...generateMoveBlockingRules(config.denyPaths, logTag))
 
   return rules
 }
@@ -602,9 +619,12 @@ export async function wrapCommandWithSandboxMacOS(
   } = params
 
   // Determine if we have restrictions to apply
-  // Read: denyOnly pattern - empty array means no restrictions
+  // Read: dual mode - check based on mode type
   // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
-  const hasReadRestrictions = readConfig && readConfig.denyOnly.length > 0
+  const hasReadRestrictions =
+    readConfig &&
+    ((readConfig.mode === 'deny-only' && readConfig.denyPaths.length > 0) ||
+      readConfig.mode === 'allow-only')
   const hasWriteRestrictions = writeConfig !== undefined
 
   // No sandboxing needed

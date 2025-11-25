@@ -5,7 +5,7 @@ import * as fs from 'fs'
 import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import {
   generateProxyEnvVars,
   normalizePathForSandbox,
@@ -332,15 +332,14 @@ function buildSandboxCommand(
 }
 
 /**
- * Generate filesystem bind mount arguments for bwrap
+ * Generate filesystem args for deny-only read mode
  */
-async function generateFilesystemArgs(
-  readConfig: FsReadRestrictionConfig | undefined,
+async function generateDenyOnlyFilesystemArgs(
+  denyPaths: string[],
   writeConfig: FsWriteRestrictionConfig | undefined,
   ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
 ): Promise<string[]> {
   const args: string[] = []
-  // fs already imported
 
   // Determine initial root mount based on write restrictions
   if (writeConfig) {
@@ -376,12 +375,12 @@ async function generateFilesystemArgs(
     }
 
     // Deny writes within allowed paths (user-specified + mandatory denies)
-    const denyPaths = [
+    const denyPathsForWrite = [
       ...(writeConfig.denyWithinAllow || []),
       ...(await getMandatoryDenyWithinAllow(ripgrepConfig)),
     ]
 
-    for (const pathPattern of denyPaths) {
+    for (const pathPattern of denyPathsForWrite) {
       const normalizedPath = normalizePathForSandbox(pathPattern)
 
       // Skip /dev/* paths since --dev /dev already handles them
@@ -419,7 +418,7 @@ async function generateFilesystemArgs(
   }
 
   // Handle read restrictions by mounting tmpfs over denied paths
-  const readDenyPaths = [...(readConfig?.denyOnly || [])]
+  const readDenyPaths = [...denyPaths]
 
   // Always hide /etc/ssh/ssh_config.d to avoid permission issues with OrbStack
   // SSH is very strict about config file permissions and ownership, and they can
@@ -447,6 +446,257 @@ async function generateFilesystemArgs(
   }
 
   return args
+}
+
+/**
+ * Generate filesystem args for allow-only read mode
+ */
+async function generateAllowOnlyFilesystemArgs(
+  allowPaths: string[],
+  denyWithinAllow: string[],
+  writeConfig: FsWriteRestrictionConfig | undefined,
+  seccompFilterPath?: string,
+  ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
+): Promise<string[]> {
+  const args: string[] = []
+
+  // Allow-only read mode: bwrap creates an empty root by default (no --tmpfs needed)
+  // We will selectively bind only allowed read paths later
+  // Create standard Linux filesystem symlinks (required for commands to work)
+  // Modern Linux systems have /bin -> /usr/bin, /lib -> /usr/lib, etc.
+  args.push('--symlink', 'usr/bin', '/bin')
+  args.push('--symlink', 'usr/sbin', '/sbin')
+  args.push('--symlink', 'usr/lib', '/lib')
+
+  // Only create lib64 symlink if host system has it
+  if (fs.existsSync('/usr/lib64')) {
+    args.push('--symlink', 'usr/lib64', '/lib64')
+  }
+
+  logForDebugging(
+    `[Sandbox Linux] Using allow-only read mode with selective bind mounts`,
+  )
+
+  // === BIND ALLOWED READ PATHS ===
+  // We selectively bind ONLY the allowed paths - nothing else is accessible
+
+  // Special: If seccomp filter is being used, we need to bind the directories
+  // containing apply-seccomp binary and BPF filter so they're accessible in the sandbox
+  if (seccompFilterPath) {
+    const applySeccompBinary = getApplySeccompBinaryPath()
+    if (applySeccompBinary) {
+      // Get the directory containing apply-seccomp (e.g., /path/to/vendor/seccomp/arm64)
+      const applySeccompDir = dirname(applySeccompBinary)
+      if (fs.existsSync(applySeccompDir)) {
+        args.push('--ro-bind', applySeccompDir, applySeccompDir)
+        logForDebugging(
+          `[Sandbox Linux] Bound seccomp binary directory: ${applySeccompDir}`,
+        )
+      }
+    }
+
+    // Also bind the BPF filter directory if different
+    const filterDir = dirname(seccompFilterPath)
+    if (fs.existsSync(filterDir)) {
+      args.push('--ro-bind', filterDir, filterDir)
+      logForDebugging(
+        `[Sandbox Linux] Bound seccomp filter directory: ${filterDir}`,
+      )
+    }
+  }
+
+  // Step 1: Bind allowed read paths
+  // These are the ONLY paths that will be readable in the sandbox
+  for (const pathPattern of allowPaths) {
+    const normalizedPath = normalizePathForSandbox(pathPattern)
+
+    if (!fs.existsSync(normalizedPath)) {
+      logForDebugging(
+        `[Sandbox Linux] Skipping non-existent read allow path: ${normalizedPath}`,
+      )
+      continue
+    }
+
+    // Check if this path should also be writable
+    const isWritable =
+      writeConfig?.allowOnly?.some(
+        writePath =>
+          normalizePathForSandbox(writePath) === normalizedPath ||
+          normalizedPath.startsWith(normalizePathForSandbox(writePath) + '/'),
+      ) || false
+
+    if (isWritable) {
+      args.push('--bind', normalizedPath, normalizedPath)
+    } else {
+      args.push('--ro-bind', normalizedPath, normalizedPath)
+    }
+  }
+
+  // Step 2: Handle write-only paths (paths that are writable but not explicitly in allowRead)
+  // These paths need to be bound if they exist
+  if (writeConfig?.allowOnly) {
+    for (const pathPattern of writeConfig.allowOnly) {
+      const normalizedPath = normalizePathForSandbox(pathPattern)
+
+      // Skip if already handled in allowRead
+      if (
+        allowPaths.some(
+          readPath => normalizePathForSandbox(readPath) === normalizedPath,
+        )
+      ) {
+        continue
+      }
+
+      if (!fs.existsSync(normalizedPath)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping non-existent write path: ${normalizedPath}`,
+        )
+        continue
+      }
+
+      args.push('--bind', normalizedPath, normalizedPath)
+    }
+  }
+
+  // Step 2.5: Apply write protections within allowed write paths
+  // This handles writeConfig.denyWithinAllow - files that should be read-only even within writable directories
+  if (writeConfig?.denyWithinAllow || writeConfig?.allowOnly) {
+    // Collect all paths that should be denied for writes (user-specified + mandatory)
+    const denyPathsForWrite = [
+      ...(writeConfig.denyWithinAllow || []),
+      ...(await getMandatoryDenyWithinAllow(ripgrepConfig)),
+    ]
+
+    // Build list of allowed write paths for checking
+    const allowedWritePaths = (writeConfig.allowOnly || []).map(
+      normalizePathForSandbox,
+    )
+
+    for (const pathPattern of denyPathsForWrite) {
+      const normalizedPath = normalizePathForSandbox(pathPattern)
+
+      // Skip /dev/* paths since --dev /dev already handles them
+      if (normalizedPath.startsWith('/dev/')) {
+        continue
+      }
+
+      // For non-existent paths, we need to check if they're within an allowed write path
+      // If so, we should still protect them by binding a placeholder
+      const isWithinAllowedPath = allowedWritePaths.some(
+        allowedPath =>
+          normalizedPath.startsWith(allowedPath + '/') ||
+          normalizedPath === allowedPath,
+      )
+
+      if (!isWithinAllowedPath) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping write-deny path not within allowed write paths: ${normalizedPath}`,
+        )
+        continue
+      }
+
+      if (!fs.existsSync(normalizedPath)) {
+        // For non-existent paths within allowed write directories,
+        // create a placeholder to prevent writes
+        logForDebugging(
+          `[Sandbox Linux] Creating placeholder for non-existent write-deny path: ${normalizedPath}`,
+        )
+        // Bind /dev/null to this path to prevent writes
+        args.push('--ro-bind', '/dev/null', normalizedPath)
+      } else {
+        // Path exists - make it read-only
+        args.push('--ro-bind', normalizedPath, normalizedPath)
+        logForDebugging(
+          `[Sandbox Linux] Applied read-only bind for write-deny path: ${normalizedPath}`,
+        )
+      }
+    }
+  }
+
+  // Step 3: Hide sensitive paths within allowed paths (denyWithinAllow, e.g., .env files)
+  for (const pathPattern of denyWithinAllow) {
+    const normalizedPath = normalizePathForSandbox(pathPattern)
+
+    if (!fs.existsSync(normalizedPath)) {
+      logForDebugging(
+        `[Sandbox Linux] Skipping non-existent deny-within-allow path: ${normalizedPath}`,
+      )
+      continue
+    }
+
+    const stat = fs.statSync(normalizedPath)
+    if (stat.isDirectory()) {
+      args.push('--tmpfs', normalizedPath)
+    } else {
+      args.push('--ro-bind', '/dev/null', normalizedPath)
+    }
+  }
+
+  return args
+}
+
+/**
+ * Generate filesystem bind mount arguments for bwrap
+ * Dispatches to deny-only or allow-only implementation based on read config mode
+ */
+async function generateFilesystemArgs(
+  readConfig: FsReadRestrictionConfig | undefined,
+  writeConfig: FsWriteRestrictionConfig | undefined,
+  seccompFilterPath?: string,
+  ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
+): Promise<string[]> {
+  // Dispatch to appropriate implementation based on read config mode
+  if (readConfig?.mode === 'deny-only') {
+    // Use deny-only implementation (original logic)
+    return generateDenyOnlyFilesystemArgs(
+      readConfig.denyPaths,
+      writeConfig,
+      ripgrepConfig,
+    )
+  } else if (readConfig?.mode === 'allow-only') {
+    // Use allow-only implementation (new logic)
+    return generateAllowOnlyFilesystemArgs(
+      readConfig.allowPaths,
+      readConfig.denyWithinAllow,
+      writeConfig,
+      seccompFilterPath,
+      ripgrepConfig,
+    )
+  } else {
+    // No read restrictions: mount entire / (respecting write restrictions if any)
+    const args: string[] = []
+    if (writeConfig) {
+      // Has write restrictions: mount / as read-only, then bind writable paths
+      args.push('--ro-bind', '/', '/')
+
+      for (const pathPattern of writeConfig.allowOnly || []) {
+        const normalizedPath = normalizePathForSandbox(pathPattern)
+
+        // Skip /dev/* paths since --dev /dev already handles them
+        if (normalizedPath.startsWith('/dev/')) {
+          continue
+        }
+
+        if (!fs.existsSync(normalizedPath)) {
+          logForDebugging(
+            `[Sandbox Linux] Skipping non-existent write path: ${normalizedPath}`,
+          )
+          continue
+        }
+
+        args.push('--bind', normalizedPath, normalizedPath)
+      }
+
+      logForDebugging(
+        `[Sandbox Linux] No read restrictions, write restrictions applied`,
+      )
+    } else {
+      // No restrictions: mount / as read-write
+      args.push('--bind', '/', '/')
+      logForDebugging(`[Sandbox Linux] No read or write restrictions`)
+    }
+    return args
+  }
 }
 
 /**
@@ -514,9 +764,12 @@ export async function wrapCommandWithSandboxLinux(
   } = params
 
   // Determine if we have restrictions to apply
-  // Read: denyOnly pattern - empty array means no restrictions
+  // Read: dual mode - check based on mode type
   // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
-  const hasReadRestrictions = readConfig && readConfig.denyOnly.length > 0
+  const hasReadRestrictions =
+    readConfig &&
+    ((readConfig.mode === 'deny-only' && readConfig.denyPaths.length > 0) ||
+      readConfig.mode === 'allow-only')
   const hasWriteRestrictions = writeConfig !== undefined
 
   // Check if we need any sandboxing
@@ -633,6 +886,7 @@ export async function wrapCommandWithSandboxLinux(
     const fsArgs = await generateFilesystemArgs(
       readConfig,
       writeConfig,
+      seccompFilterPath,
       ripgrepConfig,
     )
     bwrapArgs.push(...fsArgs)

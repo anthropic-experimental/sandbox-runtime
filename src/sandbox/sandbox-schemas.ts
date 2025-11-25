@@ -1,18 +1,31 @@
 // Filesystem restriction configs (internal structures built from permission rules)
 
 /**
- * Read restriction config using a "deny-only" pattern.
+ * Read restriction config supporting two modes:
+ *
+ * Mode 1: "deny-only" pattern (backward compatible)
+ * - `{mode: 'deny-only', denyPaths: []}` = allow all reads (empty deny list)
+ * - `{mode: 'deny-only', denyPaths: [...]}` = deny reads from these paths, allow all others
+ * - Maximally permissive by default - only explicitly denied paths are blocked
+ *
+ * Mode 2: "allow-only" pattern (more secure)
+ * - `{mode: 'allow-only', allowPaths: [...], denyWithinAllow: []}` = deny all reads except allowed paths
+ * - System paths (like /usr, /bin) are automatically included in allowPaths at runtime
+ * - Maximally restrictive by default - only explicitly allowed paths are readable
  *
  * Semantics:
- * - `undefined` = no restrictions (allow all reads)
- * - `{denyOnly: []}` = no restrictions (empty deny list = allow all reads)
- * - `{denyOnly: [...paths]}` = deny reads from these paths, allow all others
- *
- * This is maximally permissive by default - only explicitly denied paths are blocked.
+ * - `undefined` = no restrictions (allow all reads, backward compatible)
  */
-export interface FsReadRestrictionConfig {
-  denyOnly: string[]
-}
+export type FsReadRestrictionConfig =
+  | {
+      mode: 'deny-only'
+      denyPaths: string[]
+    }
+  | {
+      mode: 'allow-only'
+      allowPaths: string[]
+      denyWithinAllow: string[]
+    }
 
 /**
  * Write restriction config using an "allow-only" pattern.

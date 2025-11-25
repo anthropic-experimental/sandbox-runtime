@@ -230,7 +230,7 @@ describe('restriction pattern semantics', () => {
       const result = await wrapCommandWithSandboxLinux({
         command,
         needsNetworkRestriction: false,
-        readConfig: { denyOnly: [] },
+        readConfig: { mode: 'deny-only', denyPaths: [] },
         writeConfig: undefined,
       })
 
@@ -246,7 +246,7 @@ describe('restriction pattern semantics', () => {
       const result = await wrapCommandWithSandboxMacOS({
         command,
         needsNetworkRestriction: false,
-        readConfig: { denyOnly: [] },
+        readConfig: { mode: 'deny-only', denyPaths: [] },
         writeConfig: undefined,
       })
 
@@ -294,7 +294,7 @@ describe('restriction pattern semantics', () => {
       const result = await wrapCommandWithSandboxLinux({
         command,
         needsNetworkRestriction: false,
-        readConfig: { denyOnly: [] },
+        readConfig: { mode: 'deny-only', denyPaths: [] },
         writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
       })
 
@@ -311,7 +311,7 @@ describe('restriction pattern semantics', () => {
       const result = await wrapCommandWithSandboxLinux({
         command,
         needsNetworkRestriction: false,
-        readConfig: { denyOnly: ['/secret'] },
+        readConfig: { mode: 'deny-only', denyPaths: ['/secret'] },
         writeConfig: undefined,
       })
 
@@ -331,7 +331,7 @@ describe('restriction pattern semantics', () => {
       const result = await wrapCommandWithSandboxLinux({
         command,
         needsNetworkRestriction: false,
-        readConfig: { denyOnly: ['/secret'] },
+        readConfig: { mode: 'deny-only', denyPaths: ['/secret'] },
         writeConfig: undefined,
       })
 
@@ -347,7 +347,7 @@ describe('restriction pattern semantics', () => {
       const result = await wrapCommandWithSandboxLinux({
         command,
         needsNetworkRestriction: false,
-        readConfig: { denyOnly: [] },
+        readConfig: { mode: 'deny-only', denyPaths: [] },
         writeConfig: { allowOnly: [], denyWithinAllow: [] },
       })
 
@@ -364,7 +364,7 @@ describe('restriction pattern semantics', () => {
       const result = await wrapCommandWithSandboxMacOS({
         command,
         needsNetworkRestriction: false,
-        readConfig: { denyOnly: [] },
+        readConfig: { mode: 'deny-only', denyPaths: [] },
         writeConfig: { allowOnly: [], denyWithinAllow: [] },
       })
 
@@ -383,7 +383,7 @@ describe('restriction pattern semantics', () => {
       const result = await wrapCommandWithSandboxLinux({
         command,
         needsNetworkRestriction: false,
-        readConfig: { denyOnly: ['/secret'] },
+        readConfig: { mode: 'deny-only', denyPaths: ['/secret'] },
         writeConfig: undefined,
       })
 
@@ -400,7 +400,7 @@ describe('restriction pattern semantics', () => {
       const result = await wrapCommandWithSandboxMacOS({
         command,
         needsNetworkRestriction: false,
-        readConfig: { denyOnly: ['/secret'] },
+        readConfig: { mode: 'deny-only', denyPaths: ['/secret'] },
         writeConfig: undefined,
       })
 
