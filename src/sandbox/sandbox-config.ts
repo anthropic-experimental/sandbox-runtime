@@ -155,6 +155,16 @@ export const SandboxRuntimeConfigSchema = z.object({
   ripgrep: RipgrepConfigSchema.optional().describe(
     'Custom ripgrep configuration (default: { command: "rg" })',
   ),
+  mandatoryDenySearchDepth: z
+    .number()
+    .int()
+    .min(1)
+    .max(10)
+    .optional()
+    .describe(
+      'Maximum directory depth to search for dangerous files on Linux (default: 3). ' +
+        'Higher values provide more protection but slower performance.',
+    ),
 })
 
 // Export inferred types
