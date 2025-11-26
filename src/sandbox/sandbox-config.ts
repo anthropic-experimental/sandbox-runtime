@@ -65,6 +65,12 @@ export const NetworkConfigSchema = z.object({
   deniedDomains: z
     .array(domainPatternSchema)
     .describe('List of denied domains'),
+  blockAllNetwork: z
+    .boolean()
+    .optional()
+    .describe(
+      'Block all network access entirely (no proxy, no localhost). Takes precedence over other network settings.',
+    ),
   allowUnixSockets: z
     .array(z.string())
     .optional()

@@ -19,12 +19,14 @@ import type { IgnoreViolationsConfig } from './sandbox-config.js'
 
 export interface MacOSSandboxParams {
   command: string
+  executionId: string
   needsNetworkRestriction: boolean
   httpProxyPort?: number
   socksProxyPort?: number
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
+  blockAllNetwork?: boolean
   readConfig: FsReadRestrictionConfig | undefined
   writeConfig: FsWriteRestrictionConfig | undefined
   ignoreViolations?: IgnoreViolationsConfig | undefined
@@ -60,11 +62,31 @@ export function macGetMandatoryDenyPatterns(): string[] {
   return [...new Set(denyPaths)]
 }
 
+export type SandboxViolationType = 'filesystem' | 'network' | 'other'
+
 export interface SandboxViolationEvent {
   line: string
+  type: SandboxViolationType
+  executionId?: string
   command?: string
   encodedCommand?: string
   timestamp: Date
+}
+
+function getViolationType(line: string): SandboxViolationType {
+  // Network: explicit network ops or network-related daemons
+  if (
+    line.includes('network') ||
+    line.includes('configd') ||
+    line.includes('mDNSResponder')
+  ) {
+    return 'network'
+  }
+  // Filesystem: macOS sandbox file operations
+  if (line.includes('file-read') || line.includes('file-write')) {
+    return 'filesystem'
+  }
+  return 'other'
 }
 
 export type SandboxViolationCallback = (
@@ -112,11 +134,12 @@ export function globToRegex(globPattern: string): string {
 
 /**
  * Generate a unique log tag for sandbox monitoring
+ * @param executionId - Unique ID for this execution
  * @param command - The command being executed (will be base64 encoded)
  */
-function generateLogTag(command: string): string {
-  const encodedCommand = encodeSandboxedCommand(command)
-  return `CMD64_${encodedCommand}_END_${sessionSuffix}`
+function generateLogTag(executionId: string, command: string): string {
+  const encodedCmd = encodeSandboxedCommand(command)
+  return `EXECID_${executionId}_CMD64_${encodedCmd}_END_${sessionSuffix}`
 }
 
 /**
@@ -353,6 +376,7 @@ function generateSandboxProfile({
   allowUnixSockets,
   allowAllUnixSockets,
   allowLocalBinding,
+  blockAllNetwork,
   logTag,
 }: {
   readConfig: FsReadRestrictionConfig | undefined
@@ -363,6 +387,7 @@ function generateSandboxProfile({
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
+  blockAllNetwork?: boolean
   logTag: string
 }): string {
   const profile: string[] = [
@@ -399,6 +424,7 @@ function generateSandboxProfile({
     '  (global-name "com.apple.bsd.dirhelper")',
     '  (global-name "com.apple.securityd.xpc")',
     '  (global-name "com.apple.coreservices.launchservicesd")',
+    '  (global-name "com.apple.diagnosticd")',
     ')',
     '',
     '; POSIX IPC - shared memory',
@@ -511,8 +537,15 @@ function generateSandboxProfile({
 
   // Network rules
   profile.push('; Network')
-  if (!needsNetworkRestriction) {
+
+  // When blockAllNetwork is true, explicitly deny ALL network operations
+  // This provides defense-in-depth beyond (deny default) and blocks localhost too
+  if (blockAllNetwork) {
+    profile.push(`(deny network* (with message "${logTag}"))`)
+    profile.push('')
+  } else if (!needsNetworkRestriction) {
     profile.push('(allow network*)')
+    profile.push('')
   } else {
     // Allow local binding if requested
     if (allowLocalBinding) {
@@ -558,8 +591,8 @@ function generateSandboxProfile({
         `(allow network-outbound (remote ip "localhost:${socksProxyPort}"))`,
       )
     }
+    profile.push('')
   }
-  profile.push('')
 
   // Read rules
   profile.push('; File read')
@@ -613,12 +646,14 @@ export function wrapCommandWithSandboxMacOS(
 ): string {
   const {
     command,
+    executionId,
     needsNetworkRestriction,
     httpProxyPort,
     socksProxyPort,
     allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,
+    blockAllNetwork,
     readConfig,
     writeConfig,
     binShell,
@@ -639,7 +674,7 @@ export function wrapCommandWithSandboxMacOS(
     return command
   }
 
-  const logTag = generateLogTag(command)
+  const logTag = generateLogTag(executionId, command)
 
   const profile = generateSandboxProfile({
     readConfig,
@@ -650,10 +685,13 @@ export function wrapCommandWithSandboxMacOS(
     allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,
+    blockAllNetwork,
     logTag,
   })
 
-  // Generate proxy environment variables using shared utility
+  // Generate proxy environment variables
+  // When blockAllNetwork is true, httpProxyPort/socksProxyPort are undefined,
+  // so generateProxyEnvVars returns just basic env vars (SANDBOX_RUNTIME, TMPDIR)
   const proxyEnv = `export ${generateProxyEnvVars(httpProxyPort, socksProxyPort).join(' ')} && `
 
   // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
@@ -696,13 +734,17 @@ export function wrapCommandWithSandboxMacOS(
 /**
  * Start monitoring macOS system logs for sandbox violations
  * Look for sandbox-related kernel deny events ending in {logTag}
+ *
+ * @param skipFiltering - If true, don't filter any violations (needed for speculative execution)
  */
 export function startMacOSSandboxLogMonitor(
   callback: SandboxViolationCallback,
   ignoreViolations?: IgnoreViolationsConfig,
+  skipFiltering?: boolean,
 ): () => void {
   // Pre-compile regex patterns for better performance
-  const cmdExtractRegex = /CMD64_(.+?)_END/
+  // Log tag format: EXECID_<uuid>_CMD64_<base64command>_END_<session>
+  const tagExtractRegex = /EXECID_([^_]+)_CMD64_([^_]+)_END/
   const sandboxExtractRegex = /Sandbox:\s+(.+)$/
 
   // Pre-process ignore patterns for faster lookup
@@ -712,7 +754,6 @@ export function startMacOSSandboxLogMonitor(
     : []
 
   // Stream and filter kernel logs for all sandbox violations
-  // We can't filter by specific logTag since it's dynamic per command
   const logProcess = spawn('log', [
     'stream',
     '--predicate',
@@ -722,74 +763,90 @@ export function startMacOSSandboxLogMonitor(
   ])
 
   logProcess.stdout?.on('data', (data: Buffer) => {
-    const lines = data.toString().split('\n')
+    const isViolation = (line: string): boolean =>
+      line.includes('Sandbox:') && line.includes('deny')
+    const isTag = (line: string): boolean => line.startsWith('EXECID_')
 
-    // Get violation and command lines
-    const violationLine = lines.find(
-      line => line.includes('Sandbox:') && line.includes('deny'),
-    )
-    const commandLine = lines.find(line => line.startsWith('CMD64_'))
+    // Filter to relevant lines, then pair violations with their tags
+    const relevantLines = data
+      .toString()
+      .split('\n')
+      .filter(line => isViolation(line) || isTag(line))
 
-    if (!violationLine) return
+    relevantLines
+      .flatMap((line, i) =>
+        isViolation(line)
+          ? [{ violationLine: line, tagLine: relevantLines[i + 1] }]
+          : [],
+      )
+      .map(({ violationLine, tagLine }) => {
+        const sandboxMatch = violationLine.match(sandboxExtractRegex)
+        if (!sandboxMatch?.[1]) return null
 
-    // Extract violation details
-    const sandboxMatch = violationLine.match(sandboxExtractRegex)
-    if (!sandboxMatch?.[1]) return
+        const violationDetails = sandboxMatch[1]
 
-    const violationDetails = sandboxMatch[1]
-
-    // Try to get command
-    let command: string | undefined
-    let encodedCommand: string | undefined
-    if (commandLine) {
-      const cmdMatch = commandLine.match(cmdExtractRegex)
-      encodedCommand = cmdMatch?.[1]
-      if (encodedCommand) {
-        try {
-          command = decodeSandboxedCommand(encodedCommand)
-        } catch {
-          // Failed to decode, continue without command
+        // Extract execution ID and command from tag line
+        let executionId: string | undefined
+        let command: string | undefined
+        if (tagLine?.startsWith('EXECID_')) {
+          const tagMatch = tagLine.match(tagExtractRegex)
+          if (tagMatch) {
+            executionId = tagMatch[1]
+            try {
+              if (tagMatch[2]) {
+                command = decodeSandboxedCommand(tagMatch[2])
+              }
+            } catch {
+              // Failed to decode, continue without command
+            }
+          }
         }
-      }
-    }
 
-    // Always filter out noisey violations
-    if (
-      violationDetails.includes('mDNSResponder') ||
-      violationDetails.includes('mach-lookup com.apple.diagnosticd') ||
-      violationDetails.includes('mach-lookup com.apple.analyticsd')
-    ) {
-      return
-    }
+        return { violationDetails, executionId, command }
+      })
+      .filter((v): v is NonNullable<typeof v> => v !== null)
+      .filter(({ violationDetails, command }) => {
+        // Skip all filtering for speculative execution - we need every violation
+        if (skipFiltering) return true
 
-    // Check if we should ignore this violation
-    if (ignoreViolations && command) {
-      // Check wildcard patterns first
-      if (wildcardPaths.length > 0) {
-        const shouldIgnore = wildcardPaths.some(path =>
-          violationDetails.includes(path),
-        )
-        if (shouldIgnore) return
-      }
-
-      // Check command-specific patterns
-      for (const [pattern, paths] of commandPatterns) {
-        if (command.includes(pattern)) {
-          const shouldIgnore = paths.some(path =>
-            violationDetails.includes(path),
-          )
-          if (shouldIgnore) return
+        // Filter out noisy system violations that don't indicate real problems
+        if (
+          violationDetails.includes('mDNSResponder') ||
+          violationDetails.includes('mach-lookup com.apple.analyticsd')
+        ) {
+          return false
         }
-      }
-    }
 
-    // Not ignored - report the violation
-    callback({
-      line: violationDetails,
-      command,
-      encodedCommand,
-      timestamp: new Date(), // We could parse the timestamp from the log but this feels more reliable
-    })
+        if (!ignoreViolations) return true
+
+        // Check wildcard patterns
+        if (wildcardPaths.some(path => violationDetails.includes(path))) {
+          return false
+        }
+
+        // Check command-specific patterns
+        if (command) {
+          for (const [pattern, paths] of commandPatterns) {
+            if (
+              command.includes(pattern) &&
+              paths.some(path => violationDetails.includes(path))
+            ) {
+              return false
+            }
+          }
+        }
+
+        return true
+      })
+      .forEach(({ violationDetails, executionId, command }) => {
+        callback({
+          line: violationDetails,
+          type: getViolationType(violationDetails),
+          executionId,
+          command,
+          timestamp: new Date(),
+        })
+      })
   })
 
   logProcess.stderr?.on('data', (data: Buffer) => {

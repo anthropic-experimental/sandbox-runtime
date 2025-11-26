@@ -29,7 +29,7 @@ import {
 } from './sandbox-utils.js'
 import { hasRipgrepSync } from '../utils/ripgrep.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
-import { EOL } from 'node:os'
+import { randomUUID } from 'node:crypto'
 
 interface HostNetworkManagerContext {
   httpProxyPort: number
@@ -196,6 +196,7 @@ async function initialize(
   runtimeConfig: SandboxRuntimeConfig,
   sandboxAskCallback?: SandboxAskCallback,
   enableLogMonitor = false,
+  skipViolationFiltering = false,
 ): Promise<void> {
   // Return if already initializing
   if (initializationPromise) {
@@ -227,6 +228,7 @@ async function initialize(
     logMonitorShutdown = startMacOSSandboxLogMonitor(
       sandboxViolationStore.addViolation.bind(sandboxViolationStore),
       config.ignoreViolations,
+      skipViolationFiltering,
     )
     logForDebugging('Started macOS sandbox log monitor')
   }
@@ -481,6 +483,7 @@ async function wrapWithSandbox(
   command: string,
   binShell?: string,
   customConfig?: Partial<SandboxRuntimeConfig>,
+  executionId?: string,
   abortSignal?: AbortSignal,
 ): Promise<string> {
   const platform = getPlatform()
@@ -500,48 +503,34 @@ async function wrapWithSandbox(
       customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
   }
 
-  // Check if network config is specified - this determines if we need network restrictions
-  // Network restriction is needed when:
-  // 1. customConfig has network.allowedDomains defined (even if empty array = block all)
-  // 2. OR config has network.allowedDomains defined (even if empty array = block all)
-  // An empty allowedDomains array means "no domains allowed" = block all network access
-  const hasNetworkConfig =
-    customConfig?.network?.allowedDomains !== undefined ||
-    config?.network?.allowedDomains !== undefined
+  // blockAllNetwork: true means block all network (no proxy, no localhost)
+  const blockAllNetwork =
+    customConfig?.network?.blockAllNetwork ??
+    config?.network.blockAllNetwork ??
+    false
 
-  // Get the actual allowed domains list for proxy filtering
-  const allowedDomains =
-    customConfig?.network?.allowedDomains ??
-    config?.network.allowedDomains ??
-    []
-
-  // Network RESTRICTION is needed whenever network config is specified
-  // This includes empty allowedDomains which means "block all network"
-  const needsNetworkRestriction = hasNetworkConfig
-
-  // Network PROXY is only needed when there are domains to filter
-  // If allowedDomains is empty, we block all network and don't need the proxy
-  const needsNetworkProxy = allowedDomains.length > 0
-
-  // Wait for network initialization only if proxy is actually needed
-  if (needsNetworkProxy) {
+  if (!blockAllNetwork) {
     await waitForNetworkInitialization()
   }
+
+  // Generate execution ID if not provided
+  const execId = executionId ?? randomUUID()
 
   switch (platform) {
     case 'macos':
       // macOS sandbox profile supports glob patterns directly, no ripgrep needed
       return wrapCommandWithSandboxMacOS({
         command,
-        needsNetworkRestriction,
-        // Only pass proxy ports if proxy is running (when there are domains to filter)
-        httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
-        socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
+        executionId: execId,
+        needsNetworkRestriction: !blockAllNetwork,
+        httpProxyPort: blockAllNetwork ? undefined : getProxyPort(),
+        socksProxyPort: blockAllNetwork ? undefined : getSocksProxyPort(),
         readConfig,
         writeConfig,
-        allowUnixSockets: getAllowUnixSockets(),
-        allowAllUnixSockets: getAllowAllUnixSockets(),
-        allowLocalBinding: getAllowLocalBinding(),
+        allowUnixSockets: blockAllNetwork ? undefined : getAllowUnixSockets(),
+        allowAllUnixSockets: blockAllNetwork ? false : getAllowAllUnixSockets(),
+        allowLocalBinding: blockAllNetwork ? false : getAllowLocalBinding(),
+        blockAllNetwork,
         ignoreViolations: getIgnoreViolations(),
         binShell,
       })
@@ -549,24 +538,21 @@ async function wrapWithSandbox(
     case 'linux':
       return wrapCommandWithSandboxLinux({
         command,
-        needsNetworkRestriction,
-        // Only pass socket paths if proxy is running (when there are domains to filter)
-        httpSocketPath: needsNetworkProxy
-          ? getLinuxHttpSocketPath()
-          : undefined,
-        socksSocketPath: needsNetworkProxy
-          ? getLinuxSocksSocketPath()
-          : undefined,
-        httpProxyPort: needsNetworkProxy
-          ? managerContext?.httpProxyPort
-          : undefined,
-        socksProxyPort: needsNetworkProxy
-          ? managerContext?.socksProxyPort
-          : undefined,
+        httpSocketPath: blockAllNetwork ? undefined : getLinuxHttpSocketPath(),
+        socksSocketPath: blockAllNetwork
+          ? undefined
+          : getLinuxSocksSocketPath(),
+        httpProxyPort: blockAllNetwork
+          ? undefined
+          : managerContext?.httpProxyPort,
+        socksProxyPort: blockAllNetwork
+          ? undefined
+          : managerContext?.socksProxyPort,
+        blockAllNetwork,
         readConfig,
         writeConfig,
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
-        allowAllUnixSockets: getAllowAllUnixSockets(),
+        allowAllUnixSockets: blockAllNetwork ? false : getAllowAllUnixSockets(),
         binShell,
         ripgrepConfig: getRipgrepConfig(),
         mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
@@ -765,29 +751,6 @@ function getSandboxViolationStore() {
   return sandboxViolationStore
 }
 
-function annotateStderrWithSandboxFailures(
-  command: string,
-  stderr: string,
-): string {
-  if (!config) {
-    return stderr
-  }
-
-  const violations = sandboxViolationStore.getViolationsForCommand(command)
-  if (violations.length === 0) {
-    return stderr
-  }
-
-  let annotated = stderr
-  annotated += EOL + '<sandbox_violations>' + EOL
-  for (const violation of violations) {
-    annotated += violation.line + EOL
-  }
-  annotated += '</sandbox_violations>'
-
-  return annotated
-}
-
 /**
  * Returns glob patterns from Edit/Read permission rules that are not
  * fully supported on Linux. Returns empty array on macOS or when
@@ -836,6 +799,7 @@ export interface ISandboxManager {
     runtimeConfig: SandboxRuntimeConfig,
     sandboxAskCallback?: SandboxAskCallback,
     enableLogMonitor?: boolean,
+    skipViolationFiltering?: boolean,
   ): Promise<void>
   isSupportedPlatform(platform: Platform): boolean
   isSandboxingEnabled(): boolean
@@ -859,10 +823,10 @@ export interface ISandboxManager {
     command: string,
     binShell?: string,
     customConfig?: Partial<SandboxRuntimeConfig>,
+    executionId?: string,
     abortSignal?: AbortSignal,
   ): Promise<string>
   getSandboxViolationStore(): SandboxViolationStore
-  annotateStderrWithSandboxFailures(command: string, stderr: string): string
   getLinuxGlobPatternWarnings(): string[]
   getConfig(): SandboxRuntimeConfig | undefined
   updateConfig(newConfig: SandboxRuntimeConfig): void
@@ -897,7 +861,6 @@ export const SandboxManager: ISandboxManager = {
   wrapWithSandbox,
   reset,
   getSandboxViolationStore,
-  annotateStderrWithSandboxFailures,
   getLinuxGlobPatternWarnings,
   getConfig,
   updateConfig,

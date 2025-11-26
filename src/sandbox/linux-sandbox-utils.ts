@@ -5,7 +5,7 @@ import * as fs from 'fs'
 import { spawn, spawnSync } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
 import { tmpdir } from 'node:os'
-import path, { join } from 'node:path'
+import * as path from 'node:path'
 import { ripGrep } from '../utils/ripgrep.js'
 import {
   generateProxyEnvVars,
@@ -36,11 +36,11 @@ export interface LinuxNetworkBridgeContext {
 
 export interface LinuxSandboxParams {
   command: string
-  needsNetworkRestriction: boolean
   httpSocketPath?: string
   socksSocketPath?: string
   httpProxyPort?: number
   socksProxyPort?: number
+  blockAllNetwork?: boolean
   readConfig?: FsReadRestrictionConfig
   writeConfig?: FsWriteRestrictionConfig
   enableWeakerNestedSandbox?: boolean
@@ -128,7 +128,7 @@ async function linuxGetMandatoryDenyPaths(
       const normalizedDirName = normalizeCaseForComparison(dirName)
       const segments = absolutePath.split(path.sep)
       const dirIndex = segments.findIndex(
-        s => normalizeCaseForComparison(s) === normalizedDirName,
+        (s: string) => normalizeCaseForComparison(s) === normalizedDirName,
       )
       if (dirIndex !== -1) {
         // For .git, we want hooks/ or config, not the whole .git dir
@@ -257,8 +257,8 @@ export async function initializeLinuxNetworkBridge(
   socksProxyPort: number,
 ): Promise<LinuxNetworkBridgeContext> {
   const socketId = randomBytes(8).toString('hex')
-  const httpSocketPath = join(tmpdir(), `claude-http-${socketId}.sock`)
-  const socksSocketPath = join(tmpdir(), `claude-socks-${socketId}.sock`)
+  const httpSocketPath = path.join(tmpdir(), `claude-http-${socketId}.sock`)
+  const socksSocketPath = path.join(tmpdir(), `claude-socks-${socketId}.sock`)
 
   // Start HTTP bridge
   const httpSocatArgs = [
@@ -616,11 +616,11 @@ export async function wrapCommandWithSandboxLinux(
 ): Promise<string> {
   const {
     command,
-    needsNetworkRestriction,
     httpSocketPath,
     socksSocketPath,
     httpProxyPort,
     socksProxyPort,
+    blockAllNetwork,
     readConfig,
     writeConfig,
     enableWeakerNestedSandbox,
@@ -630,21 +630,6 @@ export async function wrapCommandWithSandboxLinux(
     mandatoryDenySearchDepth = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
     abortSignal,
   } = params
-
-  // Determine if we have restrictions to apply
-  // Read: denyOnly pattern - empty array means no restrictions
-  // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
-  const hasReadRestrictions = readConfig && readConfig.denyOnly.length > 0
-  const hasWriteRestrictions = writeConfig !== undefined
-
-  // Check if we need any sandboxing
-  if (
-    !needsNetworkRestriction &&
-    !hasReadRestrictions &&
-    !hasWriteRestrictions
-  ) {
-    return command
-  }
 
   const bwrapArgs: string[] = []
   let seccompFilterPath: string | undefined = undefined
@@ -685,67 +670,69 @@ export async function wrapCommandWithSandboxLinux(
     }
 
     // ========== NETWORK RESTRICTIONS ==========
-    if (needsNetworkRestriction) {
-      // Always unshare network namespace to isolate network access
-      // This removes all network interfaces, effectively blocking all network
-      bwrapArgs.push('--unshare-net')
+    // Network is always isolated. Either proxied through bridge sockets, or blocked entirely.
+    bwrapArgs.push('--unshare-net')
 
-      // If proxy sockets are provided, bind them into the sandbox to allow
-      // filtered network access through the proxy. If not provided, network
-      // is completely blocked (empty allowedDomains = block all)
-      if (httpSocketPath && socksSocketPath) {
-        // Verify socket files still exist before trying to bind them
-        if (!fs.existsSync(httpSocketPath)) {
-          throw new Error(
-            `Linux HTTP bridge socket does not exist: ${httpSocketPath}. ` +
-              'The bridge process may have died. Try reinitializing the sandbox.',
-          )
-        }
-        if (!fs.existsSync(socksSocketPath)) {
-          throw new Error(
-            `Linux SOCKS bridge socket does not exist: ${socksSocketPath}. ` +
-              'The bridge process may have died. Try reinitializing the sandbox.',
-          )
-        }
-
-        // Bind both sockets into the sandbox
-        bwrapArgs.push('--bind', httpSocketPath, httpSocketPath)
-        bwrapArgs.push('--bind', socksSocketPath, socksSocketPath)
-
-        // Add proxy environment variables
-        // HTTP_PROXY points to the socat listener inside the sandbox (port 3128)
-        // which forwards to the Unix socket that bridges to the host's proxy server
-        const proxyEnv = generateProxyEnvVars(
-          3128, // Internal HTTP listener port
-          1080, // Internal SOCKS listener port
+    if (!blockAllNetwork) {
+      // Verify socket files still exist before trying to bind them
+      if (!httpSocketPath || !fs.existsSync(httpSocketPath)) {
+        throw new Error(
+          `Linux HTTP bridge socket does not exist: ${httpSocketPath}. ` +
+            'The bridge process may have died. Try reinitializing the sandbox.',
         )
+      }
+      if (!socksSocketPath || !fs.existsSync(socksSocketPath)) {
+        throw new Error(
+          `Linux SOCKS bridge socket does not exist: ${socksSocketPath}. ` +
+            'The bridge process may have died. Try reinitializing the sandbox.',
+        )
+      }
+
+      // Bind both sockets into the sandbox
+      bwrapArgs.push('--bind', httpSocketPath, httpSocketPath)
+      bwrapArgs.push('--bind', socksSocketPath, socksSocketPath)
+
+      // Add proxy environment variables
+      // HTTP_PROXY points to the socat listener inside the sandbox (port 3128)
+      // which forwards to the Unix socket that bridges to the host's proxy server
+      const proxyEnv = generateProxyEnvVars(
+        3128, // Internal HTTP listener port
+        1080, // Internal SOCKS listener port
+      )
+      bwrapArgs.push(
+        ...proxyEnv.flatMap((env: string) => {
+          const firstEq = env.indexOf('=')
+          const key = env.slice(0, firstEq)
+          const value = env.slice(firstEq + 1)
+          return ['--setenv', key, value]
+        }),
+      )
+
+      // Add host proxy port environment variables for debugging/transparency
+      // These show which host ports the Unix socket bridges connect to
+      if (httpProxyPort !== undefined) {
         bwrapArgs.push(
-          ...proxyEnv.flatMap((env: string) => {
-            const firstEq = env.indexOf('=')
-            const key = env.slice(0, firstEq)
-            const value = env.slice(firstEq + 1)
-            return ['--setenv', key, value]
-          }),
+          '--setenv',
+          'CLAUDE_CODE_HOST_HTTP_PROXY_PORT',
+          String(httpProxyPort),
         )
-
-        // Add host proxy port environment variables for debugging/transparency
-        // These show which host ports the Unix socket bridges connect to
-        if (httpProxyPort !== undefined) {
-          bwrapArgs.push(
-            '--setenv',
-            'CLAUDE_CODE_HOST_HTTP_PROXY_PORT',
-            String(httpProxyPort),
-          )
-        }
-        if (socksProxyPort !== undefined) {
-          bwrapArgs.push(
-            '--setenv',
-            'CLAUDE_CODE_HOST_SOCKS_PROXY_PORT',
-            String(socksProxyPort),
-          )
+      }
+      if (socksProxyPort !== undefined) {
+        bwrapArgs.push(
+          '--setenv',
+          'CLAUDE_CODE_HOST_SOCKS_PROXY_PORT',
+          String(socksProxyPort),
+        )
+      }
+    } else {
+      // Hide any bridge socket paths to prevent access via filesystem
+      // (Unix sockets are filesystem-based, not affected by --unshare-net)
+      // When blocking all network, hide the proxy sockets if they exist
+      for (const socketPath of [httpSocketPath, socksSocketPath]) {
+        if (socketPath && fs.existsSync(socketPath)) {
+          bwrapArgs.push('--ro-bind', '/dev/null', socketPath)
         }
       }
-      // If no sockets provided, network is completely blocked (--unshare-net without proxy)
     }
 
     // ========== FILESYSTEM RESTRICTIONS ==========
@@ -787,9 +774,9 @@ export async function wrapCommandWithSandboxLinux(
     const shell = shellPathResult.stdout.trim()
     bwrapArgs.push('--', shell, '-c')
 
-    // If we have network restrictions, use the network bridge setup with apply-seccomp for seccomp
+    // If we have network proxy, use the network bridge setup with apply-seccomp for seccomp
     // Otherwise, just run the command directly with apply-seccomp if needed
-    if (needsNetworkRestriction && httpSocketPath && socksSocketPath) {
+    if (!blockAllNetwork && httpSocketPath && socksSocketPath) {
       // Pass seccomp filter to buildSandboxCommand for apply-seccomp application
       // This allows socat to start before seccomp is applied
       const sandboxCommand = buildSandboxCommand(
@@ -827,9 +814,8 @@ export async function wrapCommandWithSandboxLinux(
     const wrappedCommand = shellquote.quote(['bwrap', ...bwrapArgs])
 
     const restrictions = []
-    if (needsNetworkRestriction) restrictions.push('network')
-    if (hasReadRestrictions || hasWriteRestrictions)
-      restrictions.push('filesystem')
+    restrictions.push(blockAllNetwork ? 'network(blocked)' : 'network(proxy)')
+    if (readConfig || writeConfig) restrictions.push('filesystem')
     if (seccompFilterPath) restrictions.push('seccomp(unix-block)')
 
     logForDebugging(
