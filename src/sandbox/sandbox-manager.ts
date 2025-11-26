@@ -520,6 +520,10 @@ function getRipgrepConfig(): { command: string; args?: string[] } {
   return config?.ripgrep ?? { command: 'rg' }
 }
 
+function getMandatoryDenySearchDepth(): number {
+  return config?.mandatoryDenySearchDepth ?? 3
+}
+
 function getProxyPort(): number | undefined {
   return managerContext?.httpProxyPort
 }
@@ -559,6 +563,7 @@ async function wrapWithSandbox(
   command: string,
   binShell?: string,
   customConfig?: Partial<SandboxRuntimeConfig>,
+  abortSignal?: AbortSignal,
 ): Promise<string> {
   const platform = getPlatform()
 
@@ -566,12 +571,27 @@ async function wrapWithSandbox(
   const readConfig = getFsReadConfig()
   const writeConfig = getFsWriteConfig()
 
-  // Check if network proxy is needed based on allowed domains
-  // Unix sockets are local IPC and don't require the network proxy
+  // Check if network config is specified - this determines if we need network restrictions
+  // Network restriction is needed when:
+  // 1. customConfig has network.allowedDomains defined (even if empty array = block all)
+  // 2. OR config has network.allowedDomains defined (even if empty array = block all)
+  // An empty allowedDomains array means "no domains allowed" = block all network access
+  const hasNetworkConfig =
+    customConfig?.network?.allowedDomains !== undefined ||
+    config?.network?.allowedDomains !== undefined
+
+  // Get the actual allowed domains list for proxy filtering
   const allowedDomains =
     customConfig?.network?.allowedDomains ??
     config?.network.allowedDomains ??
     []
+
+  // Network RESTRICTION is needed whenever network config is specified
+  // This includes empty allowedDomains which means "block all network"
+  const needsNetworkRestriction = hasNetworkConfig
+
+  // Network PROXY is only needed when there are domains to filter
+  // If allowedDomains is empty, we block all network and don't need the proxy
   const needsNetworkProxy = allowedDomains.length > 0
 
   // Wait for network initialization only if proxy is actually needed
@@ -581,11 +601,13 @@ async function wrapWithSandbox(
 
   switch (platform) {
     case 'macos':
-      return await wrapCommandWithSandboxMacOS({
+      // macOS sandbox profile supports glob patterns directly, no ripgrep needed
+      return wrapCommandWithSandboxMacOS({
         command,
-        needsNetworkRestriction: needsNetworkProxy,
-        httpProxyPort: getProxyPort(),
-        socksProxyPort: getSocksProxyPort(),
+        needsNetworkRestriction,
+        // Only pass proxy ports if proxy is running (when there are domains to filter)
+        httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
+        socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
         readConfig,
         writeConfig,
         allowUnixSockets: getAllowUnixSockets(),
@@ -593,23 +615,33 @@ async function wrapWithSandbox(
         allowLocalBinding: getAllowLocalBinding(),
         ignoreViolations: getIgnoreViolations(),
         binShell,
-        ripgrepConfig: getRipgrepConfig(),
       })
 
     case 'linux':
       return wrapCommandWithSandboxLinux({
         command,
-        needsNetworkRestriction: needsNetworkProxy,
-        httpSocketPath: getLinuxHttpSocketPath(),
-        socksSocketPath: getLinuxSocksSocketPath(),
-        httpProxyPort: managerContext?.httpProxyPort,
-        socksProxyPort: managerContext?.socksProxyPort,
+        needsNetworkRestriction,
+        // Only pass socket paths if proxy is running (when there are domains to filter)
+        httpSocketPath: needsNetworkProxy
+          ? getLinuxHttpSocketPath()
+          : undefined,
+        socksSocketPath: needsNetworkProxy
+          ? getLinuxSocksSocketPath()
+          : undefined,
+        httpProxyPort: needsNetworkProxy
+          ? managerContext?.httpProxyPort
+          : undefined,
+        socksProxyPort: needsNetworkProxy
+          ? managerContext?.socksProxyPort
+          : undefined,
         readConfig,
         writeConfig,
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         binShell,
         ripgrepConfig: getRipgrepConfig(),
+        mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
+        abortSignal,
       })
 
     default:
@@ -899,6 +931,7 @@ export interface ISandboxManager {
     command: string,
     binShell?: string,
     customConfig?: Partial<SandboxRuntimeConfig>,
+    abortSignal?: AbortSignal,
   ): Promise<string>
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string

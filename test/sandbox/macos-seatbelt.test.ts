@@ -75,7 +75,7 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
   })
 
   describe('Literal Path - Direct File Move Prevention', () => {
-    it('should block moving a read-denied file to a readable location', async () => {
+    it('should block moving a read-denied file to a readable location', () => {
       if (skipIfNotMacOS()) {
         return
       }
@@ -87,7 +87,7 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       }
 
       // Generate actual sandbox command using our production code
-      const wrappedCommand = await wrapCommandWithSandboxMacOS({
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
         command: `mv ${TEST_SECRET_FILE} ${TEST_MOVED_FILE}`,
         needsNetworkRestriction: false,
         readConfig,
@@ -114,7 +114,7 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       expect(existsSync(TEST_MOVED_FILE)).toBe(false)
     })
 
-    it('should still block reading the file (sanity check)', async () => {
+    it('should still block reading the file (sanity check)', () => {
       if (skipIfNotMacOS()) {
         return
       }
@@ -126,7 +126,7 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       }
 
       // Generate actual sandbox command
-      const wrappedCommand = await wrapCommandWithSandboxMacOS({
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
         command: `cat ${TEST_SECRET_FILE}`,
         needsNetworkRestriction: false,
         readConfig,
@@ -151,7 +151,7 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
   })
 
   describe('Literal Path - Ancestor Directory Move Prevention', () => {
-    it('should block moving an ancestor directory of a read-denied file', async () => {
+    it('should block moving an ancestor directory of a read-denied file', () => {
       if (skipIfNotMacOS()) {
         return
       }
@@ -163,7 +163,7 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       }
 
       // Generate actual sandbox command
-      const wrappedCommand = await wrapCommandWithSandboxMacOS({
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
         command: `mv ${TEST_DENIED_DIR} ${TEST_MOVED_DIR}`,
         needsNetworkRestriction: false,
         readConfig,
@@ -190,7 +190,7 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       expect(existsSync(TEST_MOVED_DIR)).toBe(false)
     })
 
-    it('should block moving the grandparent directory', async () => {
+    it('should block moving the grandparent directory', () => {
       if (skipIfNotMacOS()) {
         return
       }
@@ -204,7 +204,7 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       const movedBaseDir = join(tmpdir(), 'moved-base-' + Date.now())
 
       // Try to move the grandparent directory (TEST_BASE_DIR)
-      const wrappedCommand = await wrapCommandWithSandboxMacOS({
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
         command: `mv ${TEST_BASE_DIR} ${movedBaseDir}`,
         needsNetworkRestriction: false,
         readConfig,
@@ -230,7 +230,7 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
   })
 
   describe('Glob Pattern - File Move Prevention', () => {
-    it('should block moving files matching a glob pattern (*.txt)', async () => {
+    it('should block moving files matching a glob pattern (*.txt)', () => {
       if (skipIfNotMacOS()) {
         return
       }
@@ -244,7 +244,7 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       }
 
       // Try to move a .txt file that matches the pattern
-      const wrappedCommand = await wrapCommandWithSandboxMacOS({
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
         command: `mv ${TEST_GLOB_FILE1} ${TEST_GLOB_MOVED}`,
         needsNetworkRestriction: false,
         readConfig,
@@ -271,7 +271,7 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       expect(existsSync(TEST_GLOB_MOVED)).toBe(false)
     })
 
-    it('should still block reading files matching the glob pattern', async () => {
+    it('should still block reading files matching the glob pattern', () => {
       if (skipIfNotMacOS()) {
         return
       }
@@ -285,7 +285,7 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       }
 
       // Try to read a file matching the glob
-      const wrappedCommand = await wrapCommandWithSandboxMacOS({
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
         command: `cat ${TEST_GLOB_FILE1}`,
         needsNetworkRestriction: false,
         readConfig,
@@ -308,7 +308,7 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       expect(result.stdout).not.toContain('GLOB_SECRET_1')
     })
 
-    it('should block moving the parent directory containing glob-matched files', async () => {
+    it('should block moving the parent directory containing glob-matched files', () => {
       if (skipIfNotMacOS()) {
         return
       }
@@ -324,7 +324,7 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       const movedGlobDir = join(TEST_BASE_DIR, 'moved-glob-dir')
 
       // Try to move the parent directory
-      const wrappedCommand = await wrapCommandWithSandboxMacOS({
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
         command: `mv ${TEST_GLOB_DIR} ${movedGlobDir}`,
         needsNetworkRestriction: false,
         readConfig,
@@ -350,7 +350,7 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
   })
 
   describe('Glob Pattern - Recursive Patterns', () => {
-    it('should block moving files matching a recursive glob pattern (**/*.txt)', async () => {
+    it('should block moving files matching a recursive glob pattern (**/*.txt)', () => {
       if (skipIfNotMacOS()) {
         return
       }
@@ -372,7 +372,7 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       const movedNested = join(TEST_BASE_DIR, 'moved-nested.txt')
 
       // Try to move the nested file
-      const wrappedCommand = await wrapCommandWithSandboxMacOS({
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
         command: `mv ${nestedFile} ${movedNested}`,
         needsNetworkRestriction: false,
         readConfig,
@@ -442,7 +442,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
   })
 
   describe('Literal Path - Direct Directory Move Prevention', () => {
-    it('should block write bypass via directory rename (mv a c, write c/b, mv c a)', async () => {
+    it('should block write bypass via directory rename (mv a c, write c/b, mv c a)', () => {
       if (skipIfNotMacOS()) {
         return
       }
@@ -454,7 +454,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
       }
 
       // Step 1: Try to rename the denied directory
-      const mvCommand1 = await wrapCommandWithSandboxMacOS({
+      const mvCommand1 = wrapCommandWithSandboxMacOS({
         command: `mv ${TEST_DENIED_DIR} ${TEST_RENAMED_DIR}`,
         needsNetworkRestriction: false,
         readConfig: undefined,
@@ -477,7 +477,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
       expect(existsSync(TEST_RENAMED_DIR)).toBe(false)
     })
 
-    it('should still block direct writes to denied paths (sanity check)', async () => {
+    it('should still block direct writes to denied paths (sanity check)', () => {
       if (skipIfNotMacOS()) {
         return
       }
@@ -488,7 +488,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
       }
 
       // Try to write directly to the denied file
-      const wrappedCommand = await wrapCommandWithSandboxMacOS({
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
         command: `echo "${TEST_MODIFIED_CONTENT}" > ${TEST_DENIED_FILE}`,
         needsNetworkRestriction: false,
         readConfig: undefined,
@@ -513,7 +513,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
   })
 
   describe('Literal Path - Ancestor Directory Move Prevention', () => {
-    it('should block moving an ancestor directory of a write-denied path', async () => {
+    it('should block moving an ancestor directory of a write-denied path', () => {
       if (skipIfNotMacOS()) {
         return
       }
@@ -526,7 +526,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
       const movedAllowedDir = join(TEST_BASE_DIR, 'moved-allowed')
 
       // Try to move the parent directory (TEST_ALLOWED_DIR)
-      const wrappedCommand = await wrapCommandWithSandboxMacOS({
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
         command: `mv ${TEST_ALLOWED_DIR} ${movedAllowedDir}`,
         needsNetworkRestriction: false,
         readConfig: undefined,
@@ -549,7 +549,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
       expect(existsSync(movedAllowedDir)).toBe(false)
     })
 
-    it('should block moving the grandparent directory', async () => {
+    it('should block moving the grandparent directory', () => {
       if (skipIfNotMacOS()) {
         return
       }
@@ -562,7 +562,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
       const movedBaseDir = join(tmpdir(), 'moved-write-base-' + Date.now())
 
       // Try to move the grandparent directory (TEST_BASE_DIR)
-      const wrappedCommand = await wrapCommandWithSandboxMacOS({
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
         command: `mv ${TEST_BASE_DIR} ${movedBaseDir}`,
         needsNetworkRestriction: false,
         readConfig: undefined,
@@ -587,7 +587,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
   })
 
   describe('Glob Pattern - File Move Prevention', () => {
-    it('should block write bypass via moving glob-matched files', async () => {
+    it('should block write bypass via moving glob-matched files', () => {
       if (skipIfNotMacOS()) {
         return
       }
@@ -601,7 +601,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
       }
 
       // Try to move a .txt file
-      const mvCommand = await wrapCommandWithSandboxMacOS({
+      const mvCommand = wrapCommandWithSandboxMacOS({
         command: `mv ${TEST_GLOB_SECRET1} ${join(TEST_BASE_DIR, 'moved-secret.txt')}`,
         needsNetworkRestriction: false,
         readConfig: undefined,
@@ -623,7 +623,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
       expect(existsSync(TEST_GLOB_SECRET1)).toBe(true)
     })
 
-    it('should still block direct writes to glob-matched files', async () => {
+    it('should still block direct writes to glob-matched files', () => {
       if (skipIfNotMacOS()) {
         return
       }
@@ -636,7 +636,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
       }
 
       // Try to write to a glob-matched file
-      const wrappedCommand = await wrapCommandWithSandboxMacOS({
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
         command: `echo "${TEST_MODIFIED_CONTENT}" > ${TEST_GLOB_SECRET1}`,
         needsNetworkRestriction: false,
         readConfig: undefined,
@@ -659,7 +659,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
       expect(content).toBe(TEST_ORIGINAL_CONTENT)
     })
 
-    it('should block moving the parent directory containing glob-matched files', async () => {
+    it('should block moving the parent directory containing glob-matched files', () => {
       if (skipIfNotMacOS()) {
         return
       }
@@ -672,7 +672,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
       }
 
       // Try to move the parent directory
-      const wrappedCommand = await wrapCommandWithSandboxMacOS({
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
         command: `mv ${TEST_GLOB_DIR} ${TEST_GLOB_RENAMED}`,
         needsNetworkRestriction: false,
         readConfig: undefined,
@@ -697,7 +697,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
   })
 
   describe('Glob Pattern - Recursive Patterns', () => {
-    it('should block moving files matching a recursive glob pattern (**/*.txt)', async () => {
+    it('should block moving files matching a recursive glob pattern (**/*.txt)', () => {
       if (skipIfNotMacOS()) {
         return
       }
@@ -719,7 +719,7 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
       const movedNested = join(TEST_BASE_DIR, 'moved-nested.txt')
 
       // Try to move the nested file
-      const wrappedCommand = await wrapCommandWithSandboxMacOS({
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
         command: `mv ${nestedFile} ${movedNested}`,
         needsNetworkRestriction: false,
         readConfig: undefined,

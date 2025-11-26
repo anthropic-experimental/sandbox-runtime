@@ -2,13 +2,12 @@ import { homedir } from 'os'
 import * as path from 'path'
 import * as fs from 'fs'
 import { getPlatform } from '../utils/platform.js'
-import { ripGrep } from '../utils/ripgrep.js'
 
 /**
  * Dangerous files that should be protected from writes.
  * These files can be used for code execution or data exfiltration.
  */
-const DANGEROUS_FILES = [
+export const DANGEROUS_FILES = [
   '.gitconfig',
   '.gitmodules',
   '.bashrc',
@@ -24,7 +23,20 @@ const DANGEROUS_FILES = [
  * Dangerous directories that should be protected from writes.
  * These directories contain sensitive configuration or executable files.
  */
-const DANGEROUS_DIRECTORIES = ['.git', '.vscode', '.idea'] as const
+export const DANGEROUS_DIRECTORIES = ['.git', '.vscode', '.idea'] as const
+
+/**
+ * Get the list of dangerous directories to deny writes to.
+ * Excludes .git since we need it writable for git operations -
+ * instead we block specific paths within .git (hooks and config).
+ */
+export function getDangerousDirectories(): string[] {
+  return [
+    ...DANGEROUS_DIRECTORIES.filter(d => d !== '.git'),
+    '.claude/commands',
+    '.claude/agents',
+  ]
+}
 
 /**
  * Normalizes a path for case-insensitive comparison.
@@ -35,7 +47,7 @@ const DANGEROUS_DIRECTORIES = ['.git', '.vscode', '.idea'] as const
  * @param path The path to normalize
  * @returns The lowercase path for safe comparison
  */
-function normalizeCaseForComparison(pathStr: string): string {
+export function normalizeCaseForComparison(pathStr: string): string {
   return pathStr.toLowerCase()
 }
 
@@ -144,184 +156,6 @@ export function getDefaultWritePaths(): string[] {
   ]
 
   return recommendedPaths
-}
-
-/**
- * Get mandatory deny paths within allowed write areas
- * This uses ripgrep to scan the filesystem for dangerous files and directories
- * Returns absolute paths that must be blocked from writes
- * @param ripgrepConfig Ripgrep configuration (command and optional args)
- */
-export async function getMandatoryDenyWithinAllow(
-  ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
-): Promise<string[]> {
-  const denyPaths: string[] = []
-  const cwd = process.cwd()
-
-  // Always deny writes to settings.json files
-  // Block in home directory
-  denyPaths.push(path.join(homedir(), '.claude', 'settings.json'))
-  // Block in current directory
-  denyPaths.push(path.resolve(cwd, '.claude', 'settings.json'))
-  denyPaths.push(path.resolve(cwd, '.claude', 'settings.local.json'))
-
-  // Use shared constants for dangerous files
-  const dangerousFiles = [...DANGEROUS_FILES]
-
-  // Use shared constants plus additional Claude-specific directories
-  // Note: We don't include .git as a whole directory since we need it to be writable for git operations
-  // Instead, we'll block specific dangerous paths within .git (hooks and config) below
-  const dangerousDirectories = [
-    ...DANGEROUS_DIRECTORIES.filter(d => d !== '.git'),
-    '.claude/commands',
-    '.claude/agents',
-  ]
-
-  // Create an AbortController for ripgrep operations
-  const abortController = new AbortController()
-
-  // Add absolute paths for dangerous files in CWD
-  for (const fileName of dangerousFiles) {
-    // Always include the potential path in CWD (even if file doesn't exist yet)
-    const cwdFilePath = path.resolve(cwd, fileName)
-    denyPaths.push(cwdFilePath)
-
-    // Find all existing instances of this file in CWD and subdirectories using ripgrep
-    try {
-      // Use ripgrep to find files with exact name match (case-insensitive)
-      // -g/--glob: Include/exclude files matching this glob pattern
-      // --files: List files that would be searched
-      // --hidden: Search hidden files
-      // --iglob: Case-insensitive glob matching to catch .Bashrc, .BASHRC, etc.
-      const matches = await ripGrep(
-        [
-          '--files',
-          '--hidden',
-          '--iglob',
-          fileName,
-          '-g',
-          '!**/node_modules/**',
-        ],
-        cwd,
-        abortController.signal,
-        ripgrepConfig,
-      )
-      // Convert relative paths to absolute paths
-      const absoluteMatches = matches.map(match => path.resolve(cwd, match))
-      denyPaths.push(...absoluteMatches)
-    } catch (error) {
-      // If ripgrep fails, we cannot safely determine all dangerous files
-      throw new Error(
-        `Failed to scan for dangerous file "${fileName}": ${error instanceof Error ? error.message : String(error)}`,
-      )
-    }
-  }
-
-  // Add absolute paths for dangerous directories in CWD
-  for (const dirName of dangerousDirectories) {
-    // Always include the potential path in CWD (even if directory doesn't exist yet)
-    const cwdDirPath = path.resolve(cwd, dirName)
-    denyPaths.push(cwdDirPath)
-
-    // Find all existing instances of this directory in CWD and subdirectories using ripgrep
-    try {
-      // Use ripgrep to find directories (case-insensitive)
-      // Note: ripgrep lists files, so we need to find files within these directories
-      // and then extract the directory paths
-      const pattern = `**/${dirName}/**`
-      const matches = await ripGrep(
-        [
-          '--files',
-          '--hidden',
-          '--iglob',
-          pattern,
-          '-g',
-          '!**/node_modules/**',
-        ],
-        cwd,
-        abortController.signal,
-        ripgrepConfig,
-      )
-
-      // Extract directory paths from file paths
-      const dirPaths = new Set<string>()
-      for (const match of matches) {
-        const absolutePath = path.resolve(cwd, match)
-        // Find the dangerous directory in the path (case-insensitive)
-        const segments = absolutePath.split(path.sep)
-        const normalizedDirName = normalizeCaseForComparison(dirName)
-        // Find the directory using case-insensitive comparison
-        const dirIndex = segments.findIndex(
-          segment => normalizeCaseForComparison(segment) === normalizedDirName,
-        )
-        if (dirIndex !== -1) {
-          // Reconstruct path up to and including the dangerous directory
-          const dirPath = segments.slice(0, dirIndex + 1).join(path.sep)
-          dirPaths.add(dirPath)
-        }
-      }
-      denyPaths.push(...dirPaths)
-    } catch (error) {
-      // If ripgrep fails, we cannot safely determine all dangerous directories
-      throw new Error(
-        `Failed to scan for dangerous directory "${dirName}": ${error instanceof Error ? error.message : String(error)}`,
-      )
-    }
-  }
-
-  // Special handling for dangerous .git paths
-  // We block specific paths within .git that can be used for code execution
-  const dangerousGitPaths = [
-    '.git/hooks', // Block all hook files to prevent code execution via git hooks
-    '.git/config', // Block config file to prevent dangerous config options like core.fsmonitor
-  ]
-
-  for (const gitPath of dangerousGitPaths) {
-    // Add the path in the current working directory
-    const absoluteGitPath = path.resolve(cwd, gitPath)
-    denyPaths.push(absoluteGitPath)
-
-    // Also find .git directories in subdirectories and block their hooks/config
-    // This handles nested repositories (case-insensitive)
-    try {
-      // Find all .git directories by looking for .git/HEAD files (case-insensitive)
-      const gitHeadFiles = await ripGrep(
-        [
-          '--files',
-          '--hidden',
-          '--iglob',
-          '**/.git/HEAD',
-          '-g',
-          '!**/node_modules/**',
-        ],
-        cwd,
-        abortController.signal,
-        ripgrepConfig,
-      )
-
-      for (const gitHeadFile of gitHeadFiles) {
-        // Get the .git directory path
-        const gitDir = path.dirname(gitHeadFile)
-
-        // Add the dangerous path within this .git directory
-        if (gitPath === '.git/hooks') {
-          const hooksPath = path.join(gitDir, 'hooks')
-          denyPaths.push(hooksPath)
-        } else if (gitPath === '.git/config') {
-          const configPath = path.join(gitDir, 'config')
-          denyPaths.push(configPath)
-        }
-      }
-    } catch (error) {
-      // If ripgrep fails, we cannot safely determine all .git repositories
-      throw new Error(
-        `Failed to scan for .git directories: ${error instanceof Error ? error.message : String(error)}`,
-      )
-    }
-  }
-
-  // Remove duplicates and return
-  return Array.from(new Set(denyPaths))
 }
 
 /**
