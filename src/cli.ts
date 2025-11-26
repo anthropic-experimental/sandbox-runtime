@@ -55,7 +55,20 @@ function loadConfig(filePath: string): SandboxRuntimeConfig | null {
  * Get default config path
  */
 function getDefaultConfigPath(): string {
-  return path.join(os.homedir(), '.srt-settings.json')
+  const configPaths = [
+    path.join(os.homedir(), '.config', 'srt', 'settings.json'),
+    path.join(os.homedir(), '.config', 'srt-settings.json'),
+    path.join(os.homedir(), '.srt-settings.json')
+  ]
+
+  for (const configPath of configPaths) {
+    if (fs.existsSync(configPath)) {
+      return configPath
+    }
+  }
+
+  // Return the first path as default if none exist
+  return configPaths[0]
 }
 
 /**
