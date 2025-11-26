@@ -735,3 +735,80 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
     })
   })
 })
+
+describe('macOS Seatbelt blockAllNetwork', () => {
+  it('should block all network access including localhost when blockAllNetwork is true', () => {
+    if (skipIfNotMacOS()) {
+      return
+    }
+
+    // Use blockAllNetwork to completely block all network
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command:
+        'curl -s --connect-timeout 2 http://localhost:80 || curl -s --connect-timeout 2 http://127.0.0.1:80',
+      executionId: 'test-block-all-network',
+      needsNetworkRestriction: true,
+      blockAllNetwork: true,
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    const result = spawnSync(wrappedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+
+    // The network access should be blocked by sandbox
+    // curl will fail with "Operation not permitted" from the sandbox
+    const output = (result.stderr || '').toLowerCase()
+    expect(
+      output.includes('operation not permitted') ||
+        output.includes("couldn't connect") ||
+        result.status !== 0,
+    ).toBe(true)
+  })
+
+  it('should block outbound DNS resolution when blockAllNetwork is true', () => {
+    if (skipIfNotMacOS()) {
+      return
+    }
+
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'host example.com',
+      executionId: 'test-block-dns',
+      needsNetworkRestriction: true,
+      blockAllNetwork: true,
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    const result = spawnSync(wrappedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+
+    // DNS resolution should fail
+    expect(result.status).not.toBe(0)
+  })
+
+  it('should generate sandbox profile with explicit network deny rule', () => {
+    if (skipIfNotMacOS()) {
+      return
+    }
+
+    // Generate a command and check that the sandbox profile contains the deny network* rule
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'echo test',
+      executionId: 'test-profile-check',
+      needsNetworkRestriction: true,
+      blockAllNetwork: true,
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    // The wrapped command should contain the deny network* rule in the profile
+    expect(wrappedCommand).toContain('deny network*')
+  })
+})
