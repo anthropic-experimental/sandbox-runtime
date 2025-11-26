@@ -438,6 +438,10 @@ function getRipgrepConfig(): { command: string; args?: string[] } {
   return config?.ripgrep ?? { command: 'rg' }
 }
 
+function getMandatoryDenySearchDepth(): number {
+  return config?.mandatoryDenySearchDepth ?? 3
+}
+
 function getProxyPort(): number | undefined {
   return managerContext?.httpProxyPort
 }
@@ -477,6 +481,7 @@ async function wrapWithSandbox(
   command: string,
   binShell?: string,
   customConfig?: Partial<SandboxRuntimeConfig>,
+  abortSignal?: AbortSignal,
 ): Promise<string> {
   const platform = getPlatform()
 
@@ -525,7 +530,8 @@ async function wrapWithSandbox(
 
   switch (platform) {
     case 'macos':
-      return await wrapCommandWithSandboxMacOS({
+      // macOS sandbox profile supports glob patterns directly, no ripgrep needed
+      return wrapCommandWithSandboxMacOS({
         command,
         needsNetworkRestriction,
         // Only pass proxy ports if proxy is running (when there are domains to filter)
@@ -538,7 +544,6 @@ async function wrapWithSandbox(
         allowLocalBinding: getAllowLocalBinding(),
         ignoreViolations: getIgnoreViolations(),
         binShell,
-        ripgrepConfig: getRipgrepConfig(),
       })
 
     case 'linux':
@@ -546,7 +551,9 @@ async function wrapWithSandbox(
         command,
         needsNetworkRestriction,
         // Only pass socket paths if proxy is running (when there are domains to filter)
-        httpSocketPath: needsNetworkProxy ? getLinuxHttpSocketPath() : undefined,
+        httpSocketPath: needsNetworkProxy
+          ? getLinuxHttpSocketPath()
+          : undefined,
         socksSocketPath: needsNetworkProxy
           ? getLinuxSocksSocketPath()
           : undefined,
@@ -562,6 +569,8 @@ async function wrapWithSandbox(
         allowAllUnixSockets: getAllowAllUnixSockets(),
         binShell,
         ripgrepConfig: getRipgrepConfig(),
+        mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
+        abortSignal,
       })
 
     default:
@@ -850,6 +859,7 @@ export interface ISandboxManager {
     command: string,
     binShell?: string,
     customConfig?: Partial<SandboxRuntimeConfig>,
+    abortSignal?: AbortSignal,
   ): Promise<string>
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
