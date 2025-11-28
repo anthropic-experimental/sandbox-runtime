@@ -27,7 +27,6 @@ import {
   containsGlobChars,
   removeTrailingGlobSuffix,
   getDefaultSystemReadPaths,
-  getSensitivePathsToExclude,
 } from './sandbox-utils.js'
 import { hasRipgrepSync } from '../utils/ripgrep.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
@@ -374,27 +373,12 @@ function getFsReadConfig(): FsReadRestrictionConfig | undefined {
   const filesystem = config.filesystem
   const platform = getPlatform()
 
-  // Check if user specified denyRead (deny-only mode) or allowRead (allow-only mode)
   const hasDenyRead = filesystem.denyRead && filesystem.denyRead.length > 0
   const hasAllowRead = filesystem.allowRead && filesystem.allowRead.length > 0
 
-  // Validate: can't use both modes at once
-  if (hasDenyRead && hasAllowRead) {
-    throw new Error(
-      'Cannot use both denyRead and allowRead at the same time. ' +
-        'Choose either deny-only mode (denyRead) or allow-only mode (allowRead).',
-    )
-  }
-
   if (platform === 'linux') {
     // Linux supports both deny-only and allow-only modes
-    if (hasDenyRead) {
-      // Deny-only mode: user specified denyRead
-      return {
-        mode: 'deny-only',
-        denyPaths: normalizeAndFilterPaths(filesystem.denyRead, platform),
-      }
-    } else if (hasAllowRead) {
+    if (hasAllowRead) {
       // Allow-only mode: user specified allowRead
       let allowPaths = normalizeAndFilterPaths(
         filesystem.allowRead || [],
@@ -412,14 +396,24 @@ function getFsReadConfig(): FsReadRestrictionConfig | undefined {
       }
 
       // Get sensitive paths to exclude (denyWithinAllow)
-      const sensitivePaths = getSensitivePathsToExclude()
+      // Use denyRead from config as deny-within-allow paths
+      const denyWithinAllow = normalizeAndFilterPaths(
+        filesystem.denyRead || [],
+        platform,
+      )
 
       return {
         mode: 'allow-only',
         allowPaths,
-        denyWithinAllow: sensitivePaths,
+        denyWithinAllow,
       }
     } else {
+      if (hasDenyRead) {
+        return {
+          mode: 'deny-only',
+          denyPaths: normalizeAndFilterPaths(filesystem.denyRead, platform),
+        }
+      }
       // No read restrictions specified
       return undefined
     }

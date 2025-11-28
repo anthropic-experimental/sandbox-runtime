@@ -303,19 +303,3 @@ export function getDefaultSystemReadPaths(
 
   return []
 }
-
-/**
- * Get sensitive paths that should be denied within allowed paths in allow-only mode.
- * These paths contain credentials, secrets, and other sensitive data.
- *
- * Note: This function currently returns an empty array because:
- * - On macOS: allow-only mode is not supported (automatically falls back to deny-only)
- * - On Linux: Sensitive directories (/home, /root, /etc) are already blocked at the
- *   base level in linux-sandbox-utils.ts, so additional denyWithinAllow paths are
- *   not needed for the current implementation
- *
- * @returns Array of sensitive paths to exclude from read access
- */
-export function getSensitivePathsToExclude(): string[] {
-  return []
-}

@@ -102,47 +102,38 @@ export const NetworkConfigSchema = z.object({
 /**
  * Filesystem configuration schema for validation
  */
-export const FilesystemConfigSchema = z
-  .object({
-    denyRead: z
-      .array(filesystemPathSchema)
-      .optional()
-      .default([])
-      .describe(
-        'Paths denied for reading (deny-only mode). Cannot be used with allowRead. Default: []',
-      ),
-    allowRead: z
-      .array(filesystemPathSchema)
-      .optional()
-      .describe(
-        'Paths allowed for reading (allow-only mode). System paths are auto-included. Cannot be used with denyRead.',
-      ),
-    autoAllowSystemPaths: z
-      .boolean()
-      .optional()
-      .default(true)
-      .describe(
-        'When using allowRead, automatically include system paths (/usr, /bin, etc.) for command execution. Default: true.',
-      ),
-    allowWrite: z
-      .array(filesystemPathSchema)
-      .describe('Paths allowed for writing'),
-    denyWrite: z
-      .array(filesystemPathSchema)
-      .describe('Paths denied for writing (takes precedence over allowWrite)'),
-  })
-  .refine(
-    data => {
-      // Ensure denyRead and allowRead are mutually exclusive
-      const hasDenyRead = data.denyRead && data.denyRead.length > 0
-      const hasAllowRead = data.allowRead && data.allowRead.length > 0
-      return !(hasDenyRead && hasAllowRead)
-    },
-    {
-      message:
-        'Cannot use both allowRead and denyRead. Choose one read restriction mode.',
-    },
-  )
+export const FilesystemConfigSchema = z.object({
+  denyRead: z
+    .array(filesystemPathSchema)
+    .optional()
+    .default([])
+    .describe(
+      'Paths denied for reading. Semantics depend on mode: ' +
+        '(1) Without allowRead (deny-only mode): Globally deny reading these paths. ' +
+        '(2) With allowRead (allow-only mode): Deny reading these paths within allowed paths (deny-within-allow pattern). ' +
+        'Default: []',
+    ),
+  allowRead: z
+    .array(filesystemPathSchema)
+    .optional()
+    .describe(
+      'Paths allowed for reading (allow-only mode). System paths are auto-included. ' +
+        'Use denyRead to block specific paths within allowed paths.',
+    ),
+  autoAllowSystemPaths: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe(
+      'When using allowRead, automatically include system paths (/usr, /bin, etc.) for command execution. Default: true.',
+    ),
+  allowWrite: z
+    .array(filesystemPathSchema)
+    .describe('Paths allowed for writing'),
+  denyWrite: z
+    .array(filesystemPathSchema)
+    .describe('Paths denied for writing (takes precedence over allowWrite)'),
+})
 
 /**
  * Configuration schema for ignoring specific sandbox violations
