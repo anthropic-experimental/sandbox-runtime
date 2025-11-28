@@ -82,7 +82,8 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
 
       // Use actual read restriction config with literal path
       const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [TEST_DENIED_DIR],
+        mode: 'deny-only',
+        denyPaths: [TEST_DENIED_DIR],
       }
 
       // Generate actual sandbox command using our production code
@@ -120,7 +121,8 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
 
       // Use actual read restriction config
       const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [TEST_DENIED_DIR],
+        mode: 'deny-only',
+        denyPaths: [TEST_DENIED_DIR],
       }
 
       // Generate actual sandbox command
@@ -156,7 +158,8 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
 
       // Use actual read restriction config
       const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [TEST_DENIED_DIR],
+        mode: 'deny-only',
+        denyPaths: [TEST_DENIED_DIR],
       }
 
       // Generate actual sandbox command
@@ -194,7 +197,8 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
 
       // Deny reading a specific file deep in the hierarchy
       const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [TEST_SECRET_FILE],
+        mode: 'deny-only',
+        denyPaths: [TEST_SECRET_FILE],
       }
 
       const movedBaseDir = join(tmpdir(), 'moved-base-' + Date.now())
@@ -235,7 +239,8 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       const globPattern = join(TEST_GLOB_DIR, '*.txt')
 
       const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [globPattern],
+        mode: 'deny-only',
+        denyPaths: [globPattern],
       }
 
       // Try to move a .txt file that matches the pattern
@@ -275,7 +280,8 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       const globPattern = join(TEST_GLOB_DIR, '*.txt')
 
       const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [globPattern],
+        mode: 'deny-only',
+        denyPaths: [globPattern],
       }
 
       // Try to read a file matching the glob
@@ -311,7 +317,8 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       const globPattern = join(TEST_GLOB_DIR, '*.txt')
 
       const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [globPattern],
+        mode: 'deny-only',
+        denyPaths: [globPattern],
       }
 
       const movedGlobDir = join(TEST_BASE_DIR, 'moved-glob-dir')
@@ -358,7 +365,8 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
       const globPattern = join(TEST_GLOB_DIR, '**/*.txt')
 
       const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [globPattern],
+        mode: 'deny-only',
+        denyPaths: [globPattern],
       }
 
       const movedNested = join(TEST_BASE_DIR, 'moved-nested.txt')

@@ -115,7 +115,9 @@ Both filesystem and network isolation are required for effective sandboxing. Wit
 
 **Filesystem Isolation** enforces read and write restrictions:
 
-- **Read** (deny-only pattern): By default, read access is allowed everywhere. You can deny specific paths (e.g., `~/.ssh`). An empty deny list means full read access.
+- **Read**: Supports two modes depending on platform and configuration:
+  - **Deny-only mode** (default on macOS, optional on Linux): By default, read access is allowed everywhere. You can deny specific paths using `denyRead` (e.g., `~/.ssh`). An empty deny list means full read access.
+  - **Allow-only mode** (Linux only): By default, read access is denied everywhere. You must explicitly allow paths using `allowRead` (e.g., `/usr`, `.`). System paths like `/usr`, `/bin` are auto-included unless disabled. An empty allow list means no read access (except system paths if enabled). Use `denyRead` to block specific paths within allowed paths.
 - **Write** (allow-only pattern): By default, write access is denied everywhere. You must explicitly allow paths (e.g., `.`, `/tmp`). An empty allow list means no write access.
 
 **Network Isolation** (allow-only pattern): By default, all network access is denied. You must explicitly allow domains. An empty allowedDomains list means no network access. Network traffic is routed through proxy servers running on the host:
@@ -246,6 +248,7 @@ srt --settings /path/to/srt-settings.json <command>
 
 ### Complete Configuration Example
 
+**Example with deny-only read mode (backward compatible):**
 ```json
 {
   "network": {
@@ -275,6 +278,46 @@ srt --settings /path/to/srt-settings.json <command>
 }
 ```
 
+**Example with allow-only read mode (more secure, Linux only):**
+```json
+{
+  "network": {
+    "allowedDomains": [
+      "github.com",
+      "*.github.com",
+      "npmjs.org",
+      "*.npmjs.org"
+    ],
+    "deniedDomains": []
+  },
+  "filesystem": {
+    "allowRead": [
+      ".",
+      "src/",
+      "test/",
+      "/tmp"
+    ],
+    "denyRead": [
+      ".env",
+      "secrets.json",
+      ".aws/credentials"
+    ],
+    "autoAllowSystemPaths": true,
+    "allowWrite": [
+      ".",
+      "src/",
+      "test/",
+      "/tmp"
+    ],
+    "denyWrite": [
+      ".env",
+      ".git"
+    ]
+  },
+  "enableWeakerNestedSandbox": false
+}
+```
+
 ### Configuration Options
 
 #### Network Configuration
@@ -288,11 +331,29 @@ Uses an **allow-only pattern** - all network access is denied by default.
 
 #### Filesystem Configuration
 
-Uses two different patterns:
+**Read restrictions** support two modes:
 
-**Read restrictions** (deny-only pattern) - all reads allowed by default:
+**Deny-only mode** (backward compatible):
+- `filesystem.denyRead` - Array of paths to deny read access. By default, all paths are readable except the denied ones.
+- **Supported on**: Linux and macOS
+- **Use case**: When you want to allow broad read access but block specific sensitive paths (e.g., `~/.ssh`, credentials files)
+- **Example**: `"denyRead": ["~/.ssh", "~/.aws"]` means everything is readable except those paths
 
-- `filesystem.denyRead` - Array of paths to deny read access. Empty array = full read access.
+**Allow-only mode** (more secure):
+- `filesystem.allowRead` - Array of paths to allow read access. By default, only specified paths are readable.
+- `filesystem.denyRead` - When used with `allowRead`, this denies specific paths within the allowed paths (deny-within-allow pattern).
+- `filesystem.autoAllowSystemPaths` - Boolean (default: `true`). Automatically include system paths (like `/usr`, `/bin`, `/lib`) needed for commands to execute.
+- **Supported on**: Linux only (macOS does not support this mode due to sandbox-exec limitations)
+- **Use case**: When you want maximum security and explicit control over what can be read
+- **Example**: `"allowRead": [".", "/tmp"], "denyRead": [".env", "secrets.json"]` with `autoAllowSystemPaths: true` means only those paths (plus system paths) are readable, except `.env` and `secrets.json` are blocked
+
+**Important notes:**
+- **denyRead semantics**: The meaning of `denyRead` depends on whether you use `allowRead`:
+  - **Without `allowRead`** (deny-only mode): `denyRead` globally denies paths
+  - **With `allowRead`** (allow-only mode): `denyRead` denies paths within allowed paths
+- **macOS limitation**: macOS only supports deny-only mode. If you specify `allowRead` on macOS, an error will be thrown
+- **Linux supports both**: On Linux, you can use `denyRead` alone (deny-only) or combine `allowRead` + `denyRead` (allow-only with exceptions)
+- **Default behavior**: If neither is specified, no read restrictions are applied (all reads allowed)
 
 **Write restrictions** (allow-only pattern) - all writes denied by default:
 
@@ -355,8 +416,7 @@ Examples:
 }
 ```
 
-**Restrict to specific directories:**
-
+**Restrict to specific directories (deny-only mode):**
 ```json
 {
   "network": {
@@ -370,6 +430,50 @@ Examples:
   }
 }
 ```
+
+**Maximum security: only allow reading specific directories (allow-only mode, Linux only):**
+```json
+{
+  "network": {
+    "allowedDomains": [],
+    "deniedDomains": []
+  },
+  "filesystem": {
+    "allowRead": [".", "/tmp"],
+    "denyRead": [".env", "secrets.json"],
+    "autoAllowSystemPaths": true,
+    "allowWrite": ["."],
+    "denyWrite": [".env", ".git"]
+  }
+}
+```
+
+This configuration (Linux only):
+- Only allows reading the current directory and `/tmp`
+- Blocks reading `.env` and `secrets.json` even within the current directory
+- Automatically includes system paths (`/usr`, `/bin`, `/lib`, etc.) for commands to execute
+- Only allows writing to the current directory
+- Blocks writing to `.env` and `.git` even within the current directory
+- **Note**: On macOS, this will fall back to deny-only mode (no read restrictions)
+
+**Sandbox MCP servers or AI agents (recommended):**
+```json
+{
+  "network": {
+    "allowedDomains": ["github.com", "*.github.com", "npmjs.org", "*.npmjs.org"],
+    "deniedDomains": []
+  },
+  "filesystem": {
+    "allowRead": ["/path/to/project"],
+    "denyRead": ["/path/to/project/.env", "/path/to/project/secrets.json"],
+    "autoAllowSystemPaths": true,
+    "allowWrite": ["/path/to/project"],
+    "denyWrite": ["/path/to/project/.env", "/path/to/project/.git"]
+  }
+}
+```
+
+This ensures that MCP servers or AI agents can only access the specified project directory and cannot read sensitive files like SSH keys, AWS credentials, or project secrets.
 
 ### Common Issues and Tips
 

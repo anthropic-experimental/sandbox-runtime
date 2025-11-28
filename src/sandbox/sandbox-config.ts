@@ -103,7 +103,30 @@ export const NetworkConfigSchema = z.object({
  * Filesystem configuration schema for validation
  */
 export const FilesystemConfigSchema = z.object({
-  denyRead: z.array(filesystemPathSchema).describe('Paths denied for reading'),
+  denyRead: z
+    .array(filesystemPathSchema)
+    .optional()
+    .default([])
+    .describe(
+      'Paths denied for reading. Semantics depend on mode: ' +
+        '(1) Without allowRead (deny-only mode): Globally deny reading these paths. ' +
+        '(2) With allowRead (allow-only mode): Deny reading these paths within allowed paths (deny-within-allow pattern). ' +
+        'Default: []',
+    ),
+  allowRead: z
+    .array(filesystemPathSchema)
+    .optional()
+    .describe(
+      'Paths allowed for reading (allow-only mode). System paths are auto-included. ' +
+        'Use denyRead to block specific paths within allowed paths.',
+    ),
+  autoAllowSystemPaths: z
+    .boolean()
+    .optional()
+    .default(true)
+    .describe(
+      'When using allowRead, automatically include system paths (/usr, /bin, etc.) for command execution. Default: true.',
+    ),
   allowWrite: z
     .array(filesystemPathSchema)
     .describe('Paths allowed for writing'),
