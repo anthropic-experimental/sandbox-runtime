@@ -28,6 +28,7 @@ export interface MacOSSandboxParams {
   readConfig: FsReadRestrictionConfig | undefined
   writeConfig: FsWriteRestrictionConfig | undefined
   ignoreViolations?: IgnoreViolationsConfig | undefined
+  allowPty?: boolean
   binShell?: string
 }
 
@@ -353,6 +354,7 @@ function generateSandboxProfile({
   allowUnixSockets,
   allowAllUnixSockets,
   allowLocalBinding,
+  allowPty,
   logTag,
 }: {
   readConfig: FsReadRestrictionConfig | undefined
@@ -363,6 +365,7 @@ function generateSandboxProfile({
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
+  allowPty?: boolean
   logTag: string
 }): string {
   const profile: string[] = [
@@ -570,6 +573,23 @@ function generateSandboxProfile({
   profile.push('; File write')
   profile.push(...generateWriteRules(writeConfig, logTag))
 
+  // Pseudo-terminal (pty) support for tmux and other terminal multiplexers
+  if (allowPty) {
+    profile.push('')
+    profile.push(
+      '; Pseudo-terminal (pty) support for tmux and other terminal multiplexers',
+    )
+    profile.push('(allow pseudo-tty)')
+    profile.push('(allow file-ioctl')
+    profile.push('  (literal "/dev/ptmx")')
+    profile.push('  (regex #"^/dev/ttys")')
+    profile.push(')')
+    profile.push('(allow file-read* file-write*')
+    profile.push('  (literal "/dev/ptmx")')
+    profile.push('  (regex #"^/dev/ttys")')
+    profile.push(')')
+  }
+
   return profile.join('\n')
 }
 
@@ -621,6 +641,7 @@ export function wrapCommandWithSandboxMacOS(
     allowLocalBinding,
     readConfig,
     writeConfig,
+    allowPty,
     binShell,
   } = params
 
@@ -650,6 +671,7 @@ export function wrapCommandWithSandboxMacOS(
     allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,
+    allowPty,
     logTag,
   })
 
