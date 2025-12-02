@@ -735,3 +735,42 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
     })
   })
 })
+
+describe('macOS Seatbelt Process Enumeration', () => {
+  it('should allow enumerating all process IDs (kern.proc.all sysctl)', () => {
+    if (skipIfNotMacOS()) {
+      return
+    }
+
+    // This tests that psutil.pids() and similar process enumeration works.
+    // The kern.proc.all sysctl is used by psutil to list all PIDs on the system.
+    // Use case: IPython kernel shutdown needs to enumerate child processes.
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'ps -axo pid=',
+      needsNetworkRestriction: false,
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    const result = spawnSync(wrappedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 5000,
+    })
+
+    // The command should succeed
+    expect(result.status).toBe(0)
+
+    // Should return a list of PIDs (at least the current process)
+    const pids = result.stdout
+      .trim()
+      .split('\n')
+      .filter(line => line.trim())
+    expect(pids.length).toBeGreaterThan(0)
+
+    // Each line should be a valid PID (numeric)
+    for (const pid of pids) {
+      expect(parseInt(pid.trim(), 10)).toBeGreaterThan(0)
+    }
+  })
+})
