@@ -1,1 +1,26 @@
+#!/usr/bin/env sh
+
+# Check if there are any staged .ts files
+if ! git diff --cached --name-only | grep -q '\.ts$'; then
+  echo "No TypeScript files staged, skipping lint-staged"
+  exit 0
+fi
+
+# Load nvm if available
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+
+# Try to find npx in common locations
+if ! command -v npx >/dev/null 2>&1; then
+  # Try node path from nvm
+  if [ -d "$HOME/.nvm/versions/node" ]; then
+    for node_version in "$HOME/.nvm/versions/node"/*/bin; do
+      if [ -f "$node_version/npx" ]; then
+        export PATH="$node_version:$PATH"
+        break
+      fi
+    done
+  fi
+fi
+
 npx lint-staged
