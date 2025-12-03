@@ -947,3 +947,323 @@ describe('Sandbox Integration Tests', () => {
     })
   })
 })
+
+/**
+ * Integration tests for the empty allowedDomains vulnerability fix
+ *
+ * These tests verify the ACTUAL network behavior when allowedDomains: [] is specified.
+ * With the fix:
+ * - Empty allowedDomains = ALL network access blocked (as documented)
+ * - Non-empty allowedDomains = Only specified domains allowed
+ *
+ * The bug caused empty allowedDomains to allow ALL network access instead.
+ */
+describe('Empty allowedDomains Network Blocking Integration', () => {
+  const TEST_DIR = join(process.cwd(), '.sandbox-test-empty-domains')
+
+  beforeAll(async () => {
+    if (skipIfNotLinux()) {
+      return
+    }
+
+    // Create test directory
+    if (!existsSync(TEST_DIR)) {
+      mkdirSync(TEST_DIR, { recursive: true })
+    }
+  })
+
+  afterAll(async () => {
+    if (skipIfNotLinux()) {
+      return
+    }
+
+    // Clean up test directory
+    if (existsSync(TEST_DIR)) {
+      rmSync(TEST_DIR, { recursive: true, force: true })
+    }
+
+    await SandboxManager.reset()
+  })
+
+  describe('Network blocked with empty allowedDomains', () => {
+    beforeAll(async () => {
+      if (skipIfNotLinux()) {
+        return
+      }
+
+      // Initialize with empty allowedDomains - should block ALL network
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: {
+          allowedDomains: [], // Empty = block all network (documented behavior)
+          deniedDomains: [],
+        },
+        filesystem: {
+          denyRead: [],
+          allowWrite: [TEST_DIR],
+          denyWrite: [],
+        },
+      })
+    })
+
+    it('should block all HTTP requests when allowedDomains is empty', async () => {
+      if (skipIfNotLinux()) {
+        return
+      }
+
+      // Try to access example.com - should be blocked
+      const command = await SandboxManager.wrapWithSandbox(
+        'curl -s --max-time 2 --connect-timeout 2 http://example.com 2>&1 || echo "network_failed"',
+      )
+
+      const result = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      // With empty allowedDomains, network should be completely blocked
+      // curl should fail with network-related error
+      const output = (result.stdout + result.stderr).toLowerCase()
+
+      // Network should fail - either connection error, timeout, or "network_failed" echo
+      const networkBlocked =
+        output.includes('network_failed') ||
+        output.includes('couldn\'t connect') ||
+        output.includes('connection refused') ||
+        output.includes('network is unreachable') ||
+        output.includes('name or service not known') ||
+        output.includes('timed out') ||
+        output.includes('connection timed out') ||
+        result.status !== 0
+
+      expect(networkBlocked).toBe(true)
+
+      // Should NOT contain successful HTML response
+      expect(output).not.toContain('example domain')
+      expect(output).not.toContain('<!doctype')
+    })
+
+    it('should block all HTTPS requests when allowedDomains is empty', async () => {
+      if (skipIfNotLinux()) {
+        return
+      }
+
+      const command = await SandboxManager.wrapWithSandbox(
+        'curl -s --max-time 2 --connect-timeout 2 https://example.com 2>&1 || echo "network_failed"',
+      )
+
+      const result = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      const output = (result.stdout + result.stderr).toLowerCase()
+
+      // Network should fail
+      const networkBlocked =
+        output.includes('network_failed') ||
+        output.includes('couldn\'t connect') ||
+        output.includes('connection refused') ||
+        output.includes('network is unreachable') ||
+        output.includes('name or service not known') ||
+        output.includes('timed out') ||
+        result.status !== 0
+
+      expect(networkBlocked).toBe(true)
+    })
+
+    it('should block DNS lookups when allowedDomains is empty', async () => {
+      if (skipIfNotLinux()) {
+        return
+      }
+
+      // Try DNS lookup - should fail with no network
+      const command = await SandboxManager.wrapWithSandbox(
+        'host example.com 2>&1 || nslookup example.com 2>&1 || echo "dns_failed"',
+      )
+
+      const result = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      const output = (result.stdout + result.stderr).toLowerCase()
+
+      // DNS should fail when network is blocked
+      const dnsBlocked =
+        output.includes('dns_failed') ||
+        output.includes('connection timed out') ||
+        output.includes('no servers could be reached') ||
+        output.includes('network is unreachable') ||
+        output.includes('name or service not known') ||
+        output.includes('temporary failure') ||
+        result.status !== 0
+
+      expect(dnsBlocked).toBe(true)
+    })
+
+    it('should block wget when allowedDomains is empty', async () => {
+      if (skipIfNotLinux()) {
+        return
+      }
+
+      const command = await SandboxManager.wrapWithSandbox(
+        'wget -q --timeout=2 -O - http://example.com 2>&1 || echo "wget_failed"',
+      )
+
+      const result = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      const output = (result.stdout + result.stderr).toLowerCase()
+
+      // wget should fail
+      const wgetBlocked =
+        output.includes('wget_failed') ||
+        output.includes('failed') ||
+        output.includes('network is unreachable') ||
+        output.includes('unable to resolve') ||
+        result.status !== 0
+
+      expect(wgetBlocked).toBe(true)
+    })
+
+    it('should allow local filesystem operations when network is blocked', async () => {
+      if (skipIfNotLinux()) {
+        return
+      }
+
+      // Even with network blocked, filesystem should work
+      const testFile = join(TEST_DIR, 'network-blocked-test.txt')
+      const testContent = 'test content with network blocked'
+
+      const command = await SandboxManager.wrapWithSandbox(
+        `echo "${testContent}" > ${testFile} && cat ${testFile}`,
+      )
+
+      const result = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        cwd: TEST_DIR,
+        timeout: 5000,
+      })
+
+      expect(result.status).toBe(0)
+      expect(result.stdout).toContain(testContent)
+
+      // Cleanup
+      if (existsSync(testFile)) {
+        unlinkSync(testFile)
+      }
+    })
+  })
+
+  describe('Network allowed with specific domains', () => {
+    beforeAll(async () => {
+      if (skipIfNotLinux()) {
+        return
+      }
+
+      // Reinitialize with specific domain allowed
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: {
+          allowedDomains: ['example.com'], // Only example.com allowed
+          deniedDomains: [],
+        },
+        filesystem: {
+          denyRead: [],
+          allowWrite: [TEST_DIR],
+          denyWrite: [],
+        },
+      })
+    })
+
+    it('should allow HTTP to explicitly allowed domain', async () => {
+      if (skipIfNotLinux()) {
+        return
+      }
+
+      const command = await SandboxManager.wrapWithSandbox(
+        'curl -s --max-time 5 http://example.com 2>&1',
+      )
+
+      const result = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 10000,
+      })
+
+      // Should succeed and return HTML
+      expect(result.status).toBe(0)
+      expect(result.stdout).toContain('Example Domain')
+    })
+
+    it('should block HTTP to non-allowed domain', async () => {
+      if (skipIfNotLinux()) {
+        return
+      }
+
+      const command = await SandboxManager.wrapWithSandbox(
+        'curl -s --max-time 2 http://anthropic.com 2>&1',
+      )
+
+      const result = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      const output = result.stdout.toLowerCase()
+      // Should be blocked by proxy
+      expect(output).toContain('blocked by network allowlist')
+    })
+  })
+
+  describe('Contrast: empty vs undefined network config', () => {
+    it('empty allowedDomains should block network', async () => {
+      if (skipIfNotLinux()) {
+        return
+      }
+
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: {
+          allowedDomains: [], // Explicitly empty
+          deniedDomains: [],
+        },
+        filesystem: {
+          denyRead: [],
+          allowWrite: [TEST_DIR],
+          denyWrite: [],
+        },
+      })
+
+      const command = await SandboxManager.wrapWithSandbox(
+        'curl -s --max-time 2 http://example.com 2>&1 || echo "blocked"',
+      )
+
+      const result = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      // Should be blocked
+      const output = (result.stdout + result.stderr).toLowerCase()
+      const isBlocked =
+        output.includes('blocked') ||
+        output.includes('couldn\'t connect') ||
+        output.includes('network is unreachable') ||
+        result.status !== 0
+
+      expect(isBlocked).toBe(true)
+      expect(output).not.toContain('example domain')
+    })
+  })
+})

@@ -110,6 +110,10 @@ export const FilesystemConfigSchema = z.object({
   denyWrite: z
     .array(filesystemPathSchema)
     .describe('Paths denied for writing (takes precedence over allowWrite)'),
+  allowGitConfig: z
+    .boolean()
+    .optional()
+    .describe('Allow writes to .git/config files (default: false). Enables git remote URL updates while keeping .git/hooks protected.'),
 })
 
 /**
@@ -155,6 +159,22 @@ export const SandboxRuntimeConfigSchema = z.object({
   ripgrep: RipgrepConfigSchema.optional().describe(
     'Custom ripgrep configuration (default: { command: "rg" })',
   ),
+  mandatoryDenySearchDepth: z
+    .number()
+    .int()
+    .min(1)
+    .max(10)
+    .optional()
+    .describe(
+      'Maximum directory depth to search for dangerous files on Linux (default: 3). ' +
+        'Higher values provide more protection but slower performance.',
+    ),
+  allowPty: z
+    .boolean()
+    .optional()
+    .describe(
+      'Allow pseudo-terminal (pty) operations for tmux and other terminal multiplexers (macOS only)',
+    ),
 })
 
 // Export inferred types

@@ -5,10 +5,11 @@ import { logForDebugging } from '../utils/debug.js'
 import {
   normalizePathForSandbox,
   generateProxyEnvVars,
-  getMandatoryDenyWithinAllow,
   encodeSandboxedCommand,
   decodeSandboxedCommand,
   containsGlobChars,
+  DANGEROUS_FILES,
+  getDangerousDirectories,
 } from './sandbox-utils.js'
 import type {
   FsReadRestrictionConfig,
@@ -27,8 +28,42 @@ export interface MacOSSandboxParams {
   readConfig: FsReadRestrictionConfig | undefined
   writeConfig: FsWriteRestrictionConfig | undefined
   ignoreViolations?: IgnoreViolationsConfig | undefined
+  allowPty?: boolean
+  allowGitConfig?: boolean
   binShell?: string
-  ripgrepConfig?: { command: string; args?: string[] }
+}
+
+/**
+ * Get mandatory deny patterns as glob patterns (no filesystem scanning).
+ * macOS sandbox profile supports regex/glob matching directly via globToRegex().
+ */
+export function macGetMandatoryDenyPatterns(allowGitConfig = false): string[] {
+  const cwd = process.cwd()
+  const denyPaths: string[] = []
+
+  // Dangerous files - static paths in CWD + glob patterns for subtree
+  for (const fileName of DANGEROUS_FILES) {
+    denyPaths.push(path.resolve(cwd, fileName))
+    denyPaths.push(`**/${fileName}`)
+  }
+
+  // Dangerous directories
+  for (const dirName of getDangerousDirectories()) {
+    denyPaths.push(path.resolve(cwd, dirName))
+    denyPaths.push(`**/${dirName}/**`)
+  }
+
+  // Git hooks are always blocked for security
+  denyPaths.push(path.resolve(cwd, '.git/hooks'))
+  denyPaths.push('**/.git/hooks/**')
+
+  // Git config - conditionally blocked based on allowGitConfig setting
+  if (!allowGitConfig) {
+    denyPaths.push(path.resolve(cwd, '.git/config'))
+    denyPaths.push('**/.git/config')
+  }
+
+  return [...new Set(denyPaths)]
 }
 
 export interface SandboxViolationEvent {
@@ -236,11 +271,11 @@ function generateReadRules(
 /**
  * Generate filesystem write rules for sandbox profile
  */
-async function generateWriteRules(
+function generateWriteRules(
   config: FsWriteRestrictionConfig | undefined,
   logTag: string,
-  ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
-): Promise<string[]> {
+  allowGitConfig = false,
+): string[] {
   if (!config) {
     return [`(allow file-write*)`]
   }
@@ -280,10 +315,10 @@ async function generateWriteRules(
     }
   }
 
-  // Combine user-specified and mandatory deny rules
+  // Combine user-specified and mandatory deny patterns (no ripgrep needed on macOS)
   const denyPaths = [
     ...(config.denyWithinAllow || []),
-    ...(await getMandatoryDenyWithinAllow(ripgrepConfig)),
+    ...macGetMandatoryDenyPatterns(allowGitConfig),
   ]
 
   for (const pathPattern of denyPaths) {
@@ -316,7 +351,7 @@ async function generateWriteRules(
 /**
  * Generate complete sandbox profile
  */
-async function generateSandboxProfile({
+function generateSandboxProfile({
   readConfig,
   writeConfig,
   httpProxyPort,
@@ -325,8 +360,9 @@ async function generateSandboxProfile({
   allowUnixSockets,
   allowAllUnixSockets,
   allowLocalBinding,
+  allowPty,
+  allowGitConfig = false,
   logTag,
-  ripgrepConfig = { command: 'rg' },
 }: {
   readConfig: FsReadRestrictionConfig | undefined
   writeConfig: FsWriteRestrictionConfig | undefined
@@ -336,9 +372,10 @@ async function generateSandboxProfile({
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
+  allowPty?: boolean
+  allowGitConfig?: boolean
   logTag: string
-  ripgrepConfig?: { command: string; args?: string[] }
-}): Promise<string> {
+}): string {
   const profile: string[] = [
     '(version 1)',
     `(deny default (with message "${logTag}"))`,
@@ -542,9 +579,24 @@ async function generateSandboxProfile({
 
   // Write rules
   profile.push('; File write')
-  profile.push(
-    ...(await generateWriteRules(writeConfig, logTag, ripgrepConfig)),
-  )
+  profile.push(...generateWriteRules(writeConfig, logTag, allowGitConfig))
+
+  // Pseudo-terminal (pty) support for tmux and other terminal multiplexers
+  if (allowPty) {
+    profile.push('')
+    profile.push(
+      '; Pseudo-terminal (pty) support for tmux and other terminal multiplexers',
+    )
+    profile.push('(allow pseudo-tty)')
+    profile.push('(allow file-ioctl')
+    profile.push('  (literal "/dev/ptmx")')
+    profile.push('  (regex #"^/dev/ttys")')
+    profile.push(')')
+    profile.push('(allow file-read* file-write*')
+    profile.push('  (literal "/dev/ptmx")')
+    profile.push('  (regex #"^/dev/ttys")')
+    profile.push(')')
+  }
 
   return profile.join('\n')
 }
@@ -584,9 +636,9 @@ function getTmpdirParentIfMacOSPattern(): string[] {
 /**
  * Wrap command with macOS sandbox
  */
-export async function wrapCommandWithSandboxMacOS(
+export function wrapCommandWithSandboxMacOS(
   params: MacOSSandboxParams,
-): Promise<string> {
+): string {
   const {
     command,
     needsNetworkRestriction,
@@ -597,8 +649,9 @@ export async function wrapCommandWithSandboxMacOS(
     allowLocalBinding,
     readConfig,
     writeConfig,
+    allowPty,
+    allowGitConfig = false,
     binShell,
-    ripgrepConfig = { command: 'rg' },
   } = params
 
   // Determine if we have restrictions to apply
@@ -618,7 +671,7 @@ export async function wrapCommandWithSandboxMacOS(
 
   const logTag = generateLogTag(command)
 
-  const profile = await generateSandboxProfile({
+  const profile = generateSandboxProfile({
     readConfig,
     writeConfig,
     httpProxyPort,
@@ -627,8 +680,9 @@ export async function wrapCommandWithSandboxMacOS(
     allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,
+    allowPty,
+    allowGitConfig,
     logTag,
-    ripgrepConfig,
   })
 
   // Generate proxy environment variables using shared utility

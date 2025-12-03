@@ -438,6 +438,14 @@ function getRipgrepConfig(): { command: string; args?: string[] } {
   return config?.ripgrep ?? { command: 'rg' }
 }
 
+function getMandatoryDenySearchDepth(): number {
+  return config?.mandatoryDenySearchDepth ?? 3
+}
+
+function getAllowGitConfig(): boolean {
+  return config?.filesystem?.allowGitConfig ?? false
+}
+
 function getProxyPort(): number | undefined {
   return managerContext?.httpProxyPort
 }
@@ -477,70 +485,102 @@ async function wrapWithSandbox(
   command: string,
   binShell?: string,
   customConfig?: Partial<SandboxRuntimeConfig>,
+  abortSignal?: AbortSignal,
 ): Promise<string> {
-  // If no config, return command as-is
-  if (!config) {
-    return command
-  }
-
   const platform = getPlatform()
 
   // Get configs - use custom if provided, otherwise fall back to main config
+  // If neither exists, defaults to empty arrays (most restrictive)
   // Always include default system write paths (like /dev/null, /tmp/claude)
   const userAllowWrite =
-    customConfig?.filesystem?.allowWrite ?? config.filesystem.allowWrite ?? []
+    customConfig?.filesystem?.allowWrite ?? config?.filesystem.allowWrite ?? []
   const writeConfig = {
     allowOnly: [...getDefaultWritePaths(), ...userAllowWrite],
     denyWithinAllow:
-      customConfig?.filesystem?.denyWrite ?? config.filesystem.denyWrite ?? [],
+      customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
   }
   const readConfig = {
     denyOnly:
-      customConfig?.filesystem?.denyRead ?? config.filesystem.denyRead ?? [],
+      customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
   }
 
-  // Check if network proxy is needed based on allowed domains
-  // Unix sockets are local IPC and don't require the network proxy
+  // Check if network config is specified - this determines if we need network restrictions
+  // Network restriction is needed when:
+  // 1. customConfig has network.allowedDomains defined (even if empty array = block all)
+  // 2. OR config has network.allowedDomains defined (even if empty array = block all)
+  // An empty allowedDomains array means "no domains allowed" = block all network access
+  const hasNetworkConfig =
+    customConfig?.network?.allowedDomains !== undefined ||
+    config?.network?.allowedDomains !== undefined
+
+  // Get the actual allowed domains list for proxy filtering
   const allowedDomains =
-    customConfig?.network?.allowedDomains ?? config.network.allowedDomains
-  const needsNetworkProxy = (allowedDomains?.length ?? 0) > 0
+    customConfig?.network?.allowedDomains ??
+    config?.network.allowedDomains ??
+    []
+
+  // Network RESTRICTION is needed whenever network config is specified
+  // This includes empty allowedDomains which means "block all network"
+  const needsNetworkRestriction = hasNetworkConfig
+
+  // Network PROXY is only needed when there are domains to filter
+  // If allowedDomains is empty, we block all network and don't need the proxy
+  const needsNetworkProxy = allowedDomains.length > 0
 
   // Wait for network initialization only if proxy is actually needed
   if (needsNetworkProxy) {
     await waitForNetworkInitialization()
   }
 
+  // Check custom config to allow pseudo-terminal (can be applied dynamically)
+  const allowPty = customConfig?.allowPty ?? config?.allowPty
+
   switch (platform) {
     case 'macos':
-      return await wrapCommandWithSandboxMacOS({
+      // macOS sandbox profile supports glob patterns directly, no ripgrep needed
+      return wrapCommandWithSandboxMacOS({
         command,
-        needsNetworkRestriction: needsNetworkProxy,
-        httpProxyPort: getProxyPort(),
-        socksProxyPort: getSocksProxyPort(),
+        needsNetworkRestriction,
+        // Only pass proxy ports if proxy is running (when there are domains to filter)
+        httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
+        socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
         readConfig,
         writeConfig,
         allowUnixSockets: getAllowUnixSockets(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         allowLocalBinding: getAllowLocalBinding(),
         ignoreViolations: getIgnoreViolations(),
+        allowPty,
+        allowGitConfig: getAllowGitConfig(),
         binShell,
-        ripgrepConfig: getRipgrepConfig(),
       })
 
     case 'linux':
       return wrapCommandWithSandboxLinux({
         command,
-        needsNetworkRestriction: needsNetworkProxy,
-        httpSocketPath: getLinuxHttpSocketPath(),
-        socksSocketPath: getLinuxSocksSocketPath(),
-        httpProxyPort: managerContext?.httpProxyPort,
-        socksProxyPort: managerContext?.socksProxyPort,
+        needsNetworkRestriction,
+        // Only pass socket paths if proxy is running (when there are domains to filter)
+        httpSocketPath: needsNetworkProxy
+          ? getLinuxHttpSocketPath()
+          : undefined,
+        socksSocketPath: needsNetworkProxy
+          ? getLinuxSocksSocketPath()
+          : undefined,
+        httpProxyPort: needsNetworkProxy
+          ? managerContext?.httpProxyPort
+          : undefined,
+        socksProxyPort: needsNetworkProxy
+          ? managerContext?.socksProxyPort
+          : undefined,
         readConfig,
         writeConfig,
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         binShell,
         ripgrepConfig: getRipgrepConfig(),
+        mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
+        allowGitConfig: getAllowGitConfig(),
+        abortSignal,
       })
 
     default:
@@ -829,6 +869,7 @@ export interface ISandboxManager {
     command: string,
     binShell?: string,
     customConfig?: Partial<SandboxRuntimeConfig>,
+    abortSignal?: AbortSignal,
   ): Promise<string>
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
