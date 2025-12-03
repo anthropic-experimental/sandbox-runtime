@@ -532,6 +532,9 @@ async function wrapWithSandbox(
     await waitForNetworkInitialization()
   }
 
+  // Check custom config to allow pseudo-terminal (can be applied dynamically)
+  const allowPty = customConfig?.allowPty ?? config?.allowPty
+
   switch (platform) {
     case 'macos':
       // macOS sandbox profile supports glob patterns directly, no ripgrep needed
@@ -547,6 +550,7 @@ async function wrapWithSandbox(
         allowAllUnixSockets: getAllowAllUnixSockets(),
         allowLocalBinding: getAllowLocalBinding(),
         ignoreViolations: getIgnoreViolations(),
+        allowPty,
         allowGitConfig: getAllowGitConfig(),
         binShell,
       })

@@ -169,6 +169,12 @@ export const SandboxRuntimeConfigSchema = z.object({
       'Maximum directory depth to search for dangerous files on Linux (default: 3). ' +
         'Higher values provide more protection but slower performance.',
     ),
+  allowPty: z
+    .boolean()
+    .optional()
+    .describe(
+      'Allow pseudo-terminal (pty) operations for tmux and other terminal multiplexers (macOS only)',
+    ),
 })
 
 // Export inferred types
