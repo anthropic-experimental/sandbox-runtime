@@ -28,6 +28,7 @@ export interface MacOSSandboxParams {
   readConfig: FsReadRestrictionConfig | undefined
   writeConfig: FsWriteRestrictionConfig | undefined
   ignoreViolations?: IgnoreViolationsConfig | undefined
+  allowGitConfig?: boolean
   binShell?: string
 }
 
@@ -35,7 +36,7 @@ export interface MacOSSandboxParams {
  * Get mandatory deny patterns as glob patterns (no filesystem scanning).
  * macOS sandbox profile supports regex/glob matching directly via globToRegex().
  */
-export function macGetMandatoryDenyPatterns(): string[] {
+export function macGetMandatoryDenyPatterns(allowGitConfig = false): string[] {
   const cwd = process.cwd()
   const denyPaths: string[] = []
 
@@ -51,11 +52,15 @@ export function macGetMandatoryDenyPatterns(): string[] {
     denyPaths.push(`**/${dirName}/**`)
   }
 
-  // Git hooks and config - block these specifically within .git
+  // Git hooks are always blocked for security
   denyPaths.push(path.resolve(cwd, '.git/hooks'))
-  denyPaths.push(path.resolve(cwd, '.git/config'))
   denyPaths.push('**/.git/hooks/**')
-  denyPaths.push('**/.git/config')
+
+  // Git config - conditionally blocked based on allowGitConfig setting
+  if (!allowGitConfig) {
+    denyPaths.push(path.resolve(cwd, '.git/config'))
+    denyPaths.push('**/.git/config')
+  }
 
   return [...new Set(denyPaths)]
 }
@@ -311,7 +316,7 @@ function generateWriteRules(
   // Combine user-specified and mandatory deny patterns (no ripgrep needed on macOS)
   const denyPaths = [
     ...(config.denyWithinAllow || []),
-    ...macGetMandatoryDenyPatterns(),
+    ...macGetMandatoryDenyPatterns(allowGitConfig),
   ]
 
   for (const pathPattern of denyPaths) {
@@ -353,6 +358,7 @@ function generateSandboxProfile({
   allowUnixSockets,
   allowAllUnixSockets,
   allowLocalBinding,
+  allowGitConfig = false,
   logTag,
 }: {
   readConfig: FsReadRestrictionConfig | undefined
@@ -363,6 +369,7 @@ function generateSandboxProfile({
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
+  allowGitConfig?: boolean
   logTag: string
 }): string {
   const profile: string[] = [
@@ -621,6 +628,7 @@ export function wrapCommandWithSandboxMacOS(
     allowLocalBinding,
     readConfig,
     writeConfig,
+    allowGitConfig = false,
     binShell,
   } = params
 
@@ -650,6 +658,7 @@ export function wrapCommandWithSandboxMacOS(
     allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,
+    allowGitConfig,
     logTag,
   })
 
