@@ -273,6 +273,7 @@ function generateReadRules(
 function generateWriteRules(
   config: FsWriteRestrictionConfig | undefined,
   logTag: string,
+  allowGitConfig = false,
 ): string[] {
   if (!config) {
     return [`(allow file-write*)`]
@@ -575,7 +576,7 @@ function generateSandboxProfile({
 
   // Write rules
   profile.push('; File write')
-  profile.push(...generateWriteRules(writeConfig, logTag))
+  profile.push(...generateWriteRules(writeConfig, logTag, allowGitConfig))
 
   return profile.join('\n')
 }
