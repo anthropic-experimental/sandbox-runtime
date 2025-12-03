@@ -442,6 +442,10 @@ function getMandatoryDenySearchDepth(): number {
   return config?.mandatoryDenySearchDepth ?? 3
 }
 
+function getAllowGitConfig(): boolean {
+  return config?.filesystem?.allowGitConfig ?? false
+}
+
 function getProxyPort(): number | undefined {
   return managerContext?.httpProxyPort
 }
@@ -547,6 +551,7 @@ async function wrapWithSandbox(
         allowLocalBinding: getAllowLocalBinding(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
+        allowGitConfig: getAllowGitConfig(),
         binShell,
       })
 
@@ -574,6 +579,7 @@ async function wrapWithSandbox(
         binShell,
         ripgrepConfig: getRipgrepConfig(),
         mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
+        allowGitConfig: getAllowGitConfig(),
         abortSignal,
       })
 

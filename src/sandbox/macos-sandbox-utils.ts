@@ -29,6 +29,7 @@ export interface MacOSSandboxParams {
   writeConfig: FsWriteRestrictionConfig | undefined
   ignoreViolations?: IgnoreViolationsConfig | undefined
   allowPty?: boolean
+  allowGitConfig?: boolean
   binShell?: string
 }
 
@@ -36,7 +37,7 @@ export interface MacOSSandboxParams {
  * Get mandatory deny patterns as glob patterns (no filesystem scanning).
  * macOS sandbox profile supports regex/glob matching directly via globToRegex().
  */
-export function macGetMandatoryDenyPatterns(): string[] {
+export function macGetMandatoryDenyPatterns(allowGitConfig = false): string[] {
   const cwd = process.cwd()
   const denyPaths: string[] = []
 
@@ -52,11 +53,15 @@ export function macGetMandatoryDenyPatterns(): string[] {
     denyPaths.push(`**/${dirName}/**`)
   }
 
-  // Git hooks and config - block these specifically within .git
+  // Git hooks are always blocked for security
   denyPaths.push(path.resolve(cwd, '.git/hooks'))
-  denyPaths.push(path.resolve(cwd, '.git/config'))
   denyPaths.push('**/.git/hooks/**')
-  denyPaths.push('**/.git/config')
+
+  // Git config - conditionally blocked based on allowGitConfig setting
+  if (!allowGitConfig) {
+    denyPaths.push(path.resolve(cwd, '.git/config'))
+    denyPaths.push('**/.git/config')
+  }
 
   return [...new Set(denyPaths)]
 }
@@ -269,6 +274,7 @@ function generateReadRules(
 function generateWriteRules(
   config: FsWriteRestrictionConfig | undefined,
   logTag: string,
+  allowGitConfig = false,
 ): string[] {
   if (!config) {
     return [`(allow file-write*)`]
@@ -312,7 +318,7 @@ function generateWriteRules(
   // Combine user-specified and mandatory deny patterns (no ripgrep needed on macOS)
   const denyPaths = [
     ...(config.denyWithinAllow || []),
-    ...macGetMandatoryDenyPatterns(),
+    ...macGetMandatoryDenyPatterns(allowGitConfig),
   ]
 
   for (const pathPattern of denyPaths) {
@@ -355,6 +361,7 @@ function generateSandboxProfile({
   allowAllUnixSockets,
   allowLocalBinding,
   allowPty,
+  allowGitConfig = false,
   logTag,
 }: {
   readConfig: FsReadRestrictionConfig | undefined
@@ -366,6 +373,7 @@ function generateSandboxProfile({
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
   allowPty?: boolean
+  allowGitConfig?: boolean
   logTag: string
 }): string {
   const profile: string[] = [
@@ -571,7 +579,7 @@ function generateSandboxProfile({
 
   // Write rules
   profile.push('; File write')
-  profile.push(...generateWriteRules(writeConfig, logTag))
+  profile.push(...generateWriteRules(writeConfig, logTag, allowGitConfig))
 
   // Pseudo-terminal (pty) support for tmux and other terminal multiplexers
   if (allowPty) {
@@ -642,6 +650,7 @@ export function wrapCommandWithSandboxMacOS(
     readConfig,
     writeConfig,
     allowPty,
+    allowGitConfig = false,
     binShell,
   } = params
 
@@ -672,6 +681,7 @@ export function wrapCommandWithSandboxMacOS(
     allowAllUnixSockets,
     allowLocalBinding,
     allowPty,
+    allowGitConfig,
     logTag,
   })
 

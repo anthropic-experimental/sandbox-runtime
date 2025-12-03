@@ -49,6 +49,8 @@ export interface LinuxSandboxParams {
   ripgrepConfig?: { command: string; args?: string[] }
   /** Maximum directory depth to search for dangerous files (default: 3) */
   mandatoryDenySearchDepth?: number
+  /** Allow writes to .git/config files (default: false) */
+  allowGitConfig?: boolean
   /** Abort signal to cancel the ripgrep scan */
   abortSignal?: AbortSignal
 }
@@ -64,6 +66,7 @@ const DEFAULT_MANDATORY_DENY_SEARCH_DEPTH = 3
 async function linuxGetMandatoryDenyPaths(
   ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
   maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
+  allowGitConfig = false,
   abortSignal?: AbortSignal,
 ): Promise<string[]> {
   const cwd = process.cwd()
@@ -78,10 +81,14 @@ async function linuxGetMandatoryDenyPaths(
     ...DANGEROUS_FILES.map(f => path.resolve(cwd, f)),
     // Dangerous directories in CWD
     ...dangerousDirectories.map(d => path.resolve(cwd, d)),
-    // Git paths in CWD
+    // Git hooks always blocked for security
     path.resolve(cwd, '.git/hooks'),
-    path.resolve(cwd, '.git/config'),
   ]
+
+  // Git config conditionally blocked based on allowGitConfig setting
+  if (!allowGitConfig) {
+    denyPaths.push(path.resolve(cwd, '.git/config'))
+  }
 
   // Build iglob args for all patterns in one ripgrep call
   const iglobArgs: string[] = []
@@ -91,9 +98,13 @@ async function linuxGetMandatoryDenyPaths(
   for (const dirName of dangerousDirectories) {
     iglobArgs.push('--iglob', `**/${dirName}/**`)
   }
-  // Git hooks and config in nested repos
+  // Git hooks always blocked in nested repos
   iglobArgs.push('--iglob', '**/.git/hooks/**')
-  iglobArgs.push('--iglob', '**/.git/config')
+  
+  // Git config conditionally blocked in nested repos
+  if (!allowGitConfig) {
+    iglobArgs.push('--iglob', '**/.git/config')
+  }
 
   // Single ripgrep call to find all dangerous paths in subdirectories
   // Limit depth for performance - deeply nested dangerous files are rare
@@ -449,6 +460,7 @@ async function generateFilesystemArgs(
   writeConfig: FsWriteRestrictionConfig | undefined,
   ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
+  allowGitConfig = false,
   abortSignal?: AbortSignal,
 ): Promise<string[]> {
   const args: string[] = []
@@ -493,6 +505,7 @@ async function generateFilesystemArgs(
       ...(await linuxGetMandatoryDenyPaths(
         ripgrepConfig,
         mandatoryDenySearchDepth,
+        allowGitConfig,
         abortSignal,
       )),
     ]
@@ -628,6 +641,7 @@ export async function wrapCommandWithSandboxLinux(
     binShell,
     ripgrepConfig = { command: 'rg' },
     mandatoryDenySearchDepth = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
+    allowGitConfig = false,
     abortSignal,
   } = params
 
@@ -754,6 +768,7 @@ export async function wrapCommandWithSandboxLinux(
       writeConfig,
       ripgrepConfig,
       mandatoryDenySearchDepth,
+      allowGitConfig,
       abortSignal,
     )
     bwrapArgs.push(...fsArgs)
