@@ -93,11 +93,12 @@ async function main(): Promise<void> {
       '-s, --settings <path>',
       'path to config file (default: ~/.srt-settings.json)',
     )
+    .option('-q, --quiet', 'suppress non-essential output')
     .allowUnknownOption()
     .action(
       async (
         commandArgs: string[],
-        options: { debug?: boolean; settings?: string },
+        options: { debug?: boolean; settings?: string; quiet?: boolean },
       ) => {
         try {
           // Enable debug logging if requested
@@ -136,6 +137,9 @@ async function main(): Promise<void> {
           const sandboxedCommand = await SandboxManager.wrapWithSandbox(command)
 
           // Execute the sandboxed command
+          if (!options.quiet) {
+            console.log(`Running: ${command}`)
+          }
           const child = spawn(sandboxedCommand, {
             shell: true,
             stdio: 'inherit',
