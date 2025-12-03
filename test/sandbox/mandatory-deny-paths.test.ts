@@ -4,7 +4,10 @@ import { mkdirSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getPlatform } from '../../src/utils/platform.js'
-import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
+import {
+  wrapCommandWithSandboxMacOS,
+  macGetMandatoryDenyPatterns,
+} from '../../src/sandbox/macos-sandbox-utils.js'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
 
 /**
@@ -378,5 +381,148 @@ describe('Mandatory Deny Paths - Integration Tests', () => {
         MODIFIED_CONTENT,
       )
     })
+  })
+
+  describe('allowGitConfig option', () => {
+    async function runSandboxedWriteWithGitConfig(
+      filePath: string,
+      content: string,
+      allowGitConfig: boolean,
+    ): Promise<{ success: boolean; stderr: string }> {
+      const platform = getPlatform()
+      const command = `echo '${content}' > '${filePath}'`
+
+      const writeConfig = {
+        allowOnly: ['.'],
+        denyWithinAllow: [],
+      }
+
+      let wrappedCommand: string
+      if (platform === 'macos') {
+        wrappedCommand = wrapCommandWithSandboxMacOS({
+          command,
+          needsNetworkRestriction: false,
+          readConfig: undefined,
+          writeConfig,
+          allowGitConfig,
+        })
+      } else {
+        wrappedCommand = await wrapCommandWithSandboxLinux({
+          command,
+          needsNetworkRestriction: false,
+          readConfig: undefined,
+          writeConfig,
+          allowGitConfig,
+        })
+      }
+
+      const result = spawnSync(wrappedCommand, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 10000,
+      })
+
+      return {
+        success: result.status === 0,
+        stderr: result.stderr || '',
+      }
+    }
+
+    it('blocks writes to .git/config when allowGitConfig is false (default)', async () => {
+      if (skipIfUnsupportedPlatform()) return
+
+      // Reset .git/config to original content
+      writeFileSync('.git/config', ORIGINAL_CONTENT)
+
+      const result = await runSandboxedWriteWithGitConfig(
+        '.git/config',
+        MODIFIED_CONTENT,
+        false,
+      )
+
+      expect(result.success).toBe(false)
+      expect(readFileSync('.git/config', 'utf8')).toBe(ORIGINAL_CONTENT)
+    })
+
+    it('allows writes to .git/config when allowGitConfig is true', async () => {
+      if (skipIfUnsupportedPlatform()) return
+
+      // Reset .git/config to original content
+      writeFileSync('.git/config', ORIGINAL_CONTENT)
+
+      const result = await runSandboxedWriteWithGitConfig(
+        '.git/config',
+        MODIFIED_CONTENT,
+        true,
+      )
+
+      expect(result.success).toBe(true)
+      expect(readFileSync('.git/config', 'utf8').trim()).toBe(MODIFIED_CONTENT)
+    })
+
+    it('still blocks writes to .git/hooks even when allowGitConfig is true', async () => {
+      if (skipIfUnsupportedPlatform()) return
+
+      // Reset pre-commit to original content
+      writeFileSync('.git/hooks/pre-commit', ORIGINAL_CONTENT)
+
+      const result = await runSandboxedWriteWithGitConfig(
+        '.git/hooks/pre-commit',
+        MODIFIED_CONTENT,
+        true,
+      )
+
+      expect(result.success).toBe(false)
+      expect(readFileSync('.git/hooks/pre-commit', 'utf8')).toBe(
+        ORIGINAL_CONTENT,
+      )
+    })
+  })
+})
+
+describe('macGetMandatoryDenyPatterns - Unit Tests', () => {
+  it('includes .git/config in deny patterns when allowGitConfig is false', () => {
+    const patterns = macGetMandatoryDenyPatterns(false)
+
+    // Should include .git/config pattern
+    const hasGitConfigPattern = patterns.some(
+      p => p.includes('.git/config') || p.endsWith('.git/config'),
+    )
+    expect(hasGitConfigPattern).toBe(true)
+  })
+
+  it('excludes .git/config from deny patterns when allowGitConfig is true', () => {
+    const patterns = macGetMandatoryDenyPatterns(true)
+
+    // Should NOT include .git/config pattern
+    const hasGitConfigPattern = patterns.some(
+      p => p.includes('.git/config') || p.endsWith('.git/config'),
+    )
+    expect(hasGitConfigPattern).toBe(false)
+  })
+
+  it('always includes .git/hooks in deny patterns regardless of allowGitConfig', () => {
+    const patternsWithoutGitConfig = macGetMandatoryDenyPatterns(false)
+    const patternsWithGitConfig = macGetMandatoryDenyPatterns(true)
+
+    // Both should include .git/hooks pattern
+    const hasHooksPatternFalse = patternsWithoutGitConfig.some(p =>
+      p.includes('.git/hooks'),
+    )
+    const hasHooksPatternTrue = patternsWithGitConfig.some(p =>
+      p.includes('.git/hooks'),
+    )
+
+    expect(hasHooksPatternFalse).toBe(true)
+    expect(hasHooksPatternTrue).toBe(true)
+  })
+
+  it('defaults to blocking .git/config when no argument provided', () => {
+    const patterns = macGetMandatoryDenyPatterns()
+
+    const hasGitConfigPattern = patterns.some(
+      p => p.includes('.git/config') || p.endsWith('.git/config'),
+    )
+    expect(hasGitConfigPattern).toBe(true)
   })
 })
