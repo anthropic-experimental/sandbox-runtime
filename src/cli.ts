@@ -10,6 +10,7 @@ import { logForDebugging } from './utils/debug.js'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
+import { quote } from 'shell-quote'
 
 /**
  * Load and validate sandbox configuration from a file
@@ -120,8 +121,8 @@ async function main(): Promise<void> {
           logForDebugging('Initializing sandbox...')
           await SandboxManager.initialize(runtimeConfig)
 
-          // Join command arguments into a single command string
-          const command = commandArgs.join(' ')
+          // Quote and join command arguments into a single command string
+          const command = quote(commandArgs)
           logForDebugging(`Original command: ${command}`)
 
           logForDebugging(
