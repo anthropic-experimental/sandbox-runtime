@@ -1,3 +1,4 @@
 node_modules
 dist
 .claude
+.DS_Store
