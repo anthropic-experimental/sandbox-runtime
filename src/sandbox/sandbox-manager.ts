@@ -442,6 +442,10 @@ function getMandatoryDenySearchDepth(): number {
   return config?.mandatoryDenySearchDepth ?? 3
 }
 
+function getAllowGitConfig(): boolean {
+  return config?.filesystem?.allowGitConfig ?? false
+}
+
 function getProxyPort(): number | undefined {
   return managerContext?.httpProxyPort
 }
@@ -528,6 +532,9 @@ async function wrapWithSandbox(
     await waitForNetworkInitialization()
   }
 
+  // Check custom config to allow pseudo-terminal (can be applied dynamically)
+  const allowPty = customConfig?.allowPty ?? config?.allowPty
+
   switch (platform) {
     case 'macos':
       // macOS sandbox profile supports glob patterns directly, no ripgrep needed
@@ -543,6 +550,8 @@ async function wrapWithSandbox(
         allowAllUnixSockets: getAllowAllUnixSockets(),
         allowLocalBinding: getAllowLocalBinding(),
         ignoreViolations: getIgnoreViolations(),
+        allowPty,
+        allowGitConfig: getAllowGitConfig(),
         binShell,
       })
 
@@ -570,6 +579,7 @@ async function wrapWithSandbox(
         binShell,
         ripgrepConfig: getRipgrepConfig(),
         mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
+        allowGitConfig: getAllowGitConfig(),
         abortSignal,
       })
 
