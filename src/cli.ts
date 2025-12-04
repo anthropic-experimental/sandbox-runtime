@@ -52,6 +52,48 @@ function loadConfig(filePath: string): SandboxRuntimeConfig | null {
 }
 
 /**
+ * Load and validate sandbox configuration from an inline JSON string.
+ */
+function loadInlineSettings(
+  inlineSettings: string,
+): SandboxRuntimeConfig | null {
+  try {
+    if (!inlineSettings) {
+      return null
+    }
+    const content = inlineSettings
+    if (content.trim() === '') {
+      return null
+    }
+
+    // Parse JSON
+    const parsed = JSON.parse(content)
+
+    // Validate with zod schema
+    const result = SandboxRuntimeConfigSchema.safeParse(parsed)
+
+    if (!result.success) {
+      console.error(`Invalid settings in inline settings:`)
+      result.error.issues.forEach(issue => {
+        const path = issue.path.join('.')
+        console.error(`  - ${path}: ${issue.message}`)
+      })
+      return null
+    }
+
+    return result.data
+  } catch (error) {
+    // Log parse errors to help users debug invalid config files
+    if (error instanceof SyntaxError) {
+      console.error(`Invalid JSON in inline settings: ${error.message}`)
+    } else {
+      console.error(`Failed to load config from inline settings: ${error}`)
+    }
+    return null
+  }
+}
+
+/**
  * Get default config path
  */
 function getDefaultConfigPath(): string {
@@ -93,11 +135,19 @@ async function main(): Promise<void> {
       '-s, --settings <path>',
       'path to config file (default: ~/.srt-settings.json)',
     )
+    .option(
+      '-i, --inline-settings <settings>',
+      'inline JSON string for config settings',
+    )
     .allowUnknownOption()
     .action(
       async (
         commandArgs: string[],
-        options: { debug?: boolean; settings?: string },
+        options: {
+          debug?: boolean
+          settings?: string
+          inlineSettings?: string
+        },
       ) => {
         try {
           // Enable debug logging if requested
@@ -105,14 +155,18 @@ async function main(): Promise<void> {
             process.env.DEBUG = 'true'
           }
 
-          // Load config from file
-          const configPath = options.settings || getDefaultConfigPath()
-          let runtimeConfig = loadConfig(configPath)
+          let runtimeConfig: SandboxRuntimeConfig | null = null
+          // check for inline settings
+          if (options.inlineSettings) {
+            runtimeConfig = loadInlineSettings(options.inlineSettings)
+          } else {
+            // Load config from file
+            const configPath = options.settings || getDefaultConfigPath()
+            runtimeConfig = loadConfig(configPath)
+          }
 
           if (!runtimeConfig) {
-            logForDebugging(
-              `No config found at ${configPath}, using default config`,
-            )
+            logForDebugging(`No valid config found, using default config`)
             runtimeConfig = getDefaultConfig()
           }
 
