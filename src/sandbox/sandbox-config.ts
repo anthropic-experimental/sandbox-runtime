@@ -113,7 +113,9 @@ export const FilesystemConfigSchema = z.object({
   allowGitConfig: z
     .boolean()
     .optional()
-    .describe('Allow writes to .git/config files (default: false). Enables git remote URL updates while keeping .git/hooks protected.'),
+    .describe(
+      'Allow writes to .git/config files (default: false). Enables git remote URL updates while keeping .git/hooks protected.',
+    ),
 })
 
 /**
@@ -172,9 +174,7 @@ export const SandboxRuntimeConfigSchema = z.object({
   allowPty: z
     .boolean()
     .optional()
-    .describe(
-      'Allow pseudo-terminal (pty) operations for tmux and other terminal multiplexers (macOS only)',
-    ),
+    .describe('Allow pseudo-terminal (pty) operations (macOS only)'),
 })
 
 // Export inferred types
