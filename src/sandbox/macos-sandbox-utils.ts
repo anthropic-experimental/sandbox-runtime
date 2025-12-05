@@ -581,12 +581,10 @@ function generateSandboxProfile({
   profile.push('; File write')
   profile.push(...generateWriteRules(writeConfig, logTag, allowGitConfig))
 
-  // Pseudo-terminal (pty) support for tmux and other terminal multiplexers
+  // Pseudo-terminal (pty) support
   if (allowPty) {
     profile.push('')
-    profile.push(
-      '; Pseudo-terminal (pty) support for tmux and other terminal multiplexers',
-    )
+    profile.push('; Pseudo-terminal (pty) support')
     profile.push('(allow pseudo-tty)')
     profile.push('(allow file-ioctl')
     profile.push('  (literal "/dev/ptmx")')
