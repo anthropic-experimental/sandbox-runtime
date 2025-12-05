@@ -486,6 +486,7 @@ function generateSandboxProfile({
     '  (sysctl-name-prefix "hw.optional.arm.")',
     '  (sysctl-name-prefix "hw.optional.armv8_")',
     '  (sysctl-name-prefix "hw.perflevel")',
+    '  (sysctl-name-prefix "kern.proc.all")',
     '  (sysctl-name-prefix "kern.proc.pgrp.")',
     '  (sysctl-name-prefix "kern.proc.pid.")',
     '  (sysctl-name-prefix "machdep.cpu.")',
