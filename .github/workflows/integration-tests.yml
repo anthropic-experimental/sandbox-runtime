@@ -22,7 +22,7 @@ jobs:
             runner: ubuntu-24.04-arm
             os: linux
           - arch: x86-64
-            runner: macos-13
+            runner: macos-15-large
             os: macos
           - arch: arm64
             runner: macos-14
