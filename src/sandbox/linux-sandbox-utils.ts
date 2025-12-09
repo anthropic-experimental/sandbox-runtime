@@ -100,7 +100,7 @@ async function linuxGetMandatoryDenyPaths(
   }
   // Git hooks always blocked in nested repos
   iglobArgs.push('--iglob', '**/.git/hooks/**')
-  
+
   // Git config conditionally blocked in nested repos
   if (!allowGitConfig) {
     iglobArgs.push('--iglob', '**/.git/config')
@@ -660,7 +660,7 @@ export async function wrapCommandWithSandboxLinux(
     return command
   }
 
-  const bwrapArgs: string[] = []
+  const bwrapArgs: string[] = ['--new-session', '--die-with-parent']
   let seccompFilterPath: string | undefined = undefined
 
   try {
