@@ -94,6 +94,7 @@ async function main(): Promise<void> {
       'path to config file (default: ~/.srt-settings.json)',
     )
     .allowUnknownOption()
+    .passThroughOptions()
     .action(
       async (
         commandArgs: string[],
