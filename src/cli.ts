@@ -87,17 +87,21 @@ async function main(): Promise<void> {
 
   // Default command - run command in sandbox
   program
-    .argument('<command...>', 'command to run in the sandbox')
+    .argument('[command...]', 'command to run in the sandbox')
     .option('-d, --debug', 'enable debug logging')
     .option(
       '-s, --settings <path>',
       'path to config file (default: ~/.srt-settings.json)',
     )
+    .option(
+      '-c <command>',
+      'run command string directly (like sh -c), no escaping applied',
+    )
     .allowUnknownOption()
     .action(
       async (
         commandArgs: string[],
-        options: { debug?: boolean; settings?: string },
+        options: { debug?: boolean; settings?: string; c?: string },
       ) => {
         try {
           // Enable debug logging if requested
@@ -120,9 +124,22 @@ async function main(): Promise<void> {
           logForDebugging('Initializing sandbox...')
           await SandboxManager.initialize(runtimeConfig)
 
-          // Join command arguments into a single command string
-          const command = commandArgs.join(' ')
-          logForDebugging(`Original command: ${command}`)
+          // Determine command string based on mode
+          let command: string
+          if (options.c) {
+            // -c mode: use command string directly, no escaping
+            command = options.c
+            logForDebugging(`Command string mode (-c): ${command}`)
+          } else if (commandArgs.length > 0) {
+            // Default mode: simple join
+            command = commandArgs.join(' ')
+            logForDebugging(`Original command: ${command}`)
+          } else {
+            console.error(
+              'Error: No command specified. Use -c <command> or provide command arguments.',
+            )
+            process.exit(1)
+          }
 
           logForDebugging(
             JSON.stringify(
