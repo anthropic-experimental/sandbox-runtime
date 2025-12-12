@@ -203,13 +203,12 @@ const sandboxedCommand = await SandboxManager.wrapWithSandbox(
 // Execute the sandboxed command
 const child = spawn(sandboxedCommand, { shell: true, stdio: 'inherit' })
 
-// Handle exit
-child.on('exit', code => {
+// Handle exit and cleanup after child process completes
+child.on('exit', async code => {
   console.log(`Command exited with code ${code}`)
+  // Cleanup when done (optional, happens automatically on process exit)
+  await SandboxManager.reset()
 })
-
-// Cleanup when done (optional, happens automatically on process exit)
-await SandboxManager.reset()
 ```
 
 #### Available exports
