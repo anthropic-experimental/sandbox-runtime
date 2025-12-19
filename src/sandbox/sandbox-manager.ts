@@ -438,6 +438,14 @@ function getRipgrepConfig(): { command: string; args?: string[] } {
   return config?.ripgrep ?? { command: 'rg' }
 }
 
+function getMandatoryDenySearchDepth(): number {
+  return config?.mandatoryDenySearchDepth ?? 3
+}
+
+function getAllowGitConfig(): boolean {
+  return config?.filesystem?.allowGitConfig ?? false
+}
+
 function getProxyPort(): number | undefined {
   return managerContext?.httpProxyPort
 }
@@ -477,6 +485,7 @@ async function wrapWithSandbox(
   command: string,
   binShell?: string,
   customConfig?: Partial<SandboxRuntimeConfig>,
+  abortSignal?: AbortSignal,
 ): Promise<string> {
   const platform = getPlatform()
 
@@ -523,9 +532,13 @@ async function wrapWithSandbox(
     await waitForNetworkInitialization()
   }
 
+  // Check custom config to allow pseudo-terminal (can be applied dynamically)
+  const allowPty = customConfig?.allowPty ?? config?.allowPty
+
   switch (platform) {
     case 'macos':
-      return await wrapCommandWithSandboxMacOS({
+      // macOS sandbox profile supports glob patterns directly, no ripgrep needed
+      return wrapCommandWithSandboxMacOS({
         command,
         needsNetworkRestriction,
         // Only pass proxy ports if proxy is running (when there are domains to filter)
@@ -537,8 +550,9 @@ async function wrapWithSandbox(
         allowAllUnixSockets: getAllowAllUnixSockets(),
         allowLocalBinding: getAllowLocalBinding(),
         ignoreViolations: getIgnoreViolations(),
+        allowPty,
+        allowGitConfig: getAllowGitConfig(),
         binShell,
-        ripgrepConfig: getRipgrepConfig(),
       })
 
     case 'linux':
@@ -546,7 +560,9 @@ async function wrapWithSandbox(
         command,
         needsNetworkRestriction,
         // Only pass socket paths if proxy is running (when there are domains to filter)
-        httpSocketPath: needsNetworkProxy ? getLinuxHttpSocketPath() : undefined,
+        httpSocketPath: needsNetworkProxy
+          ? getLinuxHttpSocketPath()
+          : undefined,
         socksSocketPath: needsNetworkProxy
           ? getLinuxSocksSocketPath()
           : undefined,
@@ -562,6 +578,9 @@ async function wrapWithSandbox(
         allowAllUnixSockets: getAllowAllUnixSockets(),
         binShell,
         ripgrepConfig: getRipgrepConfig(),
+        mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
+        allowGitConfig: getAllowGitConfig(),
+        abortSignal,
       })
 
     default:
@@ -850,6 +869,7 @@ export interface ISandboxManager {
     command: string,
     binShell?: string,
     customConfig?: Partial<SandboxRuntimeConfig>,
+    abortSignal?: AbortSignal,
   ): Promise<string>
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string

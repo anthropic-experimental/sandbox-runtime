@@ -237,13 +237,13 @@ describe('restriction pattern semantics', () => {
       expect(result).toBe(command)
     })
 
-    it('returns command unchanged when no restrictions on macOS', async () => {
+    it('returns command unchanged when no restrictions on macOS', () => {
       if (getPlatform() !== 'macos') {
         return
       }
 
       // No network, empty read deny, no write config = no sandboxing
-      const result = await wrapCommandWithSandboxMacOS({
+      const result = wrapCommandWithSandboxMacOS({
         command,
         needsNetworkRestriction: false,
         readConfig: { denyOnly: [] },
@@ -268,12 +268,12 @@ describe('restriction pattern semantics', () => {
       expect(result).toBe(command)
     })
 
-    it('returns command unchanged with undefined readConfig on macOS', async () => {
+    it('returns command unchanged with undefined readConfig on macOS', () => {
       if (getPlatform() !== 'macos') {
         return
       }
 
-      const result = await wrapCommandWithSandboxMacOS({
+      const result = wrapCommandWithSandboxMacOS({
         command,
         needsNetworkRestriction: false,
         readConfig: undefined,
@@ -356,12 +356,12 @@ describe('restriction pattern semantics', () => {
       expect(result).toContain('bwrap')
     })
 
-    it('any writeConfig means has restrictions on macOS', async () => {
+    it('any writeConfig means has restrictions on macOS', () => {
       if (getPlatform() !== 'macos') {
         return
       }
 
-      const result = await wrapCommandWithSandboxMacOS({
+      const result = wrapCommandWithSandboxMacOS({
         command,
         needsNetworkRestriction: false,
         readConfig: { denyOnly: [] },
@@ -392,12 +392,12 @@ describe('restriction pattern semantics', () => {
       expect(result).not.toContain('--unshare-net')
     })
 
-    it('needsNetworkRestriction false skips network sandbox on macOS', async () => {
+    it('needsNetworkRestriction false skips network sandbox on macOS', () => {
       if (getPlatform() !== 'macos') {
         return
       }
 
-      const result = await wrapCommandWithSandboxMacOS({
+      const result = wrapCommandWithSandboxMacOS({
         command,
         needsNetworkRestriction: false,
         readConfig: { denyOnly: ['/secret'] },
@@ -434,13 +434,13 @@ describe('restriction pattern semantics', () => {
       expect(result).not.toContain('HTTP_PROXY')
     })
 
-    it('needsNetworkRestriction true without proxy ports blocks all network on macOS', async () => {
+    it('needsNetworkRestriction true without proxy ports blocks all network on macOS', () => {
       if (getPlatform() !== 'macos') {
         return
       }
 
       // Network restriction enabled but no proxy ports = block all network
-      const result = await wrapCommandWithSandboxMacOS({
+      const result = wrapCommandWithSandboxMacOS({
         command,
         needsNetworkRestriction: true,
         httpProxyPort: undefined, // No proxy available
@@ -499,12 +499,12 @@ describe('restriction pattern semantics', () => {
       }
     })
 
-    it('needsNetworkRestriction true with proxy allows filtered network on macOS', async () => {
+    it('needsNetworkRestriction true with proxy allows filtered network on macOS', () => {
       if (getPlatform() !== 'macos') {
         return
       }
 
-      const result = await wrapCommandWithSandboxMacOS({
+      const result = wrapCommandWithSandboxMacOS({
         command,
         needsNetworkRestriction: true,
         httpProxyPort: 3128,

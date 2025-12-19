@@ -638,6 +638,102 @@ describe('Sandbox Integration Tests', () => {
         expect(endTime - startTime).toBeLessThan(4000)
       })
 
+      it('should kill child processes when sandbox is terminated via SIGTERM (--die-with-parent)', async () => {
+        if (skipIfNotLinux()) {
+          return
+        }
+
+        // This test verifies the --die-with-parent flag is working.
+        // Without it, child processes would continue running after timeout kills bwrap.
+        const markerFile = join(TEST_DIR, 'sigterm-test-marker.txt')
+
+        if (existsSync(markerFile)) {
+          unlinkSync(markerFile)
+        }
+
+        // Start a long-running process that we'll kill with timeout
+        // The process writes to a file every 0.2s - if it survives the kill,
+        // we'll see many more writes than expected
+        const command = await SandboxManager.wrapWithSandbox(
+          `for i in $(seq 1 50); do echo "tick $i" >> ${markerFile}; sleep 0.2; done`,
+        )
+
+        // Use timeout to kill the sandbox after 1 second
+        // The inner command would take 10 seconds to complete
+        const result = spawnSync('timeout', ['1', 'bash', '-c', command], {
+          encoding: 'utf8',
+          cwd: TEST_DIR,
+          timeout: 5000,
+        })
+
+        // timeout returns 124 when it kills the process
+        expect(result.status).toBe(124)
+
+        // Wait a bit to let any orphaned processes continue (if they weren't killed)
+        await new Promise(resolve => setTimeout(resolve, 1500))
+
+        // Check how many ticks were written
+        if (existsSync(markerFile)) {
+          const content = readFileSync(markerFile, 'utf8')
+          const lines = content.trim().split('\n').length
+
+          // With 1 second timeout and 0.2s per tick, we expect ~5 ticks
+          // If child survived, we'd see 5 + 7 (1.5s more) = 12+ ticks
+          // Allow some margin for timing variance
+          expect(lines).toBeLessThan(10)
+
+          unlinkSync(markerFile)
+        }
+      })
+
+      it('should not leave orphan processes after timeout kills sandbox', async () => {
+        if (skipIfNotLinux()) {
+          return
+        }
+
+        // Create a unique marker that only our test process would have
+        const uniqueMarker = `sandbox-orphan-test-${Date.now()}`
+        const markerFile = join(TEST_DIR, 'orphan-test.txt')
+
+        if (existsSync(markerFile)) {
+          unlinkSync(markerFile)
+        }
+
+        // Start a process that will be killed by timeout
+        // Use a distinctive command that we can grep for
+        const command = await SandboxManager.wrapWithSandbox(
+          `export ORPHAN_MARKER="${uniqueMarker}"; while true; do echo "$ORPHAN_MARKER" >> ${markerFile}; sleep 0.5; done`,
+        )
+
+        // Kill after 0.5 seconds
+        spawnSync('timeout', ['0.5', 'bash', '-c', command], {
+          encoding: 'utf8',
+          cwd: TEST_DIR,
+          timeout: 3000,
+        })
+
+        // Wait to see if any orphan continues
+        await new Promise(resolve => setTimeout(resolve, 1500))
+
+        // Check for orphan processes with our marker
+        const psResult = spawnSync(
+          'bash',
+          ['-c', `ps aux | grep "${uniqueMarker}" | grep -v grep || true`],
+          {
+            encoding: 'utf8',
+            timeout: 2000,
+          },
+        )
+
+        // Should not find any orphan processes
+        expect(psResult.stdout.trim()).toBe('')
+
+        // Cleanup
+        if (existsSync(markerFile)) {
+          unlinkSync(markerFile)
+        }
+      })
+
       it('should prevent privilege escalation attempts', async () => {
         if (skipIfNotLinux()) {
           return
@@ -1029,7 +1125,7 @@ describe('Empty allowedDomains Network Blocking Integration', () => {
       // Network should fail - either connection error, timeout, or "network_failed" echo
       const networkBlocked =
         output.includes('network_failed') ||
-        output.includes('couldn\'t connect') ||
+        output.includes("couldn't connect") ||
         output.includes('connection refused') ||
         output.includes('network is unreachable') ||
         output.includes('name or service not known') ||
@@ -1064,7 +1160,7 @@ describe('Empty allowedDomains Network Blocking Integration', () => {
       // Network should fail
       const networkBlocked =
         output.includes('network_failed') ||
-        output.includes('couldn\'t connect') ||
+        output.includes("couldn't connect") ||
         output.includes('connection refused') ||
         output.includes('network is unreachable') ||
         output.includes('name or service not known') ||
@@ -1258,7 +1354,7 @@ describe('Empty allowedDomains Network Blocking Integration', () => {
       const output = (result.stdout + result.stderr).toLowerCase()
       const isBlocked =
         output.includes('blocked') ||
-        output.includes('couldn\'t connect') ||
+        output.includes("couldn't connect") ||
         output.includes('network is unreachable') ||
         result.status !== 0
 

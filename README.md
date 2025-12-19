@@ -36,7 +36,6 @@ Running: cat ~/.ssh/id_rsa
 cat: /Users/ollie/.ssh/id_rsa: Operation not permitted  # Specific file blocked
 ```
 
-
 ## Overview
 
 This package provides a standalone sandbox implementation that can be used as both a CLI tool and a library. It's designed with a **secure-by-default** philosophy tailored for common developer use cases: processes start with minimal access, and you explicitly poke only the holes you need.
@@ -53,6 +52,7 @@ This package provides a standalone sandbox implementation that can be used as bo
 A key use case is sandboxing Model Context Protocol (MCP) servers to restrict their capabilities. For example, to sandbox the filesystem MCP server:
 
 **Without sandboxing** (`.mcp.json`):
+
 ```json
 {
   "mcpServers": {
@@ -65,6 +65,7 @@ A key use case is sandboxing Model Context Protocol (MCP) servers to restrict th
 ```
 
 **With sandboxing** (`.mcp.json`):
+
 ```json
 {
   "mcpServers": {
@@ -77,6 +78,7 @@ A key use case is sandboxing Model Context Protocol (MCP) servers to restrict th
 ```
 
 Then configure restrictions in `~/.srt-settings.json`:
+
 ```json
 {
   "filesystem": {
@@ -92,6 +94,7 @@ Then configure restrictions in `~/.srt-settings.json`:
 ```
 
 Now the MCP server will be blocked from writing to the denied path:
+
 ```
 > Write a file to ~/sensitive-folder
 ✗ Error: EPERM: operation not permitted, open '/Users/ollie/sensitive-folder/test.txt'
@@ -105,7 +108,6 @@ The sandbox uses OS-level primitives to enforce restrictions that apply to the e
 - **Linux**: Uses [bubblewrap](https://github.com/containers/bubblewrap) for containerization with network namespace isolation
 
 ![0d1c612947c798aef48e6ab4beb7e8544da9d41a-4096x2305](https://github.com/user-attachments/assets/76c838a9-19ef-4d0b-90bb-cbe1917b3551)
-
 
 ### Dual Isolation Model
 
@@ -125,6 +127,7 @@ Both filesystem and network isolation are required for effective sandboxing. Wit
 Both HTTP/HTTPS (via HTTP proxy) and other TCP traffic (via SOCKS5 proxy) are mediated by these proxies, which enforce your domain allowlists and denylists.
 
 For more details on sandboxing in Claude Code, see:
+
 - [Claude Code Sandboxing Documentation](https://docs.claude.com/en/docs/claude-code/sandboxing)
 - [Beyond Permission Prompts: Making Claude Code More Secure and Autonomous](https://www.anthropic.com/engineering/claude-code-sandboxing)
 
@@ -170,33 +173,38 @@ srt --settings /path/to/srt-settings.json npm install
 ### As a library
 
 ```typescript
-import { SandboxManager, type SandboxRuntimeConfig } from '@anthropic-ai/sandbox-runtime'
+import {
+  SandboxManager,
+  type SandboxRuntimeConfig,
+} from '@anthropic-ai/sandbox-runtime'
 import { spawn } from 'child_process'
 
 // Define your sandbox configuration
 const config: SandboxRuntimeConfig = {
   network: {
     allowedDomains: ['example.com', 'api.github.com'],
-    deniedDomains: []
+    deniedDomains: [],
   },
   filesystem: {
     denyRead: ['~/.ssh'],
     allowWrite: ['.', '/tmp'],
-    denyWrite: ['.env']
-  }
+    denyWrite: ['.env'],
+  },
 }
 
 // Initialize the sandbox (starts proxy servers, etc.)
 await SandboxManager.initialize(config)
 
 // Wrap a command with sandbox restrictions
-const sandboxedCommand = await SandboxManager.wrapWithSandbox('curl https://example.com')
+const sandboxedCommand = await SandboxManager.wrapWithSandbox(
+  'curl https://example.com',
+)
 
 // Execute the sandboxed command
 const child = spawn(sandboxedCommand, { shell: true, stdio: 'inherit' })
 
 // Handle exit
-child.on('exit', (code) => {
+child.on('exit', code => {
   console.log(`Command exited with code ${code}`)
 })
 
@@ -249,26 +257,14 @@ srt --settings /path/to/srt-settings.json <command>
       "npmjs.org",
       "*.npmjs.org"
     ],
-    "deniedDomains": [
-      "malicious.com"
-    ],
+    "deniedDomains": ["malicious.com"],
     "allowUnixSockets": ["/var/run/docker.sock"],
     "allowLocalBinding": false
   },
   "filesystem": {
-    "denyRead": [
-      "~/.ssh"
-    ],
-    "allowWrite": [
-      ".",
-      "src/",
-      "test/",
-      "/tmp"
-    ],
-    "denyWrite": [
-      ".env",
-      "config/production.json"
-    ]
+    "denyRead": ["~/.ssh"],
+    "allowWrite": [".", "src/", "test/", "/tmp"],
+    "denyWrite": [".env", "config/production.json"]
   },
   "ignoreViolations": {
     "*": ["/usr/bin", "/System"],
@@ -295,9 +291,11 @@ Uses an **allow-only pattern** - all network access is denied by default.
 Uses two different patterns:
 
 **Read restrictions** (deny-only pattern) - all reads allowed by default:
+
 - `filesystem.denyRead` - Array of paths to deny read access. Empty array = full read access.
 
 **Write restrictions** (allow-only pattern) - all writes denied by default:
+
 - `filesystem.allowWrite` - Array of paths to allow write access. Empty array = no write access.
 - `filesystem.denyWrite` - Array of paths to deny write access within allowed paths (takes precedence over allowWrite)
 
@@ -311,6 +309,7 @@ Paths support git-style glob patterns on macOS, similar to `.gitignore` syntax:
 - `[abc]` - Matches any character in the set (e.g., `file[0-9].txt` matches `file3.txt`)
 
 Examples:
+
 - `"allowWrite": ["src/"]` - Allow write to entire `src/` directory
 - `"allowWrite": ["src/**/*.ts"]` - Allow write to all `.ts` files in `src/` and subdirectories
 - `"denyRead": ["~/.ssh"]` - Deny read to SSH directory
@@ -319,10 +318,12 @@ Examples:
 **Path Syntax (Linux):**
 
 **Linux currently does not support glob matching.** Use literal paths only:
+
 - `"allowWrite": ["src/"]` - Allow write to `src/` directory
 - `"denyRead": ["/home/user/.ssh"]` - Deny read to SSH directory
 
 **All platforms:**
+
 - Paths can be absolute (e.g., `/home/user/.ssh`) or relative to the current working directory (e.g., `./src`)
 - `~` expands to the user's home directory
 
@@ -334,6 +335,7 @@ Examples:
 ### Common Configuration Recipes
 
 **Allow GitHub access** (all necessary endpoints):
+
 ```json
 {
   "network": {
@@ -354,6 +356,7 @@ Examples:
 ```
 
 **Restrict to specific directories:**
+
 ```json
 {
   "network": {
@@ -371,6 +374,7 @@ Examples:
 ### Common Issues and Tips
 
 **Running Jest:** Use `--no-watchman` flag to avoid sandbox violations:
+
 ```bash
 srt "jest --no-watchman"
 ```
@@ -386,6 +390,7 @@ Watchman accesses files outside the sandbox boundaries, which will trigger permi
 ### Platform-Specific Dependencies
 
 **Linux requires:**
+
 - `bubblewrap` - Container runtime
   - Ubuntu/Debian: `apt-get install bubblewrap`
   - Fedora: `dnf install bubblewrap`
@@ -402,6 +407,7 @@ Watchman accesses files outside the sandbox boundaries, which will trigger permi
 **Optional Linux dependencies (for seccomp fallback):**
 
 The package includes pre-generated seccomp BPF filters for x86-64 and arm architectures. These dependencies are only needed if you are on a different architecture where pre-generated filters are not available:
+
 - `gcc` or `clang` - C compiler
 - `libseccomp-dev` - Seccomp library development files
   - Ubuntu/Debian: `apt-get install gcc libseccomp-dev`
@@ -409,6 +415,7 @@ The package includes pre-generated seccomp BPF filters for x86-64 and arm archit
   - Arch: `pacman -S gcc libseccomp`
 
 **macOS requires:**
+
 - `ripgrep` - Fast search tool for deny path detection
   - Install via Homebrew: `brew install ripgrep`
   - Or download from: https://github.com/BurntSushi/ripgrep/releases
@@ -450,6 +457,7 @@ npm run build:seccomp
 ```
 
 This script uses Docker to cross-compile seccomp binaries for multiple architectures:
+
 - x64 (x86-64)
 - arm64 (aarch64)
 
@@ -481,6 +489,7 @@ Filesystem restrictions are enforced at the OS level:
 **Default filesystem permissions:**
 
 - **Read** (deny-only): Allowed everywhere by default. You can deny specific paths.
+
   - Example: `denyRead: ["~/.ssh"]` to block access to SSH keys
   - Empty `denyRead: []` = full read access (nothing denied)
 
@@ -490,6 +499,50 @@ Filesystem restrictions are enforced at the OS level:
   - `denyWrite` creates exceptions within allowed paths
 
 This model lets you start with broad read access but maximally restricted write access, then explicitly open the holes you need.
+
+### Mandatory Deny Paths (Auto-Protected Files)
+
+Certain sensitive files and directories are **always blocked from writes**, even if they fall within an allowed write path. This provides defense-in-depth against sandbox escapes and configuration tampering.
+
+**Always-blocked files:**
+
+- Shell config files: `.bashrc`, `.bash_profile`, `.zshrc`, `.zprofile`, `.profile`
+- Git config files: `.gitconfig`, `.gitmodules`
+- Other sensitive files: `.ripgreprc`, `.mcp.json`
+
+**Always-blocked directories:**
+
+- IDE directories: `.vscode/`, `.idea/`
+- Claude config directories: `.claude/commands/`, `.claude/agents/`
+- Git hooks and config: `.git/hooks/`, `.git/config`
+
+These paths are blocked automatically - you don't need to add them to `denyWrite`. For example, even with `allowWrite: ["."]`, writing to `.bashrc` or `.git/hooks/pre-commit` will fail:
+
+```bash
+$ srt 'echo "malicious" >> .bashrc'
+/bin/bash: .bashrc: Operation not permitted
+
+$ srt 'echo "bad" > .git/hooks/pre-commit'
+/bin/bash: .git/hooks/pre-commit: Operation not permitted
+```
+
+**Note (Linux):** On Linux, mandatory deny paths only block files that already exist. Non-existent files in these patterns cannot be blocked by bubblewrap's bind-mount approach. macOS uses glob patterns which block both existing and new files.
+
+**Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance. You can configure this with `mandatoryDenySearchDepth`:
+
+```json
+{
+  "mandatoryDenySearchDepth": 5,
+  "filesystem": {
+    "allowWrite": ["."]
+  }
+}
+```
+
+- Default: `3` (searches up to 3 levels deep)
+- Range: `1` to `10`
+- Higher values provide more protection but slower performance
+- Files in CWD (depth 0) are always protected regardless of this setting
 
 ### Unix Socket Restrictions (Linux)
 
@@ -565,15 +618,15 @@ Note: Custom proxy configuration is not yet supported in the new configuration f
 
 ### Security Limitations
 
-* Network Sandboxing Limitations: The network filtering system operates by restricting the domains that processes are allowed to connect to. It does not otherwise inspect the traffic passing through the proxy and users are responsible for ensuring they only allow trusted domains in their policy. 
+- Network Sandboxing Limitations: The network filtering system operates by restricting the domains that processes are allowed to connect to. It does not otherwise inspect the traffic passing through the proxy and users are responsible for ensuring they only allow trusted domains in their policy.
 
 <Warning>
 Users should be aware of potential risks that come from allowing broad domains like `github.com` that may allow for data exfiltration. Also, in some cases it may be possible to bypass the network filtering through [domain fronting](https://en.wikipedia.org/wiki/Domain_fronting).   
 </Warning>
 
-* Privilege Escalation via Unix Sockets: The `allowUnixSockets` configuration can inadvertently grant access to powerful system services that could lead to sandbox bypasses. For example, if it is used to allow access to `/var/run/docker.sock` this would effectively grant access to the host system through exploiting the docker socket. Users are encouraged to carefully consider any unix sockets that they allow through the sandbox. 
-* Filesystem Permission Escalation: Overly broad filesystem write permissions can enable privilege escalation attacks. Allowing writes to directories containing executables in `$PATH`, system configuration directories, or user shell configuration files (`.bashrc`, `.zshrc`) can lead to code execution in different security contexts when other users or system processes access these files.
-* Linux Sandbox Strength: The Linux implementation provides strong filesystem and network isolation but includes an `enableWeakerNestedSandbox` mode that enables it to work inside of Docker environments without privileged namespaces. This option considerably weakens security and should only be used incases where additional isolation is otherwise enforced.
+- Privilege Escalation via Unix Sockets: The `allowUnixSockets` configuration can inadvertently grant access to powerful system services that could lead to sandbox bypasses. For example, if it is used to allow access to `/var/run/docker.sock` this would effectively grant access to the host system through exploiting the docker socket. Users are encouraged to carefully consider any unix sockets that they allow through the sandbox.
+- Filesystem Permission Escalation: Overly broad filesystem write permissions can enable privilege escalation attacks. Allowing writes to directories containing executables in `$PATH`, system configuration directories, or user shell configuration files (`.bashrc`, `.zshrc`) can lead to code execution in different security contexts when other users or system processes access these files.
+- Linux Sandbox Strength: The Linux implementation provides strong filesystem and network isolation but includes an `enableWeakerNestedSandbox` mode that enables it to work inside of Docker environments without privileged namespaces. This option considerably weakens security and should only be used incases where additional isolation is otherwise enforced.
 
 ### Known Limitations and Future Work
 

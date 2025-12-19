@@ -2,13 +2,12 @@ import { homedir } from 'os'
 import * as path from 'path'
 import * as fs from 'fs'
 import { getPlatform } from '../utils/platform.js'
-import { ripGrep } from '../utils/ripgrep.js'
 
 /**
  * Dangerous files that should be protected from writes.
  * These files can be used for code execution or data exfiltration.
  */
-const DANGEROUS_FILES = [
+export const DANGEROUS_FILES = [
   '.gitconfig',
   '.gitmodules',
   '.bashrc',
@@ -24,7 +23,20 @@ const DANGEROUS_FILES = [
  * Dangerous directories that should be protected from writes.
  * These directories contain sensitive configuration or executable files.
  */
-const DANGEROUS_DIRECTORIES = ['.git', '.vscode', '.idea'] as const
+export const DANGEROUS_DIRECTORIES = ['.git', '.vscode', '.idea'] as const
+
+/**
+ * Get the list of dangerous directories to deny writes to.
+ * Excludes .git since we need it writable for git operations -
+ * instead we block specific paths within .git (hooks and config).
+ */
+export function getDangerousDirectories(): string[] {
+  return [
+    ...DANGEROUS_DIRECTORIES.filter(d => d !== '.git'),
+    '.claude/commands',
+    '.claude/agents',
+  ]
+}
 
 /**
  * Normalizes a path for case-insensitive comparison.
@@ -35,7 +47,7 @@ const DANGEROUS_DIRECTORIES = ['.git', '.vscode', '.idea'] as const
  * @param path The path to normalize
  * @returns The lowercase path for safe comparison
  */
-function normalizeCaseForComparison(pathStr: string): string {
+export function normalizeCaseForComparison(pathStr: string): string {
   return pathStr.toLowerCase()
 }
 
@@ -57,6 +69,127 @@ export function containsGlobChars(pathPattern: string): boolean {
  */
 export function removeTrailingGlobSuffix(pathPattern: string): string {
   return pathPattern.replace(/\/\*\*$/, '')
+}
+
+/**
+ * Check if a symlink resolution crosses expected path boundaries.
+ *
+ * When resolving symlinks for sandbox path normalization, we need to ensure
+ * the resolved path doesn't unexpectedly broaden the scope. This function
+ * returns true if the resolved path is an ancestor of the original path
+ * or resolves to a system root, which would indicate the symlink points
+ * outside expected boundaries.
+ *
+ * @param originalPath - The original path before symlink resolution
+ * @param resolvedPath - The path after fs.realpathSync() resolution
+ * @returns true if the resolved path is outside expected boundaries
+ */
+export function isSymlinkOutsideBoundary(
+  originalPath: string,
+  resolvedPath: string,
+): boolean {
+  const normalizedOriginal = path.normalize(originalPath)
+  const normalizedResolved = path.normalize(resolvedPath)
+
+  // Same path after normalization - OK
+  if (normalizedResolved === normalizedOriginal) {
+    return false
+  }
+
+  // Handle macOS /tmp -> /private/tmp canonical resolution
+  // This is a legitimate system symlink that should be allowed
+  // /tmp/claude -> /private/tmp/claude is OK
+  // /var/folders/... -> /private/var/folders/... is OK
+  if (
+    normalizedOriginal.startsWith('/tmp/') &&
+    normalizedResolved === '/private' + normalizedOriginal
+  ) {
+    return false
+  }
+  if (
+    normalizedOriginal.startsWith('/var/') &&
+    normalizedResolved === '/private' + normalizedOriginal
+  ) {
+    return false
+  }
+  // Also handle the reverse: /private/tmp/... resolving to itself
+  if (
+    normalizedOriginal.startsWith('/private/tmp/') &&
+    normalizedResolved === normalizedOriginal
+  ) {
+    return false
+  }
+  if (
+    normalizedOriginal.startsWith('/private/var/') &&
+    normalizedResolved === normalizedOriginal
+  ) {
+    return false
+  }
+
+  // If resolved path is "/" it's outside expected boundaries
+  if (normalizedResolved === '/') {
+    return true
+  }
+
+  // If resolved path is very short (single component like /tmp, /usr, /var),
+  // it's likely outside expected boundaries
+  const resolvedParts = normalizedResolved.split('/').filter(Boolean)
+  if (resolvedParts.length <= 1) {
+    return true
+  }
+
+  // If original path starts with resolved path, the resolved path is an ancestor
+  // e.g., /tmp/claude -> /tmp means the symlink points to a broader scope
+  if (normalizedOriginal.startsWith(normalizedResolved + '/')) {
+    return true
+  }
+
+  // Also check the canonical form of the original path for macOS
+  // e.g., /tmp/claude should also be checked as /private/tmp/claude
+  let canonicalOriginal = normalizedOriginal
+  if (normalizedOriginal.startsWith('/tmp/')) {
+    canonicalOriginal = '/private' + normalizedOriginal
+  } else if (normalizedOriginal.startsWith('/var/')) {
+    canonicalOriginal = '/private' + normalizedOriginal
+  }
+
+  if (
+    canonicalOriginal !== normalizedOriginal &&
+    canonicalOriginal.startsWith(normalizedResolved + '/')
+  ) {
+    return true
+  }
+
+  // STRICT CHECK: Only allow resolutions that stay within the expected path tree
+  // The resolved path must either:
+  // 1. Start with the original path (deeper/same) - already covered by returning false below
+  // 2. Start with the canonical original (deeper/same under canonical form)
+  // 3. BE the canonical form of the original (e.g., /tmp/x -> /private/tmp/x)
+  // Any other resolution (e.g., /tmp/claude -> /Users/dworken) is outside expected bounds
+
+  const resolvedStartsWithOriginal = normalizedResolved.startsWith(
+    normalizedOriginal + '/',
+  )
+  const resolvedStartsWithCanonical =
+    canonicalOriginal !== normalizedOriginal &&
+    normalizedResolved.startsWith(canonicalOriginal + '/')
+  const resolvedIsCanonical =
+    canonicalOriginal !== normalizedOriginal &&
+    normalizedResolved === canonicalOriginal
+  const resolvedIsSame = normalizedResolved === normalizedOriginal
+
+  // If resolved path is not within expected tree, it's outside boundary
+  if (
+    !resolvedIsSame &&
+    !resolvedIsCanonical &&
+    !resolvedStartsWithOriginal &&
+    !resolvedStartsWithCanonical
+  ) {
+    return true
+  }
+
+  // Allow resolution to same directory level or deeper within expected tree
+  return false
 }
 
 /**
@@ -101,9 +234,13 @@ export function normalizePathForSandbox(pathPattern: string): string {
       // Try to resolve symlinks for the base directory
       try {
         const resolvedBaseDir = fs.realpathSync(baseDir)
-        // Reconstruct the pattern with the resolved directory
-        const patternSuffix = normalizedPath.slice(baseDir.length)
-        return resolvedBaseDir + patternSuffix
+        // Validate that resolution stays within expected boundaries
+        if (!isSymlinkOutsideBoundary(baseDir, resolvedBaseDir)) {
+          // Reconstruct the pattern with the resolved directory
+          const patternSuffix = normalizedPath.slice(baseDir.length)
+          return resolvedBaseDir + patternSuffix
+        }
+        // If resolution would broaden scope, keep original pattern
       } catch {
         // If directory doesn't exist or can't be resolved, keep the original pattern
       }
@@ -112,8 +249,16 @@ export function normalizePathForSandbox(pathPattern: string): string {
   }
 
   // Resolve symlinks to real paths to avoid bwrap issues
+  // Validate that the resolution stays within expected boundaries
   try {
-    normalizedPath = fs.realpathSync(normalizedPath)
+    const resolvedPath = fs.realpathSync(normalizedPath)
+
+    // Only use resolved path if it doesn't cross boundary (e.g., symlink to parent dir)
+    if (isSymlinkOutsideBoundary(normalizedPath, resolvedPath)) {
+      // Symlink points outside expected boundaries - keep original path
+    } else {
+      normalizedPath = resolvedPath
+    }
   } catch {
     // If path doesn't exist or can't be resolved, keep the normalized path
   }
@@ -144,184 +289,6 @@ export function getDefaultWritePaths(): string[] {
   ]
 
   return recommendedPaths
-}
-
-/**
- * Get mandatory deny paths within allowed write areas
- * This uses ripgrep to scan the filesystem for dangerous files and directories
- * Returns absolute paths that must be blocked from writes
- * @param ripgrepConfig Ripgrep configuration (command and optional args)
- */
-export async function getMandatoryDenyWithinAllow(
-  ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
-): Promise<string[]> {
-  const denyPaths: string[] = []
-  const cwd = process.cwd()
-
-  // Always deny writes to settings.json files
-  // Block in home directory
-  denyPaths.push(path.join(homedir(), '.claude', 'settings.json'))
-  // Block in current directory
-  denyPaths.push(path.resolve(cwd, '.claude', 'settings.json'))
-  denyPaths.push(path.resolve(cwd, '.claude', 'settings.local.json'))
-
-  // Use shared constants for dangerous files
-  const dangerousFiles = [...DANGEROUS_FILES]
-
-  // Use shared constants plus additional Claude-specific directories
-  // Note: We don't include .git as a whole directory since we need it to be writable for git operations
-  // Instead, we'll block specific dangerous paths within .git (hooks and config) below
-  const dangerousDirectories = [
-    ...DANGEROUS_DIRECTORIES.filter(d => d !== '.git'),
-    '.claude/commands',
-    '.claude/agents',
-  ]
-
-  // Create an AbortController for ripgrep operations
-  const abortController = new AbortController()
-
-  // Add absolute paths for dangerous files in CWD
-  for (const fileName of dangerousFiles) {
-    // Always include the potential path in CWD (even if file doesn't exist yet)
-    const cwdFilePath = path.resolve(cwd, fileName)
-    denyPaths.push(cwdFilePath)
-
-    // Find all existing instances of this file in CWD and subdirectories using ripgrep
-    try {
-      // Use ripgrep to find files with exact name match (case-insensitive)
-      // -g/--glob: Include/exclude files matching this glob pattern
-      // --files: List files that would be searched
-      // --hidden: Search hidden files
-      // --iglob: Case-insensitive glob matching to catch .Bashrc, .BASHRC, etc.
-      const matches = await ripGrep(
-        [
-          '--files',
-          '--hidden',
-          '--iglob',
-          fileName,
-          '-g',
-          '!**/node_modules/**',
-        ],
-        cwd,
-        abortController.signal,
-        ripgrepConfig,
-      )
-      // Convert relative paths to absolute paths
-      const absoluteMatches = matches.map(match => path.resolve(cwd, match))
-      denyPaths.push(...absoluteMatches)
-    } catch (error) {
-      // If ripgrep fails, we cannot safely determine all dangerous files
-      throw new Error(
-        `Failed to scan for dangerous file "${fileName}": ${error instanceof Error ? error.message : String(error)}`,
-      )
-    }
-  }
-
-  // Add absolute paths for dangerous directories in CWD
-  for (const dirName of dangerousDirectories) {
-    // Always include the potential path in CWD (even if directory doesn't exist yet)
-    const cwdDirPath = path.resolve(cwd, dirName)
-    denyPaths.push(cwdDirPath)
-
-    // Find all existing instances of this directory in CWD and subdirectories using ripgrep
-    try {
-      // Use ripgrep to find directories (case-insensitive)
-      // Note: ripgrep lists files, so we need to find files within these directories
-      // and then extract the directory paths
-      const pattern = `**/${dirName}/**`
-      const matches = await ripGrep(
-        [
-          '--files',
-          '--hidden',
-          '--iglob',
-          pattern,
-          '-g',
-          '!**/node_modules/**',
-        ],
-        cwd,
-        abortController.signal,
-        ripgrepConfig,
-      )
-
-      // Extract directory paths from file paths
-      const dirPaths = new Set<string>()
-      for (const match of matches) {
-        const absolutePath = path.resolve(cwd, match)
-        // Find the dangerous directory in the path (case-insensitive)
-        const segments = absolutePath.split(path.sep)
-        const normalizedDirName = normalizeCaseForComparison(dirName)
-        // Find the directory using case-insensitive comparison
-        const dirIndex = segments.findIndex(
-          segment => normalizeCaseForComparison(segment) === normalizedDirName,
-        )
-        if (dirIndex !== -1) {
-          // Reconstruct path up to and including the dangerous directory
-          const dirPath = segments.slice(0, dirIndex + 1).join(path.sep)
-          dirPaths.add(dirPath)
-        }
-      }
-      denyPaths.push(...dirPaths)
-    } catch (error) {
-      // If ripgrep fails, we cannot safely determine all dangerous directories
-      throw new Error(
-        `Failed to scan for dangerous directory "${dirName}": ${error instanceof Error ? error.message : String(error)}`,
-      )
-    }
-  }
-
-  // Special handling for dangerous .git paths
-  // We block specific paths within .git that can be used for code execution
-  const dangerousGitPaths = [
-    '.git/hooks', // Block all hook files to prevent code execution via git hooks
-    '.git/config', // Block config file to prevent dangerous config options like core.fsmonitor
-  ]
-
-  for (const gitPath of dangerousGitPaths) {
-    // Add the path in the current working directory
-    const absoluteGitPath = path.resolve(cwd, gitPath)
-    denyPaths.push(absoluteGitPath)
-
-    // Also find .git directories in subdirectories and block their hooks/config
-    // This handles nested repositories (case-insensitive)
-    try {
-      // Find all .git directories by looking for .git/HEAD files (case-insensitive)
-      const gitHeadFiles = await ripGrep(
-        [
-          '--files',
-          '--hidden',
-          '--iglob',
-          '**/.git/HEAD',
-          '-g',
-          '!**/node_modules/**',
-        ],
-        cwd,
-        abortController.signal,
-        ripgrepConfig,
-      )
-
-      for (const gitHeadFile of gitHeadFiles) {
-        // Get the .git directory path
-        const gitDir = path.dirname(gitHeadFile)
-
-        // Add the dangerous path within this .git directory
-        if (gitPath === '.git/hooks') {
-          const hooksPath = path.join(gitDir, 'hooks')
-          denyPaths.push(hooksPath)
-        } else if (gitPath === '.git/config') {
-          const configPath = path.join(gitDir, 'config')
-          denyPaths.push(configPath)
-        }
-      }
-    } catch (error) {
-      // If ripgrep fails, we cannot safely determine all .git repositories
-      throw new Error(
-        `Failed to scan for .git directories: ${error instanceof Error ? error.message : String(error)}`,
-      )
-    }
-  }
-
-  // Remove duplicates and return
-  return Array.from(new Set(denyPaths))
 }
 
 /**
@@ -369,8 +336,9 @@ export function generateProxyEnvVars(
     // Configure Git to use SSH through SOCKS proxy (platform-aware)
     if (getPlatform() === 'macos') {
       // macOS has nc available
+      // Note: No outer quotes - bwrap --setenv sets the value directly without shell interpretation
       envVars.push(
-        `GIT_SSH_COMMAND="ssh -o ProxyCommand='nc -X 5 -x localhost:${socksProxyPort} %h %p'"`,
+        `GIT_SSH_COMMAND=ssh -o ProxyCommand='nc -X 5 -x localhost:${socksProxyPort} %h %p'`,
       )
     }
 
