@@ -55,10 +55,18 @@ export interface LinuxSandboxParams {
   seccompConfig?: { bpfPath?: string; applyPath?: string }
   /** Abort signal to cancel the ripgrep scan */
   abortSignal?: AbortSignal
+  /** Callback for warnings about unprotected paths */
+  onWarnings?: (warnings: string[]) => void
 }
 
 /** Default max depth for searching dangerous files */
 const DEFAULT_MANDATORY_DENY_SEARCH_DEPTH = 3
+
+function defaultWarningHandler(warnings: string[]): void {
+  for (const warning of warnings) {
+    console.warn(`[Sandbox] Unprotected path: ${warning}`)
+  }
+}
 
 /**
  * Find if any component of the path is a symlink within the allowed write paths.
@@ -98,30 +106,6 @@ function findSymlinkInPath(
   }
 
   return null
-}
-
-/**
- * Find the first non-existent path component.
- * E.g., for "/existing/parent/nonexistent/child/file.txt" where /existing/parent exists,
- * returns "/existing/parent/nonexistent"
- *
- * This is used to block creation of non-existent deny paths by mounting /dev/null
- * at the first missing component, preventing mkdir from creating the parent directories.
- */
-function findFirstNonExistentComponent(targetPath: string): string {
-  const parts = targetPath.split(path.sep)
-  let currentPath = ''
-
-  for (const part of parts) {
-    if (!part) continue // Skip empty parts (leading /)
-    const nextPath = currentPath + path.sep + part
-    if (!fs.existsSync(nextPath)) {
-      return nextPath
-    }
-    currentPath = nextPath
-  }
-
-  return targetPath // Shouldn't reach here if called correctly
 }
 
 /**
@@ -532,8 +516,10 @@ async function generateFilesystemArgs(
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
+  onWarnings?: (warnings: string[]) => void,
 ): Promise<string[]> {
   const args: string[] = []
+  const warnings: string[] = []
   // fs already imported
 
   // Determine initial root mount based on write restrictions
@@ -570,8 +556,12 @@ async function generateFilesystemArgs(
     }
 
     // Deny writes within allowed paths (user-specified + mandatory denies)
+    const userDenyPaths = writeConfig.denyWithinAllow || []
+    const userDenyPathsNormalized = new Set(
+      userDenyPaths.map(p => normalizePathForSandbox(p)),
+    )
     const denyPaths = [
-      ...(writeConfig.denyWithinAllow || []),
+      ...userDenyPaths,
       ...(await linuxGetMandatoryDenyPaths(
         ripgrepConfig,
         mandatoryDenySearchDepth,
@@ -588,50 +578,27 @@ async function generateFilesystemArgs(
         continue
       }
 
-      // Check for symlinks in the path - if any parent component is a symlink,
-      // mount /dev/null there to prevent symlink replacement attacks.
-      // Attack scenario: .claude is a symlink to ./decoy/, attacker deletes
-      // symlink and creates real .claude/settings.json with malicious hooks.
-      const symlinkInPath = findSymlinkInPath(normalizedPath, allowedWritePaths)
-      if (symlinkInPath) {
-        args.push('--ro-bind', '/dev/null', symlinkInPath)
+      // Skip non-existent paths. Using --ro-bind /dev/null on non-existent paths
+      // creates mount point inodes that persist on host after sandbox exits.
+      // Warn only for user-specified paths (mandatory denies are expected to vary).
+      if (!fs.existsSync(normalizedPath)) {
+        if (userDenyPathsNormalized.has(normalizedPath)) {
+          warnings.push(`cannot protect non-existent path: ${normalizedPath}`)
+        }
         logForDebugging(
-          `[Sandbox Linux] Mounted /dev/null at symlink ${symlinkInPath} to prevent symlink replacement attack`,
+          `[Sandbox Linux] Skipping non-existent deny path: ${normalizedPath}`,
         )
         continue
       }
 
-      // Handle non-existent paths by mounting /dev/null to block creation
-      if (!fs.existsSync(normalizedPath)) {
-        // Find the deepest existing ancestor directory
-        let ancestorPath = path.dirname(normalizedPath)
-        while (ancestorPath !== '/' && !fs.existsSync(ancestorPath)) {
-          ancestorPath = path.dirname(ancestorPath)
-        }
-
-        // Only protect if the existing ancestor is within an allowed write path
-        const ancestorIsWithinAllowedPath = allowedWritePaths.some(
-          allowedPath =>
-            ancestorPath.startsWith(allowedPath + '/') ||
-            ancestorPath === allowedPath ||
-            normalizedPath.startsWith(allowedPath + '/'),
+      // Warn about symlinks in path (potential symlink replacement attack vector).
+      // Only warn for user-specified paths (mandatory denies are expected to vary).
+      const symlinkInPath = findSymlinkInPath(normalizedPath, allowedWritePaths)
+      if (symlinkInPath && userDenyPathsNormalized.has(normalizedPath)) {
+        warnings.push(`symlink in path may be replaced: ${normalizedPath}`)
+        logForDebugging(
+          `[Sandbox Linux] Found symlink in deny path: ${symlinkInPath}`,
         )
-
-        if (ancestorIsWithinAllowedPath) {
-          // Mount /dev/null at the first non-existent path component
-          // This blocks creation of the entire path by making the first
-          // missing component appear as an empty file (mkdir will fail)
-          const firstNonExistent = findFirstNonExistentComponent(normalizedPath)
-          args.push('--ro-bind', '/dev/null', firstNonExistent)
-          logForDebugging(
-            `[Sandbox Linux] Mounted /dev/null at ${firstNonExistent} to block creation of ${normalizedPath}`,
-          )
-        } else {
-          logForDebugging(
-            `[Sandbox Linux] Skipping non-existent deny path not within allowed paths: ${normalizedPath}`,
-          )
-        }
-        continue
       }
 
       // Only add deny binding if this path is within an allowed write path
@@ -681,6 +648,12 @@ async function generateFilesystemArgs(
       // For files, bind /dev/null instead of tmpfs
       args.push('--ro-bind', '/dev/null', normalizedPath)
     }
+  }
+
+  const uniqueWarnings = [...new Set(warnings)]
+  if (uniqueWarnings.length > 0) {
+    const handler = onWarnings ?? defaultWarningHandler
+    handler(uniqueWarnings)
   }
 
   return args
@@ -752,6 +725,7 @@ export async function wrapCommandWithSandboxLinux(
     allowGitConfig = false,
     seccompConfig,
     abortSignal,
+    onWarnings,
   } = params
 
   // Determine if we have restrictions to apply
@@ -880,6 +854,7 @@ export async function wrapCommandWithSandboxLinux(
       mandatoryDenySearchDepth,
       allowGitConfig,
       abortSignal,
+      onWarnings,
     )
     bwrapArgs.push(...fsArgs)
 
