@@ -25,6 +25,7 @@ export interface MacOSSandboxParams {
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
+  allowMachLookup?: string[]
   readConfig: FsReadRestrictionConfig | undefined
   writeConfig: FsWriteRestrictionConfig | undefined
   ignoreViolations?: IgnoreViolationsConfig | undefined
@@ -360,6 +361,7 @@ function generateSandboxProfile({
   allowUnixSockets,
   allowAllUnixSockets,
   allowLocalBinding,
+  allowMachLookup,
   allowPty,
   allowGitConfig = false,
   logTag,
@@ -372,6 +374,7 @@ function generateSandboxProfile({
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
+  allowMachLookup?: string[]
   allowPty?: boolean
   allowGitConfig?: boolean
   logTag: string
@@ -411,6 +414,28 @@ function generateSandboxProfile({
     '  (global-name "com.apple.securityd.xpc")',
     '  (global-name "com.apple.coreservices.launchservicesd")',
     ')',
+  ]
+
+  // Add user-specified XPC/Mach services
+  if (allowMachLookup && allowMachLookup.length > 0) {
+    profile.push('')
+    profile.push('; User-specified XPC/Mach services')
+    for (const serviceName of allowMachLookup) {
+      // Support prefix matching with wildcards (e.g., "2BUA8C4S2C.com.1password.*")
+      if (serviceName.endsWith('*')) {
+        const prefix = serviceName.slice(0, -1)
+        profile.push(
+          `(allow mach-lookup (global-name-prefix ${escapePath(prefix)}))`,
+        )
+      } else {
+        profile.push(
+          `(allow mach-lookup (global-name ${escapePath(serviceName)}))`,
+        )
+      }
+    }
+  }
+
+  profile.push(
     '',
     '; POSIX IPC - shared memory',
     '(allow ipc-posix-shm)',
@@ -519,7 +544,7 @@ function generateSandboxProfile({
     '  )',
     ')',
     '',
-  ]
+  )
 
   // Network rules
   profile.push('; Network')
@@ -646,6 +671,7 @@ export function wrapCommandWithSandboxMacOS(
     allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,
+    allowMachLookup,
     readConfig,
     writeConfig,
     allowPty,
@@ -679,6 +705,7 @@ export function wrapCommandWithSandboxMacOS(
     allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,
+    allowMachLookup,
     allowPty,
     allowGitConfig,
     logTag,

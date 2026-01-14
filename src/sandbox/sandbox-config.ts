@@ -79,6 +79,12 @@ export const NetworkConfigSchema = z.object({
     .boolean()
     .optional()
     .describe('Whether to allow binding to local ports (default: false)'),
+  allowMachLookup: z
+    .array(z.string())
+    .optional()
+    .describe(
+      'Additional XPC/Mach service names to allow (macOS only). Use for tools like 1Password CLI that need specific services.',
+    ),
   httpProxyPort: z
     .number()
     .int()
