@@ -101,30 +101,6 @@ function findSymlinkInPath(
 }
 
 /**
- * Find the first non-existent path component.
- * E.g., for "/existing/parent/nonexistent/child/file.txt" where /existing/parent exists,
- * returns "/existing/parent/nonexistent"
- *
- * This is used to block creation of non-existent deny paths by mounting /dev/null
- * at the first missing component, preventing mkdir from creating the parent directories.
- */
-function findFirstNonExistentComponent(targetPath: string): string {
-  const parts = targetPath.split(path.sep)
-  let currentPath = ''
-
-  for (const part of parts) {
-    if (!part) continue // Skip empty parts (leading /)
-    const nextPath = currentPath + path.sep + part
-    if (!fs.existsSync(nextPath)) {
-      return nextPath
-    }
-    currentPath = nextPath
-  }
-
-  return targetPath // Shouldn't reach here if called correctly
-}
-
-/**
  * Get mandatory deny paths using ripgrep (Linux only).
  * Uses a SINGLE ripgrep call with multiple glob patterns for efficiency.
  * With --max-depth limiting, this is fast enough to run on each command without memoization.
@@ -601,36 +577,12 @@ async function generateFilesystemArgs(
         continue
       }
 
-      // Handle non-existent paths by mounting /dev/null to block creation
+      // Skip non-existent paths - no protection needed
+      // Mounting /dev/null over non-existent paths creates empty files on host
       if (!fs.existsSync(normalizedPath)) {
-        // Find the deepest existing ancestor directory
-        let ancestorPath = path.dirname(normalizedPath)
-        while (ancestorPath !== '/' && !fs.existsSync(ancestorPath)) {
-          ancestorPath = path.dirname(ancestorPath)
-        }
-
-        // Only protect if the existing ancestor is within an allowed write path
-        const ancestorIsWithinAllowedPath = allowedWritePaths.some(
-          allowedPath =>
-            ancestorPath.startsWith(allowedPath + '/') ||
-            ancestorPath === allowedPath ||
-            normalizedPath.startsWith(allowedPath + '/'),
+        logForDebugging(
+          `[Sandbox Linux] Skipping non-existent deny path: ${normalizedPath}`,
         )
-
-        if (ancestorIsWithinAllowedPath) {
-          // Mount /dev/null at the first non-existent path component
-          // This blocks creation of the entire path by making the first
-          // missing component appear as an empty file (mkdir will fail)
-          const firstNonExistent = findFirstNonExistentComponent(normalizedPath)
-          args.push('--ro-bind', '/dev/null', firstNonExistent)
-          logForDebugging(
-            `[Sandbox Linux] Mounted /dev/null at ${firstNonExistent} to block creation of ${normalizedPath}`,
-          )
-        } else {
-          logForDebugging(
-            `[Sandbox Linux] Skipping non-existent deny path not within allowed paths: ${normalizedPath}`,
-          )
-        }
         continue
       }
 
