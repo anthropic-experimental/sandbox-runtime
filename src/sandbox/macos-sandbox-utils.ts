@@ -405,6 +405,7 @@ function generateSandboxProfile({
     '  (global-name "com.apple.system.logger")',
     '  (global-name "com.apple.system.notification_center")',
     '  (global-name "com.apple.trustd.agent")',
+    '  (global-name "com.apple.SystemConfiguration.configd")',
     '  (global-name "com.apple.system.opendirectoryd.libinfo")',
     '  (global-name "com.apple.system.opendirectoryd.membership")',
     '  (global-name "com.apple.bsd.dirhelper")',
@@ -792,7 +793,10 @@ export function startMacOSSandboxLogMonitor(
     if (
       violationDetails.includes('mDNSResponder') ||
       violationDetails.includes('mach-lookup com.apple.diagnosticd') ||
-      violationDetails.includes('mach-lookup com.apple.analyticsd')
+      violationDetails.includes('mach-lookup com.apple.analyticsd') ||
+      violationDetails.includes(
+        'mach-lookup com.apple.SystemConfiguration.configd',
+      )
     ) {
       return
     }
