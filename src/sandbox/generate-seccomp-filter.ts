@@ -9,11 +9,16 @@ import { logForDebugging } from '../utils/debug.js'
 const bpfPathCache = new Map<string, string | null>()
 const applySeccompPathCache = new Map<string, string | null>()
 
+// Cache for global npm paths (computed once per process)
+let cachedGlobalNpmPaths: string[] | null = null
+
 /**
  * Get paths to check for globally installed @anthropic-ai/sandbox-runtime package.
  * This is used as a fallback when the binaries aren't bundled (e.g., native builds).
  */
 function getGlobalNpmPaths(): string[] {
+  if (cachedGlobalNpmPaths) return cachedGlobalNpmPaths
+
   const paths: string[] = []
 
   // Try to get the actual global npm root
@@ -71,6 +76,7 @@ function getGlobalNpmPaths(): string[] {
     ),
   )
 
+  cachedGlobalNpmPaths = paths
   return paths
 }
 
