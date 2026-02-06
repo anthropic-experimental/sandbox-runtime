@@ -75,7 +75,7 @@ async function main(): Promise<void> {
         try {
           // Enable debug logging if requested
           if (options.debug) {
-            process.env.DEBUG = 'true'
+            process.env.SRT_DEBUG = 'true'
           }
 
           // Load config from file
@@ -83,6 +83,11 @@ async function main(): Promise<void> {
           let runtimeConfig = loadConfig(configPath)
 
           if (!runtimeConfig) {
+            if (options.settings) {
+              // Explicit config path failed — refuse to run with silent defaults
+              console.error(`Error: Failed to load config from ${configPath}`)
+              process.exit(1)
+            }
             logForDebugging(
               `No config found at ${configPath}, using default config`,
             )

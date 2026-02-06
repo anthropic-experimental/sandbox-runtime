@@ -114,6 +114,74 @@ describe('CLI', () => {
     })
   })
 
+  describe('config loading safety', () => {
+    test('exits with error when --settings points to nonexistent file', () => {
+      const result = runCli([
+        '--settings',
+        '/nonexistent/path/settings.json',
+        'echo',
+        'hello',
+      ])
+      expect(result.stderr).toContain('/nonexistent/path/settings.json')
+      expect(result.status).toBe(1)
+      // Command should NOT execute
+      expect(result.stdout).not.toContain('hello')
+    })
+
+    test('exits with error when -s points to nonexistent file', () => {
+      const result = runCli([
+        '-s',
+        '/nonexistent/path/settings.json',
+        'echo',
+        'hello',
+      ])
+      expect(result.stderr).toContain('/nonexistent/path/settings.json')
+      expect(result.status).toBe(1)
+    })
+
+    test('falls back to defaults when no --settings provided and default path missing', () => {
+      // HOME is set to /tmp/cli-test-nonexistent by runCli, so
+      // ~/.srt-settings.json does not exist — this is the first-time user case
+      const result = runCli(['echo', 'hello'])
+      expect(result.stdout.trim()).toBe('hello')
+      expect(result.status).toBe(0)
+    })
+  })
+
+  describe('--debug flag enables SRT_DEBUG logging', () => {
+    test('--debug flag produces debug output', () => {
+      const result = spawnSync(
+        'bun',
+        ['run', getCliPath(), '--debug', 'echo', 'test'],
+        {
+          encoding: 'utf-8',
+          env: {
+            ...process.env,
+            HOME: '/tmp/cli-test-nonexistent',
+          },
+        },
+      )
+      expect(result.stderr).toContain('[SandboxDebug]')
+      expect(result.status).toBe(0)
+    })
+
+    test('-d flag produces debug output', () => {
+      const result = spawnSync(
+        'bun',
+        ['run', getCliPath(), '-d', 'echo', 'test'],
+        {
+          encoding: 'utf-8',
+          env: {
+            ...process.env,
+            HOME: '/tmp/cli-test-nonexistent',
+          },
+        },
+      )
+      expect(result.stderr).toContain('[SandboxDebug]')
+      expect(result.status).toBe(0)
+    })
+  })
+
   describe('debug output', () => {
     test('SRT_DEBUG enables debug output for positional args', () => {
       const result = runCli(['echo', 'test'], { debug: true })
