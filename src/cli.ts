@@ -62,6 +62,7 @@ async function main(): Promise<void> {
       parseInt,
     )
     .allowUnknownOption()
+    .passThroughOptions()
     .action(
       async (
         commandArgs: string[],
