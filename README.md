@@ -168,7 +168,13 @@ srt --debug curl https://example.com
 
 # Specify custom settings file
 srt --settings /path/to/srt-settings.json npm install
+
+# Enable TTY/PTY passthrough for interactive terminal applications (macOS only)
+srt --tty vim file.txt
+srt -t htop
 ```
+
+> **Note:** The `--tty` flag enables pseudo-terminal (PTY) operations, which are required for interactive terminal applications like `vim`, `htop`, or any TUI (Text User Interface) application. This flag only affects macOS; on Linux, PTY access is handled differently.
 
 ### As a library
 
@@ -341,6 +347,7 @@ Examples:
 
 - `ignoreViolations` - Object mapping command patterns to arrays of paths where violations should be ignored
 - `enableWeakerNestedSandbox` - Enable weaker sandbox mode for Docker environments (boolean, default: false)
+- `allowPty` - Allow pseudo-terminal (PTY) operations for interactive terminal applications (boolean, default: false, macOS only). Can also be enabled via `--tty` CLI flag.
 
 ### Common Configuration Recipes
 

@@ -136,4 +136,33 @@ describe('CLI', () => {
       expect(result.status).toBe(0)
     })
   })
+
+  describe('--tty flag', () => {
+    test('--tty flag enables PTY passthrough in debug output', () => {
+      const result = runCli(['--tty', 'echo', 'hello'], { debug: true })
+      expect(result.stderr).toContain('TTY/PTY passthrough enabled')
+      expect(result.stdout.trim()).toBe('hello')
+      expect(result.status).toBe(0)
+    })
+
+    test('-t short flag enables PTY passthrough', () => {
+      const result = runCli(['-t', 'echo', 'hello'], { debug: true })
+      expect(result.stderr).toContain('TTY/PTY passthrough enabled')
+      expect(result.stdout.trim()).toBe('hello')
+      expect(result.status).toBe(0)
+    })
+
+    test('--tty flag works with -c mode', () => {
+      const result = runCli(['--tty', '-c', 'echo hello'], { debug: true })
+      expect(result.stderr).toContain('TTY/PTY passthrough enabled')
+      expect(result.stdout.trim()).toBe('hello')
+      expect(result.status).toBe(0)
+    })
+
+    test('no TTY debug output without --tty flag', () => {
+      const result = runCli(['echo', 'hello'], { debug: true })
+      expect(result.stderr).not.toContain('TTY/PTY passthrough enabled')
+      expect(result.status).toBe(0)
+    })
+  })
 })

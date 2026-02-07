@@ -61,6 +61,10 @@ async function main(): Promise<void> {
       'read config updates from file descriptor (JSON lines protocol)',
       parseInt,
     )
+    .option(
+      '-t, --tty',
+      'enable TTY/PTY passthrough for interactive terminal applications (macOS only)',
+    )
     .allowUnknownOption()
     .action(
       async (
@@ -70,6 +74,7 @@ async function main(): Promise<void> {
           settings?: string
           c?: string
           controlFd?: number
+          tty?: boolean
         },
       ) => {
         try {
@@ -87,6 +92,12 @@ async function main(): Promise<void> {
               `No config found at ${configPath}, using default config`,
             )
             runtimeConfig = getDefaultConfig()
+          }
+
+          // Apply --tty flag to config before initialization
+          if (options.tty) {
+            runtimeConfig.allowPty = true
+            logForDebugging('TTY/PTY passthrough enabled via --tty flag')
           }
 
           // Initialize sandbox with config
