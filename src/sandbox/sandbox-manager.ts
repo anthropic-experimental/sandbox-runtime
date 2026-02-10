@@ -518,12 +518,36 @@ async function wrapWithSandbox(
   // Get configs - use custom if provided, otherwise fall back to main config
   // If neither exists, defaults to empty arrays (most restrictive)
   // Always include default system write paths (like /dev/null, /tmp/claude)
-  const userAllowWrite =
+  const rawAllowWrite =
     customConfig?.filesystem?.allowWrite ?? config?.filesystem.allowWrite ?? []
+  const rawDenyWrite =
+    customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? []
+
+  // Strip trailing /** glob suffixes and filter out remaining glob patterns
+  // on Linux/WSL (bubblewrap doesn't support globs as bind mount paths).
+  // This matches the processing done in getFsWriteConfig().
+  const userAllowWrite = rawAllowWrite
+    .map(p => removeTrailingGlobSuffix(p))
+    .filter(p => {
+      if (getPlatform() === 'linux' && containsGlobChars(p)) {
+        logForDebugging(`Skipping glob pattern in allowWrite on Linux/WSL: ${p}`)
+        return false
+      }
+      return true
+    })
+  const userDenyWrite = rawDenyWrite
+    .map(p => removeTrailingGlobSuffix(p))
+    .filter(p => {
+      if (getPlatform() === 'linux' && containsGlobChars(p)) {
+        logForDebugging(`Skipping glob pattern in denyWrite on Linux/WSL: ${p}`)
+        return false
+      }
+      return true
+    })
+
   const writeConfig = {
     allowOnly: [...getDefaultWritePaths(), ...userAllowWrite],
-    denyWithinAllow:
-      customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
+    denyWithinAllow: userDenyWrite,
   }
   const rawDenyRead =
     customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? []
