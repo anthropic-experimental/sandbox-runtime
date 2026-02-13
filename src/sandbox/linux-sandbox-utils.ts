@@ -328,7 +328,9 @@ function registerExitCleanupHandler(): void {
  * generateFilesystemArgs() and skips any that no longer exist.
  */
 export function cleanupBwrapMountPoints(): void {
-  for (const mountPoint of bwrapMountPoints) {
+  // Sort mountpoints from longest (to process files inside directories first)
+  const mountPointsSorted = [...bwrapMountPoints].sort((a, b) => b.length - a.length);
+  for (const mountPoint of mountPointsSorted) {
     try {
       // Only remove if it's still the empty file/directory bwrap created.
       // If something else has written real content, leave it alone.
