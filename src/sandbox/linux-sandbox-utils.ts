@@ -653,7 +653,7 @@ async function generateFilesystemArgs(
 
     // Allow writes to specific paths
     for (const pathPattern of writeConfig.allowOnly || []) {
-      const normalizedPath = normalizePathForSandbox(pathPattern)
+      let normalizedPath = normalizePathForSandbox(pathPattern)
 
       logForDebugging(
         `[Sandbox Linux] Processing write path: ${pathPattern} -> ${normalizedPath}`,
@@ -670,6 +670,26 @@ async function generateFilesystemArgs(
           `[Sandbox Linux] Skipping non-existent write path: ${normalizedPath}`,
         )
         continue
+      }
+
+      // bwrap cannot create mount points through symlinks. If the normalized
+      // path still contains a symlink component (normalizePathForSandbox may
+      // keep the original when its boundary check rejects the resolution),
+      // resolve it here. This is safe for allow-write paths because:
+      // - The caller explicitly requested this path be writable
+      // - The symlink already grants access to the target on the host,
+      //   so resolving doesn't broaden what's actually accessible
+      // - Without resolution, bwrap would fail entirely
+      try {
+        const resolved = fs.realpathSync(normalizedPath)
+        if (resolved !== normalizedPath) {
+          logForDebugging(
+            `[Sandbox Linux] Resolved symlink in write path: ${normalizedPath} -> ${resolved}`,
+          )
+          normalizedPath = resolved
+        }
+      } catch {
+        // realpathSync failed — keep the normalized path as-is
       }
 
       args.push('--bind', normalizedPath, normalizedPath)
