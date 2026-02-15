@@ -1,6 +1,7 @@
 import { describe, test, expect } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
+import { readFileSync } from 'node:fs'
 
 /**
  * Get the path to the CLI entry point
@@ -133,6 +134,17 @@ describe('CLI', () => {
     test('no debug output without SRT_DEBUG', () => {
       const result = runCli(['echo', 'test'], { debug: false })
       expect(result.stderr).not.toContain('[SandboxDebug]')
+      expect(result.status).toBe(0)
+    })
+  })
+
+  describe('version', () => {
+    test('--version returns the correct version from package.json', () => {
+      const packageJson = JSON.parse(
+        readFileSync(join(process.cwd(), 'package.json'), 'utf-8'),
+      )
+      const result = runCli(['--version'])
+      expect(result.stdout.trim()).toBe(packageJson.version)
       expect(result.status).toBe(0)
     })
   })
