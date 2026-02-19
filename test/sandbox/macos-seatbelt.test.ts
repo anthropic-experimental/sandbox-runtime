@@ -736,6 +736,228 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
   })
 })
 
+/**
+ * Tests for regex special character escaping in seatbelt rules.
+ *
+ * Issue: File paths containing regex-special characters (e.g., [ ] ( ) + |)
+ * were used directly in seatbelt regex rules without proper escaping.
+ * For example, a path like /tmp/He[ll]o/ would produce a regex where [ll]
+ * is interpreted as a character class (matching single 'l') rather than
+ * the literal string "[ll]". This allowed bypassing deny rules.
+ */
+describe('macOS Seatbelt Regex Special Character Escaping', () => {
+  const TEST_BASE_DIR = join(tmpdir(), 'seatbelt-regex-test-' + Date.now())
+  // Directory with regex special characters in name
+  const TEST_BRACKET_DIR = join(TEST_BASE_DIR, 'He[ll]o')
+  const TEST_SECRET_FILE = join(TEST_BRACKET_DIR, 'secret.txt')
+  const TEST_SECRET_CONTENT = 'BRACKET_SECRET_DATA'
+  const TEST_NORMAL_FILE = join(TEST_BASE_DIR, 'normal.txt')
+  const TEST_NORMAL_CONTENT = 'NORMAL_DATA'
+
+  beforeAll(() => {
+    if (skipIfNotMacOS()) {
+      return
+    }
+
+    mkdirSync(TEST_BRACKET_DIR, { recursive: true })
+    writeFileSync(TEST_SECRET_FILE, TEST_SECRET_CONTENT)
+    writeFileSync(TEST_NORMAL_FILE, TEST_NORMAL_CONTENT)
+  })
+
+  afterAll(() => {
+    if (skipIfNotMacOS()) {
+      return
+    }
+
+    if (existsSync(TEST_BASE_DIR)) {
+      rmSync(TEST_BASE_DIR, { recursive: true, force: true })
+    }
+  })
+
+  describe('Read deny rules with bracket paths', () => {
+    it('should block reading files in directories with brackets in name', () => {
+      if (skipIfNotMacOS()) {
+        return
+      }
+
+      const readConfig: FsReadRestrictionConfig = {
+        denyOnly: [TEST_BRACKET_DIR],
+      }
+
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
+        command: `cat '${TEST_SECRET_FILE}'`,
+        needsNetworkRestriction: false,
+        readConfig,
+        writeConfig: undefined,
+      })
+
+      const result = spawnSync(wrappedCommand, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      // The read should fail
+      expect(result.status).not.toBe(0)
+      expect(result.stdout).not.toContain(TEST_SECRET_CONTENT)
+    })
+
+    it('should still allow reading files outside the bracket-named directory', () => {
+      if (skipIfNotMacOS()) {
+        return
+      }
+
+      const readConfig: FsReadRestrictionConfig = {
+        denyOnly: [TEST_BRACKET_DIR],
+      }
+
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
+        command: `cat '${TEST_NORMAL_FILE}'`,
+        needsNetworkRestriction: false,
+        readConfig,
+        writeConfig: undefined,
+      })
+
+      const result = spawnSync(wrappedCommand, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      expect(result.status).toBe(0)
+      expect(result.stdout).toContain(TEST_NORMAL_CONTENT)
+    })
+  })
+
+  describe('Write deny rules with bracket paths', () => {
+    it('should block writing to files in directories with brackets in name', () => {
+      if (skipIfNotMacOS()) {
+        return
+      }
+
+      const writeConfig: FsWriteRestrictionConfig = {
+        allowOnly: [TEST_BASE_DIR],
+        denyWithinAllow: [TEST_BRACKET_DIR],
+      }
+
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
+        command: `echo "MODIFIED" > '${TEST_SECRET_FILE}'`,
+        needsNetworkRestriction: false,
+        readConfig: undefined,
+        writeConfig,
+      })
+
+      const result = spawnSync(wrappedCommand, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      // The write should fail
+      expect(result.status).not.toBe(0)
+
+      // Verify the file was NOT modified
+      const content = readFileSync(TEST_SECRET_FILE, 'utf8')
+      expect(content).toBe(TEST_SECRET_CONTENT)
+    })
+
+    it('should block moving files from directories with brackets in name', () => {
+      if (skipIfNotMacOS()) {
+        return
+      }
+
+      const readConfig: FsReadRestrictionConfig = {
+        denyOnly: [TEST_BRACKET_DIR],
+      }
+
+      const movedFile = join(TEST_BASE_DIR, 'moved-secret.txt')
+
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
+        command: `mv '${TEST_SECRET_FILE}' '${movedFile}'`,
+        needsNetworkRestriction: false,
+        readConfig,
+        writeConfig: undefined,
+      })
+
+      const result = spawnSync(wrappedCommand, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      // The move should fail
+      expect(result.status).not.toBe(0)
+      expect(existsSync(TEST_SECRET_FILE)).toBe(true)
+      expect(existsSync(movedFile)).toBe(false)
+    })
+  })
+
+  describe('Glob patterns with bracket paths in prefix', () => {
+    it('should block reading glob-matched files under bracket-named directory', () => {
+      if (skipIfNotMacOS()) {
+        return
+      }
+
+      // Glob pattern with brackets in the directory prefix
+      const globPattern = join(TEST_BRACKET_DIR, '*.txt')
+
+      const readConfig: FsReadRestrictionConfig = {
+        denyOnly: [globPattern],
+      }
+
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
+        command: `cat '${TEST_SECRET_FILE}'`,
+        needsNetworkRestriction: false,
+        readConfig,
+        writeConfig: undefined,
+      })
+
+      const result = spawnSync(wrappedCommand, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      // The read should fail
+      expect(result.status).not.toBe(0)
+      expect(result.stdout).not.toContain(TEST_SECRET_CONTENT)
+    })
+
+    it('should block writing glob-matched files under bracket-named directory', () => {
+      if (skipIfNotMacOS()) {
+        return
+      }
+
+      const globPattern = join(TEST_BRACKET_DIR, '*.txt')
+
+      const writeConfig: FsWriteRestrictionConfig = {
+        allowOnly: [TEST_BASE_DIR],
+        denyWithinAllow: [globPattern],
+      }
+
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
+        command: `echo "MODIFIED" > '${TEST_SECRET_FILE}'`,
+        needsNetworkRestriction: false,
+        readConfig: undefined,
+        writeConfig,
+      })
+
+      const result = spawnSync(wrappedCommand, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      // The write should fail
+      expect(result.status).not.toBe(0)
+
+      // Verify the file was NOT modified
+      const content = readFileSync(TEST_SECRET_FILE, 'utf8')
+      expect(content).toBe(TEST_SECRET_CONTENT)
+    })
+  })
+})
+
 describe('macOS Seatbelt Process Enumeration', () => {
   it('should allow enumerating all process IDs (kern.proc.all sysctl)', () => {
     if (skipIfNotMacOS()) {

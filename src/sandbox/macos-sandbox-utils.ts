@@ -144,7 +144,7 @@ function generateMoveBlockingRules(
 
       // For glob patterns, extract the static prefix and block ancestor moves
       // Remove glob characters to get the directory prefix
-      const staticPrefix = normalizedPath.split(/[*?[\]]/)[0]
+      const staticPrefix = normalizedPath.split(/[*?]/)[0]
       if (staticPrefix && staticPrefix !== '/') {
         // Get the directory containing the glob pattern
         const baseDir = staticPrefix.endsWith('/')

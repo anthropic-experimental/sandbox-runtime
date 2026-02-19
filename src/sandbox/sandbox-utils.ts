@@ -56,12 +56,7 @@ export function normalizeCaseForComparison(pathStr: string): string {
  * Check if a path pattern contains glob characters
  */
 export function containsGlobChars(pathPattern: string): boolean {
-  return (
-    pathPattern.includes('*') ||
-    pathPattern.includes('?') ||
-    pathPattern.includes('[') ||
-    pathPattern.includes(']')
-  )
+  return pathPattern.includes('*') || pathPattern.includes('?')
 }
 
 /**
@@ -224,7 +219,7 @@ export function normalizePathForSandbox(pathPattern: string): string {
   // For glob patterns, resolve symlinks for the directory portion only
   if (containsGlobChars(normalizedPath)) {
     // Extract the static directory prefix before glob characters
-    const staticPrefix = normalizedPath.split(/[*?[\]]/)[0]
+    const staticPrefix = normalizedPath.split(/[*?]/)[0]
     if (staticPrefix && staticPrefix !== '/') {
       // Get the directory containing the glob pattern
       // If staticPrefix ends with /, remove it to get the directory
@@ -422,7 +417,6 @@ export function decodeSandboxedCommand(encodedCommand: string): string {
  * - * matches any characters except / (e.g., *.ts matches foo.ts but not foo/bar.ts)
  * - ** matches any characters including / (e.g., src/**\/*.ts matches all .ts files in src/)
  * - ? matches any single character except / (e.g., file?.txt matches file1.txt)
- * - [abc] matches any character in the set (e.g., file[0-9].txt matches file3.txt)
  *
  * Exported for testing and shared between macOS sandbox profiles and Linux glob expansion.
  */
@@ -430,10 +424,10 @@ export function globToRegex(globPattern: string): string {
   return (
     '^' +
     globPattern
-      // Escape regex special characters (except glob chars * ? [ ])
-      .replace(/[.^$+{}()|\\]/g, '\\$&')
-      // Escape unclosed brackets (no matching ])
-      .replace(/\[([^\]]*?)$/g, '\\[$1')
+      // Escape regex special characters (except glob chars * ?)
+      // Note: [ ] are escaped to prevent path smuggling via file paths
+      // containing literal brackets (e.g., /Users/jbo/He[ll]o/).
+      .replace(/[.^$+{}()|\\[\]]/g, '\\$&')
       // Convert glob patterns to regex (order matters - ** before *)
       .replace(/\*\*\//g, '__GLOBSTAR_SLASH__') // Placeholder for **/
       .replace(/\*\*/g, '__GLOBSTAR__') // Placeholder for **
@@ -460,7 +454,7 @@ export function expandGlobPattern(globPath: string): string[] {
   const normalizedPattern = normalizePathForSandbox(globPath)
 
   // Extract the static directory prefix before any glob characters
-  const staticPrefix = normalizedPattern.split(/[*?[\]]/)[0]
+  const staticPrefix = normalizedPattern.split(/[*?]/)[0]
   if (!staticPrefix || staticPrefix === '/') {
     logForDebugging(`[Sandbox] Glob pattern too broad, skipping: ${globPath}`)
     return []

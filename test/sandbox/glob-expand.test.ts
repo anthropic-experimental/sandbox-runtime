@@ -183,6 +183,56 @@ describe('globToRegex (shared)', () => {
     expect(new RegExp(regex).test('/tmp/test/anything')).toBe(true)
     expect(new RegExp(regex).test('/tmp/test/sub/deep/file.txt')).toBe(true)
   })
+
+  it('should escape [ and ] in static prefix to prevent regex injection', () => {
+    // Path with literal brackets: /Users/jbo/He[ll]o/.gitconfig
+    // Without fix, [ll] is treated as a regex character class matching single 'l'
+    const regex = globToRegex('/Users/jbo/He[ll]o/.gitconfig')
+    const re = new RegExp(regex)
+
+    // Should match the literal path with brackets
+    expect(re.test('/Users/jbo/He[ll]o/.gitconfig')).toBe(true)
+
+    // Should NOT match a path where [ll] is interpreted as a character class
+    expect(re.test('/Users/jbo/Helo/.gitconfig')).toBe(false)
+  })
+
+  it('should escape brackets in prefix of glob patterns', () => {
+    // Glob pattern with brackets in the directory prefix
+    const regex = globToRegex('/Users/jbo/He[ll]o/**/.gitconfig')
+    const re = new RegExp(regex)
+
+    // Should match literal bracket path with any subdirectory
+    expect(re.test('/Users/jbo/He[ll]o/.gitconfig')).toBe(true)
+    expect(re.test('/Users/jbo/He[ll]o/sub/.gitconfig')).toBe(true)
+
+    // Should NOT match path where [ll] is a character class
+    expect(re.test('/Users/jbo/Helo/.gitconfig')).toBe(false)
+    expect(re.test('/Users/jbo/Helo/sub/.gitconfig')).toBe(false)
+  })
+
+  it('should escape other regex special chars in static prefix', () => {
+    // Path with parentheses, plus, pipe in directory name
+    const regex = globToRegex('/tmp/foo(bar)+|baz/**/*.txt')
+    const re = new RegExp(regex)
+
+    expect(re.test('/tmp/foo(bar)+|baz/file.txt')).toBe(true)
+    expect(re.test('/tmp/foo(bar)+|baz/sub/file.txt')).toBe(true)
+    // Should NOT match regex interpretation of (bar)+ or |baz
+    expect(re.test('/tmp/foobar|baz/file.txt')).toBe(false)
+    expect(re.test('/tmp/foobarbar|baz/file.txt')).toBe(false)
+  })
+
+  it('should handle path with only brackets and no glob chars', () => {
+    // A literal path with brackets but no * or ? - should match literally
+    const regex = globToRegex('/tmp/[test]/file.txt')
+    const re = new RegExp(regex)
+
+    expect(re.test('/tmp/[test]/file.txt')).toBe(true)
+    // Without fix, [test] would match single char t, e, s
+    expect(re.test('/tmp/t/file.txt')).toBe(false)
+    expect(re.test('/tmp/e/file.txt')).toBe(false)
+  })
 })
 
 // ============================================================================
