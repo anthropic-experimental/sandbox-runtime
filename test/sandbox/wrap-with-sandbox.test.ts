@@ -77,6 +77,39 @@ describe('wrapWithSandbox customConfig', () => {
       expect(wrapped.length).toBeGreaterThan(command.length)
     })
 
+    it('strips trailing /** from allowWrite and creates bind mount on Linux', async () => {
+      if (getPlatform() !== 'linux') {
+        return
+      }
+
+      const fs = await import('fs')
+      const os = await import('os')
+      const path = await import('path')
+
+      const tmpDir = path.join(os.tmpdir(), `sandbox-glob-test-${Date.now()}`)
+      fs.mkdirSync(tmpDir, { recursive: true })
+
+      try {
+        const command = 'echo hello'
+        const wrapped = await SandboxManager.wrapWithSandbox(
+          command,
+          undefined,
+          {
+            filesystem: {
+              denyRead: [],
+              allowWrite: [`${tmpDir}/**`],
+              denyWrite: [],
+            },
+          },
+        )
+
+        expect(wrapped).toContain(`--bind ${tmpDir} ${tmpDir}`)
+        expect(wrapped).not.toContain(`${tmpDir}/**`)
+      } finally {
+        fs.rmdirSync(tmpDir)
+      }
+    })
+
     it('uses custom denyRead when provided', async () => {
       if (skipIfUnsupportedPlatform()) {
         return
