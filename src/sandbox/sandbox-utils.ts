@@ -373,7 +373,7 @@ export function generateProxyEnvVars(
     // Google Cloud SDK - has specific proxy settings
     // Use HTTPS proxy to match other HTTP-based tools
     if (httpProxyPort) {
-      envVars.push(`CLOUDSDK_PROXY_TYPE=https`)
+      envVars.push(`CLOUDSDK_PROXY_TYPE=http`)
       envVars.push(`CLOUDSDK_PROXY_ADDRESS=localhost`)
       envVars.push(`CLOUDSDK_PROXY_PORT=${httpProxyPort}`)
     }
