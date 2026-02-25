@@ -6,6 +6,7 @@ import {
   mkdirSync,
   rmSync,
   readFileSync,
+  writeFileSync,
 } from 'node:fs'
 import type { Server } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -1363,6 +1364,115 @@ describe('Empty allowedDomains Network Blocking Integration', () => {
 
       expect(isBlocked).toBe(true)
       expect(output).not.toContain('example domain')
+    })
+  })
+
+  // ==========================================================================
+  // denyRead directory enforcement
+  // ==========================================================================
+  describe('denyRead directory enforcement', () => {
+    const DENY_DIR = join(TEST_DIR, 'deny-read-test')
+
+    beforeAll(() => {
+      if (skipIfNotLinux()) {
+        return
+      }
+      mkdirSync(DENY_DIR, { recursive: true })
+      writeFileSync(join(DENY_DIR, 'secret.txt'), 'SECRET_DATA')
+    })
+
+    afterAll(async () => {
+      if (skipIfNotLinux()) {
+        return
+      }
+      await SandboxManager.reset()
+      if (existsSync(DENY_DIR)) {
+        rmSync(DENY_DIR, { recursive: true, force: true })
+      }
+    })
+
+    it('should block reads from denyRead directory', async () => {
+      if (skipIfNotLinux()) {
+        return
+      }
+
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: [DENY_DIR],
+          allowWrite: [],
+          denyWrite: [],
+        },
+      })
+
+      const command = await SandboxManager.wrapWithSandbox(
+        `cat ${join(DENY_DIR, 'secret.txt')} 2>&1`,
+      )
+
+      const result = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      expect(result.stdout).not.toContain('SECRET_DATA')
+    })
+
+    it('should block writes to denyRead directory when no writes allowed', async () => {
+      if (skipIfNotLinux()) {
+        return
+      }
+
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: [DENY_DIR],
+          allowWrite: [],
+          denyWrite: [],
+        },
+      })
+
+      const command = await SandboxManager.wrapWithSandbox(
+        `echo WRITE_TEST > ${join(DENY_DIR, 'write-attempt.txt')}`,
+      )
+
+      const result = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      expect(result.status).not.toBe(0)
+    })
+
+    it('should block writes to denyRead directory within writable parent', async () => {
+      if (skipIfNotLinux()) {
+        return
+      }
+
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: [DENY_DIR],
+          allowWrite: [TEST_DIR],
+          denyWrite: [],
+        },
+      })
+
+      const command = await SandboxManager.wrapWithSandbox(
+        `echo WRITE_TEST > ${join(DENY_DIR, 'write-attempt.txt')}`,
+      )
+
+      const result = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      expect(result.status).not.toBe(0)
     })
   })
 })

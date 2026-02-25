@@ -284,10 +284,10 @@ async function linuxGetMandatoryDenyPaths(
 // Track generated seccomp filters for cleanup on process exit
 const generatedSeccompFilters: Set<string> = new Set()
 
-// Track mount points created by bwrap for non-existent deny paths.
-// When bwrap does --ro-bind /dev/null /nonexistent/path, it creates an empty
-// file on the host as a mount point. These persist after bwrap exits and must
-// be cleaned up explicitly.
+// Track host-side paths that need cleanup after bwrap exits:
+// - Mount points created by bwrap for non-existent deny paths (bwrap creates
+//   empty files/dirs on the host as mount targets, which persist after exit)
+// - Temp directories created as mount sources for read-deny overlays
 const bwrapMountPoints: Set<string> = new Set()
 
 let exitHandlerRegistered = false
@@ -823,7 +823,9 @@ async function generateFilesystemArgs(
     args.push('--bind', '/', '/')
   }
 
-  // Handle read restrictions by mounting tmpfs over denied paths
+  // Handle read restrictions by hiding denied paths with read-only mounts.
+  // Files: --ro-bind /dev/null (reads return empty).
+  // Directories: --ro-bind with a shared empty temp dir (reads see empty dir).
   const readDenyPaths = [...(readConfig?.denyOnly || [])]
 
   // Always hide /etc/ssh/ssh_config.d to avoid permission issues with OrbStack
@@ -832,6 +834,9 @@ async function generateFilesystemArgs(
   if (fs.existsSync('/etc/ssh/ssh_config.d')) {
     readDenyPaths.push('/etc/ssh/ssh_config.d')
   }
+
+  // Single empty dir reused for all directory read-deny mounts (all read-only).
+  let readDenyEmptyDir: string | undefined
 
   for (const pathPattern of readDenyPaths) {
     const normalizedPath = normalizePathForSandbox(pathPattern)
@@ -844,10 +849,20 @@ async function generateFilesystemArgs(
 
     const readDenyStat = fs.statSync(normalizedPath)
     if (readDenyStat.isDirectory()) {
-      args.push('--tmpfs', normalizedPath)
+      if (!readDenyEmptyDir) {
+        readDenyEmptyDir = fs.mkdtempSync(path.join(tmpdir(), 'claude-empty-'))
+        bwrapMountPoints.add(readDenyEmptyDir)
+        registerExitCleanupHandler()
+      }
+      args.push('--ro-bind', readDenyEmptyDir, normalizedPath)
+      logForDebugging(
+        `[Sandbox Linux] Mounted empty read-only dir at ${normalizedPath} to deny reads`,
+      )
     } else {
-      // For files, bind /dev/null instead of tmpfs
       args.push('--ro-bind', '/dev/null', normalizedPath)
+      logForDebugging(
+        `[Sandbox Linux] Mounted /dev/null at ${normalizedPath} to deny reads`,
+      )
     }
   }
 
