@@ -98,6 +98,38 @@ describe('CLI', () => {
       expect(result.stdout).toBe('no newline')
       expect(result.status).toBe(0)
     })
+
+    test('preserves argument boundaries when args contain spaces', () => {
+      // printf '%s\n' outputs each argument on its own line
+      // If argument boundaries are lost, "hello world" becomes two args
+      const result = runCli(['/usr/bin/printf', '%s\\n', 'hello world'])
+      expect(result.stdout).toBe('hello world\n')
+      expect(result.status).toBe(0)
+    })
+
+    test('preserves multiple arguments that each contain spaces', () => {
+      const result = runCli([
+        '/usr/bin/printf',
+        '%s|',
+        'first arg',
+        'second arg',
+      ])
+      expect(result.stdout).toBe('first arg|second arg|')
+      expect(result.status).toBe(0)
+    })
+
+    test('handles arguments with special shell characters', () => {
+      // Arguments with characters that have special meaning in shell
+      const result = runCli(['/usr/bin/printf', '%s', 'hello$world'])
+      expect(result.stdout).toBe('hello$world')
+      expect(result.status).toBe(0)
+    })
+
+    test('handles arguments with quotes', () => {
+      const result = runCli(['/usr/bin/printf', '%s', "it's a test"])
+      expect(result.stdout).toBe("it's a test")
+      expect(result.status).toBe(0)
+    })
   })
 
   describe('error handling', () => {
