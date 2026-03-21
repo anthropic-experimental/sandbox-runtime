@@ -34,6 +34,7 @@ export interface MacOSSandboxParams {
   allowPty?: boolean
   allowGitConfig?: boolean
   enableWeakerNetworkIsolation?: boolean
+  allowGPU?: boolean
   binShell?: string
 }
 
@@ -265,11 +266,8 @@ function generateReadRules(
   // directory (e.g. /Users, /Users/chris) even if only a subdirectory like
   // ~/.local is in allowWithinDeny. This only allows metadata reads on
   // directories — not listing contents (readdir) or reading files.
-  if ((config.denyOnly).length > 0) {
-    rules.push(
-      `(allow file-read-metadata`,
-      `  (vnode-type DIRECTORY))`,
-    )
+  if (config.denyOnly.length > 0) {
+    rules.push(`(allow file-read-metadata`, `  (vnode-type DIRECTORY))`)
   }
 
   // Block file movement to prevent bypass via mv/rename
@@ -373,6 +371,7 @@ function generateSandboxProfile({
   allowPty,
   allowGitConfig = false,
   enableWeakerNetworkIsolation = false,
+  allowGPU = false,
   logTag,
 }: {
   readConfig: FsReadRestrictionConfig | undefined
@@ -386,6 +385,7 @@ function generateSandboxProfile({
   allowPty?: boolean
   allowGitConfig?: boolean
   enableWeakerNetworkIsolation?: boolean
+  allowGPU?: boolean
   logTag: string
 }): string {
   const profile: string[] = [
@@ -443,6 +443,25 @@ function generateSandboxProfile({
     '  (iokit-user-client-class "IOSurfaceSendRight")',
     ')',
     '',
+    ...(allowGPU
+      ? [
+          '; GPU/Metal access - needed for local ML inference (llama.cpp, etc.)',
+          '(allow iokit-open',
+          '  (iokit-user-client-class "AGXDeviceUserClient")',
+          '  (iokit-user-client-class "IOGPUDeviceUserClient")',
+          ')',
+          '',
+          '; Mach services needed for Metal GPU compute',
+          '(allow mach-lookup',
+          '  (global-name "com.apple.windowserver.active")',
+          '  (global-name "com.apple.CoreServices.coreservicesd")',
+          '  (global-name "com.apple.DiskArbitration.diskarbitrationd")',
+          '  (global-name "com.apple.tccd.system")',
+          '  (global-name "com.apple.MTLCompilerService")',
+          ')',
+          '',
+        ]
+      : []),
     '; IOKit properties',
     '(allow iokit-get-properties)',
     '',
@@ -500,6 +519,7 @@ function generateSandboxProfile({
     '  (sysctl-name "security.mac.lockdown_mode_state")',
     '  (sysctl-name "sysctl.proc_cputype")',
     '  (sysctl-name "vm.loadavg")',
+    ...(allowGPU ? ['  (sysctl-name "vm.swapusage")'] : []),
     '  (sysctl-name-prefix "hw.optional.arm")',
     '  (sysctl-name-prefix "hw.optional.arm.")',
     '  (sysctl-name-prefix "hw.optional.armv8_")',
@@ -695,6 +715,7 @@ export function wrapCommandWithSandboxMacOS(
     allowPty,
     allowGitConfig = false,
     enableWeakerNetworkIsolation = false,
+    allowGPU = false,
     binShell,
   } = params
 
@@ -727,6 +748,7 @@ export function wrapCommandWithSandboxMacOS(
     allowPty,
     allowGitConfig,
     enableWeakerNetworkIsolation,
+    allowGPU,
     logTag,
   })
 

@@ -224,6 +224,14 @@ export const SandboxRuntimeConfigSchema = z.object({
     .boolean()
     .optional()
     .describe('Allow pseudo-terminal (pty) operations (macOS only)'),
+  allowGPU: z
+    .boolean()
+    .optional()
+    .describe(
+      'Allow GPU/Metal access (macOS only). Enables IOKit access to the GPU device ' +
+        '(AGXDeviceUserClient) and related mach services needed for Metal compute. ' +
+        'Required for local ML inference (e.g., llama.cpp, node-llama-cpp).',
+    ),
   seccomp: SeccompConfigSchema.optional().describe(
     'Custom seccomp binary paths (Linux only).',
   ),
