@@ -722,12 +722,35 @@ async function generateFilesystemArgs(
         continue
       }
 
-      // Check for symlinks in the path - if any parent component is a symlink,
+      // Check for symlinks in the path - if any component is a symlink,
       // mount /dev/null there to prevent symlink replacement attacks.
       // Attack scenario: .claude is a symlink to ./decoy/, attacker deletes
       // symlink and creates real .claude/settings.json with malicious hooks.
       const symlinkInPath = findSymlinkInPath(normalizedPath, allowedWritePaths)
       if (symlinkInPath) {
+        // When the symlink is the leaf deny path itself (e.g. ~/.bashrc -> /nix/store/...),
+        // bwrap cannot bind-mount over a symlink. Check if the symlink target is
+        // already in a read-only location (outside all allowed write paths). If so,
+        // the file content is already immutable and we can skip the deny mount.
+        if (symlinkInPath === normalizedPath) {
+          try {
+            const realTarget = fs.realpathSync(normalizedPath)
+            const targetIsWritable = allowedWritePaths.some(
+              allowedPath =>
+                realTarget.startsWith(allowedPath + '/') ||
+                realTarget === allowedPath,
+            )
+            if (!targetIsWritable) {
+              logForDebugging(
+                `[Sandbox Linux] Skipping deny for symlink to read-only target: ${normalizedPath} -> ${realTarget}`,
+              )
+              continue
+            }
+          } catch {
+            // If we can't resolve the symlink, fall through to the /dev/null mount
+          }
+        }
+
         args.push('--ro-bind', '/dev/null', symlinkInPath)
         logForDebugging(
           `[Sandbox Linux] Mounted /dev/null at symlink ${symlinkInPath} to prevent symlink replacement attack`,
