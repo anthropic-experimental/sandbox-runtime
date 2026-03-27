@@ -1,10 +1,24 @@
-import type { Server as NetServer } from 'net'
+import type { Server as NetServer, Socket } from 'net'
+import { connect as netConnect } from 'net'
 import type { Socks5Server } from '@pondwader/socks5-server'
 import { createServer } from '@pondwader/socks5-server'
 import { logForDebugging } from '../utils/debug.js'
+import type { ResolvedParentProxy } from './parent-proxy.js'
+import {
+  connectViaParentProxy,
+  selectParentProxyUrl,
+  shouldBypassParentProxy,
+} from './parent-proxy.js'
 
 export interface SocksProxyServerOptions {
   filter(port: number, host: string): Promise<boolean> | boolean
+
+  /**
+   * Optional upstream HTTP proxy. When present, SOCKS CONNECT requests are
+   * tunnelled through the parent's HTTP CONNECT instead of dialing directly.
+   * NO_PROXY-matched hosts still connect directly.
+   */
+  parentProxy?: ResolvedParentProxy
 }
 
 export interface SocksProxyWrapper {
@@ -44,6 +58,46 @@ export function createSocksProxyServer(
       })
       return false
     }
+  })
+
+  // Override the default connection handler so we can route through a parent
+  // HTTP proxy when one is configured. The default handler does a straight
+  // net.connect() which fails when direct egress is blocked.
+  socksServer.setConnectionHandler((conn, sendStatus) => {
+    const host = conn.destAddress
+    const port = conn.destPort
+
+    const parentUrl =
+      options.parentProxy &&
+      !shouldBypassParentProxy(options.parentProxy, host, port)
+        ? selectParentProxyUrl(options.parentProxy, { isHttps: port === 443 })
+        : undefined
+
+    const open = parentUrl
+      ? connectViaParentProxy(parentUrl, host, port)
+      : new Promise<Socket>((resolve, reject) => {
+          const s = netConnect(port, host, () => resolve(s))
+          s.once('error', reject)
+        })
+
+    open.then(
+      upstream => {
+        sendStatus('REQUEST_GRANTED')
+        upstream.pipe(conn.socket)
+        conn.socket.pipe(upstream)
+        upstream.on('error', () => conn.socket.destroy())
+        conn.socket.on('error', () => upstream.destroy())
+        conn.socket.on('end', () => upstream.end())
+        upstream.on('end', () => conn.socket.end())
+      },
+      err => {
+        logForDebugging(
+          `SOCKS connect to ${host}:${port} failed: ${(err as Error).message}`,
+          { level: 'error' },
+        )
+        sendStatus('HOST_UNREACHABLE')
+      },
+    )
   })
 
   return {

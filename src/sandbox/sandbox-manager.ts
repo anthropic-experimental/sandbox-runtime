@@ -32,6 +32,8 @@ import {
   expandGlobPattern,
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
+import { resolveParentProxy } from './parent-proxy.js'
+import type { ResolvedParentProxy } from './parent-proxy.js'
 import { EOL } from 'node:os'
 
 interface HostNetworkManagerContext {
@@ -51,6 +53,7 @@ let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
 let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
+let parentProxy: ResolvedParentProxy | undefined
 const sandboxViolationStore = new SandboxViolationStore()
 
 // ============================================================================
@@ -164,6 +167,7 @@ async function startHttpProxyServer(
     filter: (port: number, host: string) =>
       filterNetworkRequest(port, host, sandboxAskCallback),
     getMitmSocketPath,
+    parentProxy,
   })
 
   return new Promise<number>((resolve, reject) => {
@@ -196,6 +200,7 @@ async function startSocksProxyServer(
   socksProxyServer = createSocksProxyServer({
     filter: (port: number, host: string) =>
       filterNetworkRequest(port, host, sandboxAskCallback),
+    parentProxy,
   })
 
   return new Promise<number>((resolve, reject) => {
@@ -232,6 +237,16 @@ async function initialize(
 
   // Store config for use by other functions
   config = runtimeConfig
+
+  // Resolve parent/upstream proxy from config or HTTP_PROXY env before we
+  // start our own listeners (which will later shadow those vars in the child).
+  parentProxy = resolveParentProxy(runtimeConfig.network.parentProxy)
+  if (parentProxy) {
+    logForDebugging(
+      `Parent proxy configured: http=${parentProxy.httpUrl?.href ?? '-'} ` +
+        `https=${parentProxy.httpsUrl?.href ?? '-'}`,
+    )
+  }
 
   // Check dependencies
   const deps = checkDependencies()

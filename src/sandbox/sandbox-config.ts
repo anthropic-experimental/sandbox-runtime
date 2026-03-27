@@ -70,6 +70,33 @@ const MitmProxyConfigSchema = z.object({
 })
 
 /**
+ * Schema for upstream/parent HTTP proxy configuration.
+ * Used when SRT itself runs behind a corporate proxy and cannot make direct
+ * outbound connections.
+ */
+const ParentProxyConfigSchema = z.object({
+  http: z
+    .string()
+    .url()
+    .optional()
+    .describe('Upstream proxy URL for plain HTTP traffic'),
+  https: z
+    .string()
+    .url()
+    .optional()
+    .describe(
+      'Upstream proxy URL for HTTPS/CONNECT traffic (falls back to http if unset)',
+    ),
+  noProxy: z
+    .string()
+    .optional()
+    .describe(
+      'Comma-separated NO_PROXY list (hostname suffixes and CIDR ranges). ' +
+        'Matching destinations connect directly instead of via the parent proxy.',
+    ),
+})
+
+/**
  * Network configuration schema for validation
  */
 export const NetworkConfigSchema = z.object({
@@ -115,6 +142,12 @@ export const NetworkConfigSchema = z.object({
     ),
   mitmProxy: MitmProxyConfigSchema.optional().describe(
     'Optional MITM proxy configuration. Routes matching domains through an upstream proxy via Unix socket while SRT still handles allow/deny filtering.',
+  ),
+  parentProxy: ParentProxyConfigSchema.optional().describe(
+    "Upstream HTTP proxy for outbound connections. When set, SRT's proxy " +
+      'tunnels non-mitmProxy traffic through this parent instead of ' +
+      'connecting directly. Falls back to HTTP_PROXY/HTTPS_PROXY/NO_PROXY ' +
+      'env vars if unset.',
   ),
 })
 
@@ -231,6 +264,7 @@ export const SandboxRuntimeConfigSchema = z.object({
 
 // Export inferred types
 export type MitmProxyConfig = z.infer<typeof MitmProxyConfigSchema>
+export type ParentProxyConfig = z.infer<typeof ParentProxyConfigSchema>
 export type NetworkConfig = z.infer<typeof NetworkConfigSchema>
 export type FilesystemConfig = z.infer<typeof FilesystemConfigSchema>
 export type IgnoreViolationsConfig = z.infer<
