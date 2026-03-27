@@ -44,11 +44,12 @@ const CONNECT_TIMEOUT_MS = 30_000
 
 /**
  * Hop-by-hop headers per RFC 7230 §6.1, plus proxy-specific headers that
- * MUST NOT be forwarded to the upstream.
+ * MUST NOT be forwarded to the upstream. `transfer-encoding` is included
+ * because we re-frame bodies via Node's client; Content-Length is preserved
+ * end-to-end (Node's llhttp already rejects the TE+CL smuggling vector).
  */
 const HOP_BY_HOP = new Set([
   'connection',
-  'content-length',
   'keep-alive',
   'proxy-authenticate',
   'proxy-authorization',
@@ -151,10 +152,12 @@ function parseNoProxy(raw: string): NoProxyRules {
       continue
     }
 
-    // Hostname suffix. Normalise: lowercase, strip brackets, strip leading
-    // `*.`, strip a trailing `:port` (unless the entry is an IP literal —
-    // IPv6 addresses contain colons).
-    let v = stripBrackets(entry.toLowerCase())
+    // Hostname suffix. Normalise: lowercase, strip brackets (handling the
+    // `[v6]:port` form), strip leading `*.`, strip a trailing `:port` (unless
+    // the entry is an IP literal — IPv6 addresses contain colons).
+    let v = entry.toLowerCase()
+    const bracketed = /^\[([^\]]+)\](?::\d+)?$/.exec(v)
+    if (bracketed) v = bracketed[1]!
     if (v.startsWith('*.')) v = v.slice(1)
     const bareFam = isIP(v)
     if (!bareFam) {
@@ -382,8 +385,15 @@ export function connectViaParentProxy(
 
 export function proxyAuthHeader(proxyUrl: URL): string | undefined {
   if (!proxyUrl.username) return undefined
-  const creds = `${decodeURIComponent(proxyUrl.username)}:${decodeURIComponent(proxyUrl.password)}`
-  return `Basic ${Buffer.from(creds).toString('base64')}`
+  try {
+    const creds = `${decodeURIComponent(proxyUrl.username)}:${decodeURIComponent(proxyUrl.password)}`
+    return `Basic ${Buffer.from(creds).toString('base64')}`
+  } catch {
+    // Malformed percent-encoding in userinfo — fall back to raw values
+    // rather than throwing synchronously into the caller.
+    const creds = `${proxyUrl.username}:${proxyUrl.password}`
+    return `Basic ${Buffer.from(creds).toString('base64')}`
+  }
 }
 
 /**
@@ -428,16 +438,25 @@ function redactUserinfo(raw: string): string {
 }
 
 /**
- * Hostname validation: accepts DNS names (RFC 1123 charset) and IP literals.
+ * Hostname validation: accepts DNS names and IP literals (without zone IDs).
  * Primary purpose is to block control characters (CRLF injection, null-byte
- * DNS truncation) from reaching the wire or the allowlist matcher. Exported
- * so the allowlist check can reject malformed hosts before pattern matching.
+ * DNS truncation) and zone-identifier allowlist bypasses from reaching the
+ * wire or the allowlist matcher.
+ *
+ * IPv6 zone IDs (`fe80::1%eth0`) are rejected because `isIP` accepts a very
+ * permissive zone charset including dots — `::ffff:1.2.3.4%x.allowed.com`
+ * would pass `isIP`, pass a `.endsWith('.allowed.com')` wildcard check, and
+ * then connect to 1.2.3.4 when the OS discards the bogus scope.
  */
 export function isValidHost(h: string): boolean {
   if (!h || h.length > 255) return false
   const bare = stripBrackets(h)
+  // Reject zone identifiers outright (see doc comment).
+  if (bare.includes('%')) return false
   if (isIP(bare)) return true
-  return /^[A-Za-z0-9.-]+$/.test(bare)
+  // DNS label charset. Underscore is permitted for compatibility with real-
+  // world DNS records (_dmarc, _acme-challenge, etc.).
+  return /^[A-Za-z0-9._-]+$/.test(bare)
 }
 
 /**
@@ -467,5 +486,6 @@ export function dialDirect(
     s.setTimeout(timeoutMs, () => done(new Error('connect timed out')))
     s.once('connect', () => done())
     s.once('error', done)
+    s.once('close', () => done(new Error('socket closed before connect')))
   })
 }

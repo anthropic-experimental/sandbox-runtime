@@ -89,9 +89,11 @@ export function createSocksProxyServer(
     })
     conn.socket.on('error', () => upstreamRef?.destroy())
 
+    // SOCKS is an opaque TCP tunnel — semantically identical to HTTP
+    // CONNECT — so always prefer HTTPS_PROXY if set, regardless of dest port.
     const parentUrl =
       options.parentProxy && !shouldBypassParentProxy(options.parentProxy, host)
-        ? selectParentProxyUrl(options.parentProxy, { isHttps: port === 443 })
+        ? selectParentProxyUrl(options.parentProxy, { isHttps: true })
         : undefined
 
     const open = parentUrl
@@ -101,6 +103,7 @@ export function createSocksProxyServer(
     open
       .then(upstream => {
         upstreamRef = upstream
+        upstream.on('error', () => conn.socket.destroy())
         if (clientGone) {
           upstream.destroy()
           return
@@ -108,7 +111,6 @@ export function createSocksProxyServer(
         sendStatus('REQUEST_GRANTED')
         upstream.pipe(conn.socket)
         conn.socket.pipe(upstream)
-        upstream.on('error', () => conn.socket.destroy())
         upstream.on('close', () => conn.socket.destroy())
       })
       .catch(err => {

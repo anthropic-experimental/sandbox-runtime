@@ -117,6 +117,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       }
 
       if (clientGone) {
+        upstream.on('error', () => {}) // swallow post-resolve errors
         upstream.destroy()
         return
       }

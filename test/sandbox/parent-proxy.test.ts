@@ -304,12 +304,13 @@ describe('parent-proxy: utilities', () => {
     expect(out).toEqual({ host: 'example.com', 'x-keep': 'keep' })
   })
 
-  test('stripHopByHop strips content-length (TE.CL smuggling guard)', () => {
+  test('stripHopByHop preserves content-length (end-to-end header)', () => {
     const out = stripHopByHop({
-      'content-length': '0',
+      'content-length': '42',
+      'transfer-encoding': 'chunked',
       'x-keep': 'keep',
     })
-    expect(out).toEqual({ 'x-keep': 'keep' })
+    expect(out).toEqual({ 'content-length': '42', 'x-keep': 'keep' })
   })
 
   test('isValidHost rejects null bytes (DNS-truncation bypass)', () => {
@@ -319,6 +320,19 @@ describe('parent-proxy: utilities', () => {
   test('isValidHost rejects CRLF', () => {
     expect(isValidHost('a\r\nInjected: x')).toBe(false)
     expect(isValidHost('a\nInjected: x')).toBe(false)
+  })
+
+  test('isValidHost rejects IPv6 zone-ID allowlist bypass', () => {
+    // This payload passes net.isIP() === 6, passes .endsWith('.github.com'),
+    // and connects to 127.0.0.1 when the OS discards the bogus scope.
+    expect(isValidHost('::ffff:127.0.0.1%x.github.com')).toBe(false)
+    expect(isValidHost('fe80::1%eth0')).toBe(false)
+    expect(isValidHost('[fe80::1%eth0]')).toBe(false)
+  })
+
+  test('isValidHost accepts underscore (real-world DNS records)', () => {
+    expect(isValidHost('_dmarc.example.com')).toBe(true)
+    expect(isValidHost('_acme-challenge.example.com')).toBe(true)
   })
 
   test('isValidHost accepts DNS names and IPs', () => {
