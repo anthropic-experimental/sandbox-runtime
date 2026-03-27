@@ -9,9 +9,12 @@ import { logForDebugging } from '../utils/debug.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import {
   connectViaParentProxy,
+  openConnectTunnel,
   proxyAuthHeader,
   selectParentProxyUrl,
   shouldBypassParentProxy,
+  stripBrackets,
+  stripHopByHop,
 } from './parent-proxy.js'
 
 export interface HttpProxyServerOptions {
@@ -73,120 +76,56 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         return
       }
 
-      // Check if this host should be routed through a MITM proxy
+      // Decide upstream route: MITM unix socket > parent HTTP proxy > direct.
       const mitmSocketPath = options.getMitmSocketPath?.(hostname)
+      const parentUrl =
+        !mitmSocketPath &&
+        options.parentProxy &&
+        !shouldBypassParentProxy(options.parentProxy, hostname, port)
+          ? selectParentProxyUrl(options.parentProxy, { isHttps: port === 443 })
+          : undefined
 
-      if (mitmSocketPath) {
-        // Route through MITM proxy via Unix socket
-        logForDebugging(
-          `Routing CONNECT ${hostname}:${port} through MITM proxy at ${mitmSocketPath}`,
-        )
-
-        const mitmSocket = connect({ path: mitmSocketPath }, () => {
-          // Send CONNECT request to the MITM proxy
-          mitmSocket.write(
-            `CONNECT ${hostname}:${port} HTTP/1.1\r\n` +
-              `Host: ${hostname}:${port}\r\n` +
-              '\r\n',
+      let upstream: Socket
+      try {
+        if (mitmSocketPath) {
+          logForDebugging(
+            `Routing CONNECT ${hostname}:${port} through MITM proxy at ${mitmSocketPath}`,
           )
-        })
-
-        // Buffer to accumulate the MITM proxy's response
-        let responseBuffer = ''
-
-        const onMitmData = (chunk: Buffer) => {
-          responseBuffer += chunk.toString()
-
-          // Check if we've received the full HTTP response headers
-          const headerEndIndex = responseBuffer.indexOf('\r\n\r\n')
-          if (headerEndIndex !== -1) {
-            // Remove data listener, we're done parsing the response
-            mitmSocket.removeListener('data', onMitmData)
-
-            // Check if MITM proxy accepted the connection
-            const statusLine = responseBuffer.substring(
-              0,
-              responseBuffer.indexOf('\r\n'),
-            )
-            if (statusLine.includes(' 200 ')) {
-              // Connection established, now pipe data between client and MITM
-              socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
-
-              // If there's any data after the headers, write it to the client
-              const remainingData = responseBuffer.substring(headerEndIndex + 4)
-              if (remainingData.length > 0) {
-                socket.write(remainingData)
-              }
-
-              mitmSocket.pipe(socket)
-              socket.pipe(mitmSocket)
-            } else {
-              logForDebugging(`MITM proxy rejected CONNECT: ${statusLine}`, {
-                level: 'error',
-              })
-              socket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n')
-              mitmSocket.destroy()
-            }
-          }
+          upstream = await openConnectTunnel({
+            dial: () => connect({ path: mitmSocketPath }),
+            readyEvent: 'connect',
+            destHost: hostname,
+            destPort: port,
+          })
+        } else if (parentUrl) {
+          upstream = await connectViaParentProxy(parentUrl, hostname, port)
+        } else {
+          upstream = await new Promise<Socket>((resolve, reject) => {
+            const s = connect(port, hostname, () => resolve(s))
+            s.once('error', reject)
+          })
         }
-
-        mitmSocket.on('data', onMitmData)
-
-        mitmSocket.on('error', err => {
-          logForDebugging(`MITM proxy connection failed: ${err.message}`, {
-            level: 'error',
-          })
-          socket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n')
+      } catch (err) {
+        logForDebugging(`CONNECT tunnel failed: ${(err as Error).message}`, {
+          level: 'error',
         })
-
-        socket.on('error', err => {
-          logForDebugging(`Client socket error: ${err.message}`, {
-            level: 'error',
-          })
-          mitmSocket.destroy()
-        })
-
-        socket.on('end', () => mitmSocket.end())
-        mitmSocket.on('end', () => socket.end())
-      } else {
-        // Direct path: optionally chain through a parent HTTP proxy.
-        const parentUrl =
-          options.parentProxy &&
-          !shouldBypassParentProxy(options.parentProxy, hostname, port)
-            ? selectParentProxyUrl(options.parentProxy, {
-                isHttps: port === 443,
-              })
-            : undefined
-
-        const open = parentUrl
-          ? connectViaParentProxy(parentUrl, hostname, port)
-          : new Promise<Socket>((resolve, reject) => {
-              const s = connect(port, hostname, () => resolve(s))
-              s.once('error', reject)
-            })
-
-        try {
-          const serverSocket = await open
-          socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
-          serverSocket.pipe(socket)
-          socket.pipe(serverSocket)
-
-          serverSocket.on('error', err => {
-            logForDebugging(`CONNECT tunnel failed: ${err.message}`, {
-              level: 'error',
-            })
-            socket.destroy()
-          })
-          socket.on('error', () => serverSocket.destroy())
-          socket.on('end', () => serverSocket.end())
-          serverSocket.on('end', () => socket.end())
-        } catch (err) {
-          logForDebugging(`CONNECT tunnel failed: ${(err as Error).message}`, {
-            level: 'error',
-          })
-          socket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n')
-        }
+        socket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n')
+        return
       }
+
+      socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+      upstream.pipe(socket)
+      socket.pipe(upstream)
+
+      upstream.on('error', err => {
+        logForDebugging(`CONNECT tunnel failed: ${err.message}`, {
+          level: 'error',
+        })
+        socket.destroy()
+      })
+      socket.on('error', () => upstream.destroy())
+      socket.on('end', () => upstream.end())
+      upstream.on('end', () => socket.end())
     } catch (err) {
       logForDebugging(`Error handling CONNECT: ${err}`, { level: 'error' })
       socket.end('HTTP/1.1 500 Internal Server Error\r\n\r\n')
@@ -197,7 +136,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
   server.on('request', async (req, res) => {
     try {
       const url = new URL(req.url!)
-      const hostname = url.hostname
+      const hostname = stripBrackets(url.hostname)
       const port = url.port
         ? parseInt(url.port, 10)
         : url.protocol === 'https:'
@@ -217,119 +156,96 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         return
       }
 
-      // Check if this host should be routed through a MITM proxy
-      const mitmSocketPath = options.getMitmSocketPath?.(hostname)
+      const fwdHeaders = { ...stripHopByHop(req.headers), host: url.host }
 
+      // Decide upstream route: MITM unix socket > parent HTTP proxy > direct.
+      const mitmSocketPath = options.getMitmSocketPath?.(hostname)
+      const parentUrl =
+        !mitmSocketPath &&
+        options.parentProxy &&
+        !shouldBypassParentProxy(options.parentProxy, hostname, port)
+          ? selectParentProxyUrl(options.parentProxy, {
+              isHttps: url.protocol === 'https:',
+            })
+          : undefined
+
+      // Reconstruct the absolute URI from parsed components rather than
+      // forwarding the client's raw req.url. This ensures the upstream proxy
+      // sees exactly the host we allowlist-checked, closing URL-parser
+      // differential bypasses.
+      const absUrl = `${url.protocol}//${url.host}${url.pathname}${url.search}`
+
+      let proxyReq
       if (mitmSocketPath) {
-        // Route through MITM proxy via Unix socket
-        // Use an agent that connects via the Unix socket
         logForDebugging(
           `Routing HTTP ${req.method} ${hostname}:${port} through MITM proxy at ${mitmSocketPath}`,
         )
-
         const mitmAgent = new Agent({
           // @ts-expect-error - socketPath is valid but not in types
           socketPath: mitmSocketPath,
         })
-
-        // Send request to MITM proxy with full URL (proxy-style request)
-        const proxyReq = httpRequest(
+        proxyReq = httpRequest(
           {
             agent: mitmAgent,
-            // For proxy requests, path should be the full URL
-            path: req.url,
+            path: absUrl,
             method: req.method,
-            headers: {
-              ...req.headers,
-              host: url.host,
-            },
+            headers: fwdHeaders,
           },
           proxyRes => {
             res.writeHead(proxyRes.statusCode!, proxyRes.headers)
             proxyRes.pipe(res)
           },
         )
-
-        proxyReq.on('error', err => {
-          logForDebugging(`MITM proxy request failed: ${err.message}`, {
-            level: 'error',
-          })
-          if (!res.headersSent) {
-            res.writeHead(502, { 'Content-Type': 'text/plain' })
-            res.end('Bad Gateway')
-          }
-        })
-
-        req.pipe(proxyReq)
+      } else if (parentUrl) {
+        const parentHost = stripBrackets(parentUrl.hostname)
+        const parentPort =
+          Number(parentUrl.port) || (parentUrl.protocol === 'https:' ? 443 : 80)
+        const auth = proxyAuthHeader(parentUrl)
+        const requestFn =
+          parentUrl.protocol === 'https:' ? httpsRequest : httpRequest
+        proxyReq = requestFn(
+          {
+            hostname: parentHost,
+            port: parentPort,
+            path: absUrl,
+            method: req.method,
+            headers: auth
+              ? { ...fwdHeaders, 'proxy-authorization': auth }
+              : fwdHeaders,
+          },
+          proxyRes => {
+            res.writeHead(proxyRes.statusCode!, proxyRes.headers)
+            proxyRes.pipe(res)
+          },
+        )
       } else {
-        // Direct path: optionally chain through a parent HTTP proxy.
-        const parentUrl =
-          options.parentProxy &&
-          !shouldBypassParentProxy(options.parentProxy, hostname, port)
-            ? selectParentProxyUrl(options.parentProxy, {
-                isHttps: url.protocol === 'https:',
-              })
-            : undefined
-
-        let proxyReq
-        if (parentUrl) {
-          // Proxy-style request: absolute-URI path, sent to the parent.
-          const parentPort =
-            Number(parentUrl.port) ||
-            (parentUrl.protocol === 'https:' ? 443 : 80)
-          const auth = proxyAuthHeader(parentUrl)
-          const requestFn =
-            parentUrl.protocol === 'https:' ? httpsRequest : httpRequest
-          proxyReq = requestFn(
-            {
-              hostname: parentUrl.hostname,
-              port: parentPort,
-              path: req.url, // absolute URI as received from the client
-              method: req.method,
-              headers: {
-                ...req.headers,
-                host: url.host,
-                ...(auth ? { 'proxy-authorization': auth } : {}),
-              },
-            },
-            proxyRes => {
-              res.writeHead(proxyRes.statusCode!, proxyRes.headers)
-              proxyRes.pipe(res)
-            },
-          )
-        } else {
-          const requestFn =
-            url.protocol === 'https:' ? httpsRequest : httpRequest
-          proxyReq = requestFn(
-            {
-              hostname,
-              port,
-              path: url.pathname + url.search,
-              method: req.method,
-              headers: {
-                ...req.headers,
-                host: url.host,
-              },
-            },
-            proxyRes => {
-              res.writeHead(proxyRes.statusCode!, proxyRes.headers)
-              proxyRes.pipe(res)
-            },
-          )
-        }
-
-        proxyReq.on('error', err => {
-          logForDebugging(`Proxy request failed: ${err.message}`, {
-            level: 'error',
-          })
-          if (!res.headersSent) {
-            res.writeHead(502, { 'Content-Type': 'text/plain' })
-            res.end('Bad Gateway')
-          }
-        })
-
-        req.pipe(proxyReq)
+        const requestFn = url.protocol === 'https:' ? httpsRequest : httpRequest
+        proxyReq = requestFn(
+          {
+            hostname,
+            port,
+            path: url.pathname + url.search,
+            method: req.method,
+            headers: fwdHeaders,
+          },
+          proxyRes => {
+            res.writeHead(proxyRes.statusCode!, proxyRes.headers)
+            proxyRes.pipe(res)
+          },
+        )
       }
+
+      proxyReq.on('error', err => {
+        logForDebugging(`Proxy request failed: ${err.message}`, {
+          level: 'error',
+        })
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'text/plain' })
+          res.end('Bad Gateway')
+        }
+      })
+
+      req.pipe(proxyReq)
     } catch (err) {
       logForDebugging(`Error handling HTTP request: ${err}`, { level: 'error' })
       res.writeHead(500, { 'Content-Type': 'text/plain' })

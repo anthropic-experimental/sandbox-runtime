@@ -1,8 +1,13 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
+import { connect } from 'node:net'
 import {
+  openConnectTunnel,
+  redactUrl,
   resolveParentProxy,
-  shouldBypassParentProxy,
   selectParentProxyUrl,
+  shouldBypassParentProxy,
+  stripBrackets,
+  stripHopByHop,
 } from '../../src/sandbox/parent-proxy.js'
 
 describe('parent-proxy: resolveParentProxy', () => {
@@ -108,6 +113,12 @@ describe('parent-proxy: NO_PROXY matching', () => {
     expect(shouldBypassParentProxy(r, '1.2.3.5', 80)).toBe(false)
   })
 
+  test('CIDR v6 match', () => {
+    const r = mk('fe80::/10')
+    expect(shouldBypassParentProxy(r, 'fe80::1', 80)).toBe(true)
+    expect(shouldBypassParentProxy(r, '2001:db8::1', 80)).toBe(false)
+  })
+
   test('link-local CIDR', () => {
     const r = mk('169.254.0.0/16')
     expect(shouldBypassParentProxy(r, '169.254.169.254', 80)).toBe(true)
@@ -120,6 +131,18 @@ describe('parent-proxy: NO_PROXY matching', () => {
     expect(shouldBypassParentProxy(r, '::1', 8080)).toBe(true)
   })
 
+  test('full 127/8 and v4-mapped loopback bypass', () => {
+    const r = mk('')
+    expect(shouldBypassParentProxy(r, '127.0.0.2', 80)).toBe(true)
+    expect(shouldBypassParentProxy(r, '127.255.255.254', 80)).toBe(true)
+    expect(shouldBypassParentProxy(r, '::ffff:127.0.0.1', 80)).toBe(true)
+  })
+
+  test('bracketed IPv6 host is handled', () => {
+    const r = mk('')
+    expect(shouldBypassParentProxy(r, '[::1]', 80)).toBe(true)
+  })
+
   test('case-insensitive hostname matching', () => {
     const r = mk('Example.COM')
     expect(shouldBypassParentProxy(r, 'EXAMPLE.com', 443)).toBe(true)
@@ -128,6 +151,22 @@ describe('parent-proxy: NO_PROXY matching', () => {
   test('port suffix in NO_PROXY entry is stripped', () => {
     const r = mk('example.com:8080')
     expect(shouldBypassParentProxy(r, 'example.com', 443)).toBe(true)
+  })
+
+  test('IPv6 literal in NO_PROXY is not mangled by port-stripping', () => {
+    const r = mk('fe80::1')
+    expect(shouldBypassParentProxy(r, 'fe80::1', 80)).toBe(true)
+  })
+
+  test('empty CIDR suffix does not become match-all', () => {
+    const r = mk('10.0.0.0/')
+    // Malformed — should be ignored, not treated as /0
+    expect(shouldBypassParentProxy(r, '8.8.8.8', 80)).toBe(false)
+  })
+
+  test('malformed CIDR is ignored', () => {
+    const r = mk('10.0.0.0/999,not-an-ip/24')
+    expect(shouldBypassParentProxy(r, '10.0.0.1', 80)).toBe(false)
   })
 
   test('comma-separated list with whitespace', () => {
@@ -152,5 +191,104 @@ describe('parent-proxy: selectParentProxyUrl', () => {
   test('falls back when only one is set', () => {
     const r = resolveParentProxy({ http: 'http://only:1' })!
     expect(selectParentProxyUrl(r, { isHttps: true })?.hostname).toBe('only')
+  })
+})
+
+describe('parent-proxy: openConnectTunnel validation', () => {
+  const rejectMsg = (p: Promise<unknown>) =>
+    p.then(
+      () => 'resolved',
+      (e: Error) => e.message,
+    )
+
+  test('rejects CRLF in destHost', async () => {
+    const msg = await rejectMsg(
+      openConnectTunnel({
+        dial: () => connect(1, '127.0.0.1'),
+        readyEvent: 'connect',
+        destHost: 'evil\r\nX-Injected: yes',
+        destPort: 443,
+      }),
+    )
+    expect(msg).toMatch(/Invalid destination host/)
+  })
+
+  test('rejects request-smuggling payload in destHost', async () => {
+    const msg = await rejectMsg(
+      openConnectTunnel({
+        dial: () => connect(1, '127.0.0.1'),
+        readyEvent: 'connect',
+        destHost: 'a\r\n\r\nCONNECT internal:8080 HTTP/1.1\r\nX: .allowed.com',
+        destPort: 443,
+      }),
+    )
+    expect(msg).toMatch(/Invalid destination host/)
+  })
+
+  test('rejects invalid port', async () => {
+    const msg = await rejectMsg(
+      openConnectTunnel({
+        dial: () => connect(1, '127.0.0.1'),
+        readyEvent: 'connect',
+        destHost: 'example.com',
+        destPort: 99999,
+      }),
+    )
+    expect(msg).toMatch(/Invalid destination port/)
+  })
+
+  test('accepts plain hostname (fails on dial, not validation)', async () => {
+    const msg = await rejectMsg(
+      openConnectTunnel({
+        dial: () => connect(1, '127.0.0.1'),
+        readyEvent: 'connect',
+        destHost: 'registry.npmjs.org',
+        destPort: 443,
+        timeoutMs: 500,
+      }),
+    )
+    expect(msg).not.toMatch(/Invalid destination/)
+  })
+
+  test('accepts IPv6 literal (fails on dial, not validation)', async () => {
+    const msg = await rejectMsg(
+      openConnectTunnel({
+        dial: () => connect(1, '127.0.0.1'),
+        readyEvent: 'connect',
+        destHost: 'fe80::1',
+        destPort: 443,
+        timeoutMs: 500,
+      }),
+    )
+    expect(msg).not.toMatch(/Invalid destination/)
+  })
+})
+
+describe('parent-proxy: utilities', () => {
+  test('stripBrackets removes IPv6 brackets', () => {
+    expect(stripBrackets('[::1]')).toBe('::1')
+    expect(stripBrackets('[fe80::1]')).toBe('fe80::1')
+    expect(stripBrackets('example.com')).toBe('example.com')
+    expect(stripBrackets('127.0.0.1')).toBe('127.0.0.1')
+  })
+
+  test('redactUrl hides userinfo', () => {
+    expect(redactUrl(new URL('http://user:secret@proxy:3128'))).toBe(
+      'http://***:***@proxy:3128/',
+    )
+    expect(redactUrl(new URL('http://proxy:3128'))).toBe('http://proxy:3128/')
+    expect(redactUrl(undefined)).toBe('-')
+  })
+
+  test('stripHopByHop removes proxy and connection headers', () => {
+    const out = stripHopByHop({
+      host: 'example.com',
+      'proxy-authorization': 'Basic secret',
+      'proxy-connection': 'keep-alive',
+      connection: 'close',
+      'transfer-encoding': 'chunked',
+      'x-custom': 'keep-me',
+    })
+    expect(out).toEqual({ host: 'example.com', 'x-custom': 'keep-me' })
   })
 })

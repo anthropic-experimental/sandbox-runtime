@@ -8,16 +8,15 @@
  *
  * This module provides:
  *   - config resolution (explicit config -> HTTP_PROXY/HTTPS_PROXY/NO_PROXY env)
- *   - NO_PROXY matching (hostname suffix + CIDR, golang.org/x/net/http/httpproxy
- *     semantics)
- *   - a CONNECT-tunnel helper that returns a raw TCP socket piped through the
- *     parent
+ *   - NO_PROXY matching (hostname suffix + CIDR via net.BlockList,
+ *     golang.org/x/net/http/httpproxy semantics)
+ *   - a generic CONNECT-tunnel helper that works over Unix socket, TCP, or TLS
  */
 
 import type { Socket } from 'node:net'
-import { connect as netConnect } from 'node:net'
+import type { IncomingHttpHeaders } from 'node:http'
+import { BlockList, connect as netConnect, isIP } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
-import { isIP } from 'node:net'
 import { URL } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
 
@@ -30,15 +29,32 @@ export interface ParentProxyConfig {
 export interface ResolvedParentProxy {
   httpUrl?: URL
   httpsUrl?: URL
-  noProxy: NoProxyRule[]
+  noProxy: NoProxyRules
 }
 
-interface NoProxyRule {
-  kind: 'all' | 'suffix' | 'cidr'
-  value: string
-  /** For cidr: pre-parsed bits for matching */
-  cidr?: { ip: number[]; prefix: number; v6: boolean }
+interface NoProxyRules {
+  all: boolean
+  suffixes: string[]
+  cidr: BlockList
 }
+
+const CONNECT_TIMEOUT_MS = 30_000
+
+/**
+ * Hop-by-hop headers per RFC 7230 §6.1, plus proxy-specific headers that
+ * MUST NOT be forwarded to the upstream.
+ */
+const HOP_BY_HOP = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'proxy-connection',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+])
 
 /**
  * Resolve the parent proxy config, falling back to the SRT process's own
@@ -68,9 +84,10 @@ export function resolveParentProxy(
     try {
       return new URL(u)
     } catch {
-      logForDebugging(`Invalid parent proxy URL, ignoring: ${u}`, {
-        level: 'error',
-      })
+      logForDebugging(
+        `Invalid parent proxy URL, ignoring: ${redactUserinfo(u)}`,
+        { level: 'error' },
+      )
       return undefined
     }
   }
@@ -82,66 +99,108 @@ export function resolveParentProxy(
   }
 }
 
-function parseNoProxy(raw: string): NoProxyRule[] {
-  return raw
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean)
-    .map((entry): NoProxyRule => {
-      if (entry === '*') return { kind: 'all', value: '*' }
-      const cidr = parseCidr(entry)
-      if (cidr) return { kind: 'cidr', value: entry, cidr }
-      // Normalise: strip leading *./. and a trailing :port, lowercase
-      let v = entry.toLowerCase()
-      if (v.startsWith('*.')) v = v.slice(1)
-      // suffix rules keep a leading dot to mean "subdomain-of"; bare names
-      // match exactly *or* as a suffix (golang httpproxy semantics)
+function parseNoProxy(raw: string): NoProxyRules {
+  const rules: NoProxyRules = {
+    all: false,
+    suffixes: [],
+    cidr: new BlockList(),
+  }
+
+  for (let entry of raw.split(',')) {
+    entry = entry.trim()
+    if (!entry) continue
+    if (entry === '*') {
+      rules.all = true
+      continue
+    }
+
+    // CIDR?
+    const slash = entry.indexOf('/')
+    if (slash !== -1) {
+      const ip = entry.slice(0, slash)
+      const prefixStr = entry.slice(slash + 1)
+      const fam = isIP(ip)
+      if (fam && prefixStr !== '' && /^\d+$/.test(prefixStr)) {
+        const prefix = Number(prefixStr)
+        const max = fam === 6 ? 128 : 32
+        if (prefix >= 0 && prefix <= max) {
+          try {
+            rules.cidr.addSubnet(ip, prefix, fam === 6 ? 'ipv6' : 'ipv4')
+          } catch {
+            // BlockList rejected it; fall through to suffix handling below
+          }
+          continue
+        }
+      }
+      // malformed CIDR → ignore (do NOT treat as suffix; `/` isn't a valid
+      // hostname char)
+      continue
+    }
+
+    // Hostname suffix. Normalise: lowercase, strip leading `*.`, strip a
+    // trailing `:port` — but only if the entry isn't itself an IP literal
+    // (IPv6 addresses contain colons).
+    let v = entry.toLowerCase()
+    if (v.startsWith('*.')) v = v.slice(1)
+    if (!isIP(v.replace(/^\[|\]$/g, ''))) {
       const colon = v.lastIndexOf(':')
       if (colon !== -1 && /^\d+$/.test(v.slice(colon + 1))) {
         v = v.slice(0, colon)
       }
-      return { kind: 'suffix', value: v }
-    })
+    }
+    rules.suffixes.push(v)
+  }
+
+  return rules
 }
 
 /**
- * Returns true if the given host:port should bypass the parent proxy.
- * Always bypasses loopback.
+ * Returns true if the given host should bypass the parent proxy and connect
+ * directly. Always bypasses loopback.
  */
 export function shouldBypassParentProxy(
   resolved: ResolvedParentProxy,
   host: string,
   _port: number,
 ): boolean {
-  const h = host.toLowerCase().replace(/\.$/, '')
+  const h = stripBrackets(host.toLowerCase().replace(/\.$/, ''))
 
-  // Always bypass loopback regardless of NO_PROXY — chaining localhost through
-  // an upstream proxy is never what you want.
-  if (h === 'localhost' || h === '127.0.0.1' || h === '::1') return true
+  // Always bypass loopback — chaining localhost through an upstream proxy is
+  // never what you want. Covers the whole 127/8 block and IPv4-mapped forms.
+  if (h === 'localhost') return true
+  const fam = isIP(h)
+  if (fam) {
+    if (LOOPBACK.check(h, fam === 6 ? 'ipv6' : 'ipv4')) return true
+  }
 
-  for (const rule of resolved.noProxy) {
-    if (rule.kind === 'all') return true
-    if (rule.kind === 'cidr' && rule.cidr) {
-      if (isIP(h) && ipInCidr(h, rule.cidr)) return true
-      continue
-    }
-    // suffix
-    const v = rule.value
+  if (resolved.noProxy.all) return true
+
+  if (fam) {
+    if (resolved.noProxy.cidr.check(h, fam === 6 ? 'ipv6' : 'ipv4')) return true
+  }
+
+  for (const v of resolved.noProxy.suffixes) {
     if (v.startsWith('.')) {
       // .example.com matches foo.example.com and example.com
       if (h === v.slice(1) || h.endsWith(v)) return true
     } else {
-      // example.com matches example.com and foo.example.com
+      // example.com matches example.com and foo.example.com (golang semantics)
       if (h === v || h.endsWith('.' + v)) return true
     }
   }
   return false
 }
 
+const LOOPBACK = (() => {
+  const bl = new BlockList()
+  bl.addSubnet('127.0.0.0', 8, 'ipv4')
+  bl.addAddress('::1', 'ipv6')
+  bl.addSubnet('::ffff:127.0.0.0', 104, 'ipv6') // v4-mapped loopback
+  return bl
+})()
+
 /**
- * Pick which parent proxy URL to use for a given destination port. We treat
- * 443 as HTTPS and everything else as HTTP — callers that know better should
- * pass an explicit `isHttps`.
+ * Pick which parent proxy URL to use for a given destination.
  */
 export function selectParentProxyUrl(
   resolved: ResolvedParentProxy,
@@ -152,31 +211,50 @@ export function selectParentProxyUrl(
     : (resolved.httpUrl ?? resolved.httpsUrl)
 }
 
+// ---------------------------------------------------------------------------
+// CONNECT tunnelling
+// ---------------------------------------------------------------------------
+
+export interface ConnectTunnelOptions {
+  /** Establish the transport to the proxy. */
+  dial(): Socket
+  /** Fired when the transport is ready to write (e.g. 'connect'/'secureConnect'). */
+  readyEvent: 'connect' | 'secureConnect'
+  destHost: string
+  destPort: number
+  authHeader?: string
+  timeoutMs?: number
+}
+
 /**
- * Open a TCP connection to `destHost:destPort` tunnelled through the parent
- * HTTP proxy's CONNECT method. Resolves with a socket that is already piped
- * through to the destination; the caller can immediately pipe TLS or raw TCP
- * over it.
+ * Generic CONNECT-tunnel: dial a proxy transport (unix/tcp/tls), send
+ * `CONNECT host:port`, wait for a 2xx, and resolve with the tunnelled socket.
+ * Validates destHost to prevent CRLF injection from untrusted callers.
  */
-export function connectViaParentProxy(
-  proxyUrl: URL,
-  destHost: string,
-  destPort: number,
-): Promise<Socket> {
+export function openConnectTunnel(opts: ConnectTunnelOptions): Promise<Socket> {
+  const { destHost, destPort } = opts
+
+  // CRLF-injection guard: destHost may originate from an untrusted SOCKS5
+  // DOMAINNAME field. Reject anything that isn't a plain hostname or IP.
+  const bare = stripBrackets(destHost)
+  if (!isValidHost(bare)) {
+    return Promise.reject(
+      new Error(
+        `Invalid destination host for CONNECT: ${JSON.stringify(destHost)}`,
+      ),
+    )
+  }
+  if (!Number.isInteger(destPort) || destPort < 1 || destPort > 65535) {
+    return Promise.reject(new Error(`Invalid destination port: ${destPort}`))
+  }
+
+  const authority =
+    isIP(bare) === 6 ? `[${bare}]:${destPort}` : `${bare}:${destPort}`
+
   return new Promise((resolve, reject) => {
-    const proxyPort = Number(proxyUrl.port) || defaultPort(proxyUrl.protocol)
-    const proxyHost = proxyUrl.hostname
-
-    const useTls = proxyUrl.protocol === 'https:'
-    const sock: Socket = useTls
-      ? tlsConnect({
-          host: proxyHost,
-          port: proxyPort,
-          servername: proxyHost,
-        })
-      : netConnect(proxyPort, proxyHost)
-
+    const sock = opts.dial()
     let settled = false
+
     const fail = (err: Error) => {
       if (settled) return
       settled = true
@@ -184,14 +262,21 @@ export function connectViaParentProxy(
       reject(err)
     }
 
+    sock.setTimeout(opts.timeoutMs ?? CONNECT_TIMEOUT_MS, () =>
+      fail(new Error('CONNECT handshake timed out')),
+    )
     sock.once('error', fail)
+    sock.once('close', () =>
+      fail(new Error('Proxy closed during CONNECT handshake')),
+    )
 
-    const onConnect = () => {
-      const authHeader = proxyAuthHeader(proxyUrl)
+    sock.once(opts.readyEvent, () => {
       sock.write(
-        `CONNECT ${destHost}:${destPort} HTTP/1.1\r\n` +
-          `Host: ${destHost}:${destPort}\r\n` +
-          (authHeader ? `Proxy-Authorization: ${authHeader}\r\n` : '') +
+        `CONNECT ${authority} HTTP/1.1\r\n` +
+          `Host: ${authority}\r\n` +
+          (opts.authHeader
+            ? `Proxy-Authorization: ${opts.authHeader}\r\n`
+            : '') +
           '\r\n',
       )
 
@@ -199,32 +284,69 @@ export function connectViaParentProxy(
       const onData = (chunk: Buffer) => {
         buf += chunk.toString('latin1')
         const end = buf.indexOf('\r\n\r\n')
-        if (end === -1) return
+        if (end === -1) {
+          // Cap header size to avoid unbounded buffering on a misbehaving proxy.
+          if (buf.length > 16 * 1024)
+            fail(new Error('CONNECT response header too large'))
+          return
+        }
         sock.removeListener('data', onData)
 
         const statusLine = buf.slice(0, buf.indexOf('\r\n'))
-        if (!/ 200 /.test(statusLine)) {
-          return fail(
-            new Error(`Parent proxy refused CONNECT: ${statusLine.trim()}`),
-          )
+        if (!/^HTTP\/1\.[01] 2\d\d(?:\s|$)/.test(statusLine)) {
+          return fail(new Error(`Proxy refused CONNECT: ${statusLine.trim()}`))
         }
 
-        // Re-emit any bytes the proxy sent after the header terminator —
-        // rare for CONNECT but possible.
+        // Re-emit any bytes that arrived after the header terminator.
         const rest = buf.slice(end + 4)
         if (rest.length) sock.unshift(Buffer.from(rest, 'latin1'))
 
         settled = true
+        sock.setTimeout(0)
         sock.removeListener('error', fail)
+        sock.removeAllListeners('close')
         resolve(sock)
       }
       sock.on('data', onData)
-    }
-
-    if (useTls) sock.once('secureConnect', onConnect)
-    else sock.once('connect', onConnect)
+    })
   })
 }
+
+/**
+ * Open a CONNECT tunnel through a parent HTTP(S) proxy specified by URL.
+ * Thin wrapper around openConnectTunnel that dials TCP or TLS based on the
+ * proxy URL scheme.
+ */
+export function connectViaParentProxy(
+  proxyUrl: URL,
+  destHost: string,
+  destPort: number,
+): Promise<Socket> {
+  const proxyHost = stripBrackets(proxyUrl.hostname)
+  const proxyPort =
+    Number(proxyUrl.port) || (proxyUrl.protocol === 'https:' ? 443 : 80)
+  const useTls = proxyUrl.protocol === 'https:'
+
+  return openConnectTunnel({
+    destHost,
+    destPort,
+    authHeader: proxyAuthHeader(proxyUrl),
+    readyEvent: useTls ? 'secureConnect' : 'connect',
+    dial: () =>
+      useTls
+        ? tlsConnect({
+            host: proxyHost,
+            port: proxyPort,
+            // SNI must be a hostname, never an IP literal (RFC 6066 §3).
+            ...(isIP(proxyHost) ? {} : { servername: proxyHost }),
+          })
+        : netConnect(proxyPort, proxyHost),
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
 
 export function proxyAuthHeader(proxyUrl: URL): string | undefined {
   if (!proxyUrl.username) return undefined
@@ -232,76 +354,41 @@ export function proxyAuthHeader(proxyUrl: URL): string | undefined {
   return `Basic ${Buffer.from(creds).toString('base64')}`
 }
 
-function defaultPort(protocol: string): number {
-  return protocol === 'https:' ? 443 : 80
+/** Strip hop-by-hop and proxy-specific headers before forwarding upstream. */
+export function stripHopByHop(h: IncomingHttpHeaders): IncomingHttpHeaders {
+  const out: IncomingHttpHeaders = {}
+  for (const [k, v] of Object.entries(h)) {
+    if (!HOP_BY_HOP.has(k.toLowerCase())) out[k] = v
+  }
+  return out
 }
 
-// --- CIDR matching --------------------------------------------------------
-
-function parseCidr(
-  s: string,
-): { ip: number[]; prefix: number; v6: boolean } | undefined {
-  const slash = s.indexOf('/')
-  if (slash === -1) return undefined
-  const ipStr = s.slice(0, slash)
-  const prefix = Number(s.slice(slash + 1))
-  if (!Number.isInteger(prefix) || prefix < 0) return undefined
-  const fam = isIP(ipStr)
-  if (fam === 4) {
-    if (prefix > 32) return undefined
-    const parts = ipStr.split('.').map(Number)
-    return { ip: parts, prefix, v6: false }
-  }
-  if (fam === 6) {
-    if (prefix > 128) return undefined
-    return { ip: expandV6(ipStr), prefix, v6: true }
-  }
-  return undefined
+/** Remove surrounding square brackets from an IPv6 literal. */
+export function stripBrackets(host: string): string {
+  return host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host
 }
 
-function ipInCidr(
-  ipStr: string,
-  cidr: { ip: number[]; prefix: number; v6: boolean },
-): boolean {
-  const fam = isIP(ipStr)
-  if (fam === 4 && !cidr.v6) {
-    const ip = ipStr.split('.').map(Number)
-    return bitsMatch(ip, cidr.ip, cidr.prefix, 8)
-  }
-  if (fam === 6 && cidr.v6) {
-    const ip = expandV6(ipStr)
-    return bitsMatch(ip, cidr.ip, cidr.prefix, 16)
-  }
-  return false
+/** Redact userinfo from a URL for safe logging. */
+export function redactUrl(u: URL | undefined): string {
+  if (!u) return '-'
+  if (!u.username && !u.password) return u.href
+  const c = new URL(u.href)
+  c.username = '***'
+  c.password = '***'
+  return c.href
 }
 
-function bitsMatch(
-  a: number[],
-  b: number[],
-  prefix: number,
-  bitsPerWord: number,
-): boolean {
-  let remaining = prefix
-  for (let i = 0; i < a.length && remaining > 0; i++) {
-    const take = Math.min(bitsPerWord, remaining)
-    const mask = (0xffff << (bitsPerWord - take)) & ((1 << bitsPerWord) - 1)
-    if ((a[i]! & mask) !== (b[i]! & mask)) return false
-    remaining -= take
-  }
-  return true
+function redactUserinfo(raw: string): string {
+  // Best-effort redaction for unparseable URLs.
+  return raw.replace(/\/\/[^@/]*@/, '//***:***@')
 }
 
-function expandV6(s: string): number[] {
-  // Produce 8 x 16-bit groups. Handles :: compression; does not handle
-  // embedded v4 (rare in NO_PROXY).
-  const parts = s.split('::')
-  const head = parts[0] ? parts[0].split(':') : []
-  const tail = parts[1] ? parts[1].split(':') : []
-  const fill = 8 - head.length - tail.length
-  const groups = [
-    ...head,
-    ...Array(Math.max(0, fill)).fill('0'),
-    ...tail,
-  ].slice(0, 8)
-  return groups.map(g => parseInt(g || '0', 16))
+/** Hostname validation for CONNECT request-target. */
+function isValidHost(h: string): boolean {
+  if (!h || h.length > 255) return false
+  if (isIP(h)) return true
+  // RFC 1123 hostname: letters, digits, hyphens, dots. No leading/trailing
+  // hyphen in a label; we only enforce the character set here since the goal
+  // is CRLF/header injection prevention, not full DNS validation.
+  return /^[A-Za-z0-9.-]+$/.test(h)
 }

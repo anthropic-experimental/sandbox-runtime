@@ -32,7 +32,7 @@ import {
   expandGlobPattern,
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
-import { resolveParentProxy } from './parent-proxy.js'
+import { redactUrl, resolveParentProxy } from './parent-proxy.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import { EOL } from 'node:os'
 
@@ -243,8 +243,8 @@ async function initialize(
   parentProxy = resolveParentProxy(runtimeConfig.network.parentProxy)
   if (parentProxy) {
     logForDebugging(
-      `Parent proxy configured: http=${parentProxy.httpUrl?.href ?? '-'} ` +
-        `https=${parentProxy.httpsUrl?.href ?? '-'}`,
+      `Parent proxy configured: http=${redactUrl(parentProxy.httpUrl)} ` +
+        `https=${redactUrl(parentProxy.httpsUrl)}`,
     )
   }
 
