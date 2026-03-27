@@ -32,7 +32,7 @@ import {
   expandGlobPattern,
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
-import { redactUrl, resolveParentProxy } from './parent-proxy.js'
+import { isValidHost, redactUrl, resolveParentProxy } from './parent-proxy.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import { EOL } from 'node:os'
 
@@ -95,6 +95,19 @@ async function filterNetworkRequest(
 ): Promise<boolean> {
   if (!config) {
     logForDebugging('No config available, denying network request')
+    return false
+  }
+
+  // Reject hosts containing control characters before pattern matching.
+  // `matchesDomainPattern` uses string suffix matching which is trivially
+  // fooled by e.g. `evil.com\x00.allowed.com` — the null byte passes
+  // `.endsWith()` but truncates at the libc DNS layer. The SOCKS path is the
+  // main exposure (DOMAINNAME is unvalidated bytes); HTTP is protected by
+  // llhttp/URL parsing, but we check here for defence in depth.
+  if (!isValidHost(host)) {
+    logForDebugging(`Denying malformed host: ${JSON.stringify(host)}:${port}`, {
+      level: 'error',
+    })
     return false
   }
 

@@ -8,8 +8,10 @@
  *
  * This module provides:
  *   - config resolution (explicit config -> HTTP_PROXY/HTTPS_PROXY/NO_PROXY env)
- *   - NO_PROXY matching (hostname suffix + CIDR via net.BlockList,
- *     golang.org/x/net/http/httpproxy semantics)
+ *   - NO_PROXY matching (hostname suffix + CIDR via net.BlockList). Follows
+ *     golang.org/x/net/http/httpproxy semantics for suffix matching. Note:
+ *     port-specific NO_PROXY entries (e.g. `host:8080`) are matched by host
+ *     only; the port is ignored.
  *   - a generic CONNECT-tunnel helper that works over Unix socket, TCP, or TLS
  */
 
@@ -46,6 +48,7 @@ const CONNECT_TIMEOUT_MS = 30_000
  */
 const HOP_BY_HOP = new Set([
   'connection',
+  'content-length',
   'keep-alive',
   'proxy-authenticate',
   'proxy-authorization',
@@ -81,8 +84,19 @@ export function resolveParentProxy(
 
   const parse = (u: string | undefined): URL | undefined => {
     if (!u) return undefined
+    // Accept schemeless `host:port` like curl does, but reject any scheme
+    // other than http/https.
+    const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(u)
+    const withScheme = hasScheme ? u : `http://${u}`
     try {
-      return new URL(u)
+      const parsed = new URL(withScheme)
+      if (
+        (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') ||
+        !parsed.hostname
+      ) {
+        throw new Error('unsupported scheme or empty host')
+      }
+      return parsed
     } catch {
       logForDebugging(
         `Invalid parent proxy URL, ignoring: ${redactUserinfo(u)}`,
@@ -127,7 +141,7 @@ function parseNoProxy(raw: string): NoProxyRules {
           try {
             rules.cidr.addSubnet(ip, prefix, fam === 6 ? 'ipv6' : 'ipv4')
           } catch {
-            // BlockList rejected it; fall through to suffix handling below
+            // BlockList rejected it — ignore this entry.
           }
           continue
         }
@@ -137,15 +151,25 @@ function parseNoProxy(raw: string): NoProxyRules {
       continue
     }
 
-    // Hostname suffix. Normalise: lowercase, strip leading `*.`, strip a
-    // trailing `:port` — but only if the entry isn't itself an IP literal
-    // (IPv6 addresses contain colons).
-    let v = entry.toLowerCase()
+    // Hostname suffix. Normalise: lowercase, strip brackets, strip leading
+    // `*.`, strip a trailing `:port` (unless the entry is an IP literal —
+    // IPv6 addresses contain colons).
+    let v = stripBrackets(entry.toLowerCase())
     if (v.startsWith('*.')) v = v.slice(1)
-    if (!isIP(v.replace(/^\[|\]$/g, ''))) {
+    const bareFam = isIP(v)
+    if (!bareFam) {
       const colon = v.lastIndexOf(':')
       if (colon !== -1 && /^\d+$/.test(v.slice(colon + 1))) {
         v = v.slice(0, colon)
+      }
+    } else {
+      // Bare IP literal — store as an exact-match /32 or /128 CIDR so that
+      // lookups go through BlockList rather than string suffix matching.
+      try {
+        rules.cidr.addAddress(v, bareFam === 6 ? 'ipv6' : 'ipv4')
+        continue
+      } catch {
+        // fall through to suffix push
       }
     }
     rules.suffixes.push(v)
@@ -157,11 +181,13 @@ function parseNoProxy(raw: string): NoProxyRules {
 /**
  * Returns true if the given host should bypass the parent proxy and connect
  * directly. Always bypasses loopback.
+ *
+ * NB: the port is not consulted. NO_PROXY entries of the form `host:port` are
+ * matched by host only (the port suffix is stripped during parsing).
  */
 export function shouldBypassParentProxy(
   resolved: ResolvedParentProxy,
   host: string,
-  _port: number,
 ): boolean {
   const h = stripBrackets(host.toLowerCase().replace(/\.$/, ''))
 
@@ -206,9 +232,11 @@ export function selectParentProxyUrl(
   resolved: ResolvedParentProxy,
   opts: { isHttps: boolean },
 ): URL | undefined {
-  return opts.isHttps
-    ? (resolved.httpsUrl ?? resolved.httpUrl)
-    : (resolved.httpUrl ?? resolved.httpsUrl)
+  if (opts.isHttps) return resolved.httpsUrl ?? resolved.httpUrl
+  // For plain HTTP we only fall back to HTTPS_PROXY if it was explicitly set
+  // — matches curl's behaviour where HTTP requests go direct if only
+  // HTTPS_PROXY is configured.
+  return resolved.httpUrl
 }
 
 // ---------------------------------------------------------------------------
@@ -261,14 +289,14 @@ export function openConnectTunnel(opts: ConnectTunnelOptions): Promise<Socket> {
       sock.destroy()
       reject(err)
     }
+    const onClose = () =>
+      fail(new Error('Proxy closed during CONNECT handshake'))
 
     sock.setTimeout(opts.timeoutMs ?? CONNECT_TIMEOUT_MS, () =>
       fail(new Error('CONNECT handshake timed out')),
     )
     sock.once('error', fail)
-    sock.once('close', () =>
-      fail(new Error('Proxy closed during CONNECT handshake')),
-    )
+    sock.once('close', onClose)
 
     sock.once(opts.readyEvent, () => {
       sock.write(
@@ -290,6 +318,10 @@ export function openConnectTunnel(opts: ConnectTunnelOptions): Promise<Socket> {
             fail(new Error('CONNECT response header too large'))
           return
         }
+        // Pause before detaching the data listener so the stream stops
+        // flowing — otherwise the unshift below (or any bytes arriving
+        // between now and the caller's pipe()) would be dropped.
+        sock.pause()
         sock.removeListener('data', onData)
 
         const statusLine = buf.slice(0, buf.indexOf('\r\n'))
@@ -304,7 +336,7 @@ export function openConnectTunnel(opts: ConnectTunnelOptions): Promise<Socket> {
         settled = true
         sock.setTimeout(0)
         sock.removeListener('error', fail)
-        sock.removeAllListeners('close')
+        sock.removeListener('close', onClose)
         resolve(sock)
       }
       sock.on('data', onData)
@@ -354,11 +386,23 @@ export function proxyAuthHeader(proxyUrl: URL): string | undefined {
   return `Basic ${Buffer.from(creds).toString('base64')}`
 }
 
-/** Strip hop-by-hop and proxy-specific headers before forwarding upstream. */
+/**
+ * Strip hop-by-hop and proxy-specific headers before forwarding upstream.
+ * Also strips any headers named in the incoming `Connection` header, per
+ * RFC 7230 §6.1.
+ */
 export function stripHopByHop(h: IncomingHttpHeaders): IncomingHttpHeaders {
+  const extra = new Set<string>()
+  const connHeader = h.connection
+  if (connHeader) {
+    for (const tok of String(connHeader).split(',')) {
+      extra.add(tok.trim().toLowerCase())
+    }
+  }
   const out: IncomingHttpHeaders = {}
   for (const [k, v] of Object.entries(h)) {
-    if (!HOP_BY_HOP.has(k.toLowerCase())) out[k] = v
+    const lk = k.toLowerCase()
+    if (!HOP_BY_HOP.has(lk) && !extra.has(lk)) out[k] = v
   }
   return out
 }
@@ -383,12 +427,45 @@ function redactUserinfo(raw: string): string {
   return raw.replace(/\/\/[^@/]*@/, '//***:***@')
 }
 
-/** Hostname validation for CONNECT request-target. */
-function isValidHost(h: string): boolean {
+/**
+ * Hostname validation: accepts DNS names (RFC 1123 charset) and IP literals.
+ * Primary purpose is to block control characters (CRLF injection, null-byte
+ * DNS truncation) from reaching the wire or the allowlist matcher. Exported
+ * so the allowlist check can reject malformed hosts before pattern matching.
+ */
+export function isValidHost(h: string): boolean {
   if (!h || h.length > 255) return false
-  if (isIP(h)) return true
-  // RFC 1123 hostname: letters, digits, hyphens, dots. No leading/trailing
-  // hyphen in a label; we only enforce the character set here since the goal
-  // is CRLF/header injection prevention, not full DNS validation.
-  return /^[A-Za-z0-9.-]+$/.test(h)
+  const bare = stripBrackets(h)
+  if (isIP(bare)) return true
+  return /^[A-Za-z0-9.-]+$/.test(bare)
+}
+
+/**
+ * Dial `host:port` directly with a bounded timeout. Shared by the HTTP and
+ * SOCKS direct-connect paths so they get the same timeout behaviour as the
+ * CONNECT-tunnelled paths.
+ */
+export function dialDirect(
+  host: string,
+  port: number,
+  timeoutMs = CONNECT_TIMEOUT_MS,
+): Promise<Socket> {
+  return new Promise((resolve, reject) => {
+    const s = netConnect(port, host)
+    let settled = false
+    const done = (err?: Error) => {
+      if (settled) return
+      settled = true
+      s.setTimeout(0)
+      if (err) {
+        s.destroy()
+        reject(err)
+      } else {
+        resolve(s)
+      }
+    }
+    s.setTimeout(timeoutMs, () => done(new Error('connect timed out')))
+    s.once('connect', () => done())
+    s.once('error', done)
+  })
 }

@@ -1,11 +1,12 @@
 import type { Server as NetServer, Socket } from 'net'
-import { connect as netConnect } from 'net'
 import type { Socks5Server } from '@pondwader/socks5-server'
 import { createServer } from '@pondwader/socks5-server'
 import { logForDebugging } from '../utils/debug.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import {
   connectViaParentProxy,
+  dialDirect,
+  isValidHost,
   selectParentProxyUrl,
   shouldBypassParentProxy,
 } from './parent-proxy.js'
@@ -39,6 +40,18 @@ export function createSocksProxyServer(
       const hostname = conn.destAddress
       const port = conn.destPort
 
+      // SOCKS5 DOMAINNAME is a raw length-prefixed byte string with zero
+      // validation from the protocol or the library. Reject control chars
+      // (null bytes, CRLF) here so they never reach the allowlist matcher,
+      // where string suffix matching would be trivially fooled.
+      if (!isValidHost(hostname)) {
+        logForDebugging(
+          `Rejecting malformed SOCKS host: ${JSON.stringify(hostname)}`,
+          { level: 'error' },
+        )
+        return false
+      }
+
       logForDebugging(`Connection request to ${hostname}:${port}`)
 
       const allowed = await options.filter(port, hostname)
@@ -67,37 +80,44 @@ export function createSocksProxyServer(
     const host = conn.destAddress
     const port = conn.destPort
 
+    // Track client liveness so we can abort the upstream dial if they bail.
+    let clientGone = false
+    let upstreamRef: Socket | undefined
+    conn.socket.once('close', () => {
+      clientGone = true
+      upstreamRef?.destroy()
+    })
+    conn.socket.on('error', () => upstreamRef?.destroy())
+
     const parentUrl =
-      options.parentProxy &&
-      !shouldBypassParentProxy(options.parentProxy, host, port)
+      options.parentProxy && !shouldBypassParentProxy(options.parentProxy, host)
         ? selectParentProxyUrl(options.parentProxy, { isHttps: port === 443 })
         : undefined
 
     const open = parentUrl
       ? connectViaParentProxy(parentUrl, host, port)
-      : new Promise<Socket>((resolve, reject) => {
-          const s = netConnect(port, host, () => resolve(s))
-          s.once('error', reject)
-        })
+      : dialDirect(host, port)
 
-    open.then(
-      upstream => {
+    open
+      .then(upstream => {
+        upstreamRef = upstream
+        if (clientGone) {
+          upstream.destroy()
+          return
+        }
         sendStatus('REQUEST_GRANTED')
         upstream.pipe(conn.socket)
         conn.socket.pipe(upstream)
         upstream.on('error', () => conn.socket.destroy())
-        conn.socket.on('error', () => upstream.destroy())
-        conn.socket.on('end', () => upstream.end())
-        upstream.on('end', () => conn.socket.end())
-      },
-      err => {
+        upstream.on('close', () => conn.socket.destroy())
+      })
+      .catch(err => {
         logForDebugging(
           `SOCKS connect to ${host}:${port} failed: ${(err as Error).message}`,
           { level: 'error' },
         )
-        sendStatus('HOST_UNREACHABLE')
-      },
-    )
+        if (!clientGone) sendStatus('HOST_UNREACHABLE')
+      })
   })
 
   return {

@@ -9,6 +9,7 @@ import { logForDebugging } from '../utils/debug.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import {
   connectViaParentProxy,
+  dialDirect,
   openConnectTunnel,
   proxyAuthHeader,
   selectParentProxyUrl,
@@ -43,23 +44,28 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
   const server = createServer()
 
   // Handle CONNECT requests for HTTPS traffic
-  server.on('connect', async (req, socket) => {
+  server.on('connect', async (req, socket, head) => {
     // Attach error handler immediately to prevent unhandled errors
     socket.on('error', err => {
       logForDebugging(`Client socket error: ${err.message}`, { level: 'error' })
     })
 
-    try {
-      const [hostname, portStr] = req.url!.split(':')
-      const port = portStr === undefined ? undefined : parseInt(portStr, 10)
+    // Track client liveness so we can abort the upstream dial if they bail.
+    let clientGone = false
+    socket.once('close', () => {
+      clientGone = true
+    })
 
-      if (!hostname || !port) {
+    try {
+      const target = parseConnectTarget(req.url!)
+      if (!target) {
         logForDebugging(`Invalid CONNECT request: ${req.url}`, {
           level: 'error',
         })
         socket.end('HTTP/1.1 400 Bad Request\r\n\r\n')
         return
       }
+      const { hostname, port } = target
 
       const allowed = await options.filter(port, hostname, socket)
       if (!allowed) {
@@ -81,8 +87,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       const parentUrl =
         !mitmSocketPath &&
         options.parentProxy &&
-        !shouldBypassParentProxy(options.parentProxy, hostname, port)
-          ? selectParentProxyUrl(options.parentProxy, { isHttps: port === 443 })
+        !shouldBypassParentProxy(options.parentProxy, hostname)
+          ? selectParentProxyUrl(options.parentProxy, { isHttps: true })
           : undefined
 
       let upstream: Socket
@@ -100,10 +106,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         } else if (parentUrl) {
           upstream = await connectViaParentProxy(parentUrl, hostname, port)
         } else {
-          upstream = await new Promise<Socket>((resolve, reject) => {
-            const s = connect(port, hostname, () => resolve(s))
-            s.once('error', reject)
-          })
+          upstream = await dialDirect(hostname, port)
         }
       } catch (err) {
         logForDebugging(`CONNECT tunnel failed: ${(err as Error).message}`, {
@@ -113,7 +116,15 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         return
       }
 
+      if (clientGone) {
+        upstream.destroy()
+        return
+      }
+
       socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+      // Forward any bytes the client sent in the same packet as the CONNECT
+      // (Node delivers these as the `head` buffer, not via the socket stream).
+      if (head.length) upstream.write(head)
       upstream.pipe(socket)
       socket.pipe(upstream)
 
@@ -123,9 +134,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         })
         socket.destroy()
       })
-      socket.on('error', () => upstream.destroy())
-      socket.on('end', () => upstream.end())
-      upstream.on('end', () => socket.end())
+      socket.on('close', () => upstream.destroy())
+      upstream.on('close', () => socket.destroy())
     } catch (err) {
       logForDebugging(`Error handling CONNECT: ${err}`, { level: 'error' })
       socket.end('HTTP/1.1 500 Internal Server Error\r\n\r\n')
@@ -163,7 +173,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       const parentUrl =
         !mitmSocketPath &&
         options.parentProxy &&
-        !shouldBypassParentProxy(options.parentProxy, hostname, port)
+        !shouldBypassParentProxy(options.parentProxy, hostname)
           ? selectParentProxyUrl(options.parentProxy, {
               isHttps: url.protocol === 'https:',
             })
@@ -242,8 +252,13 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         if (!res.headersSent) {
           res.writeHead(502, { 'Content-Type': 'text/plain' })
           res.end('Bad Gateway')
+        } else {
+          res.destroy()
         }
       })
+
+      // Tear down the upstream request if the client goes away mid-flight.
+      res.on('close', () => proxyReq.destroy())
 
       req.pipe(proxyReq)
     } catch (err) {
@@ -254,4 +269,19 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
   })
 
   return server
+}
+
+/**
+ * Parse a CONNECT request-target into host + port. Handles both plain
+ * `host:port` and bracketed IPv6 `[::1]:port`.
+ */
+function parseConnectTarget(
+  target: string,
+): { hostname: string; port: number } | undefined {
+  const m =
+    /^\[([^\]]+)\]:(\d+)$/.exec(target) ?? /^([^:]+):(\d+)$/.exec(target)
+  if (!m) return undefined
+  const port = Number(m[2])
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return undefined
+  return { hostname: m[1]!, port }
 }
