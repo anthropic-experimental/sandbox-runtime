@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test'
 import { connect } from 'node:net'
 import {
+  canonicalizeHost,
   isValidHost,
   openConnectTunnel,
   redactUrl,
@@ -368,5 +369,32 @@ describe('parent-proxy: selectParentProxyUrl curl semantics', () => {
     const r = resolveParentProxy({ https: 'http://secure:1' })!
     expect(selectParentProxyUrl(r, { isHttps: false })).toBeUndefined()
     expect(selectParentProxyUrl(r, { isHttps: true })?.hostname).toBe('secure')
+  })
+})
+
+describe('parent-proxy: canonicalizeHost', () => {
+  test('normalizes inet_aton shorthand (denylist evasion guard)', () => {
+    expect(canonicalizeHost('127.1')).toBe('127.0.0.1')
+    expect(canonicalizeHost('2130706433')).toBe('127.0.0.1')
+    expect(canonicalizeHost('0x7f.0.0.1')).toBe('127.0.0.1')
+    // AWS metadata as decimal
+    expect(canonicalizeHost('2852039166')).toBe('169.254.169.254')
+  })
+
+  test('normalizes IPv6 forms', () => {
+    expect(canonicalizeHost('0:0:0:0:0:0:0:1')).toBe('::1')
+    expect(canonicalizeHost('[::1]')).toBe('::1')
+  })
+
+  test('strips trailing dot and lowercases', () => {
+    expect(canonicalizeHost('Example.COM.')).toBe('example.com')
+  })
+
+  test('passes through ordinary hostnames', () => {
+    expect(canonicalizeHost('registry.npmjs.org')).toBe('registry.npmjs.org')
+  })
+
+  test('returns undefined for garbage', () => {
+    expect(canonicalizeHost('not a host')).toBeUndefined()
   })
 })

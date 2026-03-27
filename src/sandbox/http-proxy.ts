@@ -167,6 +167,10 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         return
       }
 
+      // Client may have disconnected while we awaited the filter; bail now
+      // rather than dialing an upstream nobody will read from.
+      if (req.socket.destroyed) return
+
       const fwdHeaders = { ...stripHopByHop(req.headers), host: url.host }
 
       // Decide upstream route: MITM unix socket > parent HTTP proxy > direct.
@@ -203,7 +207,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             headers: fwdHeaders,
           },
           proxyRes => {
-            res.writeHead(proxyRes.statusCode!, proxyRes.headers)
+            res.writeHead(proxyRes.statusCode!, stripHopByHop(proxyRes.headers))
             proxyRes.pipe(res)
           },
         )
@@ -225,7 +229,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               : fwdHeaders,
           },
           proxyRes => {
-            res.writeHead(proxyRes.statusCode!, proxyRes.headers)
+            res.writeHead(proxyRes.statusCode!, stripHopByHop(proxyRes.headers))
             proxyRes.pipe(res)
           },
         )
@@ -240,7 +244,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             headers: fwdHeaders,
           },
           proxyRes => {
-            res.writeHead(proxyRes.statusCode!, proxyRes.headers)
+            res.writeHead(proxyRes.statusCode!, stripHopByHop(proxyRes.headers))
             proxyRes.pipe(res)
           },
         )
@@ -264,8 +268,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       req.pipe(proxyReq)
     } catch (err) {
       logForDebugging(`Error handling HTTP request: ${err}`, { level: 'error' })
-      res.writeHead(500, { 'Content-Type': 'text/plain' })
-      res.end('Internal Server Error')
+      if (!res.headersSent) {
+        res.writeHead(500, { 'Content-Type': 'text/plain' })
+        res.end('Internal Server Error')
+      } else {
+        res.destroy()
+      }
     }
   })
 

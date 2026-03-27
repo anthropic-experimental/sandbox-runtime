@@ -33,6 +33,7 @@ import {
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
 import {
+  canonicalizeHost,
   isValidHost,
   redactUrl,
   resolveParentProxy,
@@ -122,9 +123,14 @@ async function filterNetworkRequest(
     return false
   }
 
+  // Canonicalize so string comparisons match what getaddrinfo() will dial.
+  // Without this, inet_aton shorthand like `2852039166` (= 169.254.169.254)
+  // or `127.1` slips past a denylist entry for the dotted-decimal form.
+  const canonicalHost = canonicalizeHost(host) ?? host
+
   // Check denied domains first
   for (const deniedDomain of config.network.deniedDomains) {
-    if (matchesDomainPattern(host, deniedDomain)) {
+    if (matchesDomainPattern(canonicalHost, deniedDomain)) {
       logForDebugging(`Denied by config rule: ${host}:${port}`)
       return false
     }
@@ -132,7 +138,7 @@ async function filterNetworkRequest(
 
   // Check allowed domains
   for (const allowedDomain of config.network.allowedDomains) {
-    if (matchesDomainPattern(host, allowedDomain)) {
+    if (matchesDomainPattern(canonicalHost, allowedDomain)) {
       logForDebugging(`Allowed by config rule: ${host}:${port}`)
       return true
     }
@@ -726,6 +732,11 @@ function getConfig(): SandboxRuntimeConfig | undefined {
 function updateConfig(newConfig: SandboxRuntimeConfig): void {
   // Deep clone the config to avoid mutations
   config = cloneDeep(newConfig)
+  // Re-resolve parent proxy so hot-reload picks up changes. Note: the proxy
+  // servers capture `parentProxy` by value at creation, so changes here take
+  // effect only on re-initialize. This keeps the state consistent for the
+  // next initialize() call.
+  parentProxy = resolveParentProxy(newConfig.network.parentProxy)
   logForDebugging('Sandbox configuration updated')
 }
 
@@ -906,6 +917,7 @@ async function reset(): Promise<void> {
   socksProxyServer = undefined
   managerContext = undefined
   initializationPromise = undefined
+  parentProxy = undefined
 }
 
 function getSandboxViolationStore() {

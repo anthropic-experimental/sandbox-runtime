@@ -107,11 +107,14 @@ export function resolveParentProxy(
     }
   }
 
-  return {
-    httpUrl: parse(http),
-    httpsUrl: parse(https),
-    noProxy: parseNoProxy(noProxyRaw),
-  }
+  const httpUrl = parse(http)
+  const httpsUrl = parse(https)
+  // If both parsed to undefined, behave as if no parent proxy was configured
+  // rather than returning a husk object that makes callers do bypass checks
+  // for nothing.
+  if (!httpUrl && !httpsUrl) return undefined
+
+  return { httpUrl, httpsUrl, noProxy: parseNoProxy(noProxyRaw) }
 }
 
 function parseNoProxy(raw: string): NoProxyRules {
@@ -457,6 +460,31 @@ export function isValidHost(h: string): boolean {
   // DNS label charset. Underscore is permitted for compatibility with real-
   // world DNS records (_dmarc, _acme-challenge, etc.).
   return /^[A-Za-z0-9._-]+$/.test(bare)
+}
+
+/**
+ * Canonicalize a host string via the WHATWG URL parser so that string
+ * comparisons in the allowlist agree with what `net.connect()`/`getaddrinfo()`
+ * will actually dial. This normalizes:
+ *   - inet_aton shorthand (`127.1` → `127.0.0.1`, `2130706433` → `127.0.0.1`)
+ *   - hex/octal octets (`0x7f.0.0.1` → `127.0.0.1`)
+ *   - IPv6 compression (`0:0:0:0:0:0:0:1` → `::1`)
+ *   - trailing dots, case, brackets
+ *
+ * Returns undefined if the input is not a valid URL host.
+ */
+export function canonicalizeHost(h: string): string | undefined {
+  try {
+    const bare = stripBrackets(h)
+    // WHATWG URL rejects zone IDs and most garbage; it normalizes inet_aton
+    // forms and IPv6 compression. It does NOT strip trailing dots or IPv6
+    // brackets from the output, so we do that ourselves.
+    const bracketed = isIP(bare) === 6 ? `[${bare}]` : bare
+    const out = new URL(`http://${bracketed}/`).hostname
+    return stripBrackets(out).replace(/\.$/, '')
+  } catch {
+    return undefined
+  }
 }
 
 /**

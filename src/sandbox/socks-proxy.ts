@@ -118,7 +118,13 @@ export function createSocksProxyServer(
           `SOCKS connect to ${host}:${port} failed: ${(err as Error).message}`,
           { level: 'error' },
         )
-        if (!clientGone) sendStatus('HOST_UNREACHABLE')
+        if (!clientGone) {
+          try {
+            sendStatus('HOST_UNREACHABLE')
+          } catch {
+            // socket may have closed between the check and the write
+          }
+        }
       })
   })
 
@@ -145,7 +151,12 @@ export function createSocksProxyServer(
     },
     listen(port: number, hostname: string): Promise<number> {
       return new Promise((resolve, reject) => {
+        const serverInternal = (
+          socksServer as unknown as { server?: NetServer }
+        )?.server
+        serverInternal?.once('error', reject)
         const listeningCallback = (): void => {
+          serverInternal?.removeListener('error', reject)
           const actualPort = this.getPort()
           if (actualPort) {
             logForDebugging(
