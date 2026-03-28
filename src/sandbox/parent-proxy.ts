@@ -21,12 +21,7 @@ import { BlockList, connect as netConnect, isIP } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
 import { URL } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
-
-export interface ParentProxyConfig {
-  http?: string
-  https?: string
-  noProxy?: string
-}
+import type { ParentProxyConfig } from './sandbox-config.js'
 
 export interface ResolvedParentProxy {
   httpUrl?: URL
@@ -387,7 +382,7 @@ export function connectViaParentProxy(
 // ---------------------------------------------------------------------------
 
 export function proxyAuthHeader(proxyUrl: URL): string | undefined {
-  if (!proxyUrl.username) return undefined
+  if (!proxyUrl.username && !proxyUrl.password) return undefined
   try {
     const creds = `${decodeURIComponent(proxyUrl.username)}:${decodeURIComponent(proxyUrl.password)}`
     return `Basic ${Buffer.from(creds).toString('base64')}`
