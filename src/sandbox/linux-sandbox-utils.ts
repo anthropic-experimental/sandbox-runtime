@@ -644,13 +644,17 @@ async function generateFilesystemArgs(
   const args: string[] = []
   // fs already imported
 
+  // Collect normalized allowed write paths. Populated in the writeConfig
+  // block, read again in the denyRead loop to re-bind writes under tmpfs.
+  const allowedWritePaths: string[] = []
+  // denyWrite binds are buffered and emitted after denyRead processing so that
+  // a denyRead tmpfs over an ancestor directory doesn't wipe them out.
+  const denyWriteArgs: string[] = []
+
   // Determine initial root mount based on write restrictions
   if (writeConfig) {
     // Write restrictions: Start with read-only root, then allow writes to specific paths
     args.push('--ro-bind', '/', '/')
-
-    // Collect normalized allowed write paths for later checking
-    const allowedWritePaths: string[] = []
 
     // Allow writes to specific paths
     for (const pathPattern of writeConfig.allowOnly || []) {
@@ -714,8 +718,15 @@ async function generateFilesystemArgs(
       )),
     ]
 
+    // Dedup post-normalization: entries like ['~/.foo', '/home/user/.foo']
+    // converge to the same path here. A duplicate --ro-bind /dev/null <dest>
+    // hits a char device on the second pass and bwrap's ensure_file() falls
+    // through to creat() on a read-only mount.
+    const seenDenyWrite = new Set<string>()
     for (const pathPattern of denyPaths) {
       const normalizedPath = normalizePathForSandbox(pathPattern)
+      if (seenDenyWrite.has(normalizedPath)) continue
+      seenDenyWrite.add(normalizedPath)
 
       // Skip /dev/* paths since --dev /dev already handles them
       if (normalizedPath.startsWith('/dev/')) {
@@ -728,7 +739,7 @@ async function generateFilesystemArgs(
       // symlink and creates real .claude/settings.json with malicious hooks.
       const symlinkInPath = findSymlinkInPath(normalizedPath, allowedWritePaths)
       if (symlinkInPath) {
-        args.push('--ro-bind', '/dev/null', symlinkInPath)
+        denyWriteArgs.push('--ro-bind', '/dev/null', symlinkInPath)
         logForDebugging(
           `[Sandbox Linux] Mounted /dev/null at symlink ${symlinkInPath} to prevent symlink replacement attack`,
         )
@@ -780,14 +791,14 @@ async function generateFilesystemArgs(
             const emptyDir = fs.mkdtempSync(
               path.join(tmpdir(), 'claude-empty-'),
             )
-            args.push('--ro-bind', emptyDir, firstNonExistent)
+            denyWriteArgs.push('--ro-bind', emptyDir, firstNonExistent)
             bwrapMountPoints.add(firstNonExistent)
             registerExitCleanupHandler()
             logForDebugging(
               `[Sandbox Linux] Mounted empty dir at ${firstNonExistent} to block creation of ${normalizedPath}`,
             )
           } else {
-            args.push('--ro-bind', '/dev/null', firstNonExistent)
+            denyWriteArgs.push('--ro-bind', '/dev/null', firstNonExistent)
             bwrapMountPoints.add(firstNonExistent)
             registerExitCleanupHandler()
             logForDebugging(
@@ -811,7 +822,7 @@ async function generateFilesystemArgs(
       )
 
       if (isWithinAllowedPath) {
-        args.push('--ro-bind', normalizedPath, normalizedPath)
+        denyWriteArgs.push('--ro-bind', normalizedPath, normalizedPath)
       } else {
         logForDebugging(
           `[Sandbox Linux] Skipping deny path not within allowed paths: ${normalizedPath}`,
@@ -822,12 +833,29 @@ async function generateFilesystemArgs(
     // No write restrictions: Allow all writes
     args.push('--bind', '/', '/')
   }
+  // denyWriteArgs is emitted after the denyRead loop below.
 
   // Handle read restrictions by mounting tmpfs over denied paths
-  const readDenyPaths = [...(readConfig?.denyOnly || [])]
+  const readDenyPaths: string[] = []
   const readAllowPaths = (readConfig?.allowWithinDeny || []).map(p =>
     normalizePathForSandbox(p),
   )
+
+  // --tmpfs / would wipe all prior mounts (ro-bind /, write binds, deny binds).
+  // Expand a root deny into its direct children so the existing per-dir tmpfs
+  // + re-bind logic applies. Skip /proc and /dev: they're remounted by the
+  // caller after this function returns. Skip /sys: kernel interface, tmpfs
+  // over it breaks tooling and the host /sys is already read-only via ro-bind.
+  const rootSkip = new Set(['proc', 'dev', 'sys'])
+  for (const p of readConfig?.denyOnly || []) {
+    if (normalizePathForSandbox(p) === '/') {
+      for (const child of fs.readdirSync('/')) {
+        if (!rootSkip.has(child)) readDenyPaths.push('/' + child)
+      }
+    } else {
+      readDenyPaths.push(p)
+    }
+  }
 
   // Always hide /etc/ssh/ssh_config.d to avoid permission issues with OrbStack
   // SSH is very strict about config file permissions and ownership, and they can
@@ -845,22 +873,43 @@ async function generateFilesystemArgs(
       continue
     }
 
+    const denySep = normalizedPath === '/' ? '/' : normalizedPath + '/'
     const readDenyStat = fs.statSync(normalizedPath)
     if (readDenyStat.isDirectory()) {
       args.push('--tmpfs', normalizedPath)
+
+      // tmpfs wiped any earlier write binds under this path — restore them.
+      for (const writePath of allowedWritePaths) {
+        if (writePath.startsWith(denySep) || writePath === normalizedPath) {
+          args.push('--bind', writePath, writePath)
+          logForDebugging(
+            `[Sandbox Linux] Re-bound write path wiped by denyRead tmpfs: ${writePath}`,
+          )
+        }
+      }
 
       // Re-allow specific paths within the denied directory (allowRead overrides denyRead).
       // After mounting tmpfs over the denied dir, bind back the allowed subdirectories
       // so they are readable again.
       for (const allowPath of readAllowPaths) {
-        if (
-          allowPath.startsWith(normalizedPath + '/') ||
-          allowPath === normalizedPath
-        ) {
+        if (allowPath.startsWith(denySep) || allowPath === normalizedPath) {
           if (!fs.existsSync(allowPath)) {
             logForDebugging(
               `[Sandbox Linux] Skipping non-existent read allow path: ${allowPath}`,
             )
+            continue
+          }
+          // Skip only if a write path was re-bound just above AND covers
+          // allowPath. A write path that's an ancestor of the deny dir isn't
+          // re-bound (it wasn't wiped), so allowPath under it still needs
+          // its own ro-bind here.
+          if (
+            allowedWritePaths.some(
+              w =>
+                (w.startsWith(denySep) || w === normalizedPath) &&
+                (allowPath === w || allowPath.startsWith(w + '/')),
+            )
+          ) {
             continue
           }
           // Bind the allowed path back over the tmpfs so it's readable
@@ -887,6 +936,11 @@ async function generateFilesystemArgs(
       args.push('--ro-bind', '/dev/null', normalizedPath)
     }
   }
+
+  // Emitting denyWrite last means these ro-binds layer on top of any write
+  // paths the denyRead loop just re-bound. Before this ordering, tmpfs over
+  // an ancestor of cwd would wipe the .git/hooks protection.
+  args.push(...denyWriteArgs)
 
   return args
 }

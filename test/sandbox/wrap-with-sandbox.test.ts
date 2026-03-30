@@ -4,7 +4,7 @@ import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { getPlatform } from '../../src/utils/platform.js'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
-import { mkdirSync, rmSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -712,6 +712,44 @@ describe('allowWrite glob suffix handling', () => {
       expect(result).not.toBe(command)
       expect(result).toContain(parentDir)
       expect(result).toContain(childDir)
+    } finally {
+      await SandboxManager.reset()
+      rmSync(parentDir, { recursive: true, force: true })
+    }
+  })
+
+  // Regression: two denyWrite entries that converge to the same path after
+  // normalizePathForSandbox() produced a duplicate --ro-bind /dev/null <dest>.
+  // Second bind finds a char device at <dest>; bwrap's ensure_file() doesn't
+  // short-circuit on S_ISCHR and falls through to creat() on a read-only mount.
+  it('dedups denyWrite entries that normalize to the same path (Linux)', async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    const parentDir = join(tmpdir(), `srt-test-dup-deny-${Date.now()}`)
+    const childFile = join(parentDir, 'dup.txt')
+    mkdirSync(parentDir, { recursive: true })
+    writeFileSync(childFile, '')
+
+    try {
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: [],
+          allowWrite: [parentDir],
+          // Trailing slash and bare form both realpath to childFile
+          denyWrite: [childFile, childFile + '/'],
+        },
+      })
+
+      const result = await SandboxManager.wrapWithSandbox(command)
+
+      // One --ro-bind <path> <path> contains the path twice (src + dest).
+      // Without dedup this was 4 occurrences (two binds).
+      const occurrences = result.split(childFile).length - 1
+      expect(occurrences).toBe(2)
     } finally {
       await SandboxManager.reset()
       rmSync(parentDir, { recursive: true, force: true })
