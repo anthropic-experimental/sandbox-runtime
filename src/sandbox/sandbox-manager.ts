@@ -83,7 +83,10 @@ function registerCleanup(): void {
   cleanupRegistered = true
 }
 
-function matchesDomainPattern(hostname: string, pattern: string): boolean {
+export function matchesDomainPattern(
+  hostname: string,
+  pattern: string,
+): boolean {
   const h = hostname.toLowerCase()
   // Support wildcard patterns like *.example.com. Never apply wildcard
   // suffix matching to IP literals — an IPv6 zone-ID payload like
@@ -100,6 +103,49 @@ function matchesDomainPattern(hostname: string, pattern: string): boolean {
   return h === pattern.toLowerCase()
 }
 
+/**
+ * Pure evaluation of a host against the network allow/deny lists.
+ * Separated from filterNetworkRequest so validation, canonicalization,
+ * and deny-then-allow precedence can be unit-tested without module state
+ * or the async callback.
+ *
+ * Returns 'invalid' for hosts rejected before pattern matching, 'deny'/'allow'
+ * for rule hits, 'no-match' when the host matched neither list.
+ */
+export function evaluateNetworkRules(
+  host: string,
+  network: { allowedDomains: string[]; deniedDomains: string[] },
+): 'invalid' | 'deny' | 'allow' | 'no-match' {
+  // Reject hosts containing control characters before pattern matching.
+  // `matchesDomainPattern` uses string suffix matching which is trivially
+  // fooled by e.g. `evil.com\x00.allowed.com` — the null byte passes
+  // `.endsWith()` but truncates at the libc DNS layer. The SOCKS path is the
+  // main exposure (DOMAINNAME is unvalidated bytes); HTTP is protected by
+  // llhttp/URL parsing, but we check here for defence in depth.
+  if (!isValidHost(host)) {
+    return 'invalid'
+  }
+
+  // Canonicalize so string comparisons match what getaddrinfo() will dial.
+  // Without this, inet_aton shorthand like `2852039166` (= 169.254.169.254)
+  // or `127.1` slips past a denylist entry for the dotted-decimal form.
+  const canonicalHost = canonicalizeHost(host) ?? host
+
+  for (const deniedDomain of network.deniedDomains) {
+    if (matchesDomainPattern(canonicalHost, deniedDomain)) {
+      return 'deny'
+    }
+  }
+
+  for (const allowedDomain of network.allowedDomains) {
+    if (matchesDomainPattern(canonicalHost, allowedDomain)) {
+      return 'allow'
+    }
+  }
+
+  return 'no-match'
+}
+
 async function filterNetworkRequest(
   port: number,
   host: string,
@@ -110,38 +156,21 @@ async function filterNetworkRequest(
     return false
   }
 
-  // Reject hosts containing control characters before pattern matching.
-  // `matchesDomainPattern` uses string suffix matching which is trivially
-  // fooled by e.g. `evil.com\x00.allowed.com` — the null byte passes
-  // `.endsWith()` but truncates at the libc DNS layer. The SOCKS path is the
-  // main exposure (DOMAINNAME is unvalidated bytes); HTTP is protected by
-  // llhttp/URL parsing, but we check here for defence in depth.
-  if (!isValidHost(host)) {
+  const ruling = evaluateNetworkRules(host, config.network)
+
+  if (ruling === 'invalid') {
     logForDebugging(`Denying malformed host: ${JSON.stringify(host)}:${port}`, {
       level: 'error',
     })
     return false
   }
-
-  // Canonicalize so string comparisons match what getaddrinfo() will dial.
-  // Without this, inet_aton shorthand like `2852039166` (= 169.254.169.254)
-  // or `127.1` slips past a denylist entry for the dotted-decimal form.
-  const canonicalHost = canonicalizeHost(host) ?? host
-
-  // Check denied domains first
-  for (const deniedDomain of config.network.deniedDomains) {
-    if (matchesDomainPattern(canonicalHost, deniedDomain)) {
-      logForDebugging(`Denied by config rule: ${host}:${port}`)
-      return false
-    }
+  if (ruling === 'deny') {
+    logForDebugging(`Denied by config rule: ${host}:${port}`)
+    return false
   }
-
-  // Check allowed domains
-  for (const allowedDomain of config.network.allowedDomains) {
-    if (matchesDomainPattern(canonicalHost, allowedDomain)) {
-      logForDebugging(`Allowed by config rule: ${host}:${port}`)
-      return true
-    }
+  if (ruling === 'allow') {
+    logForDebugging(`Allowed by config rule: ${host}:${port}`)
+    return true
   }
 
   // No matching rules - ask user or deny
