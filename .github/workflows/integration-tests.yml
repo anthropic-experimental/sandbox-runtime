@@ -2,9 +2,9 @@ name: Tests
 
 on:
   push:
-    branches: [ "**" ]
+    branches: ['**']
   pull_request:
-    branches: [ "**" ]
+    branches: ['**']
 
 jobs:
   integration-tests:
@@ -71,14 +71,11 @@ jobs:
       - name: Build project
         run: npm run build
 
-      - name: Run unit tests
-        run: npm run test:unit
+      - name: Run tests
+        run: npm test
 
       - name: Run Node.js fallback tests
         run: node test/utils/which-node-test.mjs
-
-      - name: Run integration tests
-        run: npm run test:integration
 
       - name: Upload test results
         if: always()
