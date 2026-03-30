@@ -326,11 +326,14 @@ describe('allowRead carve-out with denyRead at filesystem root (issue #10)', () 
       allowWithinDeny: [TEST_DIR, ...EXEC_DEPS],
     }
 
+    // allowAllUnixSockets: true bypasses the seccomp path — otherwise the
+    // apply-seccomp binary under <repo>/vendor/ is hidden by the root deny.
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: `cat ${TEST_FILE}`,
       needsNetworkRestriction: false,
       readConfig,
       writeConfig: undefined,
+      allowAllUnixSockets: true,
     })
 
     const result = spawnSync(wrappedCommand, {
@@ -359,6 +362,7 @@ describe('allowRead carve-out with denyRead at filesystem root (issue #10)', () 
       needsNetworkRestriction: false,
       readConfig,
       writeConfig: undefined,
+      allowAllUnixSockets: true,
     })
 
     const result = spawnSync(wrappedCommand, {
@@ -388,6 +392,7 @@ describe('allowRead carve-out with denyRead at filesystem root (issue #10)', () 
         allowOnly: [TEST_DIR],
         denyWithinAllow: [],
       },
+      allowAllUnixSockets: true,
     })
 
     const result = spawnSync(wrappedCommand, {

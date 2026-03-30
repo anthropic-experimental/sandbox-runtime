@@ -746,8 +746,10 @@ describe('allowWrite glob suffix handling', () => {
 
       const result = await SandboxManager.wrapWithSandbox(command)
 
+      // One --ro-bind <path> <path> contains the path twice (src + dest).
+      // Without dedup this was 4 occurrences (two binds).
       const occurrences = result.split(childFile).length - 1
-      expect(occurrences).toBe(1)
+      expect(occurrences).toBe(2)
     } finally {
       await SandboxManager.reset()
       rmSync(parentDir, { recursive: true, force: true })
