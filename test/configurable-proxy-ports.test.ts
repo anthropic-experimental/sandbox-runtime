@@ -1,10 +1,10 @@
-import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
+import { describe, it, expect, afterAll } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import * as http from 'node:http'
 import * as net from 'node:net'
 import { SandboxManager } from '../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../src/sandbox/sandbox-config.js'
-import { getPlatform } from '../src/utils/platform.js'
+import { isLinux } from './helpers/platform.js'
 
 /**
  * Integration tests for configurable proxy ports feature
@@ -290,135 +290,143 @@ describe('Configurable Proxy Ports Integration Tests', () => {
     })
   })
 
-  describe('End-to-end: External proxy actually handles requests', () => {
-    it('should route requests through external allow-all proxy, bypassing SRT filtering', async () => {
-      // Skip if not on Linux (where we have full sandbox integration)
-      if (getPlatform() !== 'linux') {
-        console.log('Skipping end-to-end test on non-Linux platform')
-        return
-      }
+  describe.if(isLinux)(
+    'End-to-end: External proxy actually handles requests',
+    () => {
+      it('should route requests through external allow-all proxy, bypassing SRT filtering', async () => {
+        // Create a simple HTTP CONNECT proxy that allows ALL connections (no filtering)
+        let externalProxyServer: http.Server | undefined
+        let externalProxyPort: number | undefined
 
-      // Create a simple HTTP CONNECT proxy that allows ALL connections (no filtering)
-      let externalProxyServer: http.Server | undefined
-      let externalProxyPort: number | undefined
+        try {
+          externalProxyServer = http.createServer()
 
-      try {
-        externalProxyServer = http.createServer()
+          // Handle HTTP CONNECT method for HTTPS tunneling
+          externalProxyServer.on('connect', (req, clientSocket, head) => {
+            const { port, hostname } = new URL(`http://${req.url}`)
 
-        // Handle HTTP CONNECT method for HTTPS tunneling
-        externalProxyServer.on('connect', (req, clientSocket, head) => {
-          const { port, hostname } = new URL(`http://${req.url}`)
+            // Connect to target (allow everything - no filtering)
+            const serverSocket = net.connect(
+              parseInt(port) || 80,
+              hostname,
+              () => {
+                clientSocket.write(
+                  'HTTP/1.1 200 Connection Established\r\n\r\n',
+                )
+                serverSocket.write(head)
+                serverSocket.pipe(clientSocket)
+                clientSocket.pipe(serverSocket)
+              },
+            )
 
-          // Connect to target (allow everything - no filtering)
-          const serverSocket = net.connect(parseInt(port) || 80, hostname, () => {
-            clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
-            serverSocket.write(head)
-            serverSocket.pipe(clientSocket)
-            clientSocket.pipe(serverSocket)
-          })
+            serverSocket.on('error', () => {
+              clientSocket.end()
+            })
 
-          serverSocket.on('error', (err) => {
-            clientSocket.end()
-          })
-
-          clientSocket.on('error', (err) => {
-            serverSocket.end()
-          })
-        })
-
-        // Handle regular HTTP requests
-        externalProxyServer.on('request', (req, res) => {
-          const url = new URL(req.url!)
-          const options = {
-            hostname: url.hostname,
-            port: url.port || 80,
-            path: url.pathname + url.search,
-            method: req.method,
-            headers: req.headers,
-          }
-
-          const proxyReq = http.request(options, (proxyRes) => {
-            res.writeHead(proxyRes.statusCode!, proxyRes.headers)
-            proxyRes.pipe(res)
-          })
-
-          proxyReq.on('error', (err) => {
-            res.writeHead(502)
-            res.end('Bad Gateway')
-          })
-
-          req.pipe(proxyReq)
-        })
-
-        // Start the external proxy on a random port
-        await new Promise<void>((resolve, reject) => {
-          externalProxyServer!.listen(0, '127.0.0.1', () => {
-            const addr = externalProxyServer!.address()
-            if (addr && typeof addr === 'object') {
-              externalProxyPort = addr.port
-              console.log(`External allow-all proxy started on port ${externalProxyPort}`)
-              resolve()
-            } else {
-              reject(new Error('Failed to get proxy address'))
-            }
-          })
-          externalProxyServer!.on('error', reject)
-        })
-
-        // Initialize SandboxManager with restrictive config but external proxy
-        const config: SandboxRuntimeConfig = {
-          network: {
-            allowedDomains: ['example.com'], // Only allow example.com
-            deniedDomains: [],
-            httpProxyPort: externalProxyPort, // Use our allow-all external proxy
-          },
-          filesystem: {
-            denyRead: [],
-            allowWrite: [],
-            denyWrite: [],
-          },
-        }
-
-        await SandboxManager.initialize(config)
-
-        // Verify the external proxy port is being used
-        expect(SandboxManager.getProxyPort()).toBe(externalProxyPort)
-
-        // Try to access example.com (in allowlist)
-        // This verifies that requests are routed through the external proxy
-        const command = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 5 http://example.com'
-        )
-
-        const result = spawnSync(command, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 10000,
-        })
-
-        // The request should succeed
-        expect(result.status).toBe(0)
-
-        // Should NOT contain SRT's block message
-        const output = (result.stderr || result.stdout || '').toLowerCase()
-        expect(output).not.toContain('blocked by network allowlist')
-
-        console.log('✓ Request to example.com succeeded through external proxy')
-        console.log('✓ This verifies SRT used the external proxy on the configured port')
-
-      } finally {
-        // Clean up
-        await SandboxManager.reset()
-
-        if (externalProxyServer) {
-          await new Promise<void>((resolve) => {
-            externalProxyServer!.close(() => {
-              console.log('External proxy server closed')
-              resolve()
+            clientSocket.on('error', () => {
+              serverSocket.end()
             })
           })
+
+          // Handle regular HTTP requests
+          externalProxyServer.on('request', (req, res) => {
+            const url = new URL(req.url!)
+            const options = {
+              hostname: url.hostname,
+              port: url.port || 80,
+              path: url.pathname + url.search,
+              method: req.method,
+              headers: req.headers,
+            }
+
+            const proxyReq = http.request(options, proxyRes => {
+              res.writeHead(proxyRes.statusCode!, proxyRes.headers)
+              proxyRes.pipe(res)
+            })
+
+            proxyReq.on('error', () => {
+              res.writeHead(502)
+              res.end('Bad Gateway')
+            })
+
+            req.pipe(proxyReq)
+          })
+
+          // Start the external proxy on a random port
+          await new Promise<void>((resolve, reject) => {
+            externalProxyServer!.listen(0, '127.0.0.1', () => {
+              const addr = externalProxyServer!.address()
+              if (addr && typeof addr === 'object') {
+                externalProxyPort = addr.port
+                console.log(
+                  `External allow-all proxy started on port ${externalProxyPort}`,
+                )
+                resolve()
+              } else {
+                reject(new Error('Failed to get proxy address'))
+              }
+            })
+            externalProxyServer!.on('error', reject)
+          })
+
+          // Initialize SandboxManager with restrictive config but external proxy
+          const config: SandboxRuntimeConfig = {
+            network: {
+              allowedDomains: ['example.com'], // Only allow example.com
+              deniedDomains: [],
+              httpProxyPort: externalProxyPort, // Use our allow-all external proxy
+            },
+            filesystem: {
+              denyRead: [],
+              allowWrite: [],
+              denyWrite: [],
+            },
+          }
+
+          await SandboxManager.initialize(config)
+
+          // Verify the external proxy port is being used
+          expect(SandboxManager.getProxyPort()).toBe(externalProxyPort)
+
+          // Try to access example.com (in allowlist)
+          // This verifies that requests are routed through the external proxy
+          const command = await SandboxManager.wrapWithSandbox(
+            'curl -s --max-time 5 http://example.com',
+          )
+
+          const result = spawnSync(command, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 10000,
+          })
+
+          // The request should succeed
+          expect(result.status).toBe(0)
+
+          // Should NOT contain SRT's block message
+          const output = (result.stderr || result.stdout || '').toLowerCase()
+          expect(output).not.toContain('blocked by network allowlist')
+
+          console.log(
+            '✓ Request to example.com succeeded through external proxy',
+          )
+          console.log(
+            '✓ This verifies SRT used the external proxy on the configured port',
+          )
+        } finally {
+          // Clean up
+          await SandboxManager.reset()
+
+          if (externalProxyServer) {
+            await new Promise<void>(resolve => {
+              externalProxyServer!.close(() => {
+                console.log('External proxy server closed')
+                resolve()
+              })
+            })
+          }
         }
-      }
-    })
-  })
+      })
+    },
+  )
 })

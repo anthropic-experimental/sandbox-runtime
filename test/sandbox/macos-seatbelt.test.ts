@@ -9,8 +9,8 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { getPlatform } from '../../src/utils/platform.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
+import { isMacos } from '../helpers/platform.js'
 import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
@@ -30,11 +30,7 @@ import type {
  * These tests use the actual sandbox profile generation code to ensure real-world coverage.
  */
 
-function skipIfNotMacOS(): boolean {
-  return getPlatform() !== 'macos'
-}
-
-describe('macOS Seatbelt Read Bypass Prevention', () => {
+describe.if(isMacos)('macOS Seatbelt Read Bypass Prevention', () => {
   const TEST_BASE_DIR = join(tmpdir(), 'seatbelt-test-' + Date.now())
   const TEST_DENIED_DIR = join(TEST_BASE_DIR, 'denied-dir')
   const TEST_SECRET_FILE = join(TEST_DENIED_DIR, 'secret.txt')
@@ -49,10 +45,6 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
   const TEST_GLOB_MOVED = join(TEST_BASE_DIR, 'moved-glob.txt')
 
   beforeAll(() => {
-    if (skipIfNotMacOS()) {
-      return
-    }
-
     // Create test directory structure
     mkdirSync(TEST_DENIED_DIR, { recursive: true })
     writeFileSync(TEST_SECRET_FILE, TEST_SECRET_CONTENT)
@@ -64,10 +56,6 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
   })
 
   afterAll(() => {
-    if (skipIfNotMacOS()) {
-      return
-    }
-
     // Clean up test directory
     if (existsSync(TEST_BASE_DIR)) {
       rmSync(TEST_BASE_DIR, { recursive: true, force: true })
@@ -76,10 +64,6 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
 
   describe('Literal Path - Direct File Move Prevention', () => {
     it('should block moving a read-denied file to a readable location', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Use actual read restriction config with literal path
       const readConfig: FsReadRestrictionConfig = {
         denyOnly: [TEST_DENIED_DIR],
@@ -114,10 +98,6 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
     })
 
     it('should still block reading the file (sanity check)', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Use actual read restriction config
       const readConfig: FsReadRestrictionConfig = {
         denyOnly: [TEST_DENIED_DIR],
@@ -150,10 +130,6 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
 
   describe('Literal Path - Ancestor Directory Move Prevention', () => {
     it('should block moving an ancestor directory of a read-denied file', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Use actual read restriction config
       const readConfig: FsReadRestrictionConfig = {
         denyOnly: [TEST_DENIED_DIR],
@@ -188,10 +164,6 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
     })
 
     it('should block moving the grandparent directory', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Deny reading a specific file deep in the hierarchy
       const readConfig: FsReadRestrictionConfig = {
         denyOnly: [TEST_SECRET_FILE],
@@ -227,10 +199,6 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
 
   describe('Glob Pattern - File Move Prevention', () => {
     it('should block moving files matching a glob pattern (*.txt)', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Use glob pattern that matches all .txt files in glob-test directory
       const globPattern = join(TEST_GLOB_DIR, '*.txt')
 
@@ -267,10 +235,6 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
     })
 
     it('should still block reading files matching the glob pattern', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Use glob pattern
       const globPattern = join(TEST_GLOB_DIR, '*.txt')
 
@@ -303,10 +267,6 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
     })
 
     it('should block moving the parent directory containing glob-matched files', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Use glob pattern
       const globPattern = join(TEST_GLOB_DIR, '*.txt')
 
@@ -344,10 +304,6 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
 
   describe('Glob Pattern - Recursive Patterns', () => {
     it('should block moving files matching a recursive glob pattern (**/*.txt)', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Create nested directory structure
       const nestedDir = join(TEST_GLOB_DIR, 'nested')
       const nestedFile = join(nestedDir, 'nested-secret.txt')
@@ -390,7 +346,7 @@ describe('macOS Seatbelt Read Bypass Prevention', () => {
   })
 })
 
-describe('macOS Seatbelt Write Bypass Prevention', () => {
+describe.if(isMacos)('macOS Seatbelt Write Bypass Prevention', () => {
   const TEST_BASE_DIR = join(tmpdir(), 'seatbelt-write-test-' + Date.now())
   const TEST_ALLOWED_DIR = join(TEST_BASE_DIR, 'allowed')
   const TEST_DENIED_DIR = join(TEST_ALLOWED_DIR, 'secrets')
@@ -408,10 +364,6 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
   const TEST_GLOB_RENAMED = join(TEST_BASE_DIR, 'renamed-glob')
 
   beforeAll(() => {
-    if (skipIfNotMacOS()) {
-      return
-    }
-
     // Create test directory structure
     mkdirSync(TEST_DENIED_DIR, { recursive: true })
     mkdirSync(TEST_GLOB_DIR, { recursive: true })
@@ -423,10 +375,6 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
   })
 
   afterAll(() => {
-    if (skipIfNotMacOS()) {
-      return
-    }
-
     // Clean up test directory
     if (existsSync(TEST_BASE_DIR)) {
       rmSync(TEST_BASE_DIR, { recursive: true, force: true })
@@ -435,10 +383,6 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
 
   describe('Literal Path - Direct Directory Move Prevention', () => {
     it('should block write bypass via directory rename (mv a c, write c/b, mv c a)', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Allow writing to TEST_ALLOWED_DIR but deny TEST_DENIED_DIR
       const writeConfig: FsWriteRestrictionConfig = {
         allowOnly: [TEST_ALLOWED_DIR],
@@ -470,10 +414,6 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
     })
 
     it('should still block direct writes to denied paths (sanity check)', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       const writeConfig: FsWriteRestrictionConfig = {
         allowOnly: [TEST_ALLOWED_DIR],
         denyWithinAllow: [TEST_DENIED_DIR],
@@ -506,10 +446,6 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
 
   describe('Literal Path - Ancestor Directory Move Prevention', () => {
     it('should block moving an ancestor directory of a write-denied path', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       const writeConfig: FsWriteRestrictionConfig = {
         allowOnly: [TEST_ALLOWED_DIR],
         denyWithinAllow: [TEST_DENIED_FILE],
@@ -542,10 +478,6 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
     })
 
     it('should block moving the grandparent directory', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       const writeConfig: FsWriteRestrictionConfig = {
         allowOnly: [TEST_ALLOWED_DIR],
         denyWithinAllow: [TEST_DENIED_FILE],
@@ -580,10 +512,6 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
 
   describe('Glob Pattern - File Move Prevention', () => {
     it('should block write bypass via moving glob-matched files', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Allow writing to TEST_ALLOWED_DIR but deny *.txt files in glob-test
       const globPattern = join(TEST_GLOB_DIR, '*.txt')
 
@@ -616,10 +544,6 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
     })
 
     it('should still block direct writes to glob-matched files', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       const globPattern = join(TEST_GLOB_DIR, '*.txt')
 
       const writeConfig: FsWriteRestrictionConfig = {
@@ -652,10 +576,6 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
     })
 
     it('should block moving the parent directory containing glob-matched files', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       const globPattern = join(TEST_GLOB_DIR, '*.txt')
 
       const writeConfig: FsWriteRestrictionConfig = {
@@ -690,10 +610,6 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
 
   describe('Glob Pattern - Recursive Patterns', () => {
     it('should block moving files matching a recursive glob pattern (**/*.txt)', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Create nested directory structure
       const nestedDir = join(TEST_GLOB_DIR, 'nested')
       const nestedFile = join(nestedDir, 'nested-secret.txt')
@@ -750,33 +666,23 @@ describe('macOS Seatbelt Write Bypass Prevention', () => {
  * and (allow network-bind/network-outbound (local/remote unix-socket ...)) for
  * bind/connect operations.
  */
-describe('macOS Seatbelt Unix Domain Socket Support', () => {
+describe.if(isMacos)('macOS Seatbelt Unix Domain Socket Support', () => {
   const TEST_BASE_DIR = join(
     tmpdir(),
     'seatbelt-unix-socket-test-' + Date.now(),
   )
 
   beforeAll(() => {
-    if (skipIfNotMacOS()) {
-      return
-    }
     mkdirSync(TEST_BASE_DIR, { recursive: true })
   })
 
   afterAll(() => {
-    if (skipIfNotMacOS()) {
-      return
-    }
     if (existsSync(TEST_BASE_DIR)) {
       rmSync(TEST_BASE_DIR, { recursive: true, force: true })
     }
   })
 
   it('should allow Unix domain socket creation and communication with allowAllUnixSockets', () => {
-    if (skipIfNotMacOS()) {
-      return
-    }
-
     const socketPath = join(TEST_BASE_DIR, 'test.sock')
     const scriptPath = join(TEST_BASE_DIR, 'test_socket.py')
 
@@ -828,10 +734,6 @@ describe('macOS Seatbelt Unix Domain Socket Support', () => {
   })
 
   it('should allow Unix domain socket creation with specific allowUnixSockets paths', () => {
-    if (skipIfNotMacOS()) {
-      return
-    }
-
     const socketPath = join(TEST_BASE_DIR, 'specific.sock')
     const scriptPath = join(TEST_BASE_DIR, 'test_specific_socket.py')
 
@@ -882,10 +784,6 @@ describe('macOS Seatbelt Unix Domain Socket Support', () => {
   })
 
   it('should block Unix domain socket bind when neither allowAllUnixSockets nor allowUnixSockets is set', () => {
-    if (skipIfNotMacOS()) {
-      return
-    }
-
     const socketPath = join(TEST_BASE_DIR, 'blocked.sock')
     const scriptPath = join(TEST_BASE_DIR, 'test_blocked_socket.py')
 
@@ -934,12 +832,8 @@ describe('macOS Seatbelt Unix Domain Socket Support', () => {
   })
 })
 
-describe('macOS Seatbelt Process Enumeration', () => {
+describe.if(isMacos)('macOS Seatbelt Process Enumeration', () => {
   it('should allow enumerating all process IDs (kern.proc.all sysctl)', () => {
-    if (skipIfNotMacOS()) {
-      return
-    }
-
     // This tests that psutil.pids() and similar process enumeration works.
     // The kern.proc.all sysctl is used by psutil to list all PIDs on the system.
     // Use case: IPython kernel shutdown needs to enumerate child processes.

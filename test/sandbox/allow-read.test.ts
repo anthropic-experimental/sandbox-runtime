@@ -3,18 +3,10 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { getPlatform } from '../../src/utils/platform.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
 import type { FsReadRestrictionConfig } from '../../src/sandbox/sandbox-schemas.js'
-
-function skipIfNotMacOS(): boolean {
-  return getPlatform() !== 'macos'
-}
-
-function skipIfNotLinux(): boolean {
-  return getPlatform() !== 'linux'
-}
+import { isLinux, isMacos, isSupportedPlatform } from '../helpers/platform.js'
 
 /**
  * Tests for the allowRead (allowWithinDeny) feature.
@@ -33,9 +25,7 @@ describe('allowRead precedence over denyRead', () => {
   const TEST_ALLOWED_CONTENT = 'VISIBLE_DATA'
 
   beforeAll(() => {
-    if (getPlatform() !== 'macos' && getPlatform() !== 'linux') {
-      return
-    }
+    if (!isSupportedPlatform) return
 
     mkdirSync(TEST_ALLOWED_SUBDIR, { recursive: true })
     writeFileSync(TEST_SECRET_FILE, TEST_SECRET_CONTENT)
@@ -49,11 +39,7 @@ describe('allowRead precedence over denyRead', () => {
   })
 
   describe('macOS Seatbelt', () => {
-    it('should deny reading a file in a denied directory', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
+    it.if(isMacos)('should deny reading a file in a denied directory', () => {
       const readConfig: FsReadRestrictionConfig = {
         denyOnly: [TEST_DENIED_DIR],
         allowWithinDeny: [],
@@ -76,142 +62,137 @@ describe('allowRead precedence over denyRead', () => {
       expect(result.stdout).not.toContain(TEST_SECRET_CONTENT)
     })
 
-    it('should allow reading a file in an allowWithinDeny subdirectory', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
+    it.if(isMacos)(
+      'should allow reading a file in an allowWithinDeny subdirectory',
+      () => {
+        const readConfig: FsReadRestrictionConfig = {
+          denyOnly: [TEST_DENIED_DIR],
+          allowWithinDeny: [TEST_ALLOWED_SUBDIR],
+        }
 
-      const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [TEST_DENIED_DIR],
-        allowWithinDeny: [TEST_ALLOWED_SUBDIR],
-      }
+        const wrappedCommand = wrapCommandWithSandboxMacOS({
+          command: `cat ${TEST_ALLOWED_FILE}`,
+          needsNetworkRestriction: false,
+          readConfig,
+          writeConfig: undefined,
+        })
 
-      const wrappedCommand = wrapCommandWithSandboxMacOS({
-        command: `cat ${TEST_ALLOWED_FILE}`,
-        needsNetworkRestriction: false,
-        readConfig,
-        writeConfig: undefined,
-      })
+        const result = spawnSync(wrappedCommand, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 5000,
+        })
 
-      const result = spawnSync(wrappedCommand, {
-        shell: true,
-        encoding: 'utf8',
-        timeout: 5000,
-      })
+        expect(result.status).toBe(0)
+        expect(result.stdout).toContain(TEST_ALLOWED_CONTENT)
+      },
+    )
 
-      expect(result.status).toBe(0)
-      expect(result.stdout).toContain(TEST_ALLOWED_CONTENT)
-    })
+    it.if(isMacos)(
+      'should still deny reading files outside the re-allowed subdirectory',
+      () => {
+        const readConfig: FsReadRestrictionConfig = {
+          denyOnly: [TEST_DENIED_DIR],
+          allowWithinDeny: [TEST_ALLOWED_SUBDIR],
+        }
 
-    it('should still deny reading files outside the re-allowed subdirectory', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
+        const wrappedCommand = wrapCommandWithSandboxMacOS({
+          command: `cat ${TEST_SECRET_FILE}`,
+          needsNetworkRestriction: false,
+          readConfig,
+          writeConfig: undefined,
+        })
 
-      const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [TEST_DENIED_DIR],
-        allowWithinDeny: [TEST_ALLOWED_SUBDIR],
-      }
+        const result = spawnSync(wrappedCommand, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 5000,
+        })
 
-      const wrappedCommand = wrapCommandWithSandboxMacOS({
-        command: `cat ${TEST_SECRET_FILE}`,
-        needsNetworkRestriction: false,
-        readConfig,
-        writeConfig: undefined,
-      })
-
-      const result = spawnSync(wrappedCommand, {
-        shell: true,
-        encoding: 'utf8',
-        timeout: 5000,
-      })
-
-      expect(result.status).not.toBe(0)
-      expect(result.stdout).not.toContain(TEST_SECRET_CONTENT)
-    })
+        expect(result.status).not.toBe(0)
+        expect(result.stdout).not.toContain(TEST_SECRET_CONTENT)
+      },
+    )
   })
 
   describe('Linux bwrap', () => {
-    it('should deny reading a file in a denied directory', async () => {
-      if (skipIfNotLinux()) {
-        return
-      }
+    it.if(isLinux)(
+      'should deny reading a file in a denied directory',
+      async () => {
+        const readConfig: FsReadRestrictionConfig = {
+          denyOnly: [TEST_DENIED_DIR],
+          allowWithinDeny: [],
+        }
 
-      const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [TEST_DENIED_DIR],
-        allowWithinDeny: [],
-      }
+        const wrappedCommand = await wrapCommandWithSandboxLinux({
+          command: `cat ${TEST_SECRET_FILE}`,
+          needsNetworkRestriction: false,
+          readConfig,
+          writeConfig: undefined,
+        })
 
-      const wrappedCommand = await wrapCommandWithSandboxLinux({
-        command: `cat ${TEST_SECRET_FILE}`,
-        needsNetworkRestriction: false,
-        readConfig,
-        writeConfig: undefined,
-      })
+        const result = spawnSync(wrappedCommand, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 5000,
+        })
 
-      const result = spawnSync(wrappedCommand, {
-        shell: true,
-        encoding: 'utf8',
-        timeout: 5000,
-      })
+        expect(result.status).not.toBe(0)
+        expect(result.stdout).not.toContain(TEST_SECRET_CONTENT)
+      },
+    )
 
-      expect(result.status).not.toBe(0)
-      expect(result.stdout).not.toContain(TEST_SECRET_CONTENT)
-    })
+    it.if(isLinux)(
+      'should allow reading a file in an allowWithinDeny subdirectory',
+      async () => {
+        const readConfig: FsReadRestrictionConfig = {
+          denyOnly: [TEST_DENIED_DIR],
+          allowWithinDeny: [TEST_ALLOWED_SUBDIR],
+        }
 
-    it('should allow reading a file in an allowWithinDeny subdirectory', async () => {
-      if (skipIfNotLinux()) {
-        return
-      }
+        const wrappedCommand = await wrapCommandWithSandboxLinux({
+          command: `cat ${TEST_ALLOWED_FILE}`,
+          needsNetworkRestriction: false,
+          readConfig,
+          writeConfig: undefined,
+        })
 
-      const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [TEST_DENIED_DIR],
-        allowWithinDeny: [TEST_ALLOWED_SUBDIR],
-      }
+        const result = spawnSync(wrappedCommand, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 5000,
+        })
 
-      const wrappedCommand = await wrapCommandWithSandboxLinux({
-        command: `cat ${TEST_ALLOWED_FILE}`,
-        needsNetworkRestriction: false,
-        readConfig,
-        writeConfig: undefined,
-      })
+        expect(result.status).toBe(0)
+        expect(result.stdout).toContain(TEST_ALLOWED_CONTENT)
+      },
+    )
 
-      const result = spawnSync(wrappedCommand, {
-        shell: true,
-        encoding: 'utf8',
-        timeout: 5000,
-      })
+    it.if(isLinux)(
+      'should still deny reading files outside the re-allowed subdirectory',
+      async () => {
+        const readConfig: FsReadRestrictionConfig = {
+          denyOnly: [TEST_DENIED_DIR],
+          allowWithinDeny: [TEST_ALLOWED_SUBDIR],
+        }
 
-      expect(result.status).toBe(0)
-      expect(result.stdout).toContain(TEST_ALLOWED_CONTENT)
-    })
+        const wrappedCommand = await wrapCommandWithSandboxLinux({
+          command: `cat ${TEST_SECRET_FILE}`,
+          needsNetworkRestriction: false,
+          readConfig,
+          writeConfig: undefined,
+        })
 
-    it('should still deny reading files outside the re-allowed subdirectory', async () => {
-      if (skipIfNotLinux()) {
-        return
-      }
+        const result = spawnSync(wrappedCommand, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 5000,
+        })
 
-      const readConfig: FsReadRestrictionConfig = {
-        denyOnly: [TEST_DENIED_DIR],
-        allowWithinDeny: [TEST_ALLOWED_SUBDIR],
-      }
-
-      const wrappedCommand = await wrapCommandWithSandboxLinux({
-        command: `cat ${TEST_SECRET_FILE}`,
-        needsNetworkRestriction: false,
-        readConfig,
-        writeConfig: undefined,
-      })
-
-      const result = spawnSync(wrappedCommand, {
-        shell: true,
-        encoding: 'utf8',
-        timeout: 5000,
-      })
-
-      expect(result.status).not.toBe(0)
-      expect(result.stdout).not.toContain(TEST_SECRET_CONTENT)
-    })
+        expect(result.status).not.toBe(0)
+        expect(result.stdout).not.toContain(TEST_SECRET_CONTENT)
+      },
+    )
 
     // Regression: the write-path skip check in the allowRead re-bind loop was
     // too broad — it skipped any allowPath under ANY allowWrite, not just
@@ -219,33 +200,32 @@ describe('allowRead precedence over denyRead', () => {
     // ancestor of denyRead (not wiped, not re-bound), allowRead under it was
     // skipped and left sitting in the empty tmpfs.
     // Shape: allowWrite: [~], denyRead: [~/.ssh], allowRead: [~/.ssh/known_hosts].
-    it('should re-allow under denyRead when allowWrite is an ancestor of the deny', async () => {
-      if (skipIfNotLinux()) {
-        return
-      }
+    it.if(isLinux)(
+      'should re-allow under denyRead when allowWrite is an ancestor of the deny',
+      async () => {
+        const wrappedCommand = await wrapCommandWithSandboxLinux({
+          command: `cat ${TEST_ALLOWED_FILE}`,
+          needsNetworkRestriction: false,
+          readConfig: {
+            denyOnly: [TEST_DENIED_DIR],
+            allowWithinDeny: [TEST_ALLOWED_SUBDIR],
+          },
+          writeConfig: {
+            allowOnly: [TEST_BASE_DIR], // ancestor of denyRead
+            denyWithinAllow: [],
+          },
+        })
 
-      const wrappedCommand = await wrapCommandWithSandboxLinux({
-        command: `cat ${TEST_ALLOWED_FILE}`,
-        needsNetworkRestriction: false,
-        readConfig: {
-          denyOnly: [TEST_DENIED_DIR],
-          allowWithinDeny: [TEST_ALLOWED_SUBDIR],
-        },
-        writeConfig: {
-          allowOnly: [TEST_BASE_DIR], // ancestor of denyRead
-          denyWithinAllow: [],
-        },
-      })
+        const result = spawnSync(wrappedCommand, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 5000,
+        })
 
-      const result = spawnSync(wrappedCommand, {
-        shell: true,
-        encoding: 'utf8',
-        timeout: 5000,
-      })
-
-      expect(result.status).toBe(0)
-      expect(result.stdout).toContain(TEST_ALLOWED_CONTENT)
-    })
+        expect(result.status).toBe(0)
+        expect(result.stdout).toContain(TEST_ALLOWED_CONTENT)
+      },
+    )
   })
 })
 
@@ -281,9 +261,7 @@ describe('allowRead carve-out with denyRead at filesystem root (issue #10)', () 
   ]
 
   beforeAll(() => {
-    if (getPlatform() !== 'macos' && getPlatform() !== 'linux') {
-      return
-    }
+    if (!isSupportedPlatform) return
     mkdirSync(TEST_DIR, { recursive: true })
     writeFileSync(TEST_FILE, TEST_CONTENT)
   })
@@ -294,11 +272,7 @@ describe('allowRead carve-out with denyRead at filesystem root (issue #10)', () 
     }
   })
 
-  it('macOS: re-allows carve-out under a root-level deny', () => {
-    if (skipIfNotMacOS()) {
-      return
-    }
-
+  it.if(isMacos)('macOS: re-allows carve-out under a root-level deny', () => {
     const readConfig: FsReadRestrictionConfig = {
       denyOnly: ['/'],
       allowWithinDeny: [TEST_DIR, ...EXEC_DEPS],
@@ -324,124 +298,120 @@ describe('allowRead carve-out with denyRead at filesystem root (issue #10)', () 
     expect(result.stdout).toContain(TEST_CONTENT)
   })
 
-  it('macOS: still denies paths outside the carve-out under a root-level deny', () => {
-    if (skipIfNotMacOS()) {
-      return
-    }
-
-    const outside = join(homedir(), '.bashrc')
-    const readConfig: FsReadRestrictionConfig = {
-      denyOnly: ['/'],
-      allowWithinDeny: [TEST_DIR, ...EXEC_DEPS],
-    }
-
-    const wrappedCommand = wrapCommandWithSandboxMacOS({
-      command: `cat ${outside} 2>/dev/null; true`,
-      needsNetworkRestriction: false,
-      readConfig,
-      writeConfig: undefined,
-      binShell: '/bin/bash',
-    })
-
-    const result = spawnSync(wrappedCommand, {
-      shell: true,
-      encoding: 'utf8',
-      timeout: 5000,
-    })
-
-    // Process must exec (no SIGABRT) and stdout must be empty (cat denied)
-    expect(result.status).toBe(0)
-    expect(result.stdout).toBe('')
-  })
-
-  it('Linux: re-allows carve-out under a root-level deny', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
-    const readConfig: FsReadRestrictionConfig = {
-      denyOnly: ['/'],
-      allowWithinDeny: [TEST_DIR, ...EXEC_DEPS],
-    }
-
-    // allowAllUnixSockets: true bypasses the seccomp path — otherwise the
-    // apply-seccomp binary under <repo>/vendor/ is hidden by the root deny.
-    const wrappedCommand = await wrapCommandWithSandboxLinux({
-      command: `cat ${TEST_FILE}`,
-      needsNetworkRestriction: false,
-      readConfig,
-      writeConfig: undefined,
-      allowAllUnixSockets: true,
-    })
-
-    const result = spawnSync(wrappedCommand, {
-      shell: true,
-      encoding: 'utf8',
-      timeout: 5000,
-    })
-
-    expect(result.status).toBe(0)
-    expect(result.stdout).toContain(TEST_CONTENT)
-  })
-
-  it('Linux: still denies paths outside the carve-out under a root-level deny', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
-    const outside = join(homedir(), '.bashrc')
-    const readConfig: FsReadRestrictionConfig = {
-      denyOnly: ['/'],
-      allowWithinDeny: [TEST_DIR, ...EXEC_DEPS],
-    }
-
-    const wrappedCommand = await wrapCommandWithSandboxLinux({
-      command: `cat ${outside} 2>/dev/null; true`,
-      needsNetworkRestriction: false,
-      readConfig,
-      writeConfig: undefined,
-      allowAllUnixSockets: true,
-    })
-
-    const result = spawnSync(wrappedCommand, {
-      shell: true,
-      encoding: 'utf8',
-      timeout: 5000,
-    })
-
-    expect(result.status).toBe(0)
-    expect(result.stdout).toBe('')
-  })
-
-  it('Linux: preserves write binds when denyRead ancestor wipes them', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
-    const writeTarget = join(TEST_DIR, 'written.txt')
-    const wrappedCommand = await wrapCommandWithSandboxLinux({
-      command: `echo WRITE_OK > ${writeTarget} && cat ${writeTarget}`,
-      needsNetworkRestriction: false,
-      readConfig: {
+  it.if(isMacos)(
+    'macOS: still denies paths outside the carve-out under a root-level deny',
+    () => {
+      const outside = join(homedir(), '.bashrc')
+      const readConfig: FsReadRestrictionConfig = {
         denyOnly: ['/'],
-        allowWithinDeny: [...EXEC_DEPS],
-      },
-      writeConfig: {
-        allowOnly: [TEST_DIR],
-        denyWithinAllow: [],
-      },
-      allowAllUnixSockets: true,
-    })
+        allowWithinDeny: [TEST_DIR, ...EXEC_DEPS],
+      }
 
-    const result = spawnSync(wrappedCommand, {
-      shell: true,
-      encoding: 'utf8',
-      timeout: 5000,
-    })
+      const wrappedCommand = wrapCommandWithSandboxMacOS({
+        command: `cat ${outside} 2>/dev/null; true`,
+        needsNetworkRestriction: false,
+        readConfig,
+        writeConfig: undefined,
+        binShell: '/bin/bash',
+      })
 
-    expect(result.status).toBe(0)
-    expect(result.stdout).toContain('WRITE_OK')
-  })
+      const result = spawnSync(wrappedCommand, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      // Process must exec (no SIGABRT) and stdout must be empty (cat denied)
+      expect(result.status).toBe(0)
+      expect(result.stdout).toBe('')
+    },
+  )
+
+  it.if(isLinux)(
+    'Linux: re-allows carve-out under a root-level deny',
+    async () => {
+      const readConfig: FsReadRestrictionConfig = {
+        denyOnly: ['/'],
+        allowWithinDeny: [TEST_DIR, ...EXEC_DEPS],
+      }
+
+      // allowAllUnixSockets: true bypasses the seccomp path — otherwise the
+      // apply-seccomp binary under <repo>/vendor/ is hidden by the root deny.
+      const wrappedCommand = await wrapCommandWithSandboxLinux({
+        command: `cat ${TEST_FILE}`,
+        needsNetworkRestriction: false,
+        readConfig,
+        writeConfig: undefined,
+        allowAllUnixSockets: true,
+      })
+
+      const result = spawnSync(wrappedCommand, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      expect(result.status).toBe(0)
+      expect(result.stdout).toContain(TEST_CONTENT)
+    },
+  )
+
+  it.if(isLinux)(
+    'Linux: still denies paths outside the carve-out under a root-level deny',
+    async () => {
+      const outside = join(homedir(), '.bashrc')
+      const readConfig: FsReadRestrictionConfig = {
+        denyOnly: ['/'],
+        allowWithinDeny: [TEST_DIR, ...EXEC_DEPS],
+      }
+
+      const wrappedCommand = await wrapCommandWithSandboxLinux({
+        command: `cat ${outside} 2>/dev/null; true`,
+        needsNetworkRestriction: false,
+        readConfig,
+        writeConfig: undefined,
+        allowAllUnixSockets: true,
+      })
+
+      const result = spawnSync(wrappedCommand, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      expect(result.status).toBe(0)
+      expect(result.stdout).toBe('')
+    },
+  )
+
+  it.if(isLinux)(
+    'Linux: preserves write binds when denyRead ancestor wipes them',
+    async () => {
+      const writeTarget = join(TEST_DIR, 'written.txt')
+      const wrappedCommand = await wrapCommandWithSandboxLinux({
+        command: `echo WRITE_OK > ${writeTarget} && cat ${writeTarget}`,
+        needsNetworkRestriction: false,
+        readConfig: {
+          denyOnly: ['/'],
+          allowWithinDeny: [...EXEC_DEPS],
+        },
+        writeConfig: {
+          allowOnly: [TEST_DIR],
+          denyWithinAllow: [],
+        },
+        allowAllUnixSockets: true,
+      })
+
+      const result = spawnSync(wrappedCommand, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      expect(result.status).toBe(0)
+      expect(result.stdout).toContain('WRITE_OK')
+    },
+  )
 })
 
 /**
@@ -450,33 +420,31 @@ describe('allowRead carve-out with denyRead at filesystem root (issue #10)', () 
 describe('allowRead without denyRead does not trigger sandboxing', () => {
   const command = 'echo hello'
 
-  it('returns command unchanged on macOS when only allowWithinDeny is set', () => {
-    if (skipIfNotMacOS()) {
-      return
-    }
+  it.if(isMacos)(
+    'returns command unchanged on macOS when only allowWithinDeny is set',
+    () => {
+      const result = wrapCommandWithSandboxMacOS({
+        command,
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [], allowWithinDeny: ['/some/path'] },
+        writeConfig: undefined,
+      })
 
-    const result = wrapCommandWithSandboxMacOS({
-      command,
-      needsNetworkRestriction: false,
-      readConfig: { denyOnly: [], allowWithinDeny: ['/some/path'] },
-      writeConfig: undefined,
-    })
+      expect(result).toBe(command)
+    },
+  )
 
-    expect(result).toBe(command)
-  })
+  it.if(isLinux)(
+    'returns command unchanged on Linux when only allowWithinDeny is set',
+    async () => {
+      const result = await wrapCommandWithSandboxLinux({
+        command,
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [], allowWithinDeny: ['/some/path'] },
+        writeConfig: undefined,
+      })
 
-  it('returns command unchanged on Linux when only allowWithinDeny is set', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
-    const result = await wrapCommandWithSandboxLinux({
-      command,
-      needsNetworkRestriction: false,
-      readConfig: { denyOnly: [], allowWithinDeny: ['/some/path'] },
-      writeConfig: undefined,
-    })
-
-    expect(result).toBe(command)
-  })
+      expect(result).toBe(command)
+    },
+  )
 })

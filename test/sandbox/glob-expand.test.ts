@@ -12,7 +12,7 @@ import {
   expandGlobPattern,
   globToRegex,
 } from '../../src/sandbox/sandbox-utils.js'
-import { getPlatform } from '../../src/utils/platform.js'
+import { isLinux } from '../helpers/platform.js'
 import { spawnSync } from 'node:child_process'
 
 /**
@@ -189,7 +189,7 @@ describe('globToRegex (shared)', () => {
 // Tests for getFsReadConfig with glob expansion on Linux
 // ============================================================================
 
-describe('getFsReadConfig with glob patterns on Linux', () => {
+describe.if(isLinux)('getFsReadConfig with glob patterns on Linux', () => {
   const RAW_BASE_DIR = join(tmpdir(), 'fsread-glob-test-' + Date.now())
   const RAW_TEST_DIR = join(RAW_BASE_DIR, 'testdir')
 
@@ -207,10 +207,6 @@ describe('getFsReadConfig with glob patterns on Linux', () => {
   })
 
   it('should expand glob denyRead patterns to concrete paths on Linux', async () => {
-    if (getPlatform() !== 'linux') {
-      return
-    }
-
     const { SandboxManager } = await import(
       '../../src/sandbox/sandbox-manager.js'
     )
@@ -244,10 +240,6 @@ describe('getFsReadConfig with glob patterns on Linux', () => {
   })
 
   it('should pass non-glob paths through unchanged on Linux', async () => {
-    if (getPlatform() !== 'linux') {
-      return
-    }
-
     const { SandboxManager } = await import(
       '../../src/sandbox/sandbox-manager.js'
     )
@@ -275,10 +267,6 @@ describe('getFsReadConfig with glob patterns on Linux', () => {
   })
 
   it('should handle trailing /** by stripping suffix (existing behavior)', async () => {
-    if (getPlatform() !== 'linux') {
-      return
-    }
-
     const { SandboxManager } = await import(
       '../../src/sandbox/sandbox-manager.js'
     )
@@ -312,12 +300,8 @@ describe('getFsReadConfig with glob patterns on Linux', () => {
 // Tests for getLinuxGlobPatternWarnings
 // ============================================================================
 
-describe('getLinuxGlobPatternWarnings after fix', () => {
+describe.if(isLinux)('getLinuxGlobPatternWarnings after fix', () => {
   it('should NOT warn about denyRead globs on Linux (they are now expanded)', async () => {
-    if (getPlatform() !== 'linux') {
-      return
-    }
-
     const { SandboxManager } = await import(
       '../../src/sandbox/sandbox-manager.js'
     )
@@ -345,10 +329,6 @@ describe('getLinuxGlobPatternWarnings after fix', () => {
   })
 
   it('should still warn about allowWrite and denyWrite globs on Linux', async () => {
-    if (getPlatform() !== 'linux') {
-      return
-    }
-
     const { SandboxManager } = await import(
       '../../src/sandbox/sandbox-manager.js'
     )
@@ -380,7 +360,7 @@ describe('getLinuxGlobPatternWarnings after fix', () => {
 // Integration test: denyRead with glob patterns on Linux via sandbox
 // ============================================================================
 
-describe('denyRead with glob patterns - Linux integration', () => {
+describe.if(isLinux)('denyRead with glob patterns - Linux integration', () => {
   const RAW_BASE_DIR = join(tmpdir(), 'glob-deny-integ-' + Date.now())
   const RAW_TEST_DIR = join(RAW_BASE_DIR, 'testdir')
   let TEST_DIR: string
@@ -400,10 +380,6 @@ describe('denyRead with glob patterns - Linux integration', () => {
   })
 
   it('should block reading files matching *.env glob pattern via sandbox', async () => {
-    if (getPlatform() !== 'linux') {
-      return
-    }
-
     const { SandboxManager } = await import(
       '../../src/sandbox/sandbox-manager.js'
     )
@@ -439,10 +415,6 @@ describe('denyRead with glob patterns - Linux integration', () => {
   })
 
   it('should allow reading files NOT matching glob pattern via sandbox', async () => {
-    if (getPlatform() !== 'linux') {
-      return
-    }
-
     const { SandboxManager } = await import(
       '../../src/sandbox/sandbox-manager.js'
     )
@@ -478,10 +450,6 @@ describe('denyRead with glob patterns - Linux integration', () => {
   })
 
   it('should block reading with literal path (regression test)', async () => {
-    if (getPlatform() !== 'linux') {
-      return
-    }
-
     const { SandboxManager } = await import(
       '../../src/sandbox/sandbox-manager.js'
     )
@@ -516,10 +484,6 @@ describe('denyRead with glob patterns - Linux integration', () => {
   })
 
   it('should block reading with ** recursive glob via sandbox', async () => {
-    if (getPlatform() !== 'linux') {
-      return
-    }
-
     // Create a nested file
     mkdirSync(join(RAW_TEST_DIR, 'nested'), { recursive: true })
     writeFileSync(join(RAW_TEST_DIR, 'nested', 'deep.env'), 'DEEP_SECRET')
@@ -561,7 +525,7 @@ describe('denyRead with glob patterns - Linux integration', () => {
 // Tests for wrapWithSandbox with glob denyRead via customConfig
 // ============================================================================
 
-describe('wrapWithSandbox with glob denyRead customConfig', () => {
+describe.if(isLinux)('wrapWithSandbox with glob denyRead customConfig', () => {
   const RAW_BASE_DIR = join(tmpdir(), 'wrap-sandbox-glob-test-' + Date.now())
   const RAW_TEST_DIR = join(RAW_BASE_DIR, 'testdir')
   let TEST_DIR: string
@@ -580,10 +544,6 @@ describe('wrapWithSandbox with glob denyRead customConfig', () => {
   })
 
   it('should expand glob denyRead in customConfig on Linux', async () => {
-    if (getPlatform() !== 'linux') {
-      return
-    }
-
     const { SandboxManager } = await import(
       '../../src/sandbox/sandbox-manager.js'
     )

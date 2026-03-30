@@ -2,8 +2,8 @@ import { describe, it, expect, beforeAll } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { existsSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { getPlatform } from '../../src/utils/platform.js'
 import { whichSync } from '../../src/utils/which.js'
+import { isLinux } from '../helpers/platform.js'
 import {
   generateSeccompFilter,
   cleanupSeccompFilter,
@@ -15,10 +15,6 @@ import {
   checkLinuxDependencies,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 
-function skipIfNotLinux(): boolean {
-  return getPlatform() !== 'linux'
-}
-
 // wrapCommandWithSandboxLinux early-returns the raw command when no restrictions
 // are requested. Tests that want to verify seccomp enforcement need to request
 // at least one restriction so the sandbox actually wraps.
@@ -27,12 +23,8 @@ const TRIGGER_SANDBOX_WRITE_CONFIG = {
   denyWithinAllow: [],
 }
 
-describe('Linux Sandbox Dependencies', () => {
+describe.if(isLinux)('Linux Sandbox Dependencies', () => {
   it('should check for Linux sandbox dependencies', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const depCheck = checkLinuxDependencies()
     expect(depCheck).toHaveProperty('errors')
     expect(depCheck).toHaveProperty('warnings')
@@ -45,12 +37,8 @@ describe('Linux Sandbox Dependencies', () => {
   })
 })
 
-describe('Pre-generated BPF Support', () => {
+describe.if(isLinux)('Pre-generated BPF Support', () => {
   it('should detect pre-generated BPF files on x64/arm64', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     // Check if current architecture supports pre-generated BPF
     const arch = process.arch
     const preGeneratedBpf = getPreGeneratedBpfPath()
@@ -70,10 +58,6 @@ describe('Pre-generated BPF Support', () => {
   })
 
   it('should have sandbox dependencies on x64/arm64 with bwrap and socat', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const preGeneratedBpf = getPreGeneratedBpfPath()
 
     // Only test on architectures with pre-generated BPF
@@ -102,10 +86,6 @@ describe('Pre-generated BPF Support', () => {
   })
 
   it('should not allow seccomp on unsupported architectures', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const preGeneratedBpf = getPreGeneratedBpfPath()
 
     // Only test on architectures WITHOUT pre-generated BPF
@@ -130,12 +110,8 @@ describe('Pre-generated BPF Support', () => {
   })
 })
 
-describe('Seccomp Filter (Pre-generated)', () => {
+describe.if(isLinux)('Seccomp Filter (Pre-generated)', () => {
   it('should return pre-generated BPF filter on x64/arm64', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const arch = process.arch
     if (arch !== 'x64' && arch !== 'arm64') {
       // Not a supported architecture
@@ -160,10 +136,6 @@ describe('Seccomp Filter (Pre-generated)', () => {
   })
 
   it('should return same path on repeated calls (pre-generated)', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const arch = process.arch
     if (arch !== 'x64' && arch !== 'arm64') {
       return
@@ -180,10 +152,6 @@ describe('Seccomp Filter (Pre-generated)', () => {
   })
 
   it('should return null on unsupported architectures', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const arch = process.arch
     if (arch === 'x64' || arch === 'arm64') {
       // This test is for unsupported architectures only
@@ -195,10 +163,6 @@ describe('Seccomp Filter (Pre-generated)', () => {
   })
 
   it('should handle cleanup gracefully (no-op for pre-generated files)', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     // Cleanup should not throw for any path (it's a no-op)
     expect(() => cleanupSeccompFilter('/tmp/test.bpf')).not.toThrow()
     expect(() =>
@@ -208,12 +172,8 @@ describe('Seccomp Filter (Pre-generated)', () => {
   })
 })
 
-describe('Apply Seccomp Binary', () => {
+describe.if(isLinux)('Apply Seccomp Binary', () => {
   it('should find pre-built apply-seccomp binary on x64/arm64', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const arch = process.arch
     if (arch !== 'x64' && arch !== 'arm64') {
       return
@@ -230,10 +190,6 @@ describe('Apply Seccomp Binary', () => {
   })
 
   it('should return null on unsupported architectures', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const arch = process.arch
     if (arch === 'x64' || arch === 'arm64') {
       return
@@ -244,12 +200,8 @@ describe('Apply Seccomp Binary', () => {
   })
 })
 
-describe('Architecture Support', () => {
+describe.if(isLinux)('Architecture Support', () => {
   it('should allow bypassing architecture requirement with allowAllUnixSockets', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     // When allowAllUnixSockets is true, architecture check should not matter
     const testCommand = 'echo "test"'
 
@@ -266,22 +218,15 @@ describe('Architecture Support', () => {
   })
 })
 
-describe('Socket Filtering Behavior', () => {
-  let filterPath: string | null = null
-
+describe.if(isLinux)('Socket Filtering Behavior', () => {
   beforeAll(() => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
-    filterPath = generateSeccompFilter()
+    // On Linux CI with vendor/seccomp files present this always succeeds.
+    // If it returns null we want the suite to fail loudly, not silently
+    // skip — a missing BPF filter means seccomp isn't protecting anything.
+    expect(generateSeccompFilter()).not.toBeNull()
   })
 
   it('should block Unix socket creation (SOCK_STREAM)', async () => {
-    if (skipIfNotLinux() || !filterPath) {
-      return
-    }
-
     const testCommand = `python3 -c "import socket; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); print('Unix socket created')"`
 
     const wrappedCommand = await wrapCommandWithSandboxLinux({
@@ -303,10 +248,6 @@ describe('Socket Filtering Behavior', () => {
   })
 
   it('should block Unix socket creation (SOCK_DGRAM)', async () => {
-    if (skipIfNotLinux() || !filterPath) {
-      return
-    }
-
     const testCommand = `python3 -c "import socket; s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM); print('Unix datagram created')"`
 
     const wrappedCommand = await wrapCommandWithSandboxLinux({
@@ -328,10 +269,6 @@ describe('Socket Filtering Behavior', () => {
   })
 
   it('should allow TCP socket creation (IPv4)', async () => {
-    if (skipIfNotLinux() || !filterPath) {
-      return
-    }
-
     const testCommand = `python3 -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); print('TCP socket created')"`
 
     const wrappedCommand = await wrapCommandWithSandboxLinux({
@@ -350,10 +287,6 @@ describe('Socket Filtering Behavior', () => {
   })
 
   it('should allow UDP socket creation (IPv4)', async () => {
-    if (skipIfNotLinux() || !filterPath) {
-      return
-    }
-
     const testCommand = `python3 -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); print('UDP socket created')"`
 
     const wrappedCommand = await wrapCommandWithSandboxLinux({
@@ -372,10 +305,6 @@ describe('Socket Filtering Behavior', () => {
   })
 
   it('should allow IPv6 socket creation', async () => {
-    if (skipIfNotLinux() || !filterPath) {
-      return
-    }
-
     const testCommand = `python3 -c "import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM); print('IPv6 socket created')"`
 
     const wrappedCommand = await wrapCommandWithSandboxLinux({
@@ -394,12 +323,8 @@ describe('Socket Filtering Behavior', () => {
   })
 })
 
-describe('Two-Stage Seccomp Application', () => {
+describe.if(isLinux)('Two-Stage Seccomp Application', () => {
   it('should include apply-seccomp in wrapped command when filesystem restricted', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     if (checkLinuxDependencies().errors.length > 0) {
       return
     }
@@ -427,10 +352,6 @@ describe('Two-Stage Seccomp Application', () => {
   })
 
   it('should execute user command with filter applied', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     if (checkLinuxDependencies().errors.length > 0) {
       return
     }
@@ -454,12 +375,8 @@ describe('Two-Stage Seccomp Application', () => {
   })
 })
 
-describe('Sandbox Integration', () => {
+describe.if(isLinux)('Sandbox Integration', () => {
   it('should handle commands without network or filesystem restrictions', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     if (checkLinuxDependencies().errors.length > 0) {
       return
     }
@@ -476,10 +393,6 @@ describe('Sandbox Integration', () => {
   })
 
   it('should wrap commands with filesystem restrictions', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     if (checkLinuxDependencies().errors.length > 0) {
       return
     }
@@ -499,12 +412,8 @@ describe('Sandbox Integration', () => {
   })
 })
 
-describe('Error Handling', () => {
+describe.if(isLinux)('Error Handling', () => {
   it('should handle cleanup calls gracefully (no-op)', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     // Cleanup is a no-op for pre-generated files, should never throw
     expect(() => cleanupSeccompFilter('')).not.toThrow()
     expect(() => cleanupSeccompFilter('/invalid/path/filter.bpf')).not.toThrow()
@@ -515,12 +424,8 @@ describe('Error Handling', () => {
   })
 })
 
-describe('Custom Seccomp Paths (expectedPath parameter)', () => {
+describe.if(isLinux)('Custom Seccomp Paths (expectedPath parameter)', () => {
   it('should use expectedPath for BPF when provided and file exists', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const realPath = getPreGeneratedBpfPath()
     if (!realPath) {
       // Skip if no real BPF available on this architecture
@@ -533,10 +438,6 @@ describe('Custom Seccomp Paths (expectedPath parameter)', () => {
   })
 
   it('should use expectedPath for apply-seccomp when provided and file exists', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const realPath = getApplySeccompBinaryPath()
     if (!realPath) {
       // Skip if no real binary available on this architecture
@@ -549,10 +450,6 @@ describe('Custom Seccomp Paths (expectedPath parameter)', () => {
   })
 
   it('should fall back to default paths when expectedPath for BPF does not exist', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const nonExistentPath = '/tmp/nonexistent-seccomp.bpf'
     const result = getPreGeneratedBpfPath(nonExistentPath)
 
@@ -567,10 +464,6 @@ describe('Custom Seccomp Paths (expectedPath parameter)', () => {
   })
 
   it('should fall back to default paths when expectedPath for apply-seccomp does not exist', () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     const nonExistentPath = '/tmp/nonexistent-apply-seccomp'
     const result = getApplySeccompBinaryPath(nonExistentPath)
 
@@ -585,10 +478,6 @@ describe('Custom Seccomp Paths (expectedPath parameter)', () => {
   })
 
   it('should pass seccompConfig through wrapCommandWithSandboxLinux', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     if (checkLinuxDependencies().errors.length > 0) {
       return
     }
@@ -614,10 +503,6 @@ describe('Custom Seccomp Paths (expectedPath parameter)', () => {
   })
 
   it('should use custom seccompConfig paths when they exist', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
     if (checkLinuxDependencies().errors.length > 0) {
       return
     }
