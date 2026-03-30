@@ -34,9 +34,10 @@ const { checkLinuxDependencies, getLinuxDependencyStatus } = await import(
   '../../src/sandbox/linux-sandbox-utils.js'
 )
 
-// Restore original Bun.which after all tests in this file
+// Restore original Bun.which and module mocks after all tests in this file
 afterAll(() => {
   globalThis.Bun.which = originalBunWhich
+  mock.restore()
 })
 
 describe('checkLinuxDependencies', () => {
