@@ -718,8 +718,15 @@ async function generateFilesystemArgs(
       )),
     ]
 
+    // Dedup post-normalization: entries like ['~/.foo', '/home/user/.foo']
+    // converge to the same path here. A duplicate --ro-bind /dev/null <dest>
+    // hits a char device on the second pass and bwrap's ensure_file() falls
+    // through to creat() on a read-only mount.
+    const seenDenyWrite = new Set<string>()
     for (const pathPattern of denyPaths) {
       const normalizedPath = normalizePathForSandbox(pathPattern)
+      if (seenDenyWrite.has(normalizedPath)) continue
+      seenDenyWrite.add(normalizedPath)
 
       // Skip /dev/* paths since --dev /dev already handles them
       if (normalizedPath.startsWith('/dev/')) {
