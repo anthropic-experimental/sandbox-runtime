@@ -213,6 +213,7 @@ function generateReadRules(
   }
 
   const rules: string[] = []
+  let deniesRoot = false
 
   // Start by allowing everything
   rules.push(`(allow file-read*)`)
@@ -220,6 +221,8 @@ function generateReadRules(
   // Then deny specific paths
   for (const pathPattern of config.denyOnly || []) {
     const normalizedPath = normalizePathForSandbox(pathPattern)
+
+    if (normalizedPath === '/') deniesRoot = true
 
     if (containsGlobChars(normalizedPath)) {
       // Use regex matching for glob patterns
@@ -237,6 +240,13 @@ function generateReadRules(
         `  (with message "${logTag}"))`,
       )
     }
+  }
+
+  // (subpath "/") denies the root inode itself; allowWithinDeny subpaths don't
+  // cover "/", so dyld aborts before exec. Re-allow the literal root so path
+  // traversal works. This exposes `ls /` dirent names but no subtree contents.
+  if (deniesRoot) {
+    rules.push(`(allow file-read* (literal "/"))`)
   }
 
   // Re-allow specific paths within denied regions (allowWithinDeny takes precedence)
