@@ -309,6 +309,9 @@ describe('allowRead carve-out with denyRead at filesystem root (issue #10)', () 
       needsNetworkRestriction: false,
       readConfig,
       writeConfig: undefined,
+      // Pin to system bash: PATH may resolve to /opt/homebrew/bin/bash
+      // on Apple Silicon, which is outside EXEC_DEPS.
+      binShell: '/bin/bash',
     })
 
     const result = spawnSync(wrappedCommand, {
@@ -337,6 +340,7 @@ describe('allowRead carve-out with denyRead at filesystem root (issue #10)', () 
       needsNetworkRestriction: false,
       readConfig,
       writeConfig: undefined,
+      binShell: '/bin/bash',
     })
 
     const result = spawnSync(wrappedCommand, {
