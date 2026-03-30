@@ -899,10 +899,15 @@ async function generateFilesystemArgs(
             )
             continue
           }
-          // Skip if already re-bound as writable above
+          // Skip only if a write path was re-bound just above AND covers
+          // allowPath. A write path that's an ancestor of the deny dir isn't
+          // re-bound (it wasn't wiped), so allowPath under it still needs
+          // its own ro-bind here.
           if (
             allowedWritePaths.some(
-              w => allowPath === w || allowPath.startsWith(w + '/'),
+              w =>
+                (w.startsWith(denySep) || w === normalizedPath) &&
+                (allowPath === w || allowPath.startsWith(w + '/')),
             )
           ) {
             continue

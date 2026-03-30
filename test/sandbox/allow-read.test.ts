@@ -212,6 +212,40 @@ describe('allowRead precedence over denyRead', () => {
       expect(result.status).not.toBe(0)
       expect(result.stdout).not.toContain(TEST_SECRET_CONTENT)
     })
+
+    // Regression: the write-path skip check in the allowRead re-bind loop was
+    // too broad — it skipped any allowPath under ANY allowWrite, not just
+    // writes actually re-bound under this tmpfs. With allowWrite as an
+    // ancestor of denyRead (not wiped, not re-bound), allowRead under it was
+    // skipped and left sitting in the empty tmpfs.
+    // Shape: allowWrite: [~], denyRead: [~/.ssh], allowRead: [~/.ssh/known_hosts].
+    it('should re-allow under denyRead when allowWrite is an ancestor of the deny', async () => {
+      if (skipIfNotLinux()) {
+        return
+      }
+
+      const wrappedCommand = await wrapCommandWithSandboxLinux({
+        command: `cat ${TEST_ALLOWED_FILE}`,
+        needsNetworkRestriction: false,
+        readConfig: {
+          denyOnly: [TEST_DENIED_DIR],
+          allowWithinDeny: [TEST_ALLOWED_SUBDIR],
+        },
+        writeConfig: {
+          allowOnly: [TEST_BASE_DIR], // ancestor of denyRead
+          denyWithinAllow: [],
+        },
+      })
+
+      const result = spawnSync(wrappedCommand, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+
+      expect(result.status).toBe(0)
+      expect(result.stdout).toContain(TEST_ALLOWED_CONTENT)
+    })
   })
 })
 
