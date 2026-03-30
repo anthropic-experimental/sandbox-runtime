@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeAll } from 'bun:test'
+import { spawnSync } from 'node:child_process'
 import { existsSync, statSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { getPlatform } from '../../src/utils/platform.js'
 import { whichSync } from '../../src/utils/which.js'
 import {
@@ -17,8 +19,12 @@ function skipIfNotLinux(): boolean {
   return getPlatform() !== 'linux'
 }
 
-function skipIfNotAnt(): boolean {
-  return process.env.USER_TYPE !== 'ant'
+// wrapCommandWithSandboxLinux early-returns the raw command when no restrictions
+// are requested. Tests that want to verify seccomp enforcement need to request
+// at least one restriction so the sandbox actually wraps.
+const TRIGGER_SANDBOX_WRITE_CONFIG = {
+  allowOnly: [tmpdir()],
+  denyWithinAllow: [],
 }
 
 describe('Linux Sandbox Dependencies', () => {
@@ -239,42 +245,6 @@ describe('Apply Seccomp Binary', () => {
 })
 
 describe('Architecture Support', () => {
-  it('should fail fast when architecture is unsupported and seccomp is needed', async () => {
-    if (skipIfNotLinux() || skipIfNotAnt()) {
-      return
-    }
-
-    // This test documents the expected behavior:
-    // When the architecture is not x64/arm64, the sandbox should fail the dependency
-    // check instead of silently running without seccomp protection
-
-    // The actual check happens in:
-    // 1. checkLinuxDependencies() checks for apply-seccomp binary availability
-    // 2. Returns warnings if binary not available for the current architecture
-    // 3. Caller decides policy (e.g. allowAllUnixSockets bypasses seccomp requirement)
-    expect(true).toBe(true) // Placeholder - actual behavior verified by integration tests
-  })
-
-  it('should include architecture information in error messages', () => {
-    if (skipIfNotLinux() || skipIfNotAnt()) {
-      return
-    }
-
-    // Verify error messages mention architecture support and alternatives
-    // This is a documentation test to ensure error messages are helpful
-    const expectedInErrorMessage = [
-      'x64',
-      'arm64',
-      'architecture',
-      'allowAllUnixSockets',
-    ]
-
-    // Error messages should guide users to either:
-    // 1. Use a supported architecture (x64/arm64), OR
-    // 2. Set allowAllUnixSockets: true to opt out
-    expect(expectedInErrorMessage.length).toBeGreaterThan(0)
-  })
-
   it('should allow bypassing architecture requirement with allowAllUnixSockets', async () => {
     if (skipIfNotLinux()) {
       return
@@ -296,37 +266,11 @@ describe('Architecture Support', () => {
   })
 })
 
-describe('USER_TYPE Gating', () => {
-  it('should only apply seccomp in sandbox for ANT users', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
-    if (checkLinuxDependencies().errors.length > 0) {
-      return
-    }
-
-    const testCommand = 'echo "test"'
-    const wrappedCommand = await wrapCommandWithSandboxLinux({
-      command: testCommand,
-      needsNetworkRestriction: false,
-    })
-
-    if (process.env.USER_TYPE === 'ant') {
-      // ANT users should have apply-seccomp binary in command
-      expect(wrappedCommand).toContain('apply-seccomp')
-    } else {
-      // Non-ANT users should not have seccomp
-      expect(wrappedCommand).not.toContain('apply-seccomp')
-    }
-  })
-})
-
 describe('Socket Filtering Behavior', () => {
   let filterPath: string | null = null
 
   beforeAll(() => {
-    if (skipIfNotLinux() || skipIfNotAnt()) {
+    if (skipIfNotLinux()) {
       return
     }
 
@@ -334,7 +278,7 @@ describe('Socket Filtering Behavior', () => {
   })
 
   it('should block Unix socket creation (SOCK_STREAM)', async () => {
-    if (skipIfNotLinux() || skipIfNotAnt() || !filterPath) {
+    if (skipIfNotLinux() || !filterPath) {
       return
     }
 
@@ -343,6 +287,7 @@ describe('Socket Filtering Behavior', () => {
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: testCommand,
       needsNetworkRestriction: false,
+      writeConfig: TRIGGER_SANDBOX_WRITE_CONFIG,
     })
 
     const result = spawnSync('bash', ['-c', wrappedCommand], {
@@ -358,7 +303,7 @@ describe('Socket Filtering Behavior', () => {
   })
 
   it('should block Unix socket creation (SOCK_DGRAM)', async () => {
-    if (skipIfNotLinux() || skipIfNotAnt() || !filterPath) {
+    if (skipIfNotLinux() || !filterPath) {
       return
     }
 
@@ -367,6 +312,7 @@ describe('Socket Filtering Behavior', () => {
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: testCommand,
       needsNetworkRestriction: false,
+      writeConfig: TRIGGER_SANDBOX_WRITE_CONFIG,
     })
 
     const result = spawnSync('bash', ['-c', wrappedCommand], {
@@ -382,7 +328,7 @@ describe('Socket Filtering Behavior', () => {
   })
 
   it('should allow TCP socket creation (IPv4)', async () => {
-    if (skipIfNotLinux() || skipIfNotAnt() || !filterPath) {
+    if (skipIfNotLinux() || !filterPath) {
       return
     }
 
@@ -391,6 +337,7 @@ describe('Socket Filtering Behavior', () => {
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: testCommand,
       needsNetworkRestriction: false,
+      writeConfig: TRIGGER_SANDBOX_WRITE_CONFIG,
     })
 
     const result = spawnSync('bash', ['-c', wrappedCommand], {
@@ -403,7 +350,7 @@ describe('Socket Filtering Behavior', () => {
   })
 
   it('should allow UDP socket creation (IPv4)', async () => {
-    if (skipIfNotLinux() || skipIfNotAnt() || !filterPath) {
+    if (skipIfNotLinux() || !filterPath) {
       return
     }
 
@@ -412,6 +359,7 @@ describe('Socket Filtering Behavior', () => {
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: testCommand,
       needsNetworkRestriction: false,
+      writeConfig: TRIGGER_SANDBOX_WRITE_CONFIG,
     })
 
     const result = spawnSync('bash', ['-c', wrappedCommand], {
@@ -424,7 +372,7 @@ describe('Socket Filtering Behavior', () => {
   })
 
   it('should allow IPv6 socket creation', async () => {
-    if (skipIfNotLinux() || skipIfNotAnt() || !filterPath) {
+    if (skipIfNotLinux() || !filterPath) {
       return
     }
 
@@ -433,6 +381,7 @@ describe('Socket Filtering Behavior', () => {
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: testCommand,
       needsNetworkRestriction: false,
+      writeConfig: TRIGGER_SANDBOX_WRITE_CONFIG,
     })
 
     const result = spawnSync('bash', ['-c', wrappedCommand], {
@@ -446,8 +395,8 @@ describe('Socket Filtering Behavior', () => {
 })
 
 describe('Two-Stage Seccomp Application', () => {
-  it('should allow network infrastructure to run before filter', async () => {
-    if (skipIfNotLinux() || skipIfNotAnt()) {
+  it('should include apply-seccomp in wrapped command when filesystem restricted', async () => {
+    if (skipIfNotLinux()) {
       return
     }
 
@@ -455,29 +404,30 @@ describe('Two-Stage Seccomp Application', () => {
       return
     }
 
-    // This test verifies that the socat processes can start successfully
-    // even though they use Unix sockets, because they run before the filter
-    const testCommand = 'echo "test"'
-
+    // With filesystem restriction and no network, the no-socat branch at
+    // linux-sandbox-utils.ts:1197 should apply seccomp directly.
+    // Socat-before-seccomp ordering (the network-restricted branch) is
+    // covered implicitly by integration.test.ts — if socat ran after
+    // seccomp, its AF_UNIX socket would be blocked and every network
+    // test there would fail.
     const wrappedCommand = await wrapCommandWithSandboxLinux({
-      command: testCommand,
+      command: 'echo "test"',
       needsNetworkRestriction: false,
+      writeConfig: TRIGGER_SANDBOX_WRITE_CONFIG,
     })
 
-    // Command should include both socat and the apply-seccomp binary
-    expect(wrappedCommand).toContain('socat')
+    expect(wrappedCommand).toContain('bwrap')
     expect(wrappedCommand).toContain('apply-seccomp')
 
-    // The socat should come before the apply-seccomp
-    const socatIndex = wrappedCommand.indexOf('socat')
+    const bwrapIndex = wrappedCommand.indexOf('bwrap')
     const seccompIndex = wrappedCommand.indexOf('apply-seccomp')
-    expect(socatIndex).toBeGreaterThan(-1)
-    expect(seccompIndex).toBeGreaterThan(-1)
-    expect(socatIndex).toBeLessThan(seccompIndex)
+    const commandIndex = wrappedCommand.indexOf('echo')
+    expect(bwrapIndex).toBeLessThan(seccompIndex)
+    expect(seccompIndex).toBeLessThan(commandIndex)
   })
 
   it('should execute user command with filter applied', async () => {
-    if (skipIfNotLinux() || skipIfNotAnt()) {
+    if (skipIfNotLinux()) {
       return
     }
 
@@ -491,6 +441,7 @@ describe('Two-Stage Seccomp Application', () => {
     const wrappedCommand = await wrapCommandWithSandboxLinux({
       command: testCommand,
       needsNetworkRestriction: false,
+      writeConfig: TRIGGER_SANDBOX_WRITE_CONFIG,
     })
 
     const result = spawnSync('bash', ['-c', wrappedCommand], {
@@ -545,30 +496,6 @@ describe('Sandbox Integration', () => {
 
     expect(wrappedCommand).toBeTruthy()
     expect(wrappedCommand).toContain('bwrap')
-  })
-
-  it('should include seccomp for ANT users with dependencies', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
-
-    if (checkLinuxDependencies().errors.length > 0) {
-      return
-    }
-
-    const testCommand = 'echo "test"'
-    const wrappedCommand = await wrapCommandWithSandboxLinux({
-      command: testCommand,
-      needsNetworkRestriction: false,
-    })
-
-    const isAnt = process.env.USER_TYPE === 'ant'
-
-    if (isAnt) {
-      expect(wrappedCommand).toContain('apply-seccomp')
-    } else {
-      expect(wrappedCommand).not.toContain('apply-seccomp')
-    }
   })
 })
 

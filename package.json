@@ -17,8 +17,6 @@
     "build:seccomp": "scripts/build-seccomp-binaries.sh",
     "clean": "rm -rf dist",
     "test": "bun test",
-    "test:unit": "bun test test/config-validation.test.ts test/sandbox/seccomp-filter.test.ts",
-    "test:integration": "bun test test/sandbox/integration.test.ts test/sandbox/allow-read.test.ts test/sandbox/wrap-with-sandbox.test.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint 'src/**/*.ts' --fix --cache --cache-location=node_modules/.cache/.eslintcache",
     "lint:check": "eslint 'src/**/*.ts' --cache --cache-location=node_modules/.cache/.eslintcache",
