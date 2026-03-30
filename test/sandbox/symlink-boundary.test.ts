@@ -2,8 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, rmSync, unlinkSync, lstatSync } from 'node:fs'
 import { join } from 'node:path'
-import { getPlatform } from '../../src/utils/platform.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
+import { isMacos } from '../helpers/platform.js'
 import {
   isSymlinkOutsideBoundary,
   normalizePathForSandbox,
@@ -18,10 +18,6 @@ import type { FsWriteRestrictionConfig } from '../../src/sandbox/sandbox-schemas
  * scope (e.g., a parent directory or root), the original path should be
  * preserved rather than the resolved path.
  */
-
-function skipIfNotMacOS(): boolean {
-  return getPlatform() !== 'macos'
-}
 
 /**
  * Safely remove /tmp/claude if it exists (file, directory, or symlink)
@@ -44,7 +40,7 @@ function cleanupTmpClaude(): void {
   }
 }
 
-describe('macOS Seatbelt Symlink Boundary Validation', () => {
+describe.if(isMacos)('macOS Seatbelt Symlink Boundary Validation', () => {
   // Use unique test directories per run
   // Use /private/tmp (not os.tmpdir()) so test paths are outside any
   // default-allowed write location
@@ -56,10 +52,6 @@ describe('macOS Seatbelt Symlink Boundary Validation', () => {
   const TEST_CONTENT = 'TEST_CONTENT'
 
   beforeEach(() => {
-    if (skipIfNotMacOS()) {
-      return
-    }
-
     // Clean up any existing /tmp/claude symlink from previous runs
     cleanupTmpClaude()
 
@@ -71,10 +63,6 @@ describe('macOS Seatbelt Symlink Boundary Validation', () => {
   })
 
   afterEach(() => {
-    if (skipIfNotMacOS()) {
-      return
-    }
-
     // Clean up /tmp/claude
     cleanupTmpClaude()
 
@@ -89,10 +77,6 @@ describe('macOS Seatbelt Symlink Boundary Validation', () => {
 
   describe('Symlink Boundary Enforcement', () => {
     it('should preserve original path when symlink points to root', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Step 1: Verify sandbox correctly blocks writes outside workspace
       console.log('\n=== Step 1: Initial write attempt (should be blocked) ===')
 
@@ -172,10 +156,6 @@ describe('macOS Seatbelt Symlink Boundary Validation', () => {
     })
 
     it('should block writes outside workspace when /tmp/claude does not exist', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Ensure /tmp/claude doesn't exist
       cleanupTmpClaude()
       expect(existsSync('/tmp/claude')).toBe(false)
@@ -204,10 +184,6 @@ describe('macOS Seatbelt Symlink Boundary Validation', () => {
     })
 
     it('should block writes outside workspace when /tmp/claude is a regular directory', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Create /tmp/claude as a regular directory
       cleanupTmpClaude()
       mkdirSync('/tmp/claude', { recursive: true })
@@ -240,10 +216,6 @@ describe('macOS Seatbelt Symlink Boundary Validation', () => {
     })
 
     it('should block writes via symlink traversal path', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Create symlink /tmp/claude -> /
       cleanupTmpClaude()
       spawnSync('ln', ['-s', '/', '/tmp/claude'], { encoding: 'utf8' })
@@ -285,10 +257,6 @@ describe('macOS Seatbelt Symlink Boundary Validation', () => {
 
   describe('isSymlinkOutsideBoundary Integration', () => {
     it('should reject symlink resolution that broadens scope', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Create symlink pointing to root
       cleanupTmpClaude()
       spawnSync('ln', ['-s', '/', '/tmp/claude'], { encoding: 'utf8' })
@@ -441,43 +409,41 @@ describe('Glob Pattern Symlink Boundary', () => {
     }
   }
 
-  it('should preserve original glob pattern when base directory symlink points to root', () => {
-    if (getPlatform() !== 'macos') {
-      return
-    }
+  it.if(isMacos)(
+    'should preserve original glob pattern when base directory symlink points to root',
+    () => {
+      // Clean up and create symlink
+      cleanupTmpClaude()
+      spawnSync('ln', ['-s', '/', '/tmp/claude'], { encoding: 'utf8' })
 
-    // Clean up and create symlink
-    cleanupTmpClaude()
-    spawnSync('ln', ['-s', '/', '/tmp/claude'], { encoding: 'utf8' })
+      // Test that glob pattern doesn't resolve to /**
+      const result = normalizePathForSandbox('/tmp/claude/**')
 
-    // Test that glob pattern doesn't resolve to /**
-    const result = normalizePathForSandbox('/tmp/claude/**')
+      // Should keep original pattern, not resolve to /**
+      expect(result).toBe('/tmp/claude/**')
+      expect(result).not.toBe('/**')
 
-    // Should keep original pattern, not resolve to /**
-    expect(result).toBe('/tmp/claude/**')
-    expect(result).not.toBe('/**')
+      // Clean up
+      cleanupTmpClaude()
+    },
+  )
 
-    // Clean up
-    cleanupTmpClaude()
-  })
+  it.if(isMacos)(
+    'should preserve original glob pattern when base directory symlink points to parent',
+    () => {
+      // Clean up and create symlink pointing to /tmp (parent)
+      cleanupTmpClaude()
+      spawnSync('ln', ['-s', '/tmp', '/tmp/claude'], { encoding: 'utf8' })
 
-  it('should preserve original glob pattern when base directory symlink points to parent', () => {
-    if (getPlatform() !== 'macos') {
-      return
-    }
+      // Test that glob pattern doesn't resolve to /tmp/**
+      const result = normalizePathForSandbox('/tmp/claude/**')
 
-    // Clean up and create symlink pointing to /tmp (parent)
-    cleanupTmpClaude()
-    spawnSync('ln', ['-s', '/tmp', '/tmp/claude'], { encoding: 'utf8' })
+      // Should keep original pattern
+      expect(result).toBe('/tmp/claude/**')
+      expect(result).not.toBe('/tmp/**')
 
-    // Test that glob pattern doesn't resolve to /tmp/**
-    const result = normalizePathForSandbox('/tmp/claude/**')
-
-    // Should keep original pattern
-    expect(result).toBe('/tmp/claude/**')
-    expect(result).not.toBe('/tmp/**')
-
-    // Clean up
-    cleanupTmpClaude()
-  })
+      // Clean up
+      cleanupTmpClaude()
+    },
+  )
 })

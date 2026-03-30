@@ -1,11 +1,7 @@
 import { describe, it, expect } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { getPlatform } from '../../src/utils/platform.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
-
-function skipIfNotMacOS(): boolean {
-  return getPlatform() !== 'macos'
-}
+import { isMacos } from '../helpers/platform.js'
 
 function runInSandbox(
   pythonCode: string,
@@ -36,11 +32,9 @@ const bindIPv4 = (addr: string) =>
 const bindIPv6DualStack = (addr: string) =>
   `import socket; s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0); s.bind(('${addr}', 0)); print('BOUND'); s.close()`
 
-describe('macOS Seatbelt allowLocalBinding', () => {
+describe.if(isMacos)('macOS Seatbelt allowLocalBinding', () => {
   describe('when allowLocalBinding is true', () => {
     it('should allow AF_INET bind to 127.0.0.1', () => {
-      if (skipIfNotMacOS()) return
-
       const result = runInSandbox(bindIPv4('127.0.0.1'), true)
 
       expect(result.status).toBe(0)
@@ -48,8 +42,6 @@ describe('macOS Seatbelt allowLocalBinding', () => {
     })
 
     it('should allow AF_INET6 dual-stack bind to ::ffff:127.0.0.1', () => {
-      if (skipIfNotMacOS()) return
-
       // This is the case that breaks Java/Gradle: an IPv6 dual-stack socket
       // binding to 127.0.0.1, which the kernel represents as ::ffff:127.0.0.1
       const result = runInSandbox(bindIPv6DualStack('::ffff:127.0.0.1'), true)
@@ -59,8 +51,6 @@ describe('macOS Seatbelt allowLocalBinding', () => {
     })
 
     it('should allow AF_INET6 bind to ::1', () => {
-      if (skipIfNotMacOS()) return
-
       const result = runInSandbox(bindIPv6DualStack('::1'), true)
 
       expect(result.status).toBe(0)
@@ -70,16 +60,12 @@ describe('macOS Seatbelt allowLocalBinding', () => {
 
   describe('when allowLocalBinding is false', () => {
     it('should block AF_INET bind to 127.0.0.1', () => {
-      if (skipIfNotMacOS()) return
-
       const result = runInSandbox(bindIPv4('127.0.0.1'), false)
 
       expect(result.status).not.toBe(0)
     })
 
     it('should block AF_INET6 dual-stack bind to ::ffff:127.0.0.1', () => {
-      if (skipIfNotMacOS()) return
-
       const result = runInSandbox(bindIPv6DualStack('::ffff:127.0.0.1'), false)
 
       expect(result.status).not.toBe(0)

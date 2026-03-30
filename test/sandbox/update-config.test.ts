@@ -3,6 +3,7 @@ import { SandboxManager } from '../../src/index.js'
 import { connect } from 'net'
 import { spawnSync } from 'child_process'
 import { getPlatform } from '../../src/utils/platform.js'
+import { isLinux } from '../helpers/platform.js'
 
 /**
  * Helper to make a CONNECT request through the proxy using raw TCP
@@ -286,131 +287,124 @@ describe('SandboxManager.updateConfig proxy filtering', () => {
  * and actual network behavior with sandboxed curl commands.
  */
 describe('SandboxManager.updateConfig integration (wrapWithSandbox)', () => {
-  function skipIfNotLinux(): boolean {
-    return getPlatform() !== 'linux'
-  }
-
   afterEach(async () => {
     await SandboxManager.reset()
   })
 
-  it('should block then allow domain after updateConfig with sandboxed curl', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
+  it.if(isLinux)(
+    'should block then allow domain after updateConfig with sandboxed curl',
+    async () => {
+      // Initialize with empty allowlist (blocks all)
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
 
-    // Initialize with empty allowlist (blocks all)
-    await SandboxManager.initialize({
-      network: { allowedDomains: [], deniedDomains: [] },
-      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
-    })
+      // First request should be blocked
+      const cmd1 = await SandboxManager.wrapWithSandbox(
+        'curl -s --max-time 3 http://example.com 2>&1',
+      )
+      const result1 = spawnSync(cmd1, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+      const output1 = (result1.stdout + result1.stderr).toLowerCase()
+      // With empty allowlist, network is completely blocked (no proxy)
+      expect(output1).not.toContain('example domain')
 
-    // First request should be blocked
-    const cmd1 = await SandboxManager.wrapWithSandbox(
-      'curl -s --max-time 3 http://example.com 2>&1',
-    )
-    const result1 = spawnSync(cmd1, {
-      shell: true,
-      encoding: 'utf8',
-      timeout: 5000,
-    })
-    const output1 = (result1.stdout + result1.stderr).toLowerCase()
-    // With empty allowlist, network is completely blocked (no proxy)
-    expect(output1).not.toContain('example domain')
+      // Update config to allow example.com
+      SandboxManager.updateConfig({
+        network: { allowedDomains: ['example.com'], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
 
-    // Update config to allow example.com
-    SandboxManager.updateConfig({
-      network: { allowedDomains: ['example.com'], deniedDomains: [] },
-      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
-    })
+      // Second request should succeed
+      // Note: wrapWithSandbox() generates new command with updated config
+      const cmd2 = await SandboxManager.wrapWithSandbox(
+        'curl -s --max-time 5 http://example.com 2>&1',
+      )
+      const result2 = spawnSync(cmd2, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 10000,
+      })
 
-    // Second request should succeed
-    // Note: wrapWithSandbox() generates new command with updated config
-    const cmd2 = await SandboxManager.wrapWithSandbox(
-      'curl -s --max-time 5 http://example.com 2>&1',
-    )
-    const result2 = spawnSync(cmd2, {
-      shell: true,
-      encoding: 'utf8',
-      timeout: 10000,
-    })
+      expect(result2.status).toBe(0)
+      expect(result2.stdout).toContain('Example Domain')
+    },
+  )
 
-    expect(result2.status).toBe(0)
-    expect(result2.stdout).toContain('Example Domain')
-  })
+  it.if(isLinux)(
+    'should allow then block domain after updateConfig with sandboxed curl',
+    async () => {
+      // Initialize with example.com allowed
+      await SandboxManager.initialize({
+        network: { allowedDomains: ['example.com'], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
 
-  it('should allow then block domain after updateConfig with sandboxed curl', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
+      // First request should succeed
+      const cmd1 = await SandboxManager.wrapWithSandbox(
+        'curl -s --max-time 5 http://example.com 2>&1',
+      )
+      const result1 = spawnSync(cmd1, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 10000,
+      })
+      expect(result1.status).toBe(0)
+      expect(result1.stdout).toContain('Example Domain')
 
-    // Initialize with example.com allowed
-    await SandboxManager.initialize({
-      network: { allowedDomains: ['example.com'], deniedDomains: [] },
-      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
-    })
+      // Update config to block all
+      SandboxManager.updateConfig({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
 
-    // First request should succeed
-    const cmd1 = await SandboxManager.wrapWithSandbox(
-      'curl -s --max-time 5 http://example.com 2>&1',
-    )
-    const result1 = spawnSync(cmd1, {
-      shell: true,
-      encoding: 'utf8',
-      timeout: 10000,
-    })
-    expect(result1.status).toBe(0)
-    expect(result1.stdout).toContain('Example Domain')
+      // Second request should be blocked
+      const cmd2 = await SandboxManager.wrapWithSandbox(
+        'curl -s --max-time 3 http://example.com 2>&1',
+      )
+      const result2 = spawnSync(cmd2, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+      const output2 = (result2.stdout + result2.stderr).toLowerCase()
+      expect(output2).not.toContain('example domain')
+    },
+  )
 
-    // Update config to block all
-    SandboxManager.updateConfig({
-      network: { allowedDomains: [], deniedDomains: [] },
-      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
-    })
+  it.if(isLinux)(
+    'should allow network via curl after updateConfig when started with empty allowlist',
+    async () => {
+      // Initialize with EMPTY allowlist
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
 
-    // Second request should be blocked
-    const cmd2 = await SandboxManager.wrapWithSandbox(
-      'curl -s --max-time 3 http://example.com 2>&1',
-    )
-    const result2 = spawnSync(cmd2, {
-      shell: true,
-      encoding: 'utf8',
-      timeout: 5000,
-    })
-    const output2 = (result2.stdout + result2.stderr).toLowerCase()
-    expect(output2).not.toContain('example domain')
-  })
+      // Update config to allow example.com
+      SandboxManager.updateConfig({
+        network: { allowedDomains: ['example.com'], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      })
 
-  it('should allow network via curl after updateConfig when started with empty allowlist', async () => {
-    if (skipIfNotLinux()) {
-      return
-    }
+      // Full integration: sandboxed curl should work
+      const cmd = await SandboxManager.wrapWithSandbox(
+        'curl -s --max-time 5 http://example.com 2>&1',
+      )
+      const result = spawnSync(cmd, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 10000,
+      })
 
-    // Initialize with EMPTY allowlist
-    await SandboxManager.initialize({
-      network: { allowedDomains: [], deniedDomains: [] },
-      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
-    })
-
-    // Update config to allow example.com
-    SandboxManager.updateConfig({
-      network: { allowedDomains: ['example.com'], deniedDomains: [] },
-      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
-    })
-
-    // Full integration: sandboxed curl should work
-    const cmd = await SandboxManager.wrapWithSandbox(
-      'curl -s --max-time 5 http://example.com 2>&1',
-    )
-    const result = spawnSync(cmd, {
-      shell: true,
-      encoding: 'utf8',
-      timeout: 10000,
-    })
-
-    expect(result.status).toBe(0)
-    expect(result.stdout).toContain('Example Domain')
-  })
+      expect(result.status).toBe(0)
+      expect(result.stdout).toContain('Example Domain')
+    },
+  )
 
   /**
    * This test verifies the exact user scenario:

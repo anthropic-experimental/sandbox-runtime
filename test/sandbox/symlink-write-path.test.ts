@@ -10,12 +10,8 @@ import {
 } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { getPlatform } from '../../src/utils/platform.js'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
-
-function skipIfNotLinux(): boolean {
-  return getPlatform() !== 'linux'
-}
+import { isLinux } from '../helpers/platform.js'
 
 /**
  * Unit tests for symlink write path detection in generateFilesystemArgs.
@@ -24,27 +20,23 @@ function skipIfNotLinux(): boolean {
  * bwrap would follow the symlink and make the target writable. The fix detects
  * this and skips the path with a warning.
  */
-describe('Symlink write path detection (unit)', () => {
+describe.if(isLinux)('Symlink write path detection (unit)', () => {
   const TEST_ID = `symlink-write-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   const TEST_BASE = join(tmpdir(), TEST_ID)
   const USER_AREA = join(TEST_BASE, 'user_area')
   const PROTECTED = join(TEST_BASE, 'protected')
 
   beforeEach(() => {
-    if (skipIfNotLinux()) return
     mkdirSync(USER_AREA, { recursive: true })
     mkdirSync(PROTECTED, { recursive: true })
     writeFileSync(join(PROTECTED, 'secret.txt'), 'secret data')
   })
 
   afterEach(() => {
-    if (skipIfNotLinux()) return
     rmSync(TEST_BASE, { recursive: true, force: true })
   })
 
   it('should include normal (non-symlink) write paths in bwrap args', async () => {
-    if (skipIfNotLinux()) return
-
     const result = await wrapCommandWithSandboxLinux({
       command: 'echo hello',
       needsNetworkRestriction: false,
@@ -61,8 +53,6 @@ describe('Symlink write path detection (unit)', () => {
   })
 
   it('should skip symlink write paths pointing outside expected boundaries', async () => {
-    if (skipIfNotLinux()) return
-
     // Create symlink: user_area/evil -> protected/
     const evilLink = join(USER_AREA, 'evil')
     symlinkSync(PROTECTED, evilLink)
@@ -86,8 +76,6 @@ describe('Symlink write path detection (unit)', () => {
   })
 
   it('should keep legitimate write paths while skipping symlink paths', async () => {
-    if (skipIfNotLinux()) return
-
     // Create symlink: user_area/evil -> protected/
     const evilLink = join(USER_AREA, 'evil')
     symlinkSync(PROTECTED, evilLink)
@@ -109,8 +97,6 @@ describe('Symlink write path detection (unit)', () => {
   })
 
   it('should skip write paths that cannot be resolved', async () => {
-    if (skipIfNotLinux()) return
-
     // Create a broken symlink
     const brokenLink = join(USER_AREA, 'broken')
     symlinkSync('/nonexistent/path/that/does/not/exist', brokenLink)
@@ -131,8 +117,6 @@ describe('Symlink write path detection (unit)', () => {
   })
 
   it('should allow symlinks that resolve within the same directory', async () => {
-    if (skipIfNotLinux()) return
-
     // Create a subdirectory and a symlink within user_area pointing to it
     const subdir = join(USER_AREA, 'actual_data')
     mkdirSync(subdir, { recursive: true })
@@ -154,8 +138,6 @@ describe('Symlink write path detection (unit)', () => {
   })
 
   it('should include write paths with trailing slashes (not treat them as symlinks)', async () => {
-    if (skipIfNotLinux()) return
-
     // When normalizedPath has a trailing slash, realpathSync returns it without one.
     // The comparison `resolvedPath !== normalizedPath` would incorrectly be true,
     // potentially causing the path to be skipped as if it were a symlink.
@@ -183,27 +165,23 @@ describe('Symlink write path detection (unit)', () => {
  * These tests create actual symlinks and verify that the sandbox correctly
  * prevents writes through symlinks pointing outside allowed boundaries.
  */
-describe('Symlink write path detection (integration)', () => {
+describe.if(isLinux)('Symlink write path detection (integration)', () => {
   const TEST_ID = `symlink-integ-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   const TEST_BASE = join(tmpdir(), TEST_ID)
   const USER_AREA = join(TEST_BASE, 'user_area')
   const PROTECTED = join(TEST_BASE, 'protected')
 
   beforeEach(() => {
-    if (skipIfNotLinux()) return
     mkdirSync(USER_AREA, { recursive: true })
     mkdirSync(PROTECTED, { recursive: true })
     writeFileSync(join(PROTECTED, 'secret.txt'), 'secret data')
   })
 
   afterEach(() => {
-    if (skipIfNotLinux()) return
     rmSync(TEST_BASE, { recursive: true, force: true })
   })
 
   it('should block writes through symlink pointing to protected directory', async () => {
-    if (skipIfNotLinux()) return
-
     // Attack scenario: user_area/evil_symlink -> protected/
     const evilLink = join(USER_AREA, 'evil_symlink')
     symlinkSync(PROTECTED, evilLink)
@@ -232,8 +210,6 @@ describe('Symlink write path detection (integration)', () => {
   })
 
   it('should allow normal writes to non-symlink paths', async () => {
-    if (skipIfNotLinux()) return
-
     const testFile = join(USER_AREA, 'normal-write.txt')
 
     const command = await wrapCommandWithSandboxLinux({
@@ -258,8 +234,6 @@ describe('Symlink write path detection (integration)', () => {
   })
 
   it('should block writes through symlink pointing to /etc', async () => {
-    if (skipIfNotLinux()) return
-
     // Classic attack: src -> /etc
     const srcLink = join(USER_AREA, 'src')
     symlinkSync('/etc', srcLink)
@@ -285,8 +259,6 @@ describe('Symlink write path detection (integration)', () => {
   })
 
   it('should block writes through symlink pointing to parent directory', async () => {
-    if (skipIfNotLinux()) return
-
     // Symlink pointing to parent (broadens scope)
     const parentLink = join(USER_AREA, 'parent')
     symlinkSync(TEST_BASE, parentLink)

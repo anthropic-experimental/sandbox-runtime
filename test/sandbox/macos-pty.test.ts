@@ -3,38 +3,24 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, rmSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { getPlatform } from '../../src/utils/platform.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 import type { FsWriteRestrictionConfig } from '../../src/sandbox/sandbox-schemas.js'
+import { isMacos } from '../helpers/platform.js'
 
-function skipIfNotMacOS(): boolean {
-  return getPlatform() !== 'macos'
-}
-
-describe('macOS Seatbelt PTY Support', () => {
+describe.if(isMacos)('macOS Seatbelt PTY Support', () => {
   const TEST_BASE_DIR = join(tmpdir(), 'seatbelt-pty-test-' + Date.now())
 
   beforeAll(() => {
-    if (skipIfNotMacOS()) {
-      return
-    }
     mkdirSync(TEST_BASE_DIR, { recursive: true })
   })
 
   afterAll(() => {
-    if (skipIfNotMacOS()) {
-      return
-    }
     if (existsSync(TEST_BASE_DIR)) {
       rmSync(TEST_BASE_DIR, { recursive: true, force: true })
     }
   })
 
   it('should allow PTY operations when allowPty is true', () => {
-    if (skipIfNotMacOS()) {
-      return
-    }
-
     const outputFile = join(TEST_BASE_DIR, 'pty-output.txt')
 
     const writeConfig: FsWriteRestrictionConfig = {
@@ -63,10 +49,6 @@ describe('macOS Seatbelt PTY Support', () => {
   })
 
   it('should block PTY operations when allowPty is false', () => {
-    if (skipIfNotMacOS()) {
-      return
-    }
-
     const outputFile = join(TEST_BASE_DIR, 'pty-blocked.txt')
 
     const writeConfig: FsWriteRestrictionConfig = {
