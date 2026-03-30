@@ -392,26 +392,34 @@ export function getLinuxDependencyStatus(seccompConfig?: {
 }
 
 /**
+ * Pure mapping from dependency status to errors/warnings.
+ * Separated from getLinuxDependencyStatus so the classification logic
+ * can be unit-tested without mocking filesystem or binary lookups.
+ */
+export function dependencyStatusToCheck(
+  status: LinuxDependencyStatus,
+): SandboxDependencyCheck {
+  const errors: string[] = []
+  const warnings: string[] = []
+
+  if (!status.hasBwrap) errors.push('bubblewrap (bwrap) not installed')
+  if (!status.hasSocat) errors.push('socat not installed')
+
+  if (!status.hasSeccompBpf || !status.hasSeccompApply) {
+    warnings.push('seccomp not available - unix socket access not restricted')
+  }
+
+  return { warnings, errors }
+}
+
+/**
  * Check sandbox dependencies and return structured result
  */
 export function checkLinuxDependencies(seccompConfig?: {
   bpfPath?: string
   applyPath?: string
 }): SandboxDependencyCheck {
-  const errors: string[] = []
-  const warnings: string[] = []
-
-  if (whichSync('bwrap') === null)
-    errors.push('bubblewrap (bwrap) not installed')
-  if (whichSync('socat') === null) errors.push('socat not installed')
-
-  const hasBpf = getPreGeneratedBpfPath(seccompConfig?.bpfPath) !== null
-  const hasApply = getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null
-  if (!hasBpf || !hasApply) {
-    warnings.push('seccomp not available - unix socket access not restricted')
-  }
-
-  return { warnings, errors }
+  return dependencyStatusToCheck(getLinuxDependencyStatus(seccompConfig))
 }
 
 /**
