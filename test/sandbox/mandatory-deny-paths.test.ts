@@ -889,6 +889,12 @@ describe.if(isSupportedPlatform)(
               timeout: 10000,
             })
 
+            if (result.status !== 0) {
+              console.error('stdout:', result.stdout)
+              console.error('stderr:', result.stderr)
+              console.error('wrappedCommand:', wrappedCommand)
+            }
+
             // git init + git status should succeed — .git must be creatable as
             // a directory, not blocked by a /dev/null file mount.
             expect(result.status).toBe(0)
@@ -943,6 +949,12 @@ describe.if(isSupportedPlatform)(
               encoding: 'utf8',
               timeout: 10000,
             })
+
+            if (result.status !== 0) {
+              console.error('stdout:', result.stdout)
+              console.error('stderr:', result.stderr)
+              console.error('wrappedCommand:', wrappedCommand)
+            }
 
             // A simple echo should succeed — the .git-as-file worktree layout
             // should not cause the sandbox to fail.
