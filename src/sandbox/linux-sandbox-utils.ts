@@ -1226,6 +1226,14 @@ export async function wrapCommandWithSandboxLinux(
     // If we don't have --proc, it is possible to read host /proc and leak information about code running
     // outside the sandbox. But, --proc is not available when running in unprivileged docker containers
     // so we support running without it if explicitly requested.
+    if (enableWeakerNestedSandbox) {
+      // bwrap only auto-adds --unshare-user when not running as root. In a
+      // container that runs as UID 0 but without CAP_SYS_ADMIN (Docker's
+      // default), bwrap assumes it has caps, tries direct clone(CLONE_NEWPID|
+      // CLONE_NEWNET), and fails with EPERM. Forcing the userns path makes
+      // it work regardless of EUID.
+      bwrapArgs.push('--unshare-user')
+    }
     bwrapArgs.push('--unshare-pid')
     if (!enableWeakerNestedSandbox) {
       // Mount fresh /proc if PID namespace is isolated (secure mode)
