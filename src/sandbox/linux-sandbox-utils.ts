@@ -869,6 +869,9 @@ async function generateFilesystemArgs(
     normalizePathForSandbox(p),
   )
 
+  const maskedFiles = new Set<string>()
+  const maskedDirs = new Set<string>()
+
   // --tmpfs / would wipe all prior mounts (ro-bind /, write binds, deny binds).
   // Expand a root deny into its direct children so the existing per-dir tmpfs
   // + re-bind logic applies. Skip /proc and /dev: they're remounted by the
@@ -905,6 +908,7 @@ async function generateFilesystemArgs(
     const readDenyStat = fs.statSync(normalizedPath)
     if (readDenyStat.isDirectory()) {
       args.push('--tmpfs', normalizedPath)
+      maskedDirs.add(normalizedPath)
 
       // tmpfs wiped any earlier write binds under this path — restore them.
       for (const writePath of allowedWritePaths) {
@@ -967,6 +971,7 @@ async function generateFilesystemArgs(
         )
         if (withinReAllowed) {
           args.push('--ro-bind', '/dev/null', normalizedDeny)
+          maskedFiles.add(normalizedDeny)
           logForDebugging(
             `[Sandbox Linux] Re-denied file within re-allowed region: ${normalizedDeny}`,
           )
@@ -988,13 +993,68 @@ async function generateFilesystemArgs(
       }
       // For files, bind /dev/null instead of tmpfs
       args.push('--ro-bind', '/dev/null', normalizedPath)
+      maskedFiles.add(normalizedPath)
     }
   }
 
   // Emitting denyWrite last means these ro-binds layer on top of any write
   // paths the denyRead loop just re-bound. Before this ordering, tmpfs over
   // an ancestor of cwd would wipe the .git/hooks protection.
-  args.push(...denyWriteArgs)
+  for (let i = 0; i < denyWriteArgs.length; i += 3) {
+    const bindType = denyWriteArgs[i]
+    const src = denyWriteArgs[i + 1]
+    const dest = denyWriteArgs[i + 2]!
+
+    if (bindType === '--ro-bind' && src === dest) {
+      // If the path was explicitly masked by denyRead, applying --ro-bind <path> <path>
+      // would unintentionally unmask it by mounting the host file over the /dev/null mask!
+      if (maskedFiles.has(dest)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping denyWrite for ${dest} because it was specifically masked by denyRead`,
+        )
+        continue
+      }
+
+      // If the path falls inside a directory masked with tmpfs AND it wasn't re-allowed
+      // by readAllowPaths, applying --ro-bind <path> <path> would expose the host file
+      // inside the tmpfs. We must skip it to preserve the read restriction.
+      let fallsUnderUnallowedMaskedDir = false
+      for (const md of maskedDirs) {
+        const isInsideThisMaskedDir =
+          dest === md ||
+          (md === '/' ? dest.startsWith('/') : dest.startsWith(md + '/'))
+
+        if (isInsideThisMaskedDir) {
+          // It's under md. Is it re-allowed by an allowPath that's also under md?
+          // (An allowPath that is a PARENT of md does not re-allow dest, because
+          // md's tmpfs overrides the parent's read visibility.)
+          const isReAllowedHere = readAllowPaths.some(ra => {
+            const raIsUnderMd =
+              ra === md ||
+              (md === '/' ? ra.startsWith('/') : ra.startsWith(md + '/'))
+            const destIsUnderRa =
+              dest === ra ||
+              (ra === '/' ? dest.startsWith('/') : dest.startsWith(ra + '/'))
+            return raIsUnderMd && destIsUnderRa
+          })
+
+          if (!isReAllowedHere) {
+            fallsUnderUnallowedMaskedDir = true
+            break // No need to check other masked dirs, one is enough to hide it
+          }
+        }
+      }
+
+      if (fallsUnderUnallowedMaskedDir) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping denyWrite for ${dest} because it falls under a denyRead tmpfs`,
+        )
+        continue
+      }
+    }
+
+    args.push(bindType!, src!, dest)
+  }
 
   return args
 }
