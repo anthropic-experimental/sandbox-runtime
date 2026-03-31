@@ -5,7 +5,10 @@ import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
-import type { FsReadRestrictionConfig } from '../../src/sandbox/sandbox-schemas.js'
+import type {
+  FsReadRestrictionConfig,
+  FsWriteRestrictionConfig,
+} from '../../src/sandbox/sandbox-schemas.js'
 import { isLinux, isMacOS, isSupportedPlatform } from '../helpers/platform.js'
 
 /**
@@ -447,4 +450,173 @@ describe('allowRead without denyRead does not trigger sandboxing', () => {
       expect(result).toBe(command)
     },
   )
+})
+
+describe('rm in allowWrite under denyRead ancestor (issue #171)', () => {
+  const TEST_BASE_DIR = join(tmpdir(), 'rm-under-denyread-' + Date.now())
+  const TEST_PROJECT_DIR = join(TEST_BASE_DIR, 'project')
+  const TEST_OUTSIDE_DIR = join(TEST_BASE_DIR, 'outside')
+
+  beforeAll(() => {
+    if (!isSupportedPlatform) return
+
+    mkdirSync(TEST_PROJECT_DIR, { recursive: true })
+    mkdirSync(TEST_OUTSIDE_DIR, { recursive: true })
+  })
+
+  afterAll(() => {
+    if (existsSync(TEST_BASE_DIR)) {
+      rmSync(TEST_BASE_DIR, { recursive: true, force: true })
+    }
+  })
+
+  describe('macOS Seatbelt', () => {
+    // The read section's move-blocking rules emit a broad
+    // (deny file-write-unlink (subpath <denyRead>)) that a specific
+    // (allow file-write*) does not override. Without a re-allow for
+    // file-write-unlink on allowWrite paths, rm fails even though
+    // touch/write succeed.
+
+    it.if(isMacOS)(
+      'should allow rm inside an allowWrite path under a denyRead ancestor',
+      () => {
+        const targetFile = join(TEST_PROJECT_DIR, 'deleteme.txt')
+        writeFileSync(targetFile, 'data')
+
+        const readConfig: FsReadRestrictionConfig = {
+          denyOnly: [TEST_BASE_DIR],
+          allowWithinDeny: [TEST_PROJECT_DIR],
+        }
+        const writeConfig: FsWriteRestrictionConfig = {
+          allowOnly: [TEST_PROJECT_DIR],
+          denyWithinAllow: [],
+        }
+
+        const wrappedCommand = wrapCommandWithSandboxMacOS({
+          command: `rm ${targetFile}`,
+          needsNetworkRestriction: false,
+          readConfig,
+          writeConfig,
+        })
+
+        const result = spawnSync(wrappedCommand, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 5000,
+        })
+
+        expect(result.status).toBe(0)
+        expect(existsSync(targetFile)).toBe(false)
+      },
+    )
+
+    it.if(isMacOS)(
+      'should still block rm outside allowWrite under the same denyRead ancestor',
+      () => {
+        const protectedFile = join(TEST_OUTSIDE_DIR, 'protected.txt')
+        writeFileSync(protectedFile, 'data')
+
+        const readConfig: FsReadRestrictionConfig = {
+          denyOnly: [TEST_BASE_DIR],
+          allowWithinDeny: [TEST_PROJECT_DIR],
+        }
+        const writeConfig: FsWriteRestrictionConfig = {
+          allowOnly: [TEST_PROJECT_DIR],
+          denyWithinAllow: [],
+        }
+
+        const wrappedCommand = wrapCommandWithSandboxMacOS({
+          command: `rm ${protectedFile}`,
+          needsNetworkRestriction: false,
+          readConfig,
+          writeConfig,
+        })
+
+        const result = spawnSync(wrappedCommand, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 5000,
+        })
+
+        expect(result.status).not.toBe(0)
+        expect(existsSync(protectedFile)).toBe(true)
+      },
+    )
+
+    it.if(isMacOS)(
+      'should still block rm of denyWithinAllow paths despite the re-allow',
+      () => {
+        // The re-allow of file-write-unlink for allowWrite paths is emitted in
+        // the read section. The write section's own move-blocking rules for
+        // denyWithinAllow are emitted later and must win (last-match).
+        const protectedDir = join(TEST_PROJECT_DIR, 'protected')
+        const protectedFile = join(protectedDir, 'keep.txt')
+        mkdirSync(protectedDir, { recursive: true })
+        writeFileSync(protectedFile, 'data')
+
+        const readConfig: FsReadRestrictionConfig = {
+          denyOnly: [TEST_BASE_DIR],
+          allowWithinDeny: [TEST_PROJECT_DIR],
+        }
+        const writeConfig: FsWriteRestrictionConfig = {
+          allowOnly: [TEST_PROJECT_DIR],
+          denyWithinAllow: [protectedDir],
+        }
+
+        const wrappedCommand = wrapCommandWithSandboxMacOS({
+          command: `rm ${protectedFile}`,
+          needsNetworkRestriction: false,
+          readConfig,
+          writeConfig,
+        })
+
+        const result = spawnSync(wrappedCommand, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 5000,
+        })
+
+        expect(result.status).not.toBe(0)
+        expect(existsSync(protectedFile)).toBe(true)
+      },
+    )
+  })
+
+  describe('Linux bwrap', () => {
+    // #190 fixed the Linux analogue by re-binding allowWrite paths after
+    // the denyRead tmpfs wipes them. Verify rm works end-to-end.
+
+    it.if(isLinux)(
+      'should allow rm inside an allowWrite path under a denyRead ancestor',
+      async () => {
+        const targetFile = join(TEST_PROJECT_DIR, 'deleteme-linux.txt')
+        writeFileSync(targetFile, 'data')
+
+        const readConfig: FsReadRestrictionConfig = {
+          denyOnly: [TEST_BASE_DIR],
+          allowWithinDeny: [TEST_PROJECT_DIR],
+        }
+        const writeConfig: FsWriteRestrictionConfig = {
+          allowOnly: [TEST_PROJECT_DIR],
+          denyWithinAllow: [],
+        }
+
+        const wrappedCommand = await wrapCommandWithSandboxLinux({
+          command: `rm ${targetFile}`,
+          needsNetworkRestriction: false,
+          readConfig,
+          writeConfig,
+        })
+
+        const result = spawnSync(wrappedCommand, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 5000,
+        })
+
+        expect(result.status).toBe(0)
+        expect(existsSync(targetFile)).toBe(false)
+      },
+    )
+  })
 })
