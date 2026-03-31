@@ -129,6 +129,17 @@ jobs:
             ubuntu:24.04 \
             bash -c '
               set -euo pipefail
+              echo "=== userns diagnostics ==="
+              echo "EUID=$EUID"
+              cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo "sysctl not visible"
+              cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo "userns_clone not visible"
+              cat /proc/sys/user/max_user_namespaces 2>/dev/null || echo "max_user_namespaces not visible"
+              cat /proc/self/status | grep -E "^Cap|^NoNewPrivs|^Seccomp"
+              echo "--- raw unshare -U:"
+              unshare -U true && echo "unshare -U: OK" || echo "unshare -U: FAILED ($?)"
+              echo "--- unshare -Ur (map root):"
+              unshare -Ur true && echo "unshare -Ur: OK" || echo "unshare -Ur: FAILED ($?)"
+              echo "=========================="
               apt-get update -qq
               apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip git
               curl -fsSL https://bun.sh/install | bash
