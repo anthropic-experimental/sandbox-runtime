@@ -1,5 +1,13 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'bun:test'
-import { spawnSync } from 'node:child_process'
+import {
+  describe,
+  it,
+  expect,
+  beforeAll,
+  afterAll,
+  beforeEach,
+  afterEach,
+} from 'bun:test'
+import { spawn, spawnSync } from 'node:child_process'
 import {
   mkdirSync,
   rmSync,
@@ -119,6 +127,13 @@ describe.if(isSupportedPlatform)(
     beforeEach(() => {
       // Must be in TEST_DIR for mandatory deny patterns to apply correctly
       process.chdir(TEST_DIR)
+    })
+
+    afterEach(() => {
+      // Reset the active-sandbox counter and scrub any leftover mount points so
+      // each test starts clean. Tests that don't explicitly call
+      // cleanupBwrapMountPoints() would otherwise leak the counter.
+      cleanupBwrapMountPoints({ force: true })
     })
 
     async function runSandboxedWrite(
@@ -630,6 +645,212 @@ describe.if(isSupportedPlatform)(
           cleanupBwrapMountPoints()
           cleanupBwrapMountPoints()
         })
+
+        // --- Concurrent sandbox mount point cleanup ---
+        //
+        // When two sandboxed commands run concurrently and one finishes first,
+        // cleanupBwrapMountPoints() must NOT delete mount point files that the
+        // still-running sandbox depends on. Deleting a mountpoint's dentry on the
+        // host detaches the bind mount in the child namespace, so the deny rule
+        // stops applying inside the still-running sandbox.
+
+        it('defers mount point cleanup while another sandbox is still running', async () => {
+          const raceDir = join(TEST_DIR, 'race-test')
+          mkdirSync(raceDir, { recursive: true })
+          mkdirSync(join(raceDir, '.claude'), { recursive: true })
+
+          const originalDir = process.cwd()
+          process.chdir(raceDir)
+
+          try {
+            const protectedFile = join(raceDir, '.claude', 'settings.json')
+            const writeConfig = {
+              allowOnly: ['.'],
+              denyWithinAllow: [protectedFile],
+            }
+
+            // Sandbox A: long-running command that sleeps then tries to write
+            // to the denied path. The write should be blocked.
+            // allowAllUnixSockets skips seccomp (environment-dependent) while
+            // keeping the filesystem isolation we're testing.
+            const wrappedA = await wrapCommandWithSandboxLinux({
+              command: `sleep 2; echo '{"hooks":{}}' > .claude/settings.json`,
+              needsNetworkRestriction: false,
+              readConfig: undefined,
+              writeConfig,
+              enableWeakerNestedSandbox: true,
+              allowAllUnixSockets: true,
+            })
+
+            const childA = spawn(wrappedA, { shell: true })
+            const exitA = new Promise<number | null>(resolve => {
+              childA.on('exit', code => resolve(code))
+            })
+
+            // Wait for bwrap A to start and create the mount point on the host
+            await new Promise(r => setTimeout(r, 500))
+            expect(existsSync(protectedFile)).toBe(true)
+
+            // Sandbox B: short command. When it finishes, the caller invokes
+            // cleanupBwrapMountPoints() — simulating the real-world race.
+            const wrappedB = await wrapCommandWithSandboxLinux({
+              command: 'true',
+              needsNetworkRestriction: false,
+              readConfig: undefined,
+              writeConfig,
+              enableWeakerNestedSandbox: true,
+              allowAllUnixSockets: true,
+            })
+            spawnSync(wrappedB, {
+              shell: true,
+              encoding: 'utf8',
+              timeout: 10000,
+            })
+
+            // This is what the caller does after every command completes.
+            // Without deferral, this would delete sandbox A's mount point too.
+            cleanupBwrapMountPoints()
+
+            // Wait for sandbox A to attempt its write
+            await exitA
+
+            // The deny rule must have held — the file should not contain the
+            // write from sandbox A. If cleanup had deleted the mount point
+            // early, A's bind mount would have detached and the write would
+            // have landed on the host.
+            const content = existsSync(protectedFile)
+              ? readFileSync(protectedFile, 'utf8')
+              : ''
+            expect(content).not.toContain('hooks')
+
+            cleanupBwrapMountPoints()
+          } finally {
+            process.chdir(originalDir)
+            rmSync(raceDir, { recursive: true, force: true })
+          }
+        }, 15000)
+
+        it('defers cleanup when two sandboxes share the same non-existent deny path', async () => {
+          const raceDir = join(TEST_DIR, 'race-test-2')
+          mkdirSync(raceDir, { recursive: true })
+          mkdirSync(join(raceDir, '.claude'), { recursive: true })
+
+          const originalDir = process.cwd()
+          process.chdir(raceDir)
+
+          try {
+            const protectedFile = join(raceDir, '.claude', 'settings.json')
+            const writeConfig = {
+              allowOnly: ['.'],
+              denyWithinAllow: [protectedFile],
+            }
+
+            // Generate both wrapped commands BEFORE spawning, so both see the
+            // deny path as non-existent and both add it to bwrapMountPoints.
+            const wrappedA = await wrapCommandWithSandboxLinux({
+              command: `sleep 2; echo WRITTEN > .claude/settings.json`,
+              needsNetworkRestriction: false,
+              readConfig: undefined,
+              writeConfig,
+              enableWeakerNestedSandbox: true,
+              allowAllUnixSockets: true,
+            })
+            const wrappedB = await wrapCommandWithSandboxLinux({
+              command: 'sleep 0.5',
+              needsNetworkRestriction: false,
+              readConfig: undefined,
+              writeConfig,
+              enableWeakerNestedSandbox: true,
+              allowAllUnixSockets: true,
+            })
+
+            const childA = spawn(wrappedA, { shell: true })
+            const exitA = new Promise<number | null>(resolve => {
+              childA.on('exit', code => resolve(code))
+            })
+
+            // Sandbox B runs and finishes first
+            spawnSync(wrappedB, {
+              shell: true,
+              encoding: 'utf8',
+              timeout: 10000,
+            })
+            cleanupBwrapMountPoints()
+
+            await exitA
+
+            const content = existsSync(protectedFile)
+              ? readFileSync(protectedFile, 'utf8')
+              : ''
+            expect(content).not.toContain('WRITTEN')
+
+            cleanupBwrapMountPoints()
+          } finally {
+            process.chdir(originalDir)
+            rmSync(raceDir, { recursive: true, force: true })
+          }
+        }, 15000)
+
+        it('deferred cleanup runs once all concurrent sandboxes finish', async () => {
+          const raceDir = join(TEST_DIR, 'race-test-3')
+          mkdirSync(raceDir, { recursive: true })
+          mkdirSync(join(raceDir, '.claude'), { recursive: true })
+
+          const originalDir = process.cwd()
+          process.chdir(raceDir)
+
+          try {
+            const protectedFile = join(raceDir, '.claude', 'settings.json')
+            const writeConfig = {
+              allowOnly: ['.'],
+              denyWithinAllow: [protectedFile],
+            }
+
+            const wrappedA = await wrapCommandWithSandboxLinux({
+              command: 'sleep 1',
+              needsNetworkRestriction: false,
+              readConfig: undefined,
+              writeConfig,
+              enableWeakerNestedSandbox: true,
+              allowAllUnixSockets: true,
+            })
+            const wrappedB = await wrapCommandWithSandboxLinux({
+              command: 'true',
+              needsNetworkRestriction: false,
+              readConfig: undefined,
+              writeConfig,
+              enableWeakerNestedSandbox: true,
+              allowAllUnixSockets: true,
+            })
+
+            const childA = spawn(wrappedA, { shell: true })
+            const exitA = new Promise<void>(resolve => {
+              childA.on('exit', () => resolve())
+            })
+
+            await new Promise(r => setTimeout(r, 300))
+            expect(existsSync(protectedFile)).toBe(true)
+
+            spawnSync(wrappedB, {
+              shell: true,
+              encoding: 'utf8',
+              timeout: 10000,
+            })
+            cleanupBwrapMountPoints()
+
+            // Cleanup deferred — mount point still present while A runs
+            expect(existsSync(protectedFile)).toBe(true)
+
+            await exitA
+            cleanupBwrapMountPoints()
+
+            // Both sandboxes done — mount point now cleaned up
+            expect(existsSync(protectedFile)).toBe(false)
+          } finally {
+            process.chdir(originalDir)
+            rmSync(raceDir, { recursive: true, force: true })
+          }
+        }, 15000)
 
         it('non-existent .git/hooks deny does not turn .git into a file, breaking git', async () => {
           // When .git doesn't exist yet, denying .git/hooks causes

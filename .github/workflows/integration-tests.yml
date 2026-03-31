@@ -51,10 +51,12 @@ jobs:
       - name: Enable unprivileged user namespaces (Linux)
         if: matrix.os == 'linux'
         run: |
-          # Ubuntu 24.04+ restricts unprivileged user namespaces by default
-          # Set setuid bit on bwrap to allow namespace creation
-          echo "Setting setuid bit on bwrap..."
-          sudo chmod u+s $(which bwrap)
+          # Ubuntu 24.04+ sets kernel.apparmor_restrict_unprivileged_userns=1 which
+          # allows unshare(CLONE_NEWUSER) but grants the new namespace zero
+          # capabilities. Disable it so bwrap and apply-seccomp can nest
+          # namespaces without needing setuid.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
 
           # Verify bwrap can create namespaces
           echo "Testing bwrap namespace creation..."

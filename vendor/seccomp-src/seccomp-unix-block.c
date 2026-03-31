@@ -27,7 +27,11 @@
  *   gcc -o seccomp-unix-block seccomp-unix-block.c -lseccomp
  *
  * Usage:
- *   ./seccomp-unix-block <output-file>
+ *   ./seccomp-unix-block <output-file> [arch]
+ *
+ * If arch is given (x86_64 or aarch64), the filter is generated for that
+ * architecture instead of the native one. Lets a single-arch builder emit
+ * filters for both x64 and arm64.
  *
  * Dependencies:
  *   - libseccomp (libseccomp-dev package on Debian/Ubuntu)
@@ -48,18 +52,41 @@ int main(int argc, char *argv[]) {
     scmp_filter_ctx ctx;
     int rc;
 
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <output-file>\n", argv[0]);
+    if (argc < 2 || argc > 3) {
+        fprintf(stderr, "Usage: %s <output-file> [x86_64|aarch64]\n", argv[0]);
         return 1;
     }
 
     const char *output_file = argv[1];
+    const char *arch_name = (argc == 3) ? argv[2] : NULL;
 
     /* Create seccomp context with default action ALLOW */
     ctx = seccomp_init(SCMP_ACT_ALLOW);
     if (ctx == NULL) {
         fprintf(stderr, "Error: Failed to initialize seccomp context\n");
         return 1;
+    }
+
+    if (arch_name != NULL) {
+        uint32_t target;
+        if (strcmp(arch_name, "x86_64") == 0) {
+            target = SCMP_ARCH_X86_64;
+        } else if (strcmp(arch_name, "aarch64") == 0) {
+            target = SCMP_ARCH_AARCH64;
+        } else {
+            fprintf(stderr, "Error: Unsupported arch '%s'\n", arch_name);
+            seccomp_release(ctx);
+            return 1;
+        }
+        if (target != seccomp_arch_native()) {
+            rc = seccomp_arch_remove(ctx, SCMP_ARCH_NATIVE);
+            if (rc == 0) rc = seccomp_arch_add(ctx, target);
+            if (rc < 0) {
+                fprintf(stderr, "Error: Failed to set target arch: %s\n", strerror(-rc));
+                seccomp_release(ctx);
+                return 1;
+            }
+        }
     }
 
     /* Add rule to block socket(AF_UNIX, ...) */
@@ -75,6 +102,26 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: Failed to add seccomp rule: %s\n", strerror(-rc));
         seccomp_release(ctx);
         return 1;
+    }
+
+    /* Block io_uring entirely. IORING_OP_SOCKET (Linux 5.19+) creates sockets
+     * in kernel context without going through the socket() syscall, bypassing
+     * the rule above. seccomp cannot inspect io_uring SQEs (they live in a
+     * shared-memory ring), so the only safe option is to deny ring creation
+     * and use. Blocking all three syscalls also covers the case of an
+     * inherited ring fd. */
+    int io_uring_calls[] = {
+        SCMP_SYS(io_uring_setup),
+        SCMP_SYS(io_uring_enter),
+        SCMP_SYS(io_uring_register),
+    };
+    for (size_t i = 0; i < sizeof(io_uring_calls) / sizeof(io_uring_calls[0]); i++) {
+        rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), io_uring_calls[i], 0);
+        if (rc < 0) {
+            fprintf(stderr, "Error: Failed to add io_uring rule: %s\n", strerror(-rc));
+            seccomp_release(ctx);
+            return 1;
+        }
     }
 
     /* Export the filter to a file */

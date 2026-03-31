@@ -784,8 +784,9 @@ function cleanupAfterCommand(): void {
 }
 
 async function reset(): Promise<void> {
-  // Clean up any leftover bwrap mount points
-  cleanupAfterCommand()
+  // Clean up any leftover bwrap mount points. Force past the
+  // active-sandbox counter — reset() means the session is over.
+  cleanupBwrapMountPoints({ force: true })
 
   // Stop log monitor
   if (logMonitorShutdown) {

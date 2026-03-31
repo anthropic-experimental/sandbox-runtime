@@ -290,6 +290,13 @@ const generatedSeccompFilters: Set<string> = new Set()
 // be cleaned up explicitly.
 const bwrapMountPoints: Set<string> = new Set()
 
+// Number of wrapped commands that have been generated but whose cleanup has
+// not yet run. cleanupBwrapMountPoints() defers file deletion while this is
+// positive, because deleting a mount point file on the host while another
+// bwrap instance is still running detaches that instance's bind mount and
+// the deny rule stops applying inside it.
+let activeSandboxCount = 0
+
 let exitHandlerRegistered = false
 
 /**
@@ -308,7 +315,7 @@ function registerExitCleanupHandler(): void {
         // Ignore cleanup errors during exit
       }
     }
-    cleanupBwrapMountPoints()
+    cleanupBwrapMountPoints({ force: true })
   })
 
   exitHandlerRegistered = true
@@ -325,10 +332,31 @@ function registerExitCleanupHandler(): void {
  * ghost dotfiles (e.g. .bashrc, .gitconfig) from appearing in the working
  * directory. It is also called automatically on process exit as a safety net.
  *
- * Safe to call at any time — it only removes files that were tracked during
- * generateFilesystemArgs() and skips any that no longer exist.
+ * Each call decrements the active-sandbox counter that was incremented by
+ * wrapCommandWithSandboxLinux(). File deletion is deferred until the counter
+ * reaches zero. Deleting a mount point file on the host while another bwrap
+ * instance is still running detaches that instance's bind mount (the dentry
+ * is unhashed, so path lookup no longer finds the mount) and the deny rule
+ * stops applying inside that sandbox.
+ *
+ * Pass `{ force: true }` to delete unconditionally — used by the process-exit
+ * handler and reset() where deferral is not meaningful.
  */
-export function cleanupBwrapMountPoints(): void {
+export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
+  if (!opts?.force) {
+    if (activeSandboxCount > 0) {
+      activeSandboxCount--
+    }
+    if (activeSandboxCount > 0) {
+      logForDebugging(
+        `[Sandbox Linux] Deferring mount point cleanup — ${activeSandboxCount} sandbox(es) still active`,
+      )
+      return
+    }
+  } else {
+    activeSandboxCount = 0
+  }
+
   for (const mountPoint of bwrapMountPoints) {
     try {
       // Only remove if it's still the empty file/directory bwrap created.
@@ -464,9 +492,14 @@ export async function initializeLinuxNetworkBridge(
 
   logForDebugging(`Starting HTTP bridge: socat ${httpSocatArgs.join(' ')}`)
 
+  // Capture socat stderr so the error message on failure says WHY socat
+  // didn't bind, instead of a bare "Failed after N attempts". socat's
+  // stdout stays ignored — it's a long-running daemon with no stdout use.
   const httpBridgeProcess = spawn('socat', httpSocatArgs, {
-    stdio: 'ignore',
+    stdio: ['ignore', 'ignore', 'pipe'],
   })
+  const httpStderr: Buffer[] = []
+  httpBridgeProcess.stderr?.on('data', chunk => httpStderr.push(chunk))
 
   if (!httpBridgeProcess.pid) {
     throw new Error('Failed to start HTTP bridge process')
@@ -492,8 +525,10 @@ export async function initializeLinuxNetworkBridge(
   logForDebugging(`Starting SOCKS bridge: socat ${socksSocatArgs.join(' ')}`)
 
   const socksBridgeProcess = spawn('socat', socksSocatArgs, {
-    stdio: 'ignore',
+    stdio: ['ignore', 'ignore', 'pipe'],
   })
+  const socksStderr: Buffer[] = []
+  socksBridgeProcess.stderr?.on('data', chunk => socksStderr.push(chunk))
 
   if (!socksBridgeProcess.pid) {
     // Clean up HTTP bridge
@@ -518,16 +553,32 @@ export async function initializeLinuxNetworkBridge(
     )
   })
 
+  const bridgeDiagnostics = () => {
+    const httpErr = Buffer.concat(httpStderr).toString().trim()
+    const socksErr = Buffer.concat(socksStderr).toString().trim()
+    return (
+      `HTTP bridge: exit=${httpBridgeProcess.exitCode ?? 'running'} ` +
+      `sock=${fs.existsSync(httpSocketPath) ? 'bound' : 'missing'}` +
+      (httpErr ? ` stderr=${JSON.stringify(httpErr)}` : '') +
+      `\n` +
+      `SOCKS bridge: exit=${socksBridgeProcess.exitCode ?? 'running'} ` +
+      `sock=${fs.existsSync(socksSocketPath) ? 'bound' : 'missing'}` +
+      (socksErr ? ` stderr=${JSON.stringify(socksErr)}` : '')
+    )
+  }
+
   // Wait for both sockets to be ready
   const maxAttempts = 5
   for (let i = 0; i < maxAttempts; i++) {
+    // .exitCode is set once the child exits; .killed only reflects whether
+    // WE called .kill(), not whether socat died on its own.
     if (
-      !httpBridgeProcess.pid ||
-      httpBridgeProcess.killed ||
-      !socksBridgeProcess.pid ||
-      socksBridgeProcess.killed
+      httpBridgeProcess.exitCode !== null ||
+      socksBridgeProcess.exitCode !== null
     ) {
-      throw new Error('Linux bridge process died unexpectedly')
+      throw new Error(
+        `Linux bridge process died unexpectedly\n${bridgeDiagnostics()}`,
+      )
     }
 
     try {
@@ -559,7 +610,8 @@ export async function initializeLinuxNetworkBridge(
         }
       }
       throw new Error(
-        `Failed to create bridge sockets after ${maxAttempts} attempts`,
+        `Failed to create bridge sockets after ${maxAttempts} attempts\n` +
+          bridgeDiagnostics(),
       )
     }
 
@@ -966,10 +1018,12 @@ async function generateFilesystemArgs(
  *   - Filesystem restrictions are applied (read-only mounts, bind mounts, etc.)
  *   - Socat processes start and connect to Unix socket bridges (can use socket(AF_UNIX, ...))
  *
- * Stage 2: apply-seccomp - Seccomp filter application (ONLY seccomp)
- *   - apply-seccomp binary applies seccomp filter via prctl(PR_SET_SECCOMP)
- *   - Sets PR_SET_NO_NEW_PRIVS to allow seccomp without root
+ * Stage 2: apply-seccomp - Nested PID namespace + seccomp filter
+ *   - apply-seccomp creates a nested user+PID+mount namespace and remounts /proc
+ *   - Inside, apply-seccomp becomes PID 1 (non-dumpable init/reaper)
+ *   - Forks, sets PR_SET_NO_NEW_PRIVS, applies seccomp via prctl(PR_SET_SECCOMP)
  *   - Execs user command with seccomp active (cannot create new Unix sockets)
+ *   - User command cannot see or ptrace bwrap/bash/socat (separate PID namespace)
  *
  * This solves the conflict between:
  * - Security: Blocking arbitrary Unix socket creation in user commands
@@ -1035,6 +1089,14 @@ export async function wrapCommandWithSandboxLinux(
   ) {
     return command
   }
+
+  // Mark this sandbox invocation as active. cleanupBwrapMountPoints() will
+  // defer file deletion until this (and every other concurrent) invocation
+  // has been cleaned up. The matching decrement happens in
+  // cleanupBwrapMountPoints(), which the caller must invoke after the
+  // spawned command exits. If wrapping fails below, the catch block
+  // decrements so the count does not leak.
+  activeSandboxCount++
 
   const bwrapArgs: string[] = ['--new-session', '--die-with-parent']
   let seccompFilterPath: string | undefined = undefined
@@ -1170,6 +1232,12 @@ export async function wrapCommandWithSandboxLinux(
       bwrapArgs.push('--proc', '/proc')
     }
 
+    // apply-seccomp obtains CAP_SYS_ADMIN for its nested PID+mount unshare
+    // by creating a nested user namespace. This requires the host to permit
+    // capability-bearing unprivileged user namespaces (the same requirement
+    // bwrap itself has when not installed setuid). See README for the
+    // Ubuntu 24.04 sysctl if AppArmor restricts this.
+
     // ========== COMMAND ==========
     // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
     // Resolve the full path to the shell binary since bwrap doesn't use $PATH
@@ -1234,6 +1302,11 @@ export async function wrapCommandWithSandboxLinux(
 
     return wrappedCommand
   } catch (error) {
+    // Undo the activeSandboxCount increment — the caller won't call
+    // cleanupBwrapMountPoints() for a wrap that threw.
+    if (activeSandboxCount > 0) {
+      activeSandboxCount--
+    }
     // Clean up seccomp filter on error
     if (seccompFilterPath && !seccompFilterPath.includes('/vendor/seccomp/')) {
       generatedSeccompFilters.delete(seccompFilterPath)
