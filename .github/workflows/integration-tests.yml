@@ -122,6 +122,7 @@ jobs:
         run: |
           docker run --rm \
             --security-opt seccomp=unconfined \
+            --security-opt apparmor=unconfined \
             -v "${{ github.workspace }}:/work" \
             -w /work \
             -e SANDBOX_RUNTIME_DOCKER_TEST=1 \
