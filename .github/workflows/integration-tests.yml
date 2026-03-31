@@ -90,15 +90,12 @@ jobs:
           if-no-files-found: ignore
 
   docker-tests:
-    # Verify enableWeakerNestedSandbox in its target environment: an
-    # unprivileged container where bwrap --proc /proc fails. seccomp is
-    # unconfined so unshare(CLONE_NEWUSER) is permitted, but the container
-    # lacks CAP_SYS_ADMIN so fresh procfs mounts fail.
+    # Run the suite inside an unprivileged container to exercise
+    # enableWeakerNestedSandbox. The container has seccomp unconfined
+    # so unshare(CLONE_NEWUSER) is allowed, but no CAP_SYS_ADMIN so
+    # bwrap --proc /proc fails — the exact constraint the flag targets.
     name: Tests (docker / ${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    container:
-      image: ubuntu:24.04
-      options: --security-opt seccomp=unconfined
 
     strategy:
       fail-fast: false
@@ -110,31 +107,34 @@ jobs:
             runner: ubuntu-24.04-arm
 
     steps:
-      - name: Install system dependencies
-        run: |
-          apt-get update
-          apt-get install -y bubblewrap socat ripgrep python3 curl ca-certificates unzip git
-
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '18'
+      - name: Enable unprivileged user namespaces on host
+        run: |
+          # The container shares the host kernel; this sysctl must be set
+          # on the host or bwrap cannot create namespaces inside the
+          # container at all.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.1
-
-      - name: Install Node dependencies
-        run: npm install
-
-      - name: Build project
-        run: npm run build
-
-      - name: Run tests
-        env:
-          SANDBOX_RUNTIME_DOCKER_TEST: '1'
-        run: npm test
+      - name: Run tests in unprivileged container
+        run: |
+          docker run --rm \
+            --security-opt seccomp=unconfined \
+            -v "${{ github.workspace }}:/work" \
+            -w /work \
+            -e SANDBOX_RUNTIME_DOCKER_TEST=1 \
+            ubuntu:24.04 \
+            bash -c '
+              set -euo pipefail
+              apt-get update -qq
+              apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip git
+              curl -fsSL https://bun.sh/install | bash
+              export PATH="$HOME/.bun/bin:$PATH"
+              curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+              apt-get install -y -qq nodejs
+              npm install
+              npm run build
+              npm test
+            '
