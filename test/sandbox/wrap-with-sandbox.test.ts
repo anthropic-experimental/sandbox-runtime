@@ -756,3 +756,120 @@ describe('allowWrite glob suffix handling', () => {
     }
   })
 })
+
+/**
+ * Tests for denyRead blocking files inside allowRead directories.
+ *
+ * When denyRead targets a specific file and allowRead covers the parent
+ * directory, the more-specific deny must win. This verifies the fix for
+ * the bug where allowRead unconditionally overrode denyRead for child paths.
+ */
+describe('denyRead blocks files inside allowRead directories', () => {
+  const command = 'echo hello'
+
+  it('denyRead file inside allowRead directory produces deny mount on Linux', async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    const parentDir = join(tmpdir(), `srt-test-deny-in-allow-${Date.now()}`)
+    const secretFile = join(parentDir, 'secret.txt')
+    mkdirSync(parentDir, { recursive: true })
+    writeFileSync(secretFile, 'TOP SECRET DATA')
+
+    try {
+      // denyRead on file, allowRead on parent directory
+      const result = await wrapCommandWithSandboxLinux({
+        command,
+        needsNetworkRestriction: false,
+        readConfig: {
+          denyOnly: [secretFile],
+          allowWithinDeny: [parentDir],
+        },
+        writeConfig: { allowOnly: [parentDir], denyWithinAllow: [] },
+      })
+
+      expect(result).toContain('bwrap')
+      // The file should be masked with /dev/null
+      expect(result).toContain(secretFile)
+      expect(result).toContain('/dev/null')
+    } finally {
+      rmSync(parentDir, { recursive: true, force: true })
+    }
+  })
+
+  it('denyRead file inside re-allowed subdir of denied parent on Linux', async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    // Scenario: deny /home, allow /home/user/project (re-allow), deny /home/user/project/.env
+    const parentDir = join(tmpdir(), `srt-test-nested-deny-${Date.now()}`)
+    const projectDir = join(parentDir, 'project')
+    const envFile = join(projectDir, '.env')
+    mkdirSync(projectDir, { recursive: true })
+    writeFileSync(envFile, 'SECRET_KEY=abc123')
+
+    try {
+      const result = await wrapCommandWithSandboxLinux({
+        command,
+        needsNetworkRestriction: false,
+        readConfig: {
+          denyOnly: [parentDir, envFile],
+          allowWithinDeny: [projectDir],
+        },
+        writeConfig: { allowOnly: [projectDir], denyWithinAllow: [] },
+      })
+
+      expect(result).toContain('bwrap')
+      // parentDir should get tmpfs (directory deny)
+      expect(result).toContain('--tmpfs')
+      expect(result).toContain(parentDir)
+      // projectDir should be re-allowed
+      expect(result).toContain(projectDir)
+      // envFile should be re-denied with /dev/null AFTER the re-allow
+      expect(result).toContain(envFile)
+    } finally {
+      rmSync(parentDir, { recursive: true, force: true })
+    }
+  })
+
+  it('exact allowRead match on a file still overrides denyRead on Linux', async () => {
+    if (getPlatform() !== 'linux') {
+      return
+    }
+
+    const parentDir = join(tmpdir(), `srt-test-exact-allow-${Date.now()}`)
+    const targetFile = join(parentDir, 'readme.txt')
+    mkdirSync(parentDir, { recursive: true })
+    writeFileSync(targetFile, 'public info')
+
+    try {
+      // Both deny and allow point at the exact same file — allow wins
+      const result = await wrapCommandWithSandboxLinux({
+        command,
+        needsNetworkRestriction: false,
+        readConfig: {
+          denyOnly: [targetFile],
+          allowWithinDeny: [targetFile],
+        },
+        writeConfig: { allowOnly: [parentDir], denyWithinAllow: [] },
+      })
+
+      expect(result).toContain('bwrap')
+      // The file should NOT be denied (exact allow match overrides)
+      // Count occurrences: /dev/null should only appear for mandatory denies,
+      // not for our target file
+      const afterBwrap = result.split(targetFile)
+      // If denied, we'd see /dev/null <targetFile>. Since it's re-allowed,
+      // targetFile should not appear adjacent to /dev/null in the command.
+      const devNullBeforeTarget = afterBwrap.some(
+        (_segment, i) =>
+          i > 0 && afterBwrap[i - 1]!.trimEnd().endsWith('/dev/null'),
+      )
+      expect(devNullBeforeTarget).toBe(false)
+    } finally {
+      rmSync(parentDir, { recursive: true, force: true })
+    }
+  })
+})

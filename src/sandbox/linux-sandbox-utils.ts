@@ -947,14 +947,40 @@ async function generateFilesystemArgs(
           )
         }
       }
+
+      // After re-allowing paths within the denied directory, re-deny any
+      // specific denyRead files that fall inside those re-allowed paths.
+      // Mount order matters in bwrap: later --ro-bind /dev/null overrides
+      // the parent directory's bind, effectively masking the file.
+      for (const denyPath of readDenyPaths) {
+        const normalizedDeny = normalizePathForSandbox(denyPath)
+        if (normalizedDeny === normalizedPath) continue // Skip self (the directory)
+        // Only re-deny if inside this denied directory AND inside a re-allowed path
+        if (!normalizedDeny.startsWith(denySep)) continue
+        if (!fs.existsSync(normalizedDeny)) continue
+        const denyStat = fs.statSync(normalizedDeny)
+        if (!denyStat.isFile()) continue
+        const withinReAllowed = readAllowPaths.some(
+          allowPath =>
+            normalizedDeny.startsWith(allowPath + '/') ||
+            normalizedDeny === allowPath,
+        )
+        if (withinReAllowed) {
+          args.push('--ro-bind', '/dev/null', normalizedDeny)
+          logForDebugging(
+            `[Sandbox Linux] Re-denied file within re-allowed region: ${normalizedDeny}`,
+          )
+        }
+      }
     } else {
-      // For files, check if this specific file is re-allowed
-      const isReAllowed = readAllowPaths.some(
-        allowPath =>
-          normalizedPath === allowPath ||
-          normalizedPath.startsWith(allowPath + '/'),
+      // For files, check if this specific file is explicitly re-allowed.
+      // A file is re-allowed only if it exactly matches an allowWithinDeny
+      // entry. An allow on a parent directory does NOT override a deny on
+      // a specific child file — the more-specific deny wins.
+      const isExactlyReAllowed = readAllowPaths.some(
+        allowPath => normalizedPath === allowPath,
       )
-      if (isReAllowed) {
+      if (isExactlyReAllowed) {
         logForDebugging(
           `[Sandbox Linux] Skipping read deny for re-allowed path: ${normalizedPath}`,
         )
