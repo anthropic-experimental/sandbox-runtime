@@ -866,3 +866,28 @@ describe.if(isMacOS)('macOS Seatbelt Process Enumeration', () => {
     }
   })
 })
+
+describe('macOS Seatbelt Mach IPC - SystemConfiguration.configd', () => {
+  it('should include configd in the mach-lookup allowlist', () => {
+    if (skipIfNotMacOS()) {
+      return
+    }
+
+    // uv's Tokio runtime calls SCDynamicStoreCreate() to detect network proxy
+    // settings. Without mach-lookup access to configd, this returns NULL and
+    // uv's system-configuration crate panics instead of handling the error.
+    //
+    // The sandbox profile must allow com.apple.SystemConfiguration.configd
+    // in the mach-lookup rules for uv (and other tools using this API) to work.
+    //
+    // Verify the generated profile includes the configd service.
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'echo test',
+      needsNetworkRestriction: false,
+      readConfig: { denyOnly: ['/nonexistent'] },
+      writeConfig: undefined,
+    })
+
+    expect(wrappedCommand).toContain('com.apple.SystemConfiguration.configd')
+  })
+})
