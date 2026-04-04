@@ -76,7 +76,7 @@ async function main(): Promise<void> {
         try {
           // Enable debug logging if requested
           if (options.debug) {
-            process.env.DEBUG = 'true'
+            process.env.SRT_DEBUG = 'true'
           }
 
           // Load config from file
