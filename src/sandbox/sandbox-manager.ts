@@ -31,6 +31,8 @@ import {
   expandGlobPattern,
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
+import { structuredLogger } from '../utils/structured-logger.js'
+
 import {
   canonicalizeHost,
   isValidHost,
@@ -106,6 +108,7 @@ async function filterNetworkRequest(
 ): Promise<boolean> {
   if (!config) {
     logForDebugging('No config available, denying network request')
+    structuredLogger.networkBlocked(host, port, 'no_config')
     return false
   }
 
@@ -119,6 +122,7 @@ async function filterNetworkRequest(
     logForDebugging(`Denying malformed host: ${JSON.stringify(host)}:${port}`, {
       level: 'error',
     })
+    structuredLogger.networkBlocked(host, port, 'malformed_host')
     return false
   }
 
@@ -131,6 +135,12 @@ async function filterNetworkRequest(
   for (const deniedDomain of config.network.deniedDomains) {
     if (matchesDomainPattern(canonicalHost, deniedDomain)) {
       logForDebugging(`Denied by config rule: ${host}:${port}`)
+      structuredLogger.networkBlocked(
+        host,
+        port,
+        'denied_by_rule',
+        deniedDomain,
+      )
       return false
     }
   }
@@ -146,6 +156,7 @@ async function filterNetworkRequest(
   // No matching rules - ask user or deny
   if (!sandboxAskCallback) {
     logForDebugging(`No matching config rule, denying: ${host}:${port}`)
+    structuredLogger.networkBlocked(host, port, 'no_matching_allow')
     return false
   }
 
@@ -157,12 +168,14 @@ async function filterNetworkRequest(
       return true
     } else {
       logForDebugging(`User denied: ${host}:${port}`)
+      structuredLogger.networkBlocked(host, port, 'no_matching_allow')
       return false
     }
   } catch (error) {
     logForDebugging(`Error in permission callback: ${error}`, {
       level: 'error',
     })
+    structuredLogger.networkBlocked(host, port, 'no_matching_allow')
     return false
   }
 }
