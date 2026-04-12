@@ -379,9 +379,13 @@ export function generateProxyEnvVars(
     // AWS CLI v2 respects HTTPS_PROXY which we already set above
 
     // Google Cloud SDK - has specific proxy settings
-    // Use HTTPS proxy to match other HTTP-based tools
+    // Must use 'http' not 'https': gcloud's valid proxy types are
+    // http, http_no_tunnel, socks4, socks5. Setting 'https' causes:
+    //   ERROR: Invalid value for property [proxy/type]: The proxy type
+    //   property value [https] is not valid.
+    // The proxy itself is an HTTP CONNECT proxy, which gcloud calls 'http'.
     if (httpProxyPort) {
-      envVars.push(`CLOUDSDK_PROXY_TYPE=https`)
+      envVars.push(`CLOUDSDK_PROXY_TYPE=http`)
       envVars.push(`CLOUDSDK_PROXY_ADDRESS=localhost`)
       envVars.push(`CLOUDSDK_PROXY_PORT=${httpProxyPort}`)
     }
