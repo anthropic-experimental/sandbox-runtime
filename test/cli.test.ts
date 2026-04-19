@@ -98,6 +98,46 @@ describe('CLI', () => {
       expect(result.stdout).toBe('no newline')
       expect(result.status).toBe(0)
     })
+
+    // Regression tests: argv containing shell metacharacters must survive the
+    // internal re-parse done by spawn(..., { shell: true }). Before the
+    // shell-quote fix these cases either crashed with a bash syntax error
+    // or silently mangled the argument.
+    test('preserves parentheses in a single argument', () => {
+      const arg = 'Slack context (thread reply)'
+      const result = runCli(['printf', '%s', arg])
+      expect(result.stdout).toBe(arg)
+      expect(result.status).toBe(0)
+    })
+
+    test('preserves single quotes in a single argument', () => {
+      const arg = "it's a test"
+      const result = runCli(['printf', '%s', arg])
+      expect(result.stdout).toBe(arg)
+      expect(result.status).toBe(0)
+    })
+
+    test('preserves backticks without command substitution', () => {
+      const arg = 'run `whoami` manually'
+      const result = runCli(['printf', '%s', arg])
+      expect(result.stdout).toBe(arg)
+      expect(result.status).toBe(0)
+    })
+
+    test('preserves $VAR without shell expansion', () => {
+      // Positional-arg mode treats argv literally; use -c to opt into expansion.
+      const arg = 'cost is $HOME dollars'
+      const result = runCli(['printf', '%s', arg])
+      expect(result.stdout).toBe(arg)
+      expect(result.status).toBe(0)
+    })
+
+    test('preserves a realistic multi-metachar prompt argument', () => {
+      const arg = `Slack context: user said "hello (world)" — reply with 'ok' now`
+      const result = runCli(['printf', '%s', arg])
+      expect(result.stdout).toBe(arg)
+      expect(result.status).toBe(0)
+    })
   })
 
   describe('error handling', () => {
