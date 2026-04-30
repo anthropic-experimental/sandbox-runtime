@@ -995,10 +995,10 @@ describe.if(isMacOS)('macOS Seatbelt allowMachLookup', () => {
     })
 
     expect(wrappedCommand).toContain(
-      '(allow mach-lookup (global-name \\"com.apple.CoreSimulator.CoreSimulatorService\\"))',
+      '(allow mach-lookup (global-name "com.apple.CoreSimulator.CoreSimulatorService"))',
     )
     expect(wrappedCommand).toContain(
-      '(allow mach-lookup (global-name-prefix \\"2BUA8C4S2C.com.1password.\\"))',
+      '(allow mach-lookup (global-name-prefix "2BUA8C4S2C.com.1password."))',
     )
   })
 

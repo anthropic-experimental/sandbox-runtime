@@ -5,6 +5,17 @@ import { getPlatform } from '../utils/platform.js'
 import { logForDebugging } from '../utils/debug.js'
 
 /**
+ * Quote argv elements for a POSIX shell command line. Always single-quotes
+ * (same algorithm as Python's shlex.quote); single-quoted text is fully
+ * literal in POSIX sh, so there is no per-character escaping to get wrong.
+ */
+export function quoteArgs(args: readonly string[]): string {
+  return args
+    .map(s => (s === '' ? "''" : `'${s.replace(/'/g, `'\\''`)}'`))
+    .join(' ')
+}
+
+/**
  * Dangerous files that should be protected from writes.
  * These files can be used for code execution or data exfiltration.
  */

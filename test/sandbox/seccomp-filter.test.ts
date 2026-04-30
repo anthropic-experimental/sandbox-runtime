@@ -93,7 +93,7 @@ describe.if(isLinux)('Sandbox Integration', () => {
       seccompConfig: { argv0: 'apply-seccomp', applyPath: '/proc/self/fd/3' },
     })
 
-    expect(wrappedCommand).toContain('ARGV0=apply-seccomp /proc/self/fd/3 ')
+    expect(wrappedCommand).toContain("ARGV0='apply-seccomp' '/proc/self/fd/3' ")
     expect(wrappedCommand).not.toContain('vendor/seccomp')
   })
 
