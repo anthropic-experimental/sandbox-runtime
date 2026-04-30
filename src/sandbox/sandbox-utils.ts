@@ -378,10 +378,10 @@ export function generateProxyEnvVars(
     // AWS CLI - uses standard HTTPS_PROXY (v2 supports it well)
     // AWS CLI v2 respects HTTPS_PROXY which we already set above
 
-    // Google Cloud SDK - has specific proxy settings
-    // Use HTTPS proxy to match other HTTP-based tools
+    // Google Cloud SDK - has specific proxy settings. Use HTTP proxy to match other
+    // HTTP-based tools (supported modes are http, http_no_tunnel, socks4, and socks5)
     if (httpProxyPort) {
-      envVars.push(`CLOUDSDK_PROXY_TYPE=https`)
+      envVars.push(`CLOUDSDK_PROXY_TYPE=http`)
       envVars.push(`CLOUDSDK_PROXY_ADDRESS=localhost`)
       envVars.push(`CLOUDSDK_PROXY_PORT=${httpProxyPort}`)
     }
