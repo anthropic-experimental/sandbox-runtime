@@ -5,6 +5,7 @@ import type { SandboxRuntimeConfig } from './sandbox/sandbox-config.js'
 import { spawn } from 'child_process'
 import { logForDebugging } from './utils/debug.js'
 import { loadConfig, loadConfigFromString } from './utils/config-loader.js'
+import shellquote from 'shell-quote'
 import * as readline from 'readline'
 import * as fs from 'fs'
 import * as path from 'path'
@@ -147,8 +148,8 @@ async function main(): Promise<void> {
             command = options.c
             logForDebugging(`Command string mode (-c): ${command}`)
           } else if (commandArgs.length > 0) {
-            // Default mode: simple join
-            command = commandArgs.join(' ')
+            // Default mode: shell-quote preserves argument boundaries
+            command = shellquote.quote(commandArgs)
             logForDebugging(`Original command: ${command}`)
           } else {
             console.error(
