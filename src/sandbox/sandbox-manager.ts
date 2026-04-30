@@ -143,10 +143,13 @@ async function filterNetworkRequest(
     }
   }
 
-  // No matching rules - ask user or deny
+  // No matching rules - ask user, allow all, or deny
   if (!sandboxAskCallback) {
-    logForDebugging(`No matching config rule, denying: ${host}:${port}`)
-    return false
+    const allowAll = config.network.allowAllDomains ?? false
+    logForDebugging(
+      `No matching config rule, ${allowAll ? 'allowing' : 'denying'}: ${host}:${port}`,
+    )
+    return allowAll
   }
 
   logForDebugging(`No matching config rule, asking user: ${host}:${port}`)

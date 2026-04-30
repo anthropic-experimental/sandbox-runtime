@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { Command } from 'commander'
+import shellquote from 'shell-quote'
 import { SandboxManager } from './index.js'
 import type { SandboxRuntimeConfig } from './sandbox/sandbox-config.js'
 import { spawn } from 'child_process'
@@ -92,7 +93,11 @@ async function main(): Promise<void> {
 
           // Initialize sandbox with config
           logForDebugging('Initializing sandbox...')
-          await SandboxManager.initialize(runtimeConfig)
+          await SandboxManager.initialize(
+            runtimeConfig,
+            undefined,
+            !!process.env.SRT_DEBUG,
+          )
 
           // Set up control fd for dynamic config updates if specified
           let controlReader: readline.Interface | null = null
@@ -147,8 +152,10 @@ async function main(): Promise<void> {
             command = options.c
             logForDebugging(`Command string mode (-c): ${command}`)
           } else if (commandArgs.length > 0) {
-            // Default mode: simple join
-            command = commandArgs.join(' ')
+            // Default mode: shell-quote each argv so metacharacters like
+            // parentheses, quotes, backticks, and $ survive the
+            // `spawn(cmd, { shell: true })` re-parse below.
+            command = shellquote.quote(commandArgs)
             logForDebugging(`Original command: ${command}`)
           } else {
             console.error(

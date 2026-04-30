@@ -106,6 +106,14 @@ export const NetworkConfigSchema = z.object({
   deniedDomains: z
     .array(domainPatternSchema)
     .describe('List of denied domains'),
+  allowAllDomains: z
+    .boolean()
+    .optional()
+    .describe(
+      'If true, allow all network traffic by default (deny-list mode). ' +
+        'Unmatched hosts are allowed unless they appear in deniedDomains. ' +
+        'Mirrors the filesystem read pattern: open by default, block explicitly.',
+    ),
   allowUnixSockets: z
     .array(z.string())
     .optional()

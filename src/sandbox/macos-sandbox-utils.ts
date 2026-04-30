@@ -911,6 +911,7 @@ export function startMacOSSandboxLogMonitor(
       encodedCommand,
       timestamp: new Date(), // We could parse the timestamp from the log but this feels more reliable
     })
+    logForDebugging(`fs_deny: ${violationDetails}`)
   })
 
   logProcess.stderr?.on('data', (data: Buffer) => {
