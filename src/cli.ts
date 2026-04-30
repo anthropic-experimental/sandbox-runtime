@@ -4,6 +4,7 @@ import { SandboxManager } from './index.js'
 import type { SandboxRuntimeConfig } from './sandbox/sandbox-config.js'
 import { spawn } from 'child_process'
 import { logForDebugging } from './utils/debug.js'
+import { structuredLogger } from './utils/structured-logger.js'
 import { loadConfig, loadConfigFromString } from './utils/config-loader.js'
 import * as readline from 'readline'
 import * as fs from 'fs'
@@ -49,6 +50,7 @@ async function main(): Promise<void> {
   program
     .argument('[command...]', 'command to run in the sandbox')
     .option('-d, --debug', 'enable debug logging')
+    .option('--json', 'output structured JSON events to stderr')
     .option(
       '-s, --settings <path>',
       'path to config file (default: ~/.srt-settings.json)',
@@ -68,15 +70,19 @@ async function main(): Promise<void> {
         commandArgs: string[],
         options: {
           debug?: boolean
+          json?: boolean
           settings?: string
           c?: string
           controlFd?: number
         },
       ) => {
         try {
-          // Enable debug logging if requested
           if (options.debug) {
-            process.env.DEBUG = 'true'
+            process.env.SRT_DEBUG = 'true'
+          }
+
+          if (options.json) {
+            structuredLogger.enable()
           }
 
           // Load config from file
@@ -154,6 +160,7 @@ async function main(): Promise<void> {
             console.error(
               'Error: No command specified. Use -c <command> or provide command arguments.',
             )
+            structuredLogger.cliError('No command specified', 'no_command')
             process.exit(1)
           }
 
@@ -181,19 +188,38 @@ async function main(): Promise<void> {
             // non-existent deny paths. This removes them.
             SandboxManager.cleanupAfterCommand()
 
+            // Emit structured fs violation events from the violation store
+            if (structuredLogger.isEnabled()) {
+              const violations =
+                SandboxManager.getSandboxViolationStore().getViolations()
+              for (const v of violations) {
+                structuredLogger.fsViolation(v.line)
+              }
+            }
+
             if (signal) {
               if (signal === 'SIGINT' || signal === 'SIGTERM') {
+                structuredLogger.sandboxSummary(code ?? 0, signal)
                 process.exit(0)
               } else {
                 console.error(`Process killed by signal: ${signal}`)
+                structuredLogger.cliError(
+                  `Process killed by signal: ${signal}`,
+                  'signal',
+                )
                 process.exit(1)
               }
             }
+            structuredLogger.sandboxSummary(code ?? 0)
             process.exit(code ?? 0)
           })
 
           child.on('error', error => {
             console.error(`Failed to execute command: ${error.message}`)
+            structuredLogger.cliError(
+              `Failed to execute command: ${error.message}`,
+              'spawn_failure',
+            )
             process.exit(1)
           })
 
@@ -209,6 +235,10 @@ async function main(): Promise<void> {
           console.error(
             `Error: ${error instanceof Error ? error.message : String(error)}`,
           )
+          structuredLogger.cliError(
+            error instanceof Error ? error.message : String(error),
+            'init_error',
+          )
           process.exit(1)
         }
       },
@@ -219,5 +249,9 @@ async function main(): Promise<void> {
 
 main().catch(error => {
   console.error('Fatal error:', error)
+  structuredLogger.cliError(
+    error instanceof Error ? error.message : String(error),
+    'fatal',
+  )
   process.exit(1)
 })
