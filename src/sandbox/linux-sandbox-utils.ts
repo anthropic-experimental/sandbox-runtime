@@ -58,6 +58,11 @@ export interface LinuxSandboxParams {
 /** Default max depth for searching dangerous files */
 const DEFAULT_MANDATORY_DENY_SEARCH_DEPTH = 3
 
+type DenyPathEntry = {
+  path: string
+  source: 'user' | 'mandatory'
+}
+
 /**
  * Find if any component of the path is a symlink within the allowed write paths.
  * Returns the symlink path if found, or null if no symlinks.
@@ -162,7 +167,7 @@ async function linuxGetMandatoryDenyPaths(
   maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
   abortSignal?: AbortSignal,
-): Promise<string[]> {
+): Promise<DenyPathEntry[]> {
   const cwd = process.cwd()
   // Use provided signal or create a fallback controller
   const fallbackController = new AbortController()
@@ -170,11 +175,17 @@ async function linuxGetMandatoryDenyPaths(
   const dangerousDirectories = getDangerousDirectories()
 
   // Note: Settings files are added at the callsite in sandbox-manager.ts
-  const denyPaths = [
+  const denyPaths: DenyPathEntry[] = [
     // Dangerous files in CWD
-    ...DANGEROUS_FILES.map(f => path.resolve(cwd, f)),
+    ...DANGEROUS_FILES.map(f => ({
+      path: path.resolve(cwd, f),
+      source: 'mandatory' as const,
+    })),
     // Dangerous directories in CWD
-    ...dangerousDirectories.map(d => path.resolve(cwd, d)),
+    ...dangerousDirectories.map(d => ({
+      path: path.resolve(cwd, d),
+      source: 'mandatory' as const,
+    })),
   ]
 
   // Git hooks and config are only denied when .git exists as a directory.
@@ -192,11 +203,17 @@ async function linuxGetMandatoryDenyPaths(
 
   if (dotGitIsDirectory) {
     // Git hooks always blocked for security
-    denyPaths.push(path.resolve(cwd, '.git/hooks'))
+    denyPaths.push({
+      path: path.resolve(cwd, '.git/hooks'),
+      source: 'mandatory',
+    })
 
     // Git config conditionally blocked based on allowGitConfig setting
     if (!allowGitConfig) {
-      denyPaths.push(path.resolve(cwd, '.git/config'))
+      denyPaths.push({
+        path: path.resolve(cwd, '.git/config'),
+        source: 'mandatory',
+      })
     }
   }
 
@@ -256,12 +273,21 @@ async function linuxGetMandatoryDenyPaths(
         if (dirName === '.git') {
           const gitDir = segments.slice(0, dirIndex + 1).join(path.sep)
           if (match.includes('.git/hooks')) {
-            denyPaths.push(path.join(gitDir, 'hooks'))
+            denyPaths.push({
+              path: path.join(gitDir, 'hooks'),
+              source: 'mandatory',
+            })
           } else if (match.includes('.git/config')) {
-            denyPaths.push(path.join(gitDir, 'config'))
+            denyPaths.push({
+              path: path.join(gitDir, 'config'),
+              source: 'mandatory',
+            })
           }
         } else {
-          denyPaths.push(segments.slice(0, dirIndex + 1).join(path.sep))
+          denyPaths.push({
+            path: segments.slice(0, dirIndex + 1).join(path.sep),
+            source: 'mandatory',
+          })
         }
         foundDir = true
         break
@@ -270,11 +296,18 @@ async function linuxGetMandatoryDenyPaths(
 
     // Dangerous file match
     if (!foundDir) {
-      denyPaths.push(absolutePath)
+      denyPaths.push({ path: absolutePath, source: 'mandatory' })
     }
   }
 
-  return [...new Set(denyPaths)]
+  const deduped = new Map<string, DenyPathEntry>()
+  for (const denyPath of denyPaths) {
+    if (!deduped.has(denyPath.path)) {
+      deduped.set(denyPath.path, denyPath)
+    }
+  }
+
+  return [...deduped.values()]
 }
 
 // Track mount points created by bwrap for non-existent deny paths.
@@ -719,8 +752,11 @@ async function generateFilesystemArgs(
     }
 
     // Deny writes within allowed paths (user-specified + mandatory denies)
-    const denyPaths = [
-      ...(writeConfig.denyWithinAllow || []),
+    const denyPaths: DenyPathEntry[] = [
+      ...(writeConfig.denyWithinAllow || []).map(denyPath => ({
+        path: denyPath,
+        source: 'user' as const,
+      })),
       ...(await linuxGetMandatoryDenyPaths(
         ripgrepConfig,
         mandatoryDenySearchDepth,
@@ -734,7 +770,8 @@ async function generateFilesystemArgs(
     // hits a char device on the second pass and bwrap's ensure_file() falls
     // through to creat() on a read-only mount.
     const seenDenyWrite = new Set<string>()
-    for (const pathPattern of denyPaths) {
+    for (const denyPath of denyPaths) {
+      const pathPattern = denyPath.path
       const normalizedPath = normalizePathForSandbox(pathPattern)
       if (seenDenyWrite.has(normalizedPath)) continue
       seenDenyWrite.add(normalizedPath)
@@ -757,14 +794,29 @@ async function generateFilesystemArgs(
         continue
       }
 
-      // Handle non-existent paths by mounting /dev/null to block creation.
-      // Without this, a sandboxed process could mkdir+write a denied path that
-      // doesn't exist yet, bypassing the deny rule entirely.
+      // Handle explicit user non-existent paths by mounting /dev/null to block
+      // creation. Without this, a sandboxed process could mkdir+write a denied
+      // path that doesn't exist yet, bypassing the deny rule entirely.
       //
       // bwrap creates empty files on the host as mount points for these binds.
       // We track them in bwrapMountPoints so cleanupBwrapMountPoints() can
       // remove them after the command exits.
       if (!fs.existsSync(normalizedPath)) {
+        // Mandatory deny paths are auto-protection, not explicit user policy.
+        // On Linux, bwrap cannot express "this missing path must stay missing,
+        // but must not be creatable" with bind mounts alone. Creating a
+        // placeholder mount for auto-protection leaks into normal filesystem
+        // semantics: missing directories can appear as /dev/null or empty dirs
+        // inside the sandbox. Keep ENOENT for those paths and rely on the
+        // documented Linux limitation that mandatory denies only cover paths
+        // that already exist.
+        if (denyPath.source === 'mandatory') {
+          logForDebugging(
+            `[Sandbox Linux] Skipping non-existent mandatory deny path to preserve ENOENT: ${normalizedPath}`,
+          )
+          continue
+        }
+
         // Fix 1 (worktree): If any existing component in the deny path is a
         // file (not a directory), skip the deny entirely. You can't mkdir
         // under a file, so the deny path can never be created. This handles
