@@ -618,5 +618,43 @@ describe('rm in allowWrite under denyRead ancestor (issue #171)', () => {
         expect(existsSync(targetFile)).toBe(false)
       },
     )
+
+    it.if(isLinux)(
+      'should allow writes when allowRead includes the deny path itself',
+      async () => {
+        // Regression: when allowWithinDeny contains the same path as denyOnly
+        // (e.g. denyRead: ["~"], allowRead: ["~/"]), the --ro-bind at the deny
+        // path was emitted BEFORE the --bind for write paths. Since bwrap
+        // applies mounts in argument order, the parent --ro-bind hid the child
+        // --bind mounts, making the entire region read-only.
+        const targetFile = join(TEST_PROJECT_DIR, 'write-after-parent-ro.txt')
+
+        const readConfig: FsReadRestrictionConfig = {
+          denyOnly: [TEST_BASE_DIR],
+          allowWithinDeny: [TEST_BASE_DIR, TEST_PROJECT_DIR],
+        }
+        const writeConfig: FsWriteRestrictionConfig = {
+          allowOnly: [TEST_PROJECT_DIR],
+          denyWithinAllow: [],
+        }
+
+        const wrappedCommand = await wrapCommandWithSandboxLinux({
+          command: `echo WRITE_OK > ${targetFile} && cat ${targetFile}`,
+          needsNetworkRestriction: false,
+          readConfig,
+          writeConfig,
+          allowAllUnixSockets: true,
+        })
+
+        const result = spawnSync(wrappedCommand, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 5000,
+        })
+
+        expect(result.status).toBe(0)
+        expect(result.stdout).toContain('WRITE_OK')
+      },
+    )
   })
 })

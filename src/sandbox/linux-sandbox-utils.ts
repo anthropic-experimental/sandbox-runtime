@@ -898,19 +898,15 @@ async function generateFilesystemArgs(
     if (readDenyStat.isDirectory()) {
       args.push('--tmpfs', normalizedPath)
 
-      // tmpfs wiped any earlier write binds under this path — restore them.
-      for (const writePath of allowedWritePaths) {
-        if (writePath.startsWith(denySep) || writePath === normalizedPath) {
-          args.push('--bind', writePath, writePath)
-          logForDebugging(
-            `[Sandbox Linux] Re-bound write path wiped by denyRead tmpfs: ${writePath}`,
-          )
-        }
-      }
-
       // Re-allow specific paths within the denied directory (allowRead overrides denyRead).
       // After mounting tmpfs over the denied dir, bind back the allowed subdirectories
       // so they are readable again.
+      //
+      // IMPORTANT: readAllow re-binds (--ro-bind) MUST come before write re-binds
+      // (--bind) because bwrap applies mounts in argument order. A --ro-bind at a
+      // parent path (e.g. /home/user) hides any earlier sub-mounts that were on the
+      // previous mount at that path. By emitting read-only binds first, the subsequent
+      // write binds layer on top and remain writable.
       for (const allowPath of readAllowPaths) {
         if (allowPath.startsWith(denySep) || allowPath === normalizedPath) {
           if (!fs.existsSync(allowPath)) {
@@ -919,9 +915,10 @@ async function generateFilesystemArgs(
             )
             continue
           }
-          // Skip only if a write path was re-bound just above AND covers
-          // allowPath. A write path that's an ancestor of the deny dir isn't
-          // re-bound (it wasn't wiped), so allowPath under it still needs
+          // Skip if a write path will be re-bound below AND covers allowPath.
+          // The write bind will provide both read and write access, making an
+          // ro-bind redundant. A write path that's an ancestor of the deny dir
+          // isn't re-bound (it wasn't wiped), so allowPath under it still needs
           // its own ro-bind here.
           if (
             allowedWritePaths.some(
@@ -936,6 +933,17 @@ async function generateFilesystemArgs(
           args.push('--ro-bind', allowPath, allowPath)
           logForDebugging(
             `[Sandbox Linux] Re-allowed read access within denied region: ${allowPath}`,
+          )
+        }
+      }
+
+      // Restore write binds wiped by the tmpfs. These MUST come after the
+      // readAllow ro-binds above so they layer on top and remain writable.
+      for (const writePath of allowedWritePaths) {
+        if (writePath.startsWith(denySep) || writePath === normalizedPath) {
+          args.push('--bind', writePath, writePath)
+          logForDebugging(
+            `[Sandbox Linux] Re-bound write path wiped by denyRead tmpfs: ${writePath}`,
           )
         }
       }
