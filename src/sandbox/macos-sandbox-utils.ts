@@ -478,6 +478,8 @@ function generateSandboxProfile({
       ? [
           '; trustd.agent - needed for Go TLS certificate verification (weaker network isolation)',
           '(allow mach-lookup (global-name "com.apple.trustd.agent"))',
+          '; configd - needed for Rust/Go programs that query system proxy/network config (uv, cargo)',
+          '(allow mach-lookup (global-name "com.apple.SystemConfiguration.configd"))',
         ]
       : []),
     ...(allowMachLookup && allowMachLookup.length > 0
