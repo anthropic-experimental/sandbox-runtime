@@ -60,7 +60,7 @@ async function main(): Promise<void> {
     .option(
       '--control-fd <fd>',
       'read config updates from file descriptor (JSON lines protocol)',
-      parseInt,
+      (val: string) => parseInt(val, 10),
     )
     .allowUnknownOption()
     .action(
@@ -96,9 +96,10 @@ async function main(): Promise<void> {
 
           // Set up control fd for dynamic config updates if specified
           let controlReader: readline.Interface | null = null
-          if (options.controlFd !== undefined) {
+          let controlStream: fs.ReadStream | null = null
+          if (options.controlFd !== undefined && !isNaN(options.controlFd)) {
             try {
-              const controlStream = fs.createReadStream('', {
+              controlStream = fs.createReadStream('', {
                 fd: options.controlFd,
               })
               controlReader = readline.createInterface({
@@ -136,8 +137,9 @@ async function main(): Promise<void> {
           }
 
           // Cleanup control reader on exit
-          process.on('exit', () => {
+          process.once('exit', () => {
             controlReader?.close()
+            controlStream?.destroy()
           })
 
           // Determine command string based on mode
@@ -182,27 +184,30 @@ async function main(): Promise<void> {
             SandboxManager.cleanupAfterCommand()
 
             if (signal) {
-              if (signal === 'SIGINT' || signal === 'SIGTERM') {
-                process.exit(0)
-              } else {
-                console.error(`Process killed by signal: ${signal}`)
-                process.exit(1)
+              const sigNum: Record<string, number> = {
+                SIGINT: 2,
+                SIGTERM: 15,
+                SIGHUP: 1,
+                SIGQUIT: 3,
               }
+              const exitCode = 128 + (sigNum[signal] ?? 1)
+              process.exit(exitCode)
             }
             process.exit(code ?? 0)
           })
 
           child.on('error', error => {
+            SandboxManager.cleanupAfterCommand()
             console.error(`Failed to execute command: ${error.message}`)
             process.exit(1)
           })
 
           // Handle cleanup on interrupt
-          process.on('SIGINT', () => {
+          process.once('SIGINT', () => {
             child.kill('SIGINT')
           })
 
-          process.on('SIGTERM', () => {
+          process.once('SIGTERM', () => {
             child.kill('SIGTERM')
           })
         } catch (error) {
