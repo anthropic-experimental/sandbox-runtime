@@ -787,7 +787,7 @@ export function wrapCommandWithSandboxMacOS(
   const wrappedCommand = shellquote.quote([
     'env',
     ...proxyEnvArgs,
-    'sandbox-exec',
+    '/usr/bin/sandbox-exec',
     '-p',
     profile,
     shell,

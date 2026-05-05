@@ -1,6 +1,6 @@
 import { describe, it, expect, afterAll } from 'bun:test'
-import { spawnSync } from 'node:child_process'
 import * as http from 'node:http'
+import { spawnAsync } from './helpers/spawn.js'
 import * as net from 'node:net'
 import { SandboxManager } from '../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../src/sandbox/sandbox-config.js'
@@ -394,7 +394,7 @@ describe('Configurable Proxy Ports Integration Tests', () => {
             'curl -s --max-time 5 http://example.com',
           )
 
-          const result = spawnSync(command, {
+          const result = await spawnAsync(command, {
             shell: true,
             encoding: 'utf8',
             timeout: 10000,

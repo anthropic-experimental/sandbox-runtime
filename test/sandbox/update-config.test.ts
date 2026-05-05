@@ -1,8 +1,8 @@
 import { describe, it, expect, afterEach, beforeEach } from 'vitest'
 import { SandboxManager } from '../../src/index.js'
 import { connect } from 'net'
-import { spawnSync } from 'child_process'
 import { getPlatform } from '../../src/utils/platform.js'
+import { spawnAsync } from '../helpers/spawn.js'
 import { isLinux } from '../helpers/platform.js'
 
 /**
@@ -304,7 +304,7 @@ describe('SandboxManager.updateConfig integration (wrapWithSandbox)', () => {
       const cmd1 = await SandboxManager.wrapWithSandbox(
         'curl -s --max-time 3 http://example.com 2>&1',
       )
-      const result1 = spawnSync(cmd1, {
+      const result1 = await spawnAsync(cmd1, {
         shell: true,
         encoding: 'utf8',
         timeout: 5000,
@@ -324,7 +324,7 @@ describe('SandboxManager.updateConfig integration (wrapWithSandbox)', () => {
       const cmd2 = await SandboxManager.wrapWithSandbox(
         'curl -s --max-time 5 http://example.com 2>&1',
       )
-      const result2 = spawnSync(cmd2, {
+      const result2 = await spawnAsync(cmd2, {
         shell: true,
         encoding: 'utf8',
         timeout: 10000,
@@ -349,7 +349,7 @@ describe('SandboxManager.updateConfig integration (wrapWithSandbox)', () => {
       const cmd1 = await SandboxManager.wrapWithSandbox(
         'curl -s --max-time 5 http://example.com 2>&1',
       )
-      const result1 = spawnSync(cmd1, {
+      const result1 = await spawnAsync(cmd1, {
         shell: true,
         encoding: 'utf8',
         timeout: 10000,
@@ -367,7 +367,7 @@ describe('SandboxManager.updateConfig integration (wrapWithSandbox)', () => {
       const cmd2 = await SandboxManager.wrapWithSandbox(
         'curl -s --max-time 3 http://example.com 2>&1',
       )
-      const result2 = spawnSync(cmd2, {
+      const result2 = await spawnAsync(cmd2, {
         shell: true,
         encoding: 'utf8',
         timeout: 5000,
@@ -397,7 +397,7 @@ describe('SandboxManager.updateConfig integration (wrapWithSandbox)', () => {
       const cmd = await SandboxManager.wrapWithSandbox(
         'curl -s --max-time 5 http://example.com 2>&1',
       )
-      const result = spawnSync(cmd, {
+      const result = await spawnAsync(cmd, {
         shell: true,
         encoding: 'utf8',
         timeout: 10000,

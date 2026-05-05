@@ -275,6 +275,45 @@ describe('restriction pattern semantics', () => {
     )
   })
 
+  describe('explicit binary paths (Linux)', () => {
+    it.if(isLinux)('uses bwrapPath for the outer command', async () => {
+      const result = await wrapCommandWithSandboxLinux({
+        command,
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [] },
+        writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+        bwrapPath: '/opt/bw/bwrap',
+      })
+
+      expect(result.startsWith('/opt/bw/bwrap ')).toBe(true)
+      expect(result.startsWith('bwrap ')).toBe(false)
+    })
+
+    it.if(isLinux)('uses socatPath inside the sandbox script', async () => {
+      const httpSock = join(tmpdir(), `srt-test-http-${process.pid}.sock`)
+      const socksSock = join(tmpdir(), `srt-test-socks-${process.pid}.sock`)
+      writeFileSync(httpSock, '')
+      writeFileSync(socksSock, '')
+      try {
+        const result = await wrapCommandWithSandboxLinux({
+          command,
+          needsNetworkRestriction: true,
+          httpSocketPath: httpSock,
+          socksSocketPath: socksSock,
+          readConfig: { denyOnly: [] },
+          writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+          socatPath: '/opt/sc/socat',
+        })
+
+        expect(result).toContain('/opt/sc/socat')
+        expect(result).toContain('TCP-LISTEN:3128')
+      } finally {
+        rmSync(httpSock, { force: true })
+        rmSync(socksSock, { force: true })
+      }
+    })
+  })
+
   describe('write restrictions (allow-only pattern)', () => {
     it.if(isLinux)(
       'undefined writeConfig means no write restrictions on Linux',

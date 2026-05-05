@@ -77,7 +77,7 @@ describe('checkLinuxDependencies', () => {
   })
 
   test('passes custom applyPath through to the resolver', () => {
-    checkLinuxDependencies({ applyPath: '/custom/apply' })
+    checkLinuxDependencies({ seccompConfig: { applyPath: '/custom/apply' } })
 
     expect(applySpy).toHaveBeenCalledWith('/custom/apply')
   })
@@ -86,12 +86,40 @@ describe('checkLinuxDependencies', () => {
     applySpy.mockReturnValue(null)
 
     const result = checkLinuxDependencies({
-      argv0: 'apply-seccomp',
-      applyPath: '/proc/self/fd/3',
+      seccompConfig: {
+        argv0: 'apply-seccomp',
+        applyPath: '/proc/self/fd/3',
+      },
     })
 
     expect(result.warnings).toEqual([])
     expect(applySpy).not.toHaveBeenCalled()
+  })
+
+  test('explicit bwrapPath: skips PATH lookup, errors when not executable', () => {
+    const result = checkLinuxDependencies({ bwrapPath: '/no/such/bwrap' })
+
+    expect(result.errors).toContain(
+      'bubblewrap (bwrap) not executable at /no/such/bwrap',
+    )
+    // socat still falls back to PATH
+    expect(result.errors.length).toBe(1)
+    expect(whichSpy).not.toHaveBeenCalledWith('bwrap')
+  })
+
+  test('explicit socatPath: skips PATH lookup, errors when not executable', () => {
+    const result = checkLinuxDependencies({ socatPath: '/no/such/socat' })
+
+    expect(result.errors).toContain('socat not executable at /no/such/socat')
+    expect(whichSpy).not.toHaveBeenCalledWith('socat')
+  })
+
+  test('explicit bwrapPath: ok when path is executable', () => {
+    // /bin/sh exists and is executable on every Linux system
+    const result = checkLinuxDependencies({ bwrapPath: '/bin/sh' })
+
+    expect(result.errors).toEqual([])
+    expect(whichSpy).not.toHaveBeenCalledWith('bwrap')
   })
 })
 
@@ -140,11 +168,27 @@ describe('getLinuxDependencyStatus', () => {
     applySpy.mockReturnValue(null)
 
     const status = getLinuxDependencyStatus({
-      argv0: 'apply-seccomp',
-      applyPath: '/does/not/exist',
+      seccompConfig: {
+        argv0: 'apply-seccomp',
+        applyPath: '/does/not/exist',
+      },
     })
 
     expect(status.hasSeccompApply).toBe(true)
     expect(applySpy).not.toHaveBeenCalled()
+  })
+
+  test('explicit binary paths bypass PATH lookup', () => {
+    whichSpy.mockReturnValue(null)
+
+    const status = getLinuxDependencyStatus({
+      bwrapPath: '/bin/sh',
+      socatPath: '/no/such/socat',
+    })
+
+    expect(status.hasBwrap).toBe(true)
+    expect(status.hasSocat).toBe(false)
+    expect(whichSpy).not.toHaveBeenCalledWith('bwrap')
+    expect(whichSpy).not.toHaveBeenCalledWith('socat')
   })
 })

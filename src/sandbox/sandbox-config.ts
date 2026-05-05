@@ -3,6 +3,7 @@
  * This is the main configuration interface that consumers pass to SandboxManager.initialize()
  */
 
+import { isAbsolute } from 'node:path'
 import { z } from 'zod'
 
 /**
@@ -54,6 +55,18 @@ const domainPatternSchema = z.string().refine(
  * Schema for filesystem paths
  */
 const filesystemPathSchema = z.string().min(1, 'Path cannot be empty')
+
+/**
+ * Schema for an absolute path to an external binary.
+ * Relative paths are rejected to prevent PATH/CWD-based hijacking — these
+ * overrides are intended for admin-managed installs at fixed locations.
+ */
+const binaryPathSchema = z
+  .string()
+  .min(1, 'Path cannot be empty')
+  .refine(val => isAbsolute(val), {
+    message: 'Binary path must be absolute',
+  })
 
 /**
  * Schema for MITM proxy configuration
@@ -283,6 +296,18 @@ export const SandboxRuntimeConfigSchema = z.object({
   seccomp: SeccompConfigSchema.optional().describe(
     'Custom seccomp binary paths (Linux only).',
   ),
+  bwrapPath: binaryPathSchema
+    .optional()
+    .describe(
+      'Linux only: absolute path to the bwrap (bubblewrap) binary. ' +
+        'When set, this path is used directly instead of resolving "bwrap" via PATH.',
+    ),
+  socatPath: binaryPathSchema
+    .optional()
+    .describe(
+      'Linux only: absolute path to the socat binary. ' +
+        'When set, this path is used directly instead of resolving "socat" via PATH.',
+    ),
 })
 
 // Export inferred types

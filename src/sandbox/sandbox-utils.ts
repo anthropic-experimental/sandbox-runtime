@@ -300,8 +300,11 @@ export function generateProxyEnvVars(
   httpProxyPort?: number,
   socksProxyPort?: number,
 ): string[] {
-  // Respect CLAUDE_TMPDIR if set, otherwise default to /tmp/claude
-  const tmpdir = process.env.CLAUDE_TMPDIR || '/tmp/claude'
+  // Respect the caller-provided temp dir if set, otherwise fall back to
+  // /tmp/claude. CLAUDE_CODE_TMPDIR is the current name; CLAUDE_TMPDIR is
+  // kept for backwards compatibility (#141).
+  const tmpdir =
+    process.env.CLAUDE_CODE_TMPDIR || process.env.CLAUDE_TMPDIR || '/tmp/claude'
   const envVars: string[] = [`SANDBOX_RUNTIME=1`, `TMPDIR=${tmpdir}`]
 
   // If no proxy ports provided, return minimal env vars

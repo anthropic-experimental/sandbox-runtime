@@ -51,6 +51,10 @@ export interface LinuxSandboxParams {
   allowGitConfig?: boolean
   /** Custom seccomp binary paths */
   seccompConfig?: SeccompConfig
+  /** Absolute path to the bwrap binary (default: resolve "bwrap" via PATH) */
+  bwrapPath?: string
+  /** Absolute path to the socat binary (default: resolve "socat" via PATH) */
+  socatPath?: string
   /** Abort signal to cancel the ripgrep scan */
   abortSignal?: AbortSignal
 }
@@ -389,16 +393,36 @@ export type SandboxDependencyCheck = {
 }
 
 /**
+ * Options for Linux dependency checks. Explicit binary paths, when set,
+ * are checked directly instead of resolving via PATH.
+ */
+export type LinuxDependencyOptions = {
+  seccompConfig?: SeccompConfig
+  bwrapPath?: string
+  socatPath?: string
+}
+
+function isExecutable(p: string): boolean {
+  try {
+    fs.accessSync(p, fs.constants.X_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
  * Get detailed status of Linux sandbox dependencies
  */
 export function getLinuxDependencyStatus(
-  seccompConfig?: SeccompConfig,
+  opts?: LinuxDependencyOptions,
 ): LinuxDependencyStatus {
+  const { seccompConfig, bwrapPath, socatPath } = opts ?? {}
   // argv0 mode: apply-seccomp is compiled into the caller's binary — skip
   // the on-disk lookup and trust that applyPath resolves inside bwrap.
   return {
-    hasBwrap: whichSync('bwrap') !== null,
-    hasSocat: whichSync('socat') !== null,
+    hasBwrap: bwrapPath ? isExecutable(bwrapPath) : whichSync('bwrap') !== null,
+    hasSocat: socatPath ? isExecutable(socatPath) : whichSync('socat') !== null,
     hasSeccompApply: seccompConfig?.argv0
       ? true
       : getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null,
@@ -409,14 +433,27 @@ export function getLinuxDependencyStatus(
  * Check sandbox dependencies and return structured result
  */
 export function checkLinuxDependencies(
-  seccompConfig?: SeccompConfig,
+  opts?: LinuxDependencyOptions,
 ): SandboxDependencyCheck {
+  const { seccompConfig, bwrapPath, socatPath } = opts ?? {}
   const errors: string[] = []
   const warnings: string[] = []
 
-  if (whichSync('bwrap') === null)
+  // An explicit override is a directive, not a hint — if it doesn't exist,
+  // surface that rather than silently falling back to PATH.
+  if (bwrapPath) {
+    if (!isExecutable(bwrapPath))
+      errors.push(`bubblewrap (bwrap) not executable at ${bwrapPath}`)
+  } else if (whichSync('bwrap') === null) {
     errors.push('bubblewrap (bwrap) not installed')
-  if (whichSync('socat') === null) errors.push('socat not installed')
+  }
+
+  if (socatPath) {
+    if (!isExecutable(socatPath))
+      errors.push(`socat not executable at ${socatPath}`)
+  } else if (whichSync('socat') === null) {
+    errors.push('socat not installed')
+  }
 
   if (
     !seccompConfig?.argv0 &&
@@ -457,7 +494,9 @@ export function checkLinuxDependencies(
 export async function initializeLinuxNetworkBridge(
   httpProxyPort: number,
   socksProxyPort: number,
+  socatPath?: string,
 ): Promise<LinuxNetworkBridgeContext> {
+  const socat = socatPath ?? 'socat'
   const socketId = randomBytes(8).toString('hex')
   const httpSocketPath = join(tmpdir(), `claude-http-${socketId}.sock`)
   const socksSocketPath = join(tmpdir(), `claude-socks-${socketId}.sock`)
@@ -468,9 +507,9 @@ export async function initializeLinuxNetworkBridge(
     `TCP:localhost:${httpProxyPort},keepalive,keepidle=10,keepintvl=5,keepcnt=3`,
   ]
 
-  logForDebugging(`Starting HTTP bridge: socat ${httpSocatArgs.join(' ')}`)
+  logForDebugging(`Starting HTTP bridge: ${socat} ${httpSocatArgs.join(' ')}`)
 
-  const httpBridgeProcess = spawn('socat', httpSocatArgs, {
+  const httpBridgeProcess = spawn(socat, httpSocatArgs, {
     stdio: 'ignore',
   })
 
@@ -495,9 +534,9 @@ export async function initializeLinuxNetworkBridge(
     `TCP:localhost:${socksProxyPort},keepalive,keepidle=10,keepintvl=5,keepcnt=3`,
   ]
 
-  logForDebugging(`Starting SOCKS bridge: socat ${socksSocatArgs.join(' ')}`)
+  logForDebugging(`Starting SOCKS bridge: ${socat} ${socksSocatArgs.join(' ')}`)
 
-  const socksBridgeProcess = spawn('socat', socksSocatArgs, {
+  const socksBridgeProcess = spawn(socat, socksSocatArgs, {
     stdio: 'ignore',
   })
 
@@ -617,12 +656,16 @@ function buildSandboxCommand(
   userCommand: string,
   applySeccompPrefix: string | undefined,
   shell?: string,
+  socatPath?: string,
 ): string {
   // Default to bash for backward compatibility
   const shellPath = shell || 'bash'
+  // Host filesystem is bind-mounted into the sandbox, so an explicit
+  // socatPath resolves to the same binary inside bwrap.
+  const socat = shellquote.quote([socatPath ?? 'socat'])
   const socatCommands = [
-    `socat TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
-    `socat TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
+    `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
+    `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
     'trap "kill %1 %2 2>/dev/null; exit" EXIT',
   ]
 
@@ -1045,6 +1088,8 @@ export async function wrapCommandWithSandboxLinux(
     mandatoryDenySearchDepth = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
     allowGitConfig = false,
     seccompConfig,
+    bwrapPath,
+    socatPath,
     abortSignal,
   } = params
 
@@ -1228,6 +1273,7 @@ export async function wrapCommandWithSandboxLinux(
         command,
         applySeccompPrefix,
         shell,
+        socatPath,
       )
       bwrapArgs.push(sandboxCommand)
     } else if (applySeccompPrefix) {
@@ -1238,7 +1284,10 @@ export async function wrapCommandWithSandboxLinux(
       bwrapArgs.push(command)
     }
 
-    const wrappedCommand = shellquote.quote(['bwrap', ...bwrapArgs])
+    const wrappedCommand = shellquote.quote([
+      bwrapPath ?? 'bwrap',
+      ...bwrapArgs,
+    ])
 
     const restrictions = []
     if (needsNetworkRestriction) restrictions.push('network')

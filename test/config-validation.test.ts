@@ -278,4 +278,47 @@ describe('Config Validation', () => {
       expect(result.data.ripgrep).toBeUndefined()
     }
   })
+
+  describe('bwrapPath / socatPath', () => {
+    const base = {
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    }
+
+    test('accepts absolute paths', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        bwrapPath: '/usr/local/bin/bwrap',
+        socatPath: '/opt/tools/socat',
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('rejects relative bwrapPath', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        bwrapPath: 'bwrap',
+      })
+      expect(result.success).toBe(false)
+      if (!result.success) {
+        expect(result.error.issues[0]?.message).toContain('must be absolute')
+      }
+    })
+
+    test('rejects relative socatPath', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        socatPath: './bin/socat',
+      })
+      expect(result.success).toBe(false)
+    })
+
+    test('rejects empty bwrapPath', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        bwrapPath: '',
+      })
+      expect(result.success).toBe(false)
+    })
+  })
 })
