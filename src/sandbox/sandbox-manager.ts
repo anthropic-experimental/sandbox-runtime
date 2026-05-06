@@ -1,6 +1,7 @@
 import { createHttpProxyServer } from './http-proxy.js'
 import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
+import { loadMitmCA, resetMitmCA } from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
@@ -275,6 +276,12 @@ async function initialize(
       `Parent proxy configured: http=${redactUrl(parentProxy.httpUrl)} ` +
         `https=${redactUrl(parentProxy.httpsUrl)}`,
     )
+  }
+
+  // Load TLS-termination CA if configured. Throws on unreadable/non-PEM —
+  // tlsTerminate is explicit opt-in, so a bad config is a hard error.
+  if (runtimeConfig.network.tlsTerminate) {
+    loadMitmCA(runtimeConfig.network.tlsTerminate)
   }
 
   // Check dependencies
@@ -930,6 +937,7 @@ async function reset(): Promise<void> {
   managerContext = undefined
   initializationPromise = undefined
   parentProxy = undefined
+  resetMitmCA()
 }
 
 function getSandboxViolationStore() {

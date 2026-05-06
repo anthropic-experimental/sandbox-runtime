@@ -173,6 +173,27 @@ export const NetworkConfigSchema = z.object({
   mitmProxy: MitmProxyConfigSchema.optional().describe(
     'Optional MITM proxy configuration. Routes matching domains through an upstream proxy via Unix socket while SRT still handles allow/deny filtering.',
   ),
+  tlsTerminate: z
+    .object({
+      caCertPath: z
+        .string()
+        .min(1)
+        .describe(
+          'Path to a PEM-encoded CA certificate. The sandboxed child is ' +
+            'configured to trust this CA, and the TLS-terminating proxy uses ' +
+            'it to sign per-host certificates.',
+        ),
+      caKeyPath: z
+        .string()
+        .min(1)
+        .describe('Path to the PEM-encoded private key for caCertPath.'),
+    })
+    .optional()
+    .describe(
+      '[EXPERIMENTAL] Enable in-process TLS termination so HTTPS ' +
+        'request/response bodies are visible to SRT. Requires a user-' +
+        'supplied CA cert+key; SRT does not generate one.',
+    ),
   parentProxy: ParentProxyConfigSchema.optional().describe(
     "Upstream HTTP proxy for outbound connections. When set, SRT's proxy " +
       'tunnels non-mitmProxy traffic through this parent instead of ' +
