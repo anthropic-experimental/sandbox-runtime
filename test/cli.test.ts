@@ -1,6 +1,11 @@
 import { describe, test, expect } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
+import { readFileSync } from 'node:fs'
+
+const { version } = JSON.parse(readFileSync('package.json', 'utf8')) as {
+  version: string
+}
 
 /**
  * Get the path to the CLI entry point
@@ -32,6 +37,12 @@ function runCli(args: string[], options?: { input?: string; debug?: boolean }) {
 }
 
 describe('CLI', () => {
+  test('-V reports package version', () => {
+    const result = runCli(['-V'])
+    expect(result.stdout.trim()).toBe(version)
+    expect(result.status).toBe(0)
+  })
+
   describe('-c flag (command string mode)', () => {
     test('executes simple command with -c flag', () => {
       const result = runCli(['-c', 'echo hello'])
