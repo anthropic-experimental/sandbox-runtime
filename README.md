@@ -257,7 +257,7 @@ srt --settings /path/to/srt-settings.json <command>
       "*.npmjs.org"
     ],
     "deniedDomains": ["malicious.com"],
-    "allowUnixSockets": ["/var/run/docker.sock"],
+    "allowUnixSockets": [],
     "allowLocalBinding": false
   },
   "filesystem": {
@@ -297,6 +297,8 @@ Unix sockets are **blocked by default** on both platforms.
 
 - **macOS**: Use `allowUnixSockets` to allow specific paths (e.g., `["/var/run/docker.sock"]`), or `allowAllUnixSockets: true` to allow all.
 - **Linux**: Blocking uses seccomp filters (x64/arm64 only). If seccomp isn't available, sockets are unrestricted and a warning is shown. Use `allowAllUnixSockets: true` to explicitly disable blocking.
+
+**Security note:** Do not allowlist `/var/run/docker.sock` in a generic sandbox configuration. Access to the Docker socket is effectively root-equivalent on the host because a sandboxed process can start containers with host filesystem mounts. Only add it for workflows that explicitly need Docker daemon access and have accepted that trust boundary.
 
 #### Filesystem Configuration
 
