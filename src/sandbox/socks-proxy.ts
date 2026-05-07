@@ -1,7 +1,7 @@
 import type { Server as NetServer, Socket } from 'net'
 import type { Socks5Server } from '@pondwader/socks5-server'
 import { createServer } from '@pondwader/socks5-server'
-import { logForDebugging } from '../utils/debug.js'
+import { logForDebugging, logProxyDeny } from '../utils/debug.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import {
   connectViaParentProxy,
@@ -57,6 +57,7 @@ export function createSocksProxyServer(
       const allowed = await options.filter(port, hostname)
 
       if (!allowed) {
+        logProxyDeny('SOCKS', hostname, port)
         logForDebugging(`Connection blocked to ${hostname}:${port}`, {
           level: 'error',
         })

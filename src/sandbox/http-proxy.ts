@@ -5,7 +5,7 @@ import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { connect } from 'node:net'
 import { URL } from 'node:url'
-import { logForDebugging } from '../utils/debug.js'
+import { logForDebugging, logProxyDeny } from '../utils/debug.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import {
   connectViaParentProxy,
@@ -69,6 +69,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
 
       const allowed = await options.filter(port, hostname, socket)
       if (!allowed) {
+        logProxyDeny('HTTPS-CONNECT', hostname, port)
         logForDebugging(`Connection blocked to ${hostname}:${port}`, {
           level: 'error',
         })
@@ -156,6 +157,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
 
       const allowed = await options.filter(port, hostname, req.socket)
       if (!allowed) {
+        logProxyDeny('HTTP', hostname, port)
         logForDebugging(`HTTP request blocked to ${hostname}:${port}`, {
           level: 'error',
         })
