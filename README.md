@@ -298,7 +298,9 @@ Unix sockets are **blocked by default** on both platforms.
 - **macOS**: Use `allowUnixSockets` to allow specific paths (e.g., `["/var/run/docker.sock"]`), or `allowAllUnixSockets: true` to allow all.
 - **Linux**: Blocking uses seccomp filters (x64/arm64 only). If seccomp isn't available, sockets are unrestricted and a warning is shown. Use `allowAllUnixSockets: true` to explicitly disable blocking.
 
-**Security note:** Do not allowlist `/var/run/docker.sock` in a generic sandbox configuration. Access to the Docker socket is effectively root-equivalent on the host because a sandboxed process can start containers with host filesystem mounts. Only add it for workflows that explicitly need Docker daemon access and have accepted that trust boundary.
+**Security note — `/var/run/docker.sock`:** Never mount the host's Docker socket into a sandbox that runs untrusted or AI-driven code (e.g. an IDE sandboxing an agent). Write access to `/var/run/docker.sock` is equivalent to root on the host: anything that can talk to the Docker daemon can launch a privileged container, bind-mount `/` from the host, and read or modify any file on the workstation — defeating the sandbox entirely.
+
+Allowlist it only in narrow, server-side workflows where the sandboxed process is already trusted to act as host root (e.g. a CI runner that builds images on a dedicated VM whose only purpose is to run the Docker daemon). If you are unsure whether your workflow qualifies, leave `/var/run/docker.sock` out of `allowUnixSockets` and use a rootless or remote Docker setup instead.
 
 #### Filesystem Configuration
 
