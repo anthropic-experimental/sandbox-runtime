@@ -39,6 +39,8 @@ export interface LinuxSandboxParams {
   socksSocketPath?: string
   httpProxyPort?: number
   socksProxyPort?: number
+  /** Path to the TLS-termination CA cert; injected as trust env vars. */
+  caCertPath?: string
   readConfig?: FsReadRestrictionConfig
   writeConfig?: FsWriteRestrictionConfig
   enableWeakerNestedSandbox?: boolean
@@ -1079,6 +1081,7 @@ export async function wrapCommandWithSandboxLinux(
     socksSocketPath,
     httpProxyPort,
     socksProxyPort,
+    caCertPath,
     readConfig,
     writeConfig,
     enableWeakerNestedSandbox,
@@ -1180,6 +1183,7 @@ export async function wrapCommandWithSandboxLinux(
         const proxyEnv = generateProxyEnvVars(
           3128, // Internal HTTP listener port
           1080, // Internal SOCKS listener port
+          caCertPath,
         )
         bwrapArgs.push(
           ...proxyEnv.flatMap((env: string) => {

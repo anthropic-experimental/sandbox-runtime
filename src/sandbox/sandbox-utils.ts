@@ -296,9 +296,26 @@ export function getDefaultWritePaths(): string[] {
 /**
  * Generate proxy environment variables for sandboxed processes
  */
+/**
+ * Per-tool trust-store env vars set to the TLS-termination CA cert path so
+ * HTTPS clients in the sandboxed child accept proxy-minted certs.
+ */
+export const CA_TRUST_VARS = [
+  'NODE_EXTRA_CA_CERTS',
+  'SSL_CERT_FILE',
+  'CURL_CA_BUNDLE',
+  'REQUESTS_CA_BUNDLE',
+  'PIP_CERT',
+  'GIT_SSL_CAINFO',
+  'AWS_CA_BUNDLE',
+  'CARGO_HTTP_CAINFO',
+  'DENO_CERT',
+] as const
+
 export function generateProxyEnvVars(
   httpProxyPort?: number,
   socksProxyPort?: number,
+  caCertPath?: string,
 ): string[] {
   // Respect the caller-provided temp dir if set, otherwise fall back to
   // /tmp/claude. CLAUDE_CODE_TMPDIR is the current name; CLAUDE_TMPDIR is
@@ -306,6 +323,15 @@ export function generateProxyEnvVars(
   const tmpdir =
     process.env.CLAUDE_CODE_TMPDIR || process.env.CLAUDE_TMPDIR || '/tmp/claude'
   const envVars: string[] = [`SANDBOX_RUNTIME=1`, `TMPDIR=${tmpdir}`]
+
+  // When TLS termination is configured, the child only ever sees proxy-minted
+  // certs signed by the configured CA. Point the common per-tool trust-store
+  // env vars at it so HTTPS clients accept those certs.
+  if (caCertPath) {
+    for (const v of CA_TRUST_VARS) {
+      envVars.push(`${v}=${caCertPath}`)
+    }
+  }
 
   // If no proxy ports provided, return minimal env vars
   if (!httpProxyPort && !socksProxyPort) {

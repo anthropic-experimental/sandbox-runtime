@@ -27,6 +27,12 @@ export type {
   NetworkHostPattern,
 } from './sandbox/sandbox-schemas.js'
 
+// Per-request filter
+export type {
+  FilterRequestCallback,
+  RequestDecision,
+} from './sandbox/request-filter.js'
+
 // Platform-specific utilities
 export type { SandboxViolationEvent } from './sandbox/macos-sandbox-utils.js'
 export { type SandboxDependencyCheck } from './sandbox/linux-sandbox-utils.js'

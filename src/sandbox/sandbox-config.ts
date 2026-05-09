@@ -3,6 +3,8 @@
  * This is the main configuration interface that consumers pass to SandboxManager.initialize()
  */
 
+import type { FilterRequestCallback } from './request-filter.js'
+
 import { isAbsolute } from 'node:path'
 import { z } from 'zod'
 
@@ -173,26 +175,46 @@ export const NetworkConfigSchema = z.object({
   mitmProxy: MitmProxyConfigSchema.optional().describe(
     'Optional MITM proxy configuration. Routes matching domains through an upstream proxy via Unix socket while SRT still handles allow/deny filtering.',
   ),
+  filterRequest: z
+    .custom<FilterRequestCallback>(v => typeof v === 'function', {
+      message: 'filterRequest must be a function',
+    })
+    .optional()
+    .describe(
+      'Per-request filter callback. Receives the parsed HTTP request ' +
+        '(web-standard Request) and returns {action, reason?}. Denied ' +
+        'requests get a 403 with the reason. If the callback throws, the ' +
+        'request is denied. Applies to plain HTTP through the proxy and, ' +
+        'when tlsTerminate is configured, to terminated HTTPS. SRT does not ' +
+        'provide a policy language; library consumers own matching.',
+    ),
   tlsTerminate: z
     .object({
       caCertPath: z
         .string()
         .min(1)
+        .optional()
         .describe(
           'Path to a PEM-encoded CA certificate. The sandboxed child is ' +
             'configured to trust this CA, and the TLS-terminating proxy uses ' +
-            'it to sign per-host certificates.',
+            'it to sign per-host certificates. If omitted, SRT generates an ' +
+            'ephemeral CA into a temp directory for the lifetime of the ' +
+            'session.',
         ),
       caKeyPath: z
         .string()
         .min(1)
+        .optional()
         .describe('Path to the PEM-encoded private key for caCertPath.'),
+    })
+    .refine(o => !o.caCertPath === !o.caKeyPath, {
+      message: 'caCertPath and caKeyPath must be provided together',
     })
     .optional()
     .describe(
       '[EXPERIMENTAL] Enable in-process TLS termination so HTTPS ' +
-        'request/response bodies are visible to SRT. Requires a user-' +
-        'supplied CA cert+key; SRT does not generate one.',
+        'request/response bodies are visible to SRT. Provide a CA cert+key, ' +
+        'or omit both to have SRT generate an ephemeral one.',
     ),
   parentProxy: ParentProxyConfigSchema.optional().describe(
     "Upstream HTTP proxy for outbound connections. When set, SRT's proxy " +
