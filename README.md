@@ -300,7 +300,9 @@ Unix sockets are **blocked by default** on both platforms.
 
 **Security note — `/var/run/docker.sock`:** Never mount the host's Docker socket into a sandbox that runs untrusted or AI-driven code (e.g. an IDE sandboxing an agent). Write access to `/var/run/docker.sock` is equivalent to root on the host: anything that can talk to the Docker daemon can launch a privileged container, bind-mount `/` from the host, and read or modify any file on the workstation — defeating the sandbox entirely.
 
-Allowlist it only in narrow, server-side workflows where the sandboxed process is already trusted to act as host root (e.g. a CI runner that builds images on a dedicated VM whose only purpose is to run the Docker daemon). If you are unsure whether your workflow qualifies, leave `/var/run/docker.sock` out of `allowUnixSockets` and use a rootless or remote Docker setup instead.
+Allowlist it only in narrow, server-side workflows where the sandboxed process is already trusted to act as host root (e.g. a CI runner that builds images on a dedicated VM whose only purpose is to run the Docker daemon). If you are unsure whether your workflow qualifies, leave `/var/run/docker.sock` out of `allowUnixSockets`.
+
+Note that a rootless daemon (e.g. rootless Docker, or Podman running as your user) is **not** a fix for the IDE/agent case. Rootless removes the host-root escalation — the daemon can no longer bind-mount host `/` and rewrite system files — but the sandboxed process still inherits everything the user account can touch: `~/.ssh`, cloud credentials, source trees, browser profiles, dotfiles. If the threat you care about is a sandboxed agent reading user-owned secrets, the actual mitigations are (a) running the daemon on a separate VM or remote host that your local user has no credentials on, or (b) not exposing a daemon socket at all and using a runtime that doesn't share state with the user account.
 
 #### Filesystem Configuration
 
