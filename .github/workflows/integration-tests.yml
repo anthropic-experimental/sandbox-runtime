@@ -44,7 +44,7 @@ jobs:
         if: matrix.os != 'windows'
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          node-version: '24'
 
       - name: Setup Bun
         if: matrix.os != 'windows'
@@ -176,7 +176,7 @@ jobs:
               apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc libseccomp-dev
               curl -fsSL https://bun.sh/install | bash
               export PATH="$HOME/.bun/bin:$PATH"
-              curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+              curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
               apt-get install -y -qq nodejs
               npm ci
               npm run build:seccomp

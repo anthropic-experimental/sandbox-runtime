@@ -61,7 +61,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          # Check LTS versions: https://nodejs.org/en/about/previous-releases
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
       - uses: actions/download-artifact@v4
