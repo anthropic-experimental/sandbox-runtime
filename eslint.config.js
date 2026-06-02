@@ -19,7 +19,10 @@ export default [
     languageOptions: {
       parserOptions: {
         projectService: {
-          allowDefaultProject: ['eslint.config.js', 'vendor/seccomp/build.ts'],
+          allowDefaultProject: [
+            'eslint.config.js',
+            'vendor/srt-launcher-rs/build.ts',
+          ],
         },
         tsconfigRootDir: import.meta.dirname,
       },

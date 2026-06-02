@@ -1,4 +1,4 @@
-import { describe, it, expect, afterAll } from 'bun:test'
+import { describe, it, expect, afterEach, afterAll } from 'bun:test'
 import * as http from 'node:http'
 import { spawnAsync } from './helpers/spawn.js'
 import * as net from 'node:net'
@@ -7,11 +7,33 @@ import type { SandboxRuntimeConfig } from '../src/sandbox/sandbox-config.js'
 import { isLinux } from './helpers/platform.js'
 
 /**
+ * On Linux, the internal proxy listens on a unix socket — there is no TCP port.
+ * On macOS, the internal proxy listens on an ephemeral TCP port. This helper
+ * abstracts the per-platform "internal proxy was started" assertion so the
+ * external-port assertions stay platform-neutral.
+ */
+function expectInternalProxyStarted(port: number | undefined): void {
+  if (isLinux) {
+    expect(port).toBeUndefined()
+  } else {
+    expect(port).toBeDefined()
+    expect(port).toBeGreaterThan(0)
+    expect(port).toBeLessThan(65536)
+  }
+}
+
+/**
  * Integration tests for configurable proxy ports feature
  * Tests that external proxy ports can be specified in config,
  * and that the library skips starting proxies when external ports are provided
  */
 describe('Configurable Proxy Ports Integration Tests', () => {
+  afterEach(async () => {
+    // A failing assertion above the per-test reset() leaves the manager
+    // initialized; the next test's initialize() then short-circuits and
+    // returns the stale context.
+    await SandboxManager.reset()
+  })
   afterAll(async () => {
     // Always reset after tests
     await SandboxManager.reset()
@@ -39,11 +61,10 @@ describe('Configurable Proxy Ports Integration Tests', () => {
       const httpProxyPort = SandboxManager.getProxyPort()
       expect(httpProxyPort).toBe(8888)
 
-      // SOCKS proxy should have been started locally with dynamic port
+      // SOCKS proxy started internally (TCP on macOS, unix socket on Linux)
       const socksProxyPort = SandboxManager.getSocksProxyPort()
-      expect(socksProxyPort).toBeDefined()
-      expect(socksProxyPort).not.toBe(8888)
-      expect(socksProxyPort).toBeGreaterThan(0)
+      expectInternalProxyStarted(socksProxyPort)
+      if (!isLinux) expect(socksProxyPort).not.toBe(8888)
 
       await SandboxManager.reset()
     })
@@ -71,11 +92,10 @@ describe('Configurable Proxy Ports Integration Tests', () => {
       const socksProxyPort = SandboxManager.getSocksProxyPort()
       expect(socksProxyPort).toBe(1080)
 
-      // HTTP proxy should have been started locally with dynamic port
+      // HTTP proxy started internally (TCP on macOS, unix socket on Linux)
       const httpProxyPort = SandboxManager.getProxyPort()
-      expect(httpProxyPort).toBeDefined()
-      expect(httpProxyPort).not.toBe(1080)
-      expect(httpProxyPort).toBeGreaterThan(0)
+      expectInternalProxyStarted(httpProxyPort)
+      if (!isLinux) expect(httpProxyPort).not.toBe(1080)
 
       await SandboxManager.reset()
     })
@@ -127,19 +147,12 @@ describe('Configurable Proxy Ports Integration Tests', () => {
 
       await SandboxManager.initialize(config)
 
-      // Both proxies should have been started locally with dynamic ports
+      // Both proxies should have been started internally
       const httpProxyPort = SandboxManager.getProxyPort()
-      expect(httpProxyPort).toBeDefined()
-      expect(httpProxyPort).toBeGreaterThan(0)
-      expect(httpProxyPort).toBeLessThan(65536)
-
       const socksProxyPort = SandboxManager.getSocksProxyPort()
-      expect(socksProxyPort).toBeDefined()
-      expect(socksProxyPort).toBeGreaterThan(0)
-      expect(socksProxyPort).toBeLessThan(65536)
-
-      // Should be different ports
-      expect(httpProxyPort).not.toBe(socksProxyPort)
+      expectInternalProxyStarted(httpProxyPort)
+      expectInternalProxyStarted(socksProxyPort)
+      if (!isLinux) expect(httpProxyPort).not.toBe(socksProxyPort)
 
       await SandboxManager.reset()
     })
@@ -161,10 +174,8 @@ describe('Configurable Proxy Ports Integration Tests', () => {
       }
 
       await SandboxManager.initialize(config1)
-      const httpPort1 = SandboxManager.getProxyPort()
-      const socksPort1 = SandboxManager.getSocksProxyPort()
-      expect(httpPort1).toBeDefined()
-      expect(socksPort1).toBeDefined()
+      expectInternalProxyStarted(SandboxManager.getProxyPort())
+      expectInternalProxyStarted(SandboxManager.getSocksProxyPort())
       await SandboxManager.reset()
 
       // Second: both external
@@ -204,8 +215,8 @@ describe('Configurable Proxy Ports Integration Tests', () => {
       await SandboxManager.initialize(config3)
       expect(SandboxManager.getProxyPort()).toBe(6666)
       const socksPort3 = SandboxManager.getSocksProxyPort()
-      expect(socksPort3).toBeDefined()
-      expect(socksPort3).not.toBe(6666)
+      expectInternalProxyStarted(socksPort3)
+      if (!isLinux) expect(socksPort3).not.toBe(6666)
       await SandboxManager.reset()
     })
   })

@@ -22,10 +22,23 @@ export interface SocksProxyServerOptions {
   parentProxy?: ResolvedParentProxy
 }
 
+/**
+ * Where to listen. macOS uses a TCP port (the seatbelt sandbox connects to
+ * `localhost:<port>` directly). Linux listens on a unix socket: the
+ * srt-launcher relay inside the sandbox netns connects to that socket via a
+ * bind-mount, and there is no TCP loopback hop on the host.
+ */
+export type ProxyListenTarget =
+  | { kind: 'tcp'; port: number; hostname: string }
+  | { kind: 'unix'; path: string }
+
 export interface SocksProxyWrapper {
   server: Socks5Server
-  getPort(): number | undefined
-  listen(port: number, hostname: string): Promise<number>
+  /**
+   * Start listening. Resolves to the actual TCP port (for `kind: 'tcp'`; the
+   * port can be 0 to let the OS pick) or the socket path (for `kind: 'unix'`).
+   */
+  listen(target: ProxyListenTarget): Promise<number | string>
   close(): Promise<void>
   unref(): void
 }
@@ -144,38 +157,37 @@ export function createSocksProxyServer(
 
   return {
     server: socksServer,
-    getPort(): number | undefined {
-      // Access the internal server to get the port
-      // We need to use type assertion here as the server property is private
-      try {
-        if (internalServer && typeof internalServer?.address === 'function') {
-          const address = internalServer.address()
-          if (address && typeof address === 'object' && 'port' in address) {
-            return address.port
-          }
-        }
-      } catch (error) {
-        // Server might not be listening yet or property access failed
-        logForDebugging(`Error getting port: ${error}`, { level: 'error' })
-      }
-      return undefined
-    },
-    listen(port: number, hostname: string): Promise<number> {
+    listen(target: ProxyListenTarget): Promise<number | string> {
       return new Promise((resolve, reject) => {
         internalServer?.once('error', reject)
         const listeningCallback = (): void => {
           internalServer?.removeListener('error', reject)
-          const actualPort = this.getPort()
-          if (actualPort) {
+          const addr = internalServer?.address()
+          if (target.kind === 'unix') {
+            logForDebugging(`SOCKS proxy listening on ${target.path}`)
+            resolve(target.path)
+          } else if (addr && typeof addr === 'object') {
             logForDebugging(
-              `SOCKS proxy listening on ${hostname}:${actualPort}`,
+              `SOCKS proxy listening on ${target.hostname}:${addr.port}`,
             )
-            resolve(actualPort)
+            resolve(addr.port)
           } else {
-            reject(new Error('Failed to get SOCKS proxy server port'))
+            reject(new Error('Failed to get SOCKS proxy server address'))
           }
         }
-        socksServer.listen(port, hostname, listeningCallback)
+        // @pondwader/socks5-server's `listen` is a verbatim pass-through to
+        // net.Server.listen(...args), so it accepts a unix-socket path despite
+        // the (port, hostname) typing. net.Server.listen has ~10 overloads;
+        // `Parameters<>` picks the first, so cast through `unknown[]` rather
+        // than fork the dependency for a type-only fix.
+        const polymorphicListen = socksServer.listen.bind(socksServer) as (
+          ...a: unknown[]
+        ) => void
+        if (target.kind === 'unix') {
+          polymorphicListen(target.path, listeningCallback)
+        } else {
+          polymorphicListen(target.port, target.hostname, listeningCallback)
+        }
       })
     },
     async close(): Promise<void> {

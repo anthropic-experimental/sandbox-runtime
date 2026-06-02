@@ -13,7 +13,7 @@ import { isLinux } from '../helpers/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
-import { getApplySeccompBinaryPath } from '../../src/sandbox/generate-seccomp-filter.js'
+import { getSrtLauncherPath } from '../../src/sandbox/srt-launcher.js'
 
 /**
  * Create a minimal test configuration for the sandbox with example.com allowed
@@ -37,16 +37,16 @@ function createTestConfig(testDir: string): SandboxRuntimeConfig {
 // ============================================================================
 
 /**
- * Assert that the built apply-seccomp binary is available from vendor/seccomp/.
+ * Assert that the vendored srt-launcher binary resolved.
  */
 function assertPrecompiledBpfInUse(): void {
-  const binary = getApplySeccompBinaryPath()
+  const binary = getSrtLauncherPath()
 
   expect(binary).toBeTruthy()
-  expect(binary).toContain('/vendor/seccomp/')
+  expect(binary).toContain('/vendor/srt-launcher/')
   expect(existsSync(binary!)).toBe(true)
 
-  console.log(`✓ Verified apply-seccomp binary: ${binary}`)
+  console.log(`✓ Verified srt-launcher binary: ${binary}`)
 }
 
 // ============================================================================
@@ -1257,7 +1257,7 @@ describe.if(isLinux)('Git over SSH through sandbox proxy', () => {
     await SandboxManager.reset()
   })
 
-  it('should set GIT_SSH_COMMAND to route SSH through socat proxy on Linux', async () => {
+  it('should set GIT_SSH_COMMAND to route SSH through the launcher proxy on Linux', async () => {
     const command = await SandboxManager.wrapWithSandbox(
       'echo "$GIT_SSH_COMMAND"',
     )
@@ -1272,9 +1272,10 @@ describe.if(isLinux)('Git over SSH through sandbox proxy', () => {
     const gitSshCommand = result.stdout.trim()
     // Must be set (issue #161: was empty on Linux)
     expect(gitSshCommand).not.toBe('')
-    // Must route through socat HTTP CONNECT proxy
-    expect(gitSshCommand).toContain('ssh -o ProxyCommand=')
-    expect(gitSshCommand).toContain('socat - PROXY:localhost:')
+    // Must route through the launcher's HTTP CONNECT helper
+    expect(gitSshCommand).toMatch(/^ssh -o '?ProxyCommand=/)
+    expect(gitSshCommand).toContain('srt-launcher')
+    expect(gitSshCommand).toContain('connect')
   })
 
   it('should resolve DNS and connect when running git over SSH', async () => {

@@ -1,3 +1,4 @@
+import shellquote from 'shell-quote'
 import { homedir } from 'os'
 import * as path from 'path'
 import * as fs from 'fs'
@@ -250,7 +251,7 @@ export function normalizePathForSandbox(pathPattern: string): string {
     return normalizedPath
   }
 
-  // Resolve symlinks to real paths to avoid bwrap issues
+  // Resolve symlinks to real paths so the launcher's bind-mounts cover the real target
   // Validate that the resolution stays within expected boundaries
   try {
     const resolvedPath = fs.realpathSync(normalizedPath)
@@ -316,6 +317,13 @@ export function generateProxyEnvVars(
   httpProxyPort?: number,
   socksProxyPort?: number,
   caCertPath?: string,
+  /**
+   * Linux only: absolute path to the srt-launcher binary as it appears
+   * *inside* the sandbox (the host filesystem is bind-mounted, so this is the
+   * same path getSrtLauncherPath() resolved on the host). Used for
+   * GIT_SSH_COMMAND's ProxyCommand.
+   */
+  launcherPath?: string,
 ): string[] {
   // Respect the caller-provided temp dir if set, otherwise fall back to
   // /tmp/claude. CLAUDE_CODE_TMPDIR is the current name; CLAUDE_TMPDIR is
@@ -373,12 +381,19 @@ export function generateProxyEnvVars(
       envVars.push(
         `GIT_SSH_COMMAND=ssh -o ProxyCommand='nc -X 5 -x localhost:${socksProxyPort} %h %p'`,
       )
-    } else if (platform === 'linux' && httpProxyPort) {
-      // Linux: use socat HTTP CONNECT via the HTTP proxy bridge.
-      // socat is already a required Linux sandbox dependency, and PROXY: is
-      // portable across all socat versions (unlike SOCKS5-CONNECT which needs >= 1.8.0).
+    } else if (platform === 'linux' && httpProxyPort && launcherPath) {
+      // Linux: use srt-launcher's HTTP CONNECT helper via the in-sandbox
+      // HTTP relay. ssh execs this as ProxyCommand inside the sandbox netns.
+      // The launcher validates %h/%p (which derive from the git remote URL)
+      // before splicing them into the CONNECT request line; the proxy on the
+      // other end of the relay applies the allow/deny filter.
+      //
+      // Two shell layers see this: git runs $GIT_SSH_COMMAND via sh, then ssh
+      // runs ProxyCommand via sh. Quote the launcher path for the inner sh
+      // first, then quote the whole ProxyCommand= token for the outer sh.
+      const inner = `${shellquote.quote([launcherPath])} connect %h %p --proxy 127.0.0.1:${httpProxyPort}`
       envVars.push(
-        `GIT_SSH_COMMAND=ssh -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=${httpProxyPort}'`,
+        `GIT_SSH_COMMAND=ssh -o ${shellquote.quote([`ProxyCommand=${inner}`])}`,
       )
     }
 

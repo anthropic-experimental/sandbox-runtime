@@ -5,15 +5,33 @@ import { getPlatform } from '../../src/utils/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import { isLinux } from '../helpers/platform.js'
 
+type ProxyTarget = { port: number } | { socketPath: string }
+
 /**
- * Helper to make a CONNECT request through the proxy using raw TCP
+ * Resolve where the running HTTP proxy is listening: a TCP port on macOS,
+ * a unix socket on Linux (the in-process proxy binds the socket directly).
+ */
+function getProxyTarget(): ProxyTarget {
+  const port = SandboxManager.getProxyPort()
+  if (port !== undefined) return { port }
+  const socketPath = SandboxManager.getLinuxHttpSocketPath()
+  if (socketPath) return { socketPath }
+  throw new Error('proxy not running')
+}
+
+/**
+ * Helper to make a CONNECT request through the proxy using raw TCP / unix.
  */
 function proxyRequest(
-  proxyPort: number,
+  target: ProxyTarget,
   targetHost: string,
 ): Promise<{ allowed: boolean; statusCode?: number; response?: string }> {
   return new Promise(resolve => {
-    const socket = connect(proxyPort, '127.0.0.1', () => {
+    const socket =
+      'port' in target
+        ? connect(target.port, '127.0.0.1')
+        : connect(target.socketPath)
+    socket.on('connect', () => {
       socket.write(
         `CONNECT ${targetHost}:443 HTTP/1.1\r\nHost: ${targetHost}:443\r\n\r\n`,
       )
@@ -190,11 +208,10 @@ describe('SandboxManager.updateConfig proxy filtering', () => {
       filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
     })
 
-    const proxyPort = SandboxManager.getProxyPort()
-    expect(proxyPort).toBeDefined()
+    const target = getProxyTarget()
 
     // Should be allowed initially
-    const result1 = await proxyRequest(proxyPort!, 'example.com')
+    const result1 = await proxyRequest(target, 'example.com')
     expect(result1.allowed).toBe(true)
 
     // Update to block example.com (empty allowlist)
@@ -204,7 +221,7 @@ describe('SandboxManager.updateConfig proxy filtering', () => {
     })
 
     // Should now be blocked
-    const result2 = await proxyRequest(proxyPort!, 'example.com')
+    const result2 = await proxyRequest(target, 'example.com')
     expect(result2.allowed).toBe(false)
   })
 
@@ -215,11 +232,10 @@ describe('SandboxManager.updateConfig proxy filtering', () => {
       filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
     })
 
-    const proxyPort = SandboxManager.getProxyPort()
-    expect(proxyPort).toBeDefined()
+    const target = getProxyTarget()
 
     // Should be blocked initially
-    const result1 = await proxyRequest(proxyPort!, 'example.com')
+    const result1 = await proxyRequest(target, 'example.com')
     expect(result1.allowed).toBe(false)
 
     // Update to allow example.com
@@ -229,7 +245,7 @@ describe('SandboxManager.updateConfig proxy filtering', () => {
     })
 
     // Should now be allowed
-    const result2 = await proxyRequest(proxyPort!, 'example.com')
+    const result2 = await proxyRequest(target, 'example.com')
     expect(result2.allowed).toBe(true)
   })
 
@@ -240,11 +256,10 @@ describe('SandboxManager.updateConfig proxy filtering', () => {
       filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
     })
 
-    const proxyPort = SandboxManager.getProxyPort()
-    expect(proxyPort).toBeDefined()
+    const target = getProxyTarget()
 
     // Should be allowed initially
-    const result1 = await proxyRequest(proxyPort!, 'example.com')
+    const result1 = await proxyRequest(target, 'example.com')
     expect(result1.allowed).toBe(true)
 
     // Move to denylist
@@ -254,7 +269,7 @@ describe('SandboxManager.updateConfig proxy filtering', () => {
     })
 
     // Should now be blocked
-    const result2 = await proxyRequest(proxyPort!, 'example.com')
+    const result2 = await proxyRequest(target, 'example.com')
     expect(result2.allowed).toBe(false)
 
     // Move back to allowlist
@@ -264,7 +279,7 @@ describe('SandboxManager.updateConfig proxy filtering', () => {
     })
 
     // Should be allowed again
-    const result3 = await proxyRequest(proxyPort!, 'example.com')
+    const result3 = await proxyRequest(target, 'example.com')
     expect(result3.allowed).toBe(true)
   })
 
@@ -274,8 +289,7 @@ describe('SandboxManager.updateConfig proxy filtering', () => {
       filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
     })
 
-    const proxyPort = SandboxManager.getProxyPort()
-    expect(proxyPort).toBeDefined()
+    const target = getProxyTarget()
 
     // Rapid updates
     for (let i = 0; i < 5; i++) {
@@ -291,7 +305,7 @@ describe('SandboxManager.updateConfig proxy filtering', () => {
     }
 
     // Final state should allow example.com
-    const result = await proxyRequest(proxyPort!, 'example.com')
+    const result = await proxyRequest(target, 'example.com')
     expect(result.allowed).toBe(true)
   })
 })
@@ -450,11 +464,10 @@ describe('SandboxManager.updateConfig integration (wrapWithSandbox)', () => {
     }
 
     // Proxy should be running
-    const proxyPort = SandboxManager.getProxyPort()
-    expect(proxyPort).toBeDefined()
+    const target = getProxyTarget()
 
     // Initially, example.com should be blocked (empty allowlist = block all)
-    const blockedResult = await proxyRequest(proxyPort!, 'example.com')
+    const blockedResult = await proxyRequest(target, 'example.com')
     expect(blockedResult.allowed).toBe(false)
 
     // Update config to allow example.com
@@ -464,7 +477,7 @@ describe('SandboxManager.updateConfig integration (wrapWithSandbox)', () => {
     })
 
     // Now example.com should be allowed
-    const allowedResult = await proxyRequest(proxyPort!, 'example.com')
+    const allowedResult = await proxyRequest(target, 'example.com')
     expect(allowedResult.allowed).toBe(true)
   })
 

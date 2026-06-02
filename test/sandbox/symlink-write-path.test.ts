@@ -70,7 +70,7 @@ describe.if(isLinux)('Symlink write path detection (unit)', () => {
     // The symlink path should NOT be bound writable
     // Since it's the only allowOnly path and it's skipped, the result should
     // still have bwrap but without --bind for this path
-    expect(result).toContain('bwrap')
+    expect(result).toContain('srt-launcher')
     // The evil link target (PROTECTED) should not appear as a --bind target
     expect(result).not.toContain(`--bind ${evilLink} ${evilLink}`)
   })
@@ -134,7 +134,7 @@ describe.if(isLinux)('Symlink write path detection (unit)', () => {
     })
 
     // Symlink within same area should be allowed (resolves to deeper path)
-    expect(result).toContain('bwrap')
+    expect(result).toContain('srt-launcher')
   })
 
   it('should include write paths with trailing slashes (not treat them as symlinks)', async () => {

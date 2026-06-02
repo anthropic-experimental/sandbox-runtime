@@ -254,7 +254,7 @@ describe('restriction pattern semantics', () => {
 
         // Should wrap because of write restrictions
         expect(result).not.toBe(command)
-        expect(result).toContain('bwrap')
+        expect(result).toContain('srt-launcher')
       },
     )
 
@@ -270,48 +270,9 @@ describe('restriction pattern semantics', () => {
 
         // Should wrap because of read restrictions
         expect(result).not.toBe(command)
-        expect(result).toContain('bwrap')
+        expect(result).toContain('srt-launcher')
       },
     )
-  })
-
-  describe('explicit binary paths (Linux)', () => {
-    it.if(isLinux)('uses bwrapPath for the outer command', async () => {
-      const result = await wrapCommandWithSandboxLinux({
-        command,
-        needsNetworkRestriction: false,
-        readConfig: { denyOnly: [] },
-        writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
-        bwrapPath: '/opt/bw/bwrap',
-      })
-
-      expect(result.startsWith('/opt/bw/bwrap ')).toBe(true)
-      expect(result.startsWith('bwrap ')).toBe(false)
-    })
-
-    it.if(isLinux)('uses socatPath inside the sandbox script', async () => {
-      const httpSock = join(tmpdir(), `srt-test-http-${process.pid}.sock`)
-      const socksSock = join(tmpdir(), `srt-test-socks-${process.pid}.sock`)
-      writeFileSync(httpSock, '')
-      writeFileSync(socksSock, '')
-      try {
-        const result = await wrapCommandWithSandboxLinux({
-          command,
-          needsNetworkRestriction: true,
-          httpSocketPath: httpSock,
-          socksSocketPath: socksSock,
-          readConfig: { denyOnly: [] },
-          writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
-          socatPath: '/opt/sc/socat',
-        })
-
-        expect(result).toContain('/opt/sc/socat')
-        expect(result).toContain('TCP-LISTEN:3128')
-      } finally {
-        rmSync(httpSock, { force: true })
-        rmSync(socksSock, { force: true })
-      }
-    })
   })
 
   describe('write restrictions (allow-only pattern)', () => {
@@ -343,7 +304,7 @@ describe('restriction pattern semantics', () => {
 
         // Should wrap because empty allowOnly is still a restriction
         expect(result).not.toBe(command)
-        expect(result).toContain('bwrap')
+        expect(result).toContain('srt-launcher')
       },
     )
 
@@ -411,7 +372,7 @@ describe('restriction pattern semantics', () => {
 
         // Should wrap with --unshare-net to block all network
         expect(result).not.toBe(command)
-        expect(result).toContain('bwrap')
+        expect(result).toContain('srt-launcher')
         expect(result).toContain('--unshare-net')
         // Should NOT contain proxy-related environment variables since no proxy
         expect(result).not.toContain('HTTP_PROXY')
@@ -460,17 +421,16 @@ describe('restriction pattern semantics', () => {
             needsNetworkRestriction: true,
             httpSocketPath: httpSocket,
             socksSocketPath: socksSocket,
-            httpProxyPort: 3128,
-            socksProxyPort: 1080,
             readConfig: { denyOnly: [] },
             writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
           })
 
           // Should wrap with network namespace isolation
           expect(result).not.toBe(command)
-          expect(result).toContain('bwrap')
+          expect(result).toContain('srt-launcher')
           expect(result).toContain('--unshare-net')
-          // Should bind the socket files
+          // Should wire up the in-sandbox relay listeners
+          expect(result).toContain('--relay 3128')
           expect(result).toContain(httpSocket)
           expect(result).toContain(socksSocket)
         } finally {
@@ -558,7 +518,7 @@ describe('empty allowedDomains network blocking (CVE fix)', () => {
 
         // With the fix, empty allowedDomains should trigger network isolation
         expect(result).not.toBe(command)
-        expect(result).toContain('bwrap')
+        expect(result).toContain('srt-launcher')
         expect(result).toContain('--unshare-net')
       },
     )

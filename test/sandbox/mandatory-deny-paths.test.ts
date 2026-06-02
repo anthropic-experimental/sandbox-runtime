@@ -26,7 +26,7 @@ import {
 } from '../../src/sandbox/macos-sandbox-utils.js'
 import {
   wrapCommandWithSandboxLinux,
-  cleanupBwrapMountPoints,
+  cleanupSandboxMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux, isSupportedPlatform } from '../helpers/platform.js'
 
@@ -132,8 +132,8 @@ describe.if(isSupportedPlatform)(
     afterEach(() => {
       // Reset the active-sandbox counter and scrub any leftover mount points so
       // each test starts clean. Tests that don't explicitly call
-      // cleanupBwrapMountPoints() would otherwise leak the counter.
-      cleanupBwrapMountPoints({ force: true })
+      // cleanupSandboxMountPoints() would otherwise leak the counter.
+      cleanupSandboxMountPoints({ force: true })
     })
 
     async function runSandboxedWrite(
@@ -473,7 +473,7 @@ describe.if(isSupportedPlatform)(
         // 1. Non-existent deny paths within writable areas are blocked by mounting
         //    /dev/null at the first non-existent component
         // 2. The mount point artifacts bwrap creates on the host are cleaned up
-        //    by cleanupBwrapMountPoints()
+        //    by cleanupSandboxMountPoints()
         //
         // Background: When bwrap does --ro-bind /dev/null /nonexistent/path, it
         // creates an empty file on the host as a mount point. Without cleanup,
@@ -531,7 +531,7 @@ describe.if(isSupportedPlatform)(
           const content = readFileSync(nonExistentFile, 'utf8')
           expect(content).toBe('')
 
-          cleanupBwrapMountPoints()
+          cleanupSandboxMountPoints()
         })
 
         it('blocks creation of non-existent file when parent dir also does not exist', async () => {
@@ -548,7 +548,7 @@ describe.if(isSupportedPlatform)(
           const stat = statSync('nonexistent-dir')
           expect(stat.isDirectory()).toBe(true)
 
-          cleanupBwrapMountPoints()
+          cleanupSandboxMountPoints()
         })
 
         it('blocks creation of deeply nested non-existent path', async () => {
@@ -565,12 +565,12 @@ describe.if(isSupportedPlatform)(
           const stat = statSync('a')
           expect(stat.isDirectory()).toBe(true)
 
-          cleanupBwrapMountPoints()
+          cleanupSandboxMountPoints()
         })
 
         // --- Cleanup: mount point artifact removal ---
 
-        it('cleanupBwrapMountPoints removes mount point artifacts', async () => {
+        it('cleanupSandboxMountPoints removes mount point artifacts', async () => {
           const nonExistentPath = 'cleanup-test-dir/file.txt'
 
           await runSandboxedWriteWithDenyPaths(
@@ -582,13 +582,13 @@ describe.if(isSupportedPlatform)(
           expect(existsSync('cleanup-test-dir')).toBe(true)
 
           // Clean up
-          cleanupBwrapMountPoints()
+          cleanupSandboxMountPoints()
 
           // Artifact should be gone
           expect(existsSync('cleanup-test-dir')).toBe(false)
         })
 
-        it('cleanupBwrapMountPoints removes multiple mount points from a single command', async () => {
+        it('cleanupSandboxMountPoints removes multiple mount points from a single command', async () => {
           // Two non-existent deny paths in different subtrees
           const path1 = 'ghost-dir-a/secret.txt'
           const path2 = 'ghost-dir-b/secret.txt'
@@ -602,14 +602,14 @@ describe.if(isSupportedPlatform)(
           expect(existsSync('ghost-dir-a')).toBe(true)
           expect(existsSync('ghost-dir-b')).toBe(true)
 
-          cleanupBwrapMountPoints()
+          cleanupSandboxMountPoints()
 
           // Both should be cleaned up
           expect(existsSync('ghost-dir-a')).toBe(false)
           expect(existsSync('ghost-dir-b')).toBe(false)
         })
 
-        it('cleanupBwrapMountPoints preserves non-empty directories', async () => {
+        it('cleanupSandboxMountPoints preserves non-empty directories', async () => {
           const nonExistentPath = 'preserve-test-dir/file.txt'
 
           await runSandboxedWriteWithDenyPaths(
@@ -625,7 +625,7 @@ describe.if(isSupportedPlatform)(
             writeFileSync(join(mountPoint, 'real-file.txt'), 'real content')
           }
 
-          cleanupBwrapMountPoints()
+          cleanupSandboxMountPoints()
 
           // Directory with real content should be preserved
           if (existsSync(mountPoint)) {
@@ -640,16 +640,16 @@ describe.if(isSupportedPlatform)(
           }
         })
 
-        it('cleanupBwrapMountPoints is safe to call when there are no mount points', () => {
+        it('cleanupSandboxMountPoints is safe to call when there are no mount points', () => {
           // Should not throw
-          cleanupBwrapMountPoints()
-          cleanupBwrapMountPoints()
+          cleanupSandboxMountPoints()
+          cleanupSandboxMountPoints()
         })
 
         // --- Concurrent sandbox mount point cleanup ---
         //
         // When two sandboxed commands run concurrently and one finishes first,
-        // cleanupBwrapMountPoints() must NOT delete mount point files that the
+        // cleanupSandboxMountPoints() must NOT delete mount point files that the
         // still-running sandbox depends on. Deleting a mountpoint's dentry on the
         // host detaches the bind mount in the child namespace, so the deny rule
         // stops applying inside the still-running sandbox.
@@ -692,7 +692,7 @@ describe.if(isSupportedPlatform)(
             expect(existsSync(protectedFile)).toBe(true)
 
             // Sandbox B: short command. When it finishes, the caller invokes
-            // cleanupBwrapMountPoints() — simulating the real-world race.
+            // cleanupSandboxMountPoints() — simulating the real-world race.
             const wrappedB = await wrapCommandWithSandboxLinux({
               command: 'true',
               needsNetworkRestriction: false,
@@ -709,7 +709,7 @@ describe.if(isSupportedPlatform)(
 
             // This is what the caller does after every command completes.
             // Without deferral, this would delete sandbox A's mount point too.
-            cleanupBwrapMountPoints()
+            cleanupSandboxMountPoints()
 
             // Wait for sandbox A to attempt its write
             await exitA
@@ -723,7 +723,7 @@ describe.if(isSupportedPlatform)(
               : ''
             expect(content).not.toContain('hooks')
 
-            cleanupBwrapMountPoints()
+            cleanupSandboxMountPoints()
           } finally {
             process.chdir(originalDir)
             rmSync(raceDir, { recursive: true, force: true })
@@ -775,7 +775,7 @@ describe.if(isSupportedPlatform)(
               encoding: 'utf8',
               timeout: 10000,
             })
-            cleanupBwrapMountPoints()
+            cleanupSandboxMountPoints()
 
             await exitA
 
@@ -784,7 +784,7 @@ describe.if(isSupportedPlatform)(
               : ''
             expect(content).not.toContain('WRITTEN')
 
-            cleanupBwrapMountPoints()
+            cleanupSandboxMountPoints()
           } finally {
             process.chdir(originalDir)
             rmSync(raceDir, { recursive: true, force: true })
@@ -836,13 +836,13 @@ describe.if(isSupportedPlatform)(
               encoding: 'utf8',
               timeout: 10000,
             })
-            cleanupBwrapMountPoints()
+            cleanupSandboxMountPoints()
 
             // Cleanup deferred — mount point still present while A runs
             expect(existsSync(protectedFile)).toBe(true)
 
             await exitA
-            cleanupBwrapMountPoints()
+            cleanupSandboxMountPoints()
 
             // Both sandboxes done — mount point now cleaned up
             expect(existsSync(protectedFile)).toBe(false)
@@ -893,7 +893,7 @@ describe.if(isSupportedPlatform)(
             // a directory, not blocked by a /dev/null file mount.
             expect(result.status).toBe(0)
 
-            cleanupBwrapMountPoints()
+            cleanupSandboxMountPoints()
           } finally {
             process.chdir(originalDir)
             rmSync(noGitDir, { recursive: true, force: true })
@@ -949,7 +949,7 @@ describe.if(isSupportedPlatform)(
             expect(result.status).toBe(0)
             expect(result.stdout.trim()).toBe('hello')
 
-            cleanupBwrapMountPoints()
+            cleanupSandboxMountPoints()
           } finally {
             process.chdir(originalDir)
             rmSync(worktreeDir, { recursive: true, force: true })
@@ -993,7 +993,7 @@ describe.if(isSupportedPlatform)(
             })
 
             // Run cleanup (as the CLI / Claude Code would)
-            cleanupBwrapMountPoints()
+            cleanupSandboxMountPoints()
 
             // Verify no ghost dotfiles were left behind
             const { readdirSync } = await import('node:fs')

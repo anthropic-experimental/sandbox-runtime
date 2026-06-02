@@ -5,8 +5,8 @@
 
 import type { FilterRequestCallback } from './request-filter.js'
 
-import { isAbsolute } from 'node:path'
 import { z } from 'zod'
+import { isAbsolute } from 'node:path'
 
 /**
  * Schema for domain patterns (e.g., "example.com", "*.npmjs.org")
@@ -57,18 +57,6 @@ const domainPatternSchema = z.string().refine(
  * Schema for filesystem paths
  */
 const filesystemPathSchema = z.string().min(1, 'Path cannot be empty')
-
-/**
- * Schema for an absolute path to an external binary.
- * Relative paths are rejected to prevent PATH/CWD-based hijacking — these
- * overrides are intended for admin-managed installs at fixed locations.
- */
-const binaryPathSchema = z
-  .string()
-  .min(1, 'Path cannot be empty')
-  .refine(val => isAbsolute(val), {
-    message: 'Binary path must be absolute',
-  })
 
 /**
  * Schema for MITM proxy configuration
@@ -323,20 +311,39 @@ export const WindowsConfigSchema = z.object({
 })
 
 /**
- * Seccomp configuration schema (Linux only)
+ * Location of the srt-launcher helper binary (Linux only).
+ *
+ * srt-launcher is a single statically-linked binary vendored with this package
+ * that provides namespace + filesystem isolation, the in-sandbox proxy relay,
+ * and the seccomp filter. Embedders normally don't set this — the vendored
+ * binary is found automatically. Set `path` to point at an alternate build,
+ * or set both `path` and `argv0` when srt-launcher is compiled into a larger
+ * multicall binary that dispatches on the ARGV0 env var.
  */
-export const SeccompConfigSchema = z.object({
-  applyPath: z.string().optional().describe('Path to the apply-seccomp binary'),
+export const LauncherConfigSchema = z.object({
+  path: z
+    .string()
+    .min(1, 'Path cannot be empty')
+    .refine(isAbsolute, {
+      // A relative path here would resolve via CWD or PATH, both of which
+      // the sandboxed workload can influence. Admin-managed installs are at
+      // fixed locations.
+      message: 'launcher.path must be an absolute path',
+    })
+    .optional()
+    .describe(
+      'Absolute path to the srt-launcher binary. Defaults to the vendored ' +
+        'build under vendor/srt-launcher/{x64,arm64}/srt-launcher.',
+    ),
   argv0: z
     .string()
     .optional()
     .describe(
-      'Invoke apply-seccomp as a multicall binary that dispatches on the ' +
-        'ARGV0 environment variable. When set, applyPath is used verbatim ' +
-        '(no existence check) and the invocation inside bwrap is prefixed ' +
-        'with ARGV0=<this value>. The caller is responsible for ensuring ' +
-        'applyPath resolves inside the bwrap namespace and that the target ' +
-        'binary implements the apply-seccomp interface when ARGV0 matches.',
+      'Invoke srt-launcher as a multicall binary that dispatches on the ' +
+        'ARGV0 environment variable. When set, `path` is used verbatim (no ' +
+        'existence check) and the spawned process gets ARGV0=<this value>. ' +
+        'The target binary must implement the srt-launcher CLI when ARGV0 ' +
+        'matches.',
     ),
 })
 
@@ -381,21 +388,11 @@ export const SandboxRuntimeConfigSchema = z.object({
     .boolean()
     .optional()
     .describe('Allow pseudo-terminal (pty) operations (macOS only)'),
-  seccomp: SeccompConfigSchema.optional().describe(
-    'Custom seccomp binary paths (Linux only).',
+  launcher: LauncherConfigSchema.optional().describe(
+    'Linux only: location of the srt-launcher helper binary. Defaults to ' +
+      'the vendored build; set this only to point at an alternate build or ' +
+      'a multicall host binary.',
   ),
-  bwrapPath: binaryPathSchema
-    .optional()
-    .describe(
-      'Linux only: absolute path to the bwrap (bubblewrap) binary. ' +
-        'When set, this path is used directly instead of resolving "bwrap" via PATH.',
-    ),
-  socatPath: binaryPathSchema
-    .optional()
-    .describe(
-      'Linux only: absolute path to the socat binary. ' +
-        'When set, this path is used directly instead of resolving "socat" via PATH.',
-    ),
   windows: WindowsConfigSchema.optional().describe(
     'Windows-specific settings (group, WFP sublayer, proxy port range).',
   ),
@@ -410,6 +407,6 @@ export type IgnoreViolationsConfig = z.infer<
   typeof IgnoreViolationsConfigSchema
 >
 export type RipgrepConfig = z.infer<typeof RipgrepConfigSchema>
-export type SeccompConfig = z.infer<typeof SeccompConfigSchema>
+export type LauncherConfig = z.infer<typeof LauncherConfigSchema>
 export type WindowsConfig = z.infer<typeof WindowsConfigSchema>
 export type SandboxRuntimeConfig = z.infer<typeof SandboxRuntimeConfigSchema>

@@ -9,32 +9,37 @@ permissions:
   id-token: write
 
 jobs:
-  build-seccomp:
-    name: Build seccomp (${{ matrix.arch }})
+  build-launcher:
+    name: Build srt-launcher (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         include:
           - arch: x64
             runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
           - arch: arm64
             runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.3.1
-      - run: sudo apt-get update && sudo apt-get install -y gcc libseccomp-dev
-      - run: npm run build:seccomp
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: sudo apt-get update && sudo apt-get install -y gcc libseccomp-dev musl-tools
+      - run: npm run build:launcher
       - uses: actions/upload-artifact@v4
         with:
-          name: seccomp-${{ matrix.arch }}
-          path: vendor/seccomp/${{ matrix.arch }}
+          name: srt-launcher-${{ matrix.arch }}
+          path: vendor/srt-launcher/${{ matrix.arch }}
           if-no-files-found: error
 
   publish:
     name: Publish to npm
-    needs: build-seccomp
+    needs: build-launcher
     runs-on: ubuntu-latest
     environment: npm
     steps:
@@ -66,13 +71,13 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: seccomp-x64
-          path: vendor/seccomp/x64
+          name: srt-launcher-x64
+          path: vendor/srt-launcher/x64
       - uses: actions/download-artifact@v4
         with:
-          name: seccomp-arm64
-          path: vendor/seccomp/arm64
-      - run: chmod +x vendor/seccomp/*/apply-seccomp
+          name: srt-launcher-arm64
+          path: vendor/srt-launcher/arm64
+      - run: chmod +x vendor/srt-launcher/*/srt-launcher
 
       - run: npm install
       - run: npm run clean && npm run build

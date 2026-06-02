@@ -1,0 +1,31 @@
+[package]
+name = "srt-launcher"
+version = "0.1.0"
+edition = "2021"
+
+# This crate is the Linux sandbox helper for sandbox-runtime. It replaces three
+# external binaries with one statically-linked vendored binary:
+#
+#   bwrap         -> srt-launcher run     namespace + filesystem isolation + exec
+#   apply-seccomp -> srt-launcher run     unix-socket-block seccomp before exec
+#   socat         -> srt-launcher run     TCP<->Unix relays forked from PID 1
+#                    srt-launcher relay   host-side bridge to an external proxy
+#                    srt-launcher connect ssh ProxyCommand HTTP CONNECT helper
+#
+# See src/run.rs for the process-tree comment.
+
+[dependencies]
+# Raw libc only. No `nix`/`rustix`: the security-critical mount sequencing
+# should read like the bubblewrap C it's reviewed against, and the convenience
+# wrappers don't help with the post-fork-pre-exec discipline anyway.
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+# No unwinding: smaller binary, and panicking between fork() and exec() with
+# unwinding enabled would run drop glue across a fork boundary, which is the
+# kind of thing that's fine until it isn't.
+panic = "abort"
+strip = "symbols"

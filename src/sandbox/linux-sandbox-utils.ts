@@ -1,12 +1,11 @@
 import shellquote from 'shell-quote'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
-import { randomBytes } from 'node:crypto'
 import * as fs from 'fs'
-import { spawn } from 'node:child_process'
-import type { ChildProcess } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
+import { once } from 'node:events'
 import { tmpdir } from 'node:os'
-import path, { join } from 'node:path'
+import path from 'node:path'
 import { ripGrep } from '../utils/ripgrep.js'
 import {
   generateProxyEnvVars,
@@ -20,16 +19,32 @@ import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
 } from './sandbox-schemas.js'
-import { getApplySeccompBinaryPath } from './generate-seccomp-filter.js'
-import type { SeccompConfig } from './sandbox-config.js'
+import { getSrtLauncherPath, getSrtLauncherInvocation } from './srt-launcher.js'
+import type { LauncherConfig } from './sandbox-config.js'
 
-export interface LinuxNetworkBridgeContext {
+/**
+ * State for the Linux network plumbing.
+ *
+ * The proxy <-> sandbox link is a pair of unix sockets in a private 0700
+ * directory owned by the caller. Inside the sandbox, `srt-launcher run
+ * --relay 3128 <httpSock> --relay 1080 <socksSock>` listens on the loopback
+ * ports and forwards each connection to the corresponding socket.
+ *
+ * In the common case (sandbox-manager runs its own proxy servers) those
+ * servers listen on the unix sockets directly and there is nothing else to
+ * track here. When the user supplies an external `httpProxyPort` /
+ * `socksProxyPort`, `initializeLinuxNetworkContext` spawns a host-side
+ * `srt-launcher relay` per socket to bridge unix -> 127.0.0.1:<port>, and
+ * those child processes are recorded for cleanup.
+ */
+export interface LinuxNetworkContext {
+  socketDir: string
   httpSocketPath: string
   socksSocketPath: string
-  httpBridgeProcess: ChildProcess
-  socksBridgeProcess: ChildProcess
-  httpProxyPort: number
-  socksProxyPort: number
+  /** Host-side relay to an external HTTP proxy. Absent for internal proxy. */
+  httpRelay?: ChildProcess
+  /** Host-side relay to an external SOCKS proxy. Absent for internal proxy. */
+  socksRelay?: ChildProcess
 }
 
 export interface LinuxSandboxParams {
@@ -37,8 +52,6 @@ export interface LinuxSandboxParams {
   needsNetworkRestriction: boolean
   httpSocketPath?: string
   socksSocketPath?: string
-  httpProxyPort?: number
-  socksProxyPort?: number
   /** Path to the TLS-termination CA cert; injected as trust env vars. */
   caCertPath?: string
   readConfig?: FsReadRestrictionConfig
@@ -51,12 +64,8 @@ export interface LinuxSandboxParams {
   mandatoryDenySearchDepth?: number
   /** Allow writes to .git/config files (default: false) */
   allowGitConfig?: boolean
-  /** Custom seccomp binary paths */
-  seccompConfig?: SeccompConfig
-  /** Absolute path to the bwrap binary (default: resolve "bwrap" via PATH) */
-  bwrapPath?: string
-  /** Absolute path to the socat binary (default: resolve "socat" via PATH) */
-  socatPath?: string
+  /** Location of the srt-launcher helper binary. */
+  launcher?: LauncherConfig
   /** Abort signal to cancel the ripgrep scan */
   abortSignal?: AbortSignal
 }
@@ -185,9 +194,9 @@ async function linuxGetMandatoryDenyPaths(
 
   // Git hooks and config are only denied when .git exists as a directory.
   // In git worktrees, .git is a file (e.g., "gitdir: /path/..."), so
-  // .git/hooks can never exist — denying it would cause bwrap to fail.
-  // When .git doesn't exist at all, mounting at .git would block its
-  // creation and break git init.
+  // .git/hooks can never exist — denying it would cause the launcher's
+  // ro-bind to fail. When .git doesn't exist at all, mounting at .git would
+  // block its creation and break git init.
   const dotGitPath = path.resolve(cwd, '.git')
   let dotGitIsDirectory = false
   try {
@@ -283,23 +292,23 @@ async function linuxGetMandatoryDenyPaths(
   return [...new Set(denyPaths)]
 }
 
-// Track mount points created by bwrap for non-existent deny paths.
-// When bwrap does --ro-bind /dev/null /nonexistent/path, it creates an empty
-// file on the host as a mount point. These persist after bwrap exits and must
-// be cleaned up explicitly.
-const bwrapMountPoints: Set<string> = new Set()
+// Track mount points created by srt-launcher for non-existent deny paths.
+// When the launcher does --ro-bind /dev/null /nonexistent/path, it creates an
+// empty file on the host as a mount point. These persist after the sandbox
+// exits and must be cleaned up explicitly.
+const sandboxMountPoints: Set<string> = new Set()
 
 // Number of wrapped commands that have been generated but whose cleanup has
-// not yet run. cleanupBwrapMountPoints() defers file deletion while this is
+// not yet run. cleanupSandboxMountPoints() defers file deletion while this is
 // positive, because deleting a mount point file on the host while another
-// bwrap instance is still running detaches that instance's bind mount and
+// sandbox instance is still running detaches that instance's bind mount and
 // the deny rule stops applying inside it.
 let activeSandboxCount = 0
 
 let exitHandlerRegistered = false
 
 /**
- * Register cleanup handler for bwrap mount points
+ * Register cleanup handler for sandbox mount points
  */
 function registerExitCleanupHandler(): void {
   if (exitHandlerRegistered) {
@@ -307,18 +316,19 @@ function registerExitCleanupHandler(): void {
   }
 
   process.on('exit', () => {
-    cleanupBwrapMountPoints({ force: true })
+    cleanupSandboxMountPoints({ force: true })
   })
 
   exitHandlerRegistered = true
 }
 
 /**
- * Clean up mount point files created by bwrap for non-existent deny paths.
+ * Clean up mount point files created by the launcher for non-existent deny
+ * paths.
  *
- * When protecting non-existent deny paths, bwrap creates empty files on the
- * host filesystem as mount points for --ro-bind. These files persist after
- * bwrap exits. This function removes them.
+ * When protecting non-existent deny paths, the launcher creates empty files on
+ * the host filesystem as mount points for --ro-bind. These files persist after
+ * the sandbox exits. This function removes them.
  *
  * This should be called after each sandboxed command completes to prevent
  * ghost dotfiles (e.g. .bashrc, .gitconfig) from appearing in the working
@@ -326,15 +336,15 @@ function registerExitCleanupHandler(): void {
  *
  * Each call decrements the active-sandbox counter that was incremented by
  * wrapCommandWithSandboxLinux(). File deletion is deferred until the counter
- * reaches zero. Deleting a mount point file on the host while another bwrap
- * instance is still running detaches that instance's bind mount (the dentry
- * is unhashed, so path lookup no longer finds the mount) and the deny rule
- * stops applying inside that sandbox.
+ * reaches zero. Deleting a mount point file on the host while another sandbox
+ * instance is still running detaches that instance's bind mount (the dentry is
+ * unhashed, so path lookup no longer finds the mount) and the deny rule stops
+ * applying inside that sandbox.
  *
  * Pass `{ force: true }` to delete unconditionally — used by the process-exit
  * handler and reset() where deferral is not meaningful.
  */
-export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
+export function cleanupSandboxMountPoints(opts?: { force?: boolean }): void {
   if (!opts?.force) {
     if (activeSandboxCount > 0) {
       activeSandboxCount--
@@ -349,15 +359,15 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
     activeSandboxCount = 0
   }
 
-  for (const mountPoint of bwrapMountPoints) {
+  for (const mountPoint of sandboxMountPoints) {
     try {
-      // Only remove if it's still the empty file/directory bwrap created.
-      // If something else has written real content, leave it alone.
+      // Only remove if it's still the empty file/directory the launcher
+      // created. If something else has written real content, leave it alone.
       const stat = fs.statSync(mountPoint)
       if (stat.isFile() && stat.size === 0) {
         fs.unlinkSync(mountPoint)
         logForDebugging(
-          `[Sandbox Linux] Cleaned up bwrap mount point (file): ${mountPoint}`,
+          `[Sandbox Linux] Cleaned up mount point (file): ${mountPoint}`,
         )
       } else if (stat.isDirectory()) {
         // Empty directory mount points are created for intermediate
@@ -366,7 +376,7 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
         if (entries.length === 0) {
           fs.rmdirSync(mountPoint)
           logForDebugging(
-            `[Sandbox Linux] Cleaned up bwrap mount point (dir): ${mountPoint}`,
+            `[Sandbox Linux] Cleaned up mount point (dir): ${mountPoint}`,
           )
         }
       }
@@ -374,16 +384,14 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
       // Ignore cleanup errors — the file may have already been removed
     }
   }
-  bwrapMountPoints.clear()
+  sandboxMountPoints.clear()
 }
 
 /**
  * Detailed status of Linux sandbox dependencies
  */
 export type LinuxDependencyStatus = {
-  hasBwrap: boolean
-  hasSocat: boolean
-  hasSeccompApply: boolean
+  hasLauncher: boolean
 }
 
 /**
@@ -395,299 +403,186 @@ export type SandboxDependencyCheck = {
 }
 
 /**
- * Options for Linux dependency checks. Explicit binary paths, when set,
- * are checked directly instead of resolving via PATH.
- */
-export type LinuxDependencyOptions = {
-  seccompConfig?: SeccompConfig
-  bwrapPath?: string
-  socatPath?: string
-}
-
-function isExecutable(p: string): boolean {
-  try {
-    fs.accessSync(p, fs.constants.X_OK)
-    return true
-  } catch {
-    return false
-  }
-}
-
-/**
- * Get detailed status of Linux sandbox dependencies
+ * Get detailed status of Linux sandbox dependencies.
+ *
+ * srt-launcher is the only native dependency on Linux — it bundles namespace
+ * isolation, the in-sandbox relay, and the seccomp filter into one
+ * statically-linked binary.
  */
 export function getLinuxDependencyStatus(
-  opts?: LinuxDependencyOptions,
+  cfg?: LauncherConfig,
 ): LinuxDependencyStatus {
-  const { seccompConfig, bwrapPath, socatPath } = opts ?? {}
-  // argv0 mode: apply-seccomp is compiled into the caller's binary — skip
-  // the on-disk lookup and trust that applyPath resolves inside bwrap.
-  return {
-    hasBwrap: bwrapPath ? isExecutable(bwrapPath) : whichSync('bwrap') !== null,
-    hasSocat: socatPath ? isExecutable(socatPath) : whichSync('socat') !== null,
-    hasSeccompApply: seccompConfig?.argv0
-      ? true
-      : getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null,
-  }
+  return { hasLauncher: getSrtLauncherPath(cfg) !== null }
 }
 
 /**
  * Check sandbox dependencies and return structured result
  */
 export function checkLinuxDependencies(
-  opts?: LinuxDependencyOptions,
+  cfg?: LauncherConfig,
 ): SandboxDependencyCheck {
-  const { seccompConfig, bwrapPath, socatPath } = opts ?? {}
   const errors: string[] = []
   const warnings: string[] = []
 
-  // An explicit override is a directive, not a hint — if it doesn't exist,
-  // surface that rather than silently falling back to PATH.
-  if (bwrapPath) {
-    if (!isExecutable(bwrapPath))
-      errors.push(`bubblewrap (bwrap) not executable at ${bwrapPath}`)
-  } else if (whichSync('bwrap') === null) {
-    errors.push('bubblewrap (bwrap) not installed')
-  }
-
-  if (socatPath) {
-    if (!isExecutable(socatPath))
-      errors.push(`socat not executable at ${socatPath}`)
-  } else if (whichSync('socat') === null) {
-    errors.push('socat not installed')
-  }
-
-  if (
-    !seccompConfig?.argv0 &&
-    getApplySeccompBinaryPath(seccompConfig?.applyPath) === null
-  ) {
-    warnings.push('seccomp not available - unix socket access not restricted')
+  if (getSrtLauncherPath(cfg) === null) {
+    if (cfg?.path) {
+      errors.push(`srt-launcher not executable at ${cfg.path}`)
+    } else {
+      errors.push(
+        'srt-launcher binary not found (vendor/srt-launcher/<arch>/srt-launcher). ' +
+          'This package ships it; if you are bundling, ensure the vendor ' +
+          'directory is preserved or set launcher.path explicitly.',
+      )
+    }
   }
 
   return { warnings, errors }
 }
 
 /**
- * Initialize the Linux network bridge for sandbox networking
+ * Spawn a host-side `srt-launcher relay` that listens on `socketPath` and
+ * forwards each connection to `127.0.0.1:port`. Resolves once the relay has
+ * written its readiness byte to fd 3.
  *
- * ARCHITECTURE NOTE:
- * Linux network sandboxing uses bwrap --unshare-net which creates a completely isolated
- * network namespace with NO network access. To enable network access, we:
- *
- * 1. Host side: Run socat bridges that listen on Unix sockets and forward to host proxy servers
- *    - HTTP bridge: Unix socket -> host HTTP proxy (for HTTP/HTTPS traffic)
- *    - SOCKS bridge: Unix socket -> host SOCKS5 proxy (for SSH/git traffic)
- *
- * 2. Sandbox side: Bind the Unix sockets into the isolated namespace and run socat listeners
- *    - HTTP listener on port 3128 -> HTTP Unix socket -> host HTTP proxy
- *    - SOCKS listener on port 1080 -> SOCKS Unix socket -> host SOCKS5 proxy
- *
- * 3. Configure environment:
- *    - HTTP_PROXY=http://localhost:3128 for HTTP/HTTPS tools
- *    - GIT_SSH_COMMAND with socat for SSH through SOCKS5
- *
- * LIMITATION: Unlike macOS sandbox which can enforce domain-based allowlists at the kernel level,
- * Linux's --unshare-net provides only all-or-nothing network isolation. Domain filtering happens
- * at the host proxy level, not the sandbox boundary. This means network restrictions on Linux
- * depend on the proxy's filtering capabilities.
- *
- * DEPENDENCIES: Requires bwrap (bubblewrap) and socat
+ * The returned child has been `unref()`ed; the binary sets PR_SET_PDEATHSIG
+ * so it dies with this process. Callers tear it down with
+ * `proc.kill('SIGKILL')`.
  */
-export async function initializeLinuxNetworkBridge(
-  httpProxyPort: number,
-  socksProxyPort: number,
-  socatPath?: string,
-): Promise<LinuxNetworkBridgeContext> {
-  const socat = socatPath ?? 'socat'
-  const socketId = randomBytes(8).toString('hex')
-  const httpSocketPath = join(tmpdir(), `claude-http-${socketId}.sock`)
-  const socksSocketPath = join(tmpdir(), `claude-socks-${socketId}.sock`)
+async function spawnHostRelay(
+  invocation: { argv: string[]; env: Record<string, string> },
+  socketPath: string,
+  port: number,
+  label: string,
+): Promise<ChildProcess> {
+  const [bin, ...prefix] = invocation.argv
+  // Ready-fd is the relay's stdout. The relay writes one byte once it's
+  // listening, then closes it; nothing else ever goes to stdout. We avoid an
+  // extra `stdio: [..., 'pipe']` (fd 3) slot here because Bun's fd accounting
+  // for extra-stdio pipes is fragile across spawn-then-kill cycles: after ~6
+  // such children, the next `http.Server.listen()` in the same process returns
+  // `address() === null`. Reproduced standalone; stdout is robust.
+  const proc = spawn(
+    bin!,
+    [...prefix, '--ready-fd', '1', socketPath, `127.0.0.1:${port}`],
+    {
+      stdio: ['ignore', 'pipe', 'inherit'],
+      env: { ...process.env, ...invocation.env },
+    },
+  )
 
-  // Start HTTP bridge
-  const httpSocatArgs = [
-    `UNIX-LISTEN:${httpSocketPath},fork,reuseaddr`,
-    `TCP:localhost:${httpProxyPort},keepalive,keepidle=10,keepintvl=5,keepcnt=3`,
-  ]
+  const readyPipe = proc.stdout!
 
-  logForDebugging(`Starting HTTP bridge: ${socat} ${httpSocatArgs.join(' ')}`)
+  // Race readiness against premature exit. Swallow the loser so a later
+  // 'error' or 'exit' doesn't surface as an unhandled rejection.
+  const readyP = once(readyPipe, 'data')
+  readyP.catch(() => {})
+  const exitP = once(proc, 'exit')
+  exitP.catch(() => {})
 
-  const httpBridgeProcess = spawn(socat, httpSocatArgs, {
-    stdio: 'ignore',
-  })
-
-  if (!httpBridgeProcess.pid) {
-    throw new Error('Failed to start HTTP bridge process')
-  }
-
-  // Add error and exit handlers to monitor bridge health
-  httpBridgeProcess.on('error', err => {
-    logForDebugging(`HTTP bridge process error: ${err}`, { level: 'error' })
-  })
-  httpBridgeProcess.on('exit', (code, signal) => {
-    logForDebugging(
-      `HTTP bridge process exited with code ${code}, signal ${signal}`,
-      { level: code === 0 ? 'info' : 'error' },
+  const winner = await Promise.race([
+    readyP.then(() => 'ready' as const),
+    exitP.then(r => r as [number | null, NodeJS.Signals | null]),
+  ])
+  if (winner !== 'ready') {
+    const [code, signal] = winner
+    throw new Error(
+      `srt-launcher ${label} relay exited before becoming ready ` +
+        `(code=${code}, signal=${signal})`,
     )
-  })
-
-  // Start SOCKS bridge
-  const socksSocatArgs = [
-    `UNIX-LISTEN:${socksSocketPath},fork,reuseaddr`,
-    `TCP:localhost:${socksProxyPort},keepalive,keepidle=10,keepintvl=5,keepcnt=3`,
-  ]
-
-  logForDebugging(`Starting SOCKS bridge: ${socat} ${socksSocatArgs.join(' ')}`)
-
-  const socksBridgeProcess = spawn(socat, socksSocatArgs, {
-    stdio: 'ignore',
-  })
-
-  if (!socksBridgeProcess.pid) {
-    // Clean up HTTP bridge
-    if (httpBridgeProcess.pid) {
-      try {
-        process.kill(httpBridgeProcess.pid, 'SIGTERM')
-      } catch {
-        // Ignore errors
-      }
-    }
-    throw new Error('Failed to start SOCKS bridge process')
   }
 
-  // Add error and exit handlers to monitor bridge health
-  socksBridgeProcess.on('error', err => {
-    logForDebugging(`SOCKS bridge process error: ${err}`, { level: 'error' })
-  })
-  socksBridgeProcess.on('exit', (code, signal) => {
-    logForDebugging(
-      `SOCKS bridge process exited with code ${code}, signal ${signal}`,
-      { level: code === 0 ? 'info' : 'error' },
-    )
-  })
-
-  // Wait for both sockets to be ready
-  const maxAttempts = 5
-  for (let i = 0; i < maxAttempts; i++) {
-    if (
-      !httpBridgeProcess.pid ||
-      httpBridgeProcess.killed ||
-      !socksBridgeProcess.pid ||
-      socksBridgeProcess.killed
-    ) {
-      throw new Error('Linux bridge process died unexpectedly')
-    }
-
-    try {
-      // fs already imported
-      if (fs.existsSync(httpSocketPath) && fs.existsSync(socksSocketPath)) {
-        logForDebugging(`Linux bridges ready after ${i + 1} attempts`)
-        break
-      }
-    } catch (err) {
-      logForDebugging(`Error checking sockets (attempt ${i + 1}): ${err}`, {
-        level: 'error',
-      })
-    }
-
-    if (i === maxAttempts - 1) {
-      // Clean up both processes
-      if (httpBridgeProcess.pid) {
-        try {
-          process.kill(httpBridgeProcess.pid, 'SIGTERM')
-        } catch {
-          // Ignore errors
-        }
-      }
-      if (socksBridgeProcess.pid) {
-        try {
-          process.kill(socksBridgeProcess.pid, 'SIGTERM')
-        } catch {
-          // Ignore errors
-        }
-      }
-      throw new Error(
-        `Failed to create bridge sockets after ${maxAttempts} attempts`,
-      )
-    }
-
-    await new Promise(resolve => setTimeout(resolve, i * 100))
-  }
-
-  return {
-    httpSocketPath,
-    socksSocketPath,
-    httpBridgeProcess,
-    socksBridgeProcess,
-    httpProxyPort,
-    socksProxyPort,
-  }
+  // Detach: PR_SET_PDEATHSIG in the relay handles parent death; we don't keep
+  // the event loop alive on this child. Drop the dangling 'exit' listener from
+  // the race so the handle is fully quiescent.
+  proc.removeAllListeners('exit')
+  readyPipe.destroy()
+  proc.unref()
+  return proc
 }
 
 /**
- * Resolve how to invoke apply-seccomp: either a standalone binary path, or a
- * multicall-binary prefix that dispatches on the ARGV0 env var.
+ * Prepare the Linux network context for a sandbox session.
  *
- * Returns a shell-ready string ending in a trailing space — callers append
- * shellquote.quote([shell, '-c', cmd]). Returns undefined when seccomp is
- * unavailable (no argv0, no binary found).
+ * The caller (sandbox-manager) owns the private 0700 mkdtemp socket directory
+ * and passes the two socket paths in. There are two modes:
  *
- * When argv0 is set, applyPath is used verbatim (no existence check); the
- * caller is responsible for ensuring it resolves inside the bwrap namespace.
+ *  - Internal proxy (no `externalHttpPort`/`externalSocksPort`): the caller
+ *    has already bound its own proxy servers to the unix socket paths. This
+ *    function does nothing beyond packaging the paths into a context object.
+ *
+ *  - External proxy: the caller passed `network.httpProxyPort` /
+ *    `network.socksProxyPort` from config. Spawn one `srt-launcher relay` per
+ *    port to bridge the unix socket to `127.0.0.1:<port>`, wait for readiness,
+ *    and record the child for cleanup.
+ *
+ * In both modes, the in-sandbox side is wired up later by
+ * `wrapCommandWithSandboxLinux` via `--relay 3128 <httpSock>` /
+ * `--relay 1080 <socksSock>`.
  */
-function resolveApplySeccompPrefix(
-  applyPath: string | undefined,
-  argv0: string | undefined,
-): string | undefined {
-  if (argv0) {
-    if (!applyPath) {
-      throw new Error('seccompConfig.argv0 requires seccompConfig.applyPath')
-    }
-    return `ARGV0=${shellquote.quote([argv0])} ${shellquote.quote([applyPath])} `
-  }
-  const binary = getApplySeccompBinaryPath(applyPath)
-  return binary ? `${shellquote.quote([binary])} ` : undefined
-}
-
-/**
- * Build the command that runs inside the sandbox.
- * Sets up HTTP proxy on port 3128 and SOCKS proxy on port 1080
- */
-function buildSandboxCommand(
+export async function initializeLinuxNetworkContext(
   httpSocketPath: string,
   socksSocketPath: string,
-  userCommand: string,
-  applySeccompPrefix: string | undefined,
-  shell?: string,
-  socatPath?: string,
-): string {
-  // Default to bash for backward compatibility
-  const shellPath = shell || 'bash'
-  // Host filesystem is bind-mounted into the sandbox, so an explicit
-  // socatPath resolves to the same binary inside bwrap.
-  const socat = shellquote.quote([socatPath ?? 'socat'])
-  const socatCommands = [
-    `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
-    `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
-    'trap "kill %1 %2 2>/dev/null; exit" EXIT',
-  ]
-
-  // apply-seccomp runs after socat so socat can still create Unix sockets.
-  if (applySeccompPrefix) {
-    const applySeccompCmd =
-      applySeccompPrefix + shellquote.quote([shellPath, '-c', userCommand])
-    const innerScript = [...socatCommands, applySeccompCmd].join('\n')
-    return `${shellPath} -c ${shellquote.quote([innerScript])}`
-  } else {
-    const innerScript = [
-      ...socatCommands,
-      `eval ${shellquote.quote([userCommand])}`,
-    ].join('\n')
-    return `${shellPath} -c ${shellquote.quote([innerScript])}`
+  externalHttpPort?: number,
+  externalSocksPort?: number,
+  launcherCfg?: LauncherConfig,
+): Promise<LinuxNetworkContext> {
+  const ctx: LinuxNetworkContext = {
+    socketDir: path.dirname(httpSocketPath),
+    httpSocketPath,
+    socksSocketPath,
   }
+
+  if (externalHttpPort === undefined && externalSocksPort === undefined) {
+    // Internal-proxy mode: caller already listened on the sockets.
+    return ctx
+  }
+
+  const invocation = getSrtLauncherInvocation(launcherCfg, 'relay')
+  if (!invocation) {
+    throw new Error(
+      'srt-launcher binary not found — cannot bridge to external proxy',
+    )
+  }
+
+  try {
+    if (externalHttpPort !== undefined) {
+      ctx.httpRelay = await spawnHostRelay(
+        invocation,
+        httpSocketPath,
+        externalHttpPort,
+        'HTTP',
+      )
+      logForDebugging(
+        `[Sandbox Linux] HTTP relay listening at ${httpSocketPath} -> 127.0.0.1:${externalHttpPort}`,
+      )
+    }
+    if (externalSocksPort !== undefined) {
+      ctx.socksRelay = await spawnHostRelay(
+        invocation,
+        socksSocketPath,
+        externalSocksPort,
+        'SOCKS',
+      )
+      logForDebugging(
+        `[Sandbox Linux] SOCKS relay listening at ${socksSocketPath} -> 127.0.0.1:${externalSocksPort}`,
+      )
+    }
+  } catch (err) {
+    // Partial-failure cleanup: kill whatever started.
+    ctx.httpRelay?.kill('SIGKILL')
+    ctx.socksRelay?.kill('SIGKILL')
+    throw err
+  }
+
+  return ctx
 }
 
 /**
- * Generate filesystem bind mount arguments for bwrap
+ * Generate filesystem bind mount arguments for srt-launcher.
+ *
+ * The flag surface (--bind / --ro-bind / --tmpfs) is identical to bwrap's, so
+ * the bind-mount-deny mechanism (mount /dev/null over deny paths, tmpfs over
+ * deny-read directories, re-bind writes underneath) is unchanged.
  */
 async function generateFilesystemArgs(
   readConfig: FsReadRestrictionConfig | undefined,
@@ -733,9 +628,10 @@ async function generateFilesystemArgs(
         continue
       }
 
-      // Check if path is a symlink pointing outside expected boundaries
-      // bwrap follows symlinks, so --bind on a symlink makes the target writable
-      // This could unexpectedly expose paths the user didn't intend to allow
+      // Check if path is a symlink pointing outside expected boundaries.
+      // The launcher follows symlinks, so --bind on a symlink makes the target
+      // writable. This could unexpectedly expose paths the user didn't intend
+      // to allow.
       try {
         const resolvedPath = fs.realpathSync(normalizedPath)
         // Trim trailing slashes before comparing: realpathSync never returns
@@ -776,13 +672,23 @@ async function generateFilesystemArgs(
 
     // Dedup post-normalization: entries like ['~/.foo', '/home/user/.foo']
     // converge to the same path here. A duplicate --ro-bind /dev/null <dest>
-    // hits a char device on the second pass and bwrap's ensure_file() falls
-    // through to creat() on a read-only mount.
+    // hits a char device on the second pass and the launcher's ensure_file()
+    // falls through to creat() on a read-only mount.
     const seenDenyWrite = new Set<string>()
+    // Directories already ro-bound; a child deny under one of these is
+    // redundant and srt-launcher's ensure_file() would creat() the child
+    // mountpoint inside what is now a read-only mount.
+    const denyWriteDirs: string[] = []
     for (const pathPattern of denyPaths) {
       const normalizedPath = normalizePathForSandbox(pathPattern)
       if (seenDenyWrite.has(normalizedPath)) continue
       seenDenyWrite.add(normalizedPath)
+      if (denyWriteDirs.some(d => normalizedPath.startsWith(d + '/'))) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping deny path under already-denied dir: ${normalizedPath}`,
+        )
+        continue
+      }
 
       // Skip /dev/* paths since --dev /dev already handles them
       if (normalizedPath.startsWith('/dev/')) {
@@ -806,9 +712,9 @@ async function generateFilesystemArgs(
       // Without this, a sandboxed process could mkdir+write a denied path that
       // doesn't exist yet, bypassing the deny rule entirely.
       //
-      // bwrap creates empty files on the host as mount points for these binds.
-      // We track them in bwrapMountPoints so cleanupBwrapMountPoints() can
-      // remove them after the command exits.
+      // The launcher creates empty files on the host as mount points for these
+      // binds. We track them in sandboxMountPoints so cleanupSandboxMountPoints()
+      // can remove them after the command exits.
       if (!fs.existsSync(normalizedPath)) {
         // Fix 1 (worktree): If any existing component in the deny path is a
         // file (not a directory), skip the deny entirely. You can't mkdir
@@ -848,14 +754,14 @@ async function generateFilesystemArgs(
               path.join(tmpdir(), 'claude-empty-'),
             )
             denyWriteArgs.push('--ro-bind', emptyDir, firstNonExistent)
-            bwrapMountPoints.add(firstNonExistent)
+            sandboxMountPoints.add(firstNonExistent)
             registerExitCleanupHandler()
             logForDebugging(
               `[Sandbox Linux] Mounted empty dir at ${firstNonExistent} to block creation of ${normalizedPath}`,
             )
           } else {
             denyWriteArgs.push('--ro-bind', '/dev/null', firstNonExistent)
-            bwrapMountPoints.add(firstNonExistent)
+            sandboxMountPoints.add(firstNonExistent)
             registerExitCleanupHandler()
             logForDebugging(
               `[Sandbox Linux] Mounted /dev/null at ${firstNonExistent} to block creation of ${normalizedPath}`,
@@ -879,6 +785,13 @@ async function generateFilesystemArgs(
 
       if (isWithinAllowedPath) {
         denyWriteArgs.push('--ro-bind', normalizedPath, normalizedPath)
+        try {
+          if (fs.statSync(normalizedPath).isDirectory()) {
+            denyWriteDirs.push(normalizedPath)
+          }
+        } catch {
+          // ignore
+        }
       } else {
         logForDebugging(
           `[Sandbox Linux] Skipping deny path not within allowed paths: ${normalizedPath}`,
@@ -1016,52 +929,27 @@ async function generateFilesystemArgs(
 }
 
 /**
- * Wrap a command with sandbox restrictions on Linux
+ * Wrap a command with sandbox restrictions on Linux.
  *
- * UNIX SOCKET BLOCKING (APPLY-SECCOMP):
- * This implementation uses a custom apply-seccomp binary to block Unix domain socket
- * creation for user commands while allowing network infrastructure:
+ * Emits a single shell-quoted `srt-launcher run` invocation. The launcher
+ * handles, in one process:
  *
- * Stage 1: Outer bwrap - Network and filesystem isolation (NO seccomp)
- *   - Bubblewrap starts with isolated network namespace (--unshare-net)
- *   - Bubblewrap applies PID namespace isolation (--unshare-pid and --proc)
- *   - Filesystem restrictions are applied (read-only mounts, bind mounts, etc.)
- *   - Socat processes start and connect to Unix socket bridges (can use socket(AF_UNIX, ...))
+ *  - namespace isolation: `--unshare-pid` (always), `--unshare-net` when
+ *    network is restricted, `--unshare-user` only in the weaker-nested mode.
+ *  - filesystem: `--ro-bind / /` + per-path `--bind`/`--ro-bind`/`--tmpfs`
+ *    layered on top, `--dev /dev`, and either a fresh `--proc /proc` or a
+ *    bind of the host's `/proc` (`--host-proc /proc`) when running inside an
+ *    unprivileged container that can't mount procfs.
+ *  - in-sandbox proxy relay: `--relay 3128 <httpSock>` /
+ *    `--relay 1080 <socksSock>` fork TCP listeners on loopback inside the
+ *    netns that forward to the unix sockets owned by the host-side proxy.
+ *  - seccomp: `--seccomp-unix-block` applies the baked-in BPF filter that
+ *    rejects `socket(AF_UNIX, ...)` after the relay sockets are open, so the
+ *    workload can't open new unix sockets but the relays still work.
  *
- * Stage 2: apply-seccomp - Nested PID namespace + seccomp filter
- *   - apply-seccomp creates a nested user+PID+mount namespace and remounts /proc
- *   - Inside, apply-seccomp becomes PID 1 (non-dumpable init/reaper)
- *   - Forks, sets PR_SET_NO_NEW_PRIVS, applies seccomp via prctl(PR_SET_SECCOMP)
- *   - Execs user command with seccomp active (cannot create new Unix sockets)
- *   - User command cannot see or ptrace bwrap/bash/socat (separate PID namespace)
- *
- * This solves the conflict between:
- * - Security: Blocking arbitrary Unix socket creation in user commands
- * - Functionality: Network sandboxing requires socat to call socket(AF_UNIX, ...) for bridge connections
- *
- * The seccomp-bpf filter blocks socket(AF_UNIX, ...) syscalls, preventing:
- * - Creating new Unix domain socket file descriptors
- *
- * Security limitations:
- * - Does NOT block operations (bind, connect, sendto, etc.) on inherited Unix socket FDs
- * - Does NOT prevent passing Unix socket FDs via SCM_RIGHTS
- * - For most sandboxing use cases, blocking socket creation is sufficient
- *
- * The filter allows:
- * - All TCP/UDP sockets (AF_INET, AF_INET6) for normal network operations
- * - All other syscalls
- *
- * PLATFORM NOTE:
- * The allowUnixSockets configuration is not path-based on Linux (unlike macOS)
- * because seccomp-bpf cannot inspect user-space memory to read socket paths.
- *
- * Requirements for seccomp filtering:
- * - Pre-built apply-seccomp binaries are included for x64 and ARM64
- * - Pre-generated BPF filters are included for x64 and ARM64
- * - Other architectures are not currently supported (no apply-seccomp binary available)
- * - To use sandboxing without Unix socket blocking on unsupported architectures,
- *   set allowAllUnixSockets: true in your configuration
- * Dependencies are checked by checkLinuxDependencies() before enabling the sandbox.
+ * The seccomp filter only blocks creation; it does not block operations on
+ * inherited unix-socket fds nor SCM_RIGHTS passing. allowUnixSockets is not
+ * path-based on Linux because seccomp-bpf cannot inspect user-space memory.
  */
 export async function wrapCommandWithSandboxLinux(
   params: LinuxSandboxParams,
@@ -1071,8 +959,6 @@ export async function wrapCommandWithSandboxLinux(
     needsNetworkRestriction,
     httpSocketPath,
     socksSocketPath,
-    httpProxyPort,
-    socksProxyPort,
     caCertPath,
     readConfig,
     writeConfig,
@@ -1082,9 +968,7 @@ export async function wrapCommandWithSandboxLinux(
     ripgrepConfig = { command: 'rg' },
     mandatoryDenySearchDepth = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
     allowGitConfig = false,
-    seccompConfig,
-    bwrapPath,
-    socatPath,
+    launcher,
     abortSignal,
   } = params
 
@@ -1103,107 +987,88 @@ export async function wrapCommandWithSandboxLinux(
     return command
   }
 
-  // Mark this sandbox invocation as active. cleanupBwrapMountPoints() will
+  const launcherPath = getSrtLauncherPath(launcher)
+  if (!launcherPath) {
+    throw new Error(
+      'srt-launcher binary not found. Run checkLinuxDependencies() before ' +
+        'wrapping commands, or set launcher.path explicitly.',
+    )
+  }
+
+  // Mark this sandbox invocation as active. cleanupSandboxMountPoints() will
   // defer file deletion until this (and every other concurrent) invocation
   // has been cleaned up. The matching decrement happens in
-  // cleanupBwrapMountPoints(), which the caller must invoke after the
+  // cleanupSandboxMountPoints(), which the caller must invoke after the
   // spawned command exits. If wrapping fails below, the catch block
   // decrements so the count does not leak.
   activeSandboxCount++
 
-  const bwrapArgs: string[] = ['--new-session', '--die-with-parent']
-  let applySeccompPrefix: string | undefined
+  // PID namespace, setsid, and PR_SET_PDEATHSIG are not flag-gated — the
+  // launcher applies them unconditionally (they're correctness properties,
+  // not tunables). /proc is mounted further down, after the filesystem args:
+  // srt-launcher applies mounts in argument order, so a later `--ro-bind / /`
+  // would overmount a /proc placed here and expose the host PID list.
+  const args: string[] = ['run']
 
   try {
-    // ========== SECCOMP FILTER (Unix Socket Blocking) ==========
-    // apply-seccomp wraps the workload and applies the baked-in BPF filter
-    // that blocks socket(AF_UNIX, ...). Skipped when allowAllUnixSockets is true.
-    if (!allowAllUnixSockets) {
-      applySeccompPrefix = resolveApplySeccompPrefix(
-        seccompConfig?.applyPath,
-        seccompConfig?.argv0,
-      )
-
-      if (!applySeccompPrefix) {
-        logForDebugging(
-          '[Sandbox Linux] apply-seccomp binary not available - unix socket blocking disabled. ' +
-            'Install @anthropic-ai/sandbox-runtime globally for full protection.',
-          { level: 'warn' },
-        )
-      } else {
-        logForDebugging(
-          '[Sandbox Linux] Applying seccomp filter for Unix socket blocking',
-        )
-      }
-    } else {
-      logForDebugging(
-        '[Sandbox Linux] Skipping seccomp filter - allowAllUnixSockets is enabled',
-      )
+    if (enableWeakerNestedSandbox) {
+      // Unprivileged-container mode: --unshare-user forces the userns path so
+      // the launcher gets the caps it needs for the other unshares.
+      args.push('--unshare-user')
     }
 
     // ========== NETWORK RESTRICTIONS ==========
     if (needsNetworkRestriction) {
-      // Always unshare network namespace to isolate network access
-      // This removes all network interfaces, effectively blocking all network
-      bwrapArgs.push('--unshare-net')
+      // Isolated network namespace: only loopback exists inside.
+      args.push('--unshare-net')
 
-      // If proxy sockets are provided, bind them into the sandbox to allow
-      // filtered network access through the proxy. If not provided, network
-      // is completely blocked (empty allowedDomains = block all)
+      // If proxy sockets are provided, wire up the in-sandbox relays so
+      // filtered traffic can leave via the host proxy. If not provided,
+      // network is completely blocked.
       if (httpSocketPath && socksSocketPath) {
-        // Verify socket files still exist before trying to bind them
         if (!fs.existsSync(httpSocketPath)) {
           throw new Error(
-            `Linux HTTP bridge socket does not exist: ${httpSocketPath}. ` +
-              'The bridge process may have died. Try reinitializing the sandbox.',
+            `Linux HTTP proxy socket does not exist: ${httpSocketPath}. ` +
+              'The proxy may have died. Try reinitializing the sandbox.',
           )
         }
         if (!fs.existsSync(socksSocketPath)) {
           throw new Error(
-            `Linux SOCKS bridge socket does not exist: ${socksSocketPath}. ` +
-              'The bridge process may have died. Try reinitializing the sandbox.',
+            `Linux SOCKS proxy socket does not exist: ${socksSocketPath}. ` +
+              'The proxy may have died. Try reinitializing the sandbox.',
           )
         }
 
-        // Bind both sockets into the sandbox
-        bwrapArgs.push('--bind', httpSocketPath, httpSocketPath)
-        bwrapArgs.push('--bind', socksSocketPath, socksSocketPath)
+        args.push('--relay', '3128', httpSocketPath)
+        args.push('--relay', '1080', socksSocketPath)
 
-        // Add proxy environment variables
-        // HTTP_PROXY points to the socat listener inside the sandbox (port 3128)
-        // which forwards to the Unix socket that bridges to the host's proxy server
+        // Proxy environment variables: HTTP_PROXY etc. point at the
+        // in-sandbox relay listeners on loopback.
         const proxyEnv = generateProxyEnvVars(
-          3128, // Internal HTTP listener port
-          1080, // Internal SOCKS listener port
+          3128,
+          1080,
           caCertPath,
+          launcherPath,
         )
-        bwrapArgs.push(
-          ...proxyEnv.flatMap((env: string) => {
-            const firstEq = env.indexOf('=')
-            const key = env.slice(0, firstEq)
-            const value = env.slice(firstEq + 1)
-            return ['--setenv', key, value]
-          }),
-        )
-
-        // Add host proxy port environment variables for debugging/transparency
-        // These show which host ports the Unix socket bridges connect to
-        if (httpProxyPort !== undefined) {
-          bwrapArgs.push(
-            '--setenv',
-            'CLAUDE_CODE_HOST_HTTP_PROXY_PORT',
-            String(httpProxyPort),
-          )
-        }
-        if (socksProxyPort !== undefined) {
-          bwrapArgs.push(
-            '--setenv',
-            'CLAUDE_CODE_HOST_SOCKS_PROXY_PORT',
-            String(socksProxyPort),
-          )
+        for (const env of proxyEnv) {
+          const eq = env.indexOf('=')
+          args.push('--setenv', env.slice(0, eq), env.slice(eq + 1))
         }
       }
-      // If no sockets provided, network is completely blocked (--unshare-net without proxy)
+    }
+
+    // ========== SECCOMP FILTER (Unix Socket Blocking) ==========
+    // The launcher applies the filter after the relay sockets are open, so the
+    // relays keep working but the workload can't create new AF_UNIX sockets.
+    if (!allowAllUnixSockets) {
+      args.push('--seccomp-unix-block')
+      logForDebugging(
+        '[Sandbox Linux] Applying seccomp filter for Unix socket blocking',
+      )
+    } else {
+      logForDebugging(
+        '[Sandbox Linux] Skipping seccomp filter - allowAllUnixSockets is enabled',
+      )
     }
 
     // ========== FILESYSTEM RESTRICTIONS ==========
@@ -1215,90 +1080,58 @@ export async function wrapCommandWithSandboxLinux(
       allowGitConfig,
       abortSignal,
     )
-    bwrapArgs.push(...fsArgs)
+    args.push(...fsArgs)
 
-    // Always bind /dev
-    bwrapArgs.push('--dev', '/dev')
-
-    // ========== PID NAMESPACE ISOLATION ==========
-    // IMPORTANT: These must come AFTER filesystem binds for nested bwrap to work
-    // By default, always unshare PID namespace and mount fresh /proc.
-    // If we don't have --unshare-pid, it is possible to escape the sandbox.
-    // If we don't have --proc, it is possible to read host /proc and leak information about code running
-    // outside the sandbox. But, --proc is not available when running in unprivileged docker containers
-    // so we support running without it if explicitly requested.
-    bwrapArgs.push('--unshare-pid')
+    // /proc and /dev go after the filesystem args so the root bind from
+    // generateFilesystemArgs() doesn't overmount them.
     if (!enableWeakerNestedSandbox) {
-      // Mount fresh /proc if PID namespace is isolated (secure mode)
-      bwrapArgs.push('--proc', '/proc')
+      args.push('--proc', '/proc')
     } else {
-      // --unshare-user: bwrap only auto-adds this when EUID != 0. In an
-      // unprivileged container (Docker's default: EUID=0 without
-      // CAP_SYS_ADMIN), bwrap assumes it has caps, tries direct clone,
-      // and EPERMs. Force the userns path so bwrap starts at all.
-      //
-      // --bind /proc /proc: apply-seccomp's nested-userns path writes
-      // /proc/self/setgroups and uid_map. Without --proc above, the
-      // --ro-bind / / leaves /proc read-only and those writes EROFS.
-      bwrapArgs.push('--unshare-user', '--bind', '/proc', '/proc')
+      // Unprivileged-container mode: the host kernel won't let us mount a
+      // fresh procfs. --host-proc binds the outer /proc read-write so
+      // /proc/self/{setgroups,uid_map} are writable for the nested userns
+      // setup.
+      args.push('--host-proc', '/proc')
     }
-
-    // apply-seccomp obtains CAP_SYS_ADMIN for its nested PID+mount unshare
-    // by creating a nested user namespace. This requires the host to permit
-    // capability-bearing unprivileged user namespaces (the same requirement
-    // bwrap itself has when not installed setuid). See README for the
-    // Ubuntu 24.04 sysctl if AppArmor restricts this.
+    args.push('--dev', '/dev')
 
     // ========== COMMAND ==========
     // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
-    // Resolve the full path to the shell binary since bwrap doesn't use $PATH
+    // Resolve the full path to the shell binary since the launcher doesn't use $PATH
     const shellName = binShell || 'bash'
     const shell = whichSync(shellName)
     if (!shell) {
       throw new Error(`Shell '${shellName}' not found in PATH`)
     }
-    bwrapArgs.push('--', shell, '-c')
+    // srt-launcher captures its spawn-time cwd before pivot_root and restores
+    // it best-effort afterwards (falling back to / if the path doesn't exist
+    // inside the sandbox), so the inner shell sees the caller's cwd without
+    // any TS-side handling.
+    args.push('--', shell, '-c', command)
 
-    // With network restrictions, route the command through buildSandboxCommand
-    // so socat starts before seccomp is applied. Otherwise invoke apply-seccomp
-    // directly if we have a binary.
-    if (needsNetworkRestriction && httpSocketPath && socksSocketPath) {
-      const sandboxCommand = buildSandboxCommand(
-        httpSocketPath,
-        socksSocketPath,
-        command,
-        applySeccompPrefix,
-        shell,
-        socatPath,
-      )
-      bwrapArgs.push(sandboxCommand)
-    } else if (applySeccompPrefix) {
-      const applySeccompCmd =
-        applySeccompPrefix + shellquote.quote([shell, '-c', command])
-      bwrapArgs.push(applySeccompCmd)
-    } else {
-      bwrapArgs.push(command)
-    }
-
-    const wrappedCommand = shellquote.quote([
-      bwrapPath ?? 'bwrap',
-      ...bwrapArgs,
-    ])
+    // Multicall mode: when the launcher is compiled into a host binary that
+    // dispatches on the ARGV0 env var, prepend the env-assignment word so the
+    // shell sets it for the launcher process only.
+    const argv0Prefix = launcher?.argv0
+      ? 'ARGV0=' + shellquote.quote([launcher.argv0]) + ' '
+      : ''
+    const wrappedCommand =
+      argv0Prefix + shellquote.quote([launcherPath, ...args])
 
     const restrictions = []
     if (needsNetworkRestriction) restrictions.push('network')
     if (hasReadRestrictions || hasWriteRestrictions)
       restrictions.push('filesystem')
-    if (applySeccompPrefix) restrictions.push('seccomp(unix-block)')
+    if (!allowAllUnixSockets) restrictions.push('seccomp(unix-block)')
 
     logForDebugging(
-      `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,
+      `[Sandbox Linux] Wrapped command with srt-launcher (${restrictions.join(', ')} restrictions)`,
     )
 
     return wrappedCommand
   } catch (error) {
     // Undo the activeSandboxCount increment — the caller won't call
-    // cleanupBwrapMountPoints() for a wrap that threw.
+    // cleanupSandboxMountPoints() for a wrap that threw.
     if (activeSandboxCount > 0) {
       activeSandboxCount--
     }

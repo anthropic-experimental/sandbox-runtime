@@ -279,46 +279,47 @@ describe('Config Validation', () => {
     }
   })
 
-  describe('bwrapPath / socatPath', () => {
+  describe('launcher', () => {
     const base = {
       network: { allowedDomains: [], deniedDomains: [] },
       filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
     }
 
-    test('accepts absolute paths', () => {
+    test('accepts absolute path', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,
-        bwrapPath: '/usr/local/bin/bwrap',
-        socatPath: '/opt/tools/socat',
+        launcher: { path: '/usr/local/bin/srt-launcher' },
       })
       expect(result.success).toBe(true)
     })
 
-    test('rejects relative bwrapPath', () => {
+    test('rejects relative launcher.path', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,
-        bwrapPath: 'bwrap',
+        launcher: { path: 'srt-launcher' },
       })
       expect(result.success).toBe(false)
       if (!result.success) {
-        expect(result.error.issues[0]?.message).toContain('must be absolute')
+        expect(result.error.issues[0]?.message).toContain(
+          'must be an absolute path',
+        )
       }
     })
 
-    test('rejects relative socatPath', () => {
+    test('rejects empty launcher.path', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,
-        socatPath: './bin/socat',
+        launcher: { path: '' },
       })
       expect(result.success).toBe(false)
     })
 
-    test('rejects empty bwrapPath', () => {
+    test('accepts argv0 with path', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,
-        bwrapPath: '',
+        launcher: { path: '/proc/self/exe', argv0: 'srt-launcher' },
       })
-      expect(result.success).toBe(false)
+      expect(result.success).toBe(true)
     })
   })
 

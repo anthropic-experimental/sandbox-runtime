@@ -110,21 +110,23 @@ jobs:
         if: matrix.os == 'linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y bubblewrap libseccomp-dev gcc socat ripgrep apparmor-profiles zsh
+          sudo apt-get install -y libseccomp-dev gcc musl-tools ripgrep apparmor-profiles zsh
+
+      - name: Set up Rust toolchain (Linux)
+        if: matrix.os == 'linux'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch == 'arm64' && 'aarch64-unknown-linux-musl' || 'x86_64-unknown-linux-musl' }}
 
       - name: Enable unprivileged user namespaces (Linux)
         if: matrix.os == 'linux'
         run: |
           # Ubuntu 24.04+ sets kernel.apparmor_restrict_unprivileged_userns=1 which
           # allows unshare(CLONE_NEWUSER) but grants the new namespace zero
-          # capabilities. Disable it so bwrap and apply-seccomp can nest
-          # namespaces without needing setuid.
+          # capabilities. Disable it so srt-launcher can set up the mount
+          # namespace without needing setuid.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
-
-          # Verify bwrap can create namespaces
-          echo "Testing bwrap namespace creation..."
-          bwrap --ro-bind / / --unshare-net true && echo "✓ bwrap namespace creation works" || echo "✗ bwrap namespace creation still fails"
 
       - name: Install system dependencies (macOS)
         if: matrix.os == 'macos'
@@ -135,9 +137,9 @@ jobs:
         if: matrix.os != 'windows'
         run: npm install
 
-      - name: Build seccomp binaries (Linux)
+      - name: Build srt-launcher (Linux)
         if: matrix.os == 'linux'
-        run: npm run build:seccomp
+        run: npm run build:launcher
 
       - name: Build project
         if: matrix.os != 'windows'
@@ -194,13 +196,15 @@ jobs:
             ubuntu:24.04 \
             bash -euo pipefail -c '
               apt-get update -qq
-              apt-get install -y -qq bubblewrap socat ripgrep python3 curl ca-certificates unzip gcc libseccomp-dev
+              apt-get install -y -qq ripgrep python3 curl ca-certificates unzip gcc libseccomp-dev musl-tools
               curl -fsSL https://bun.sh/install | bash
-              export PATH="$HOME/.bun/bin:$PATH"
+              export PATH="$HOME/.bun/bin:$HOME/.cargo/bin:$PATH"
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+              rustup target add "$(uname -m)-unknown-linux-musl"
               curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
               apt-get install -y -qq nodejs
               npm ci
-              npm run build:seccomp
+              npm run build:launcher
               npm run build
               bun test test/docker-weak-sandbox.test.ts
             '

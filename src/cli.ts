@@ -280,9 +280,9 @@ async function main(): Promise<void> {
 
           // Handle process exit
           child.on('exit', (code, signal) => {
-            // Clean up bwrap mount point artifacts before exiting.
-            // On Linux, bwrap creates empty files on the host when protecting
-            // non-existent deny paths. This removes them.
+            // Clean up sandbox mount-point artifacts before exiting. On Linux,
+            // protecting a non-existent deny path requires creating an empty
+            // file on the host as the bind-mount target; this removes them.
             SandboxManager.cleanupAfterCommand()
 
             if (signal) {

@@ -2,7 +2,7 @@
 
 A lightweight sandboxing tool for enforcing filesystem and network restrictions on arbitrary processes at the OS level, without requiring a container.
 
-`srt` uses native OS sandboxing primitives (`sandbox-exec` on macOS, `bubblewrap` on Linux) and proxy-based network filtering. It can be used to sandbox the behaviour of agents, local MCP servers, bash commands and arbitrary processes.
+`srt` uses native OS sandboxing primitives (`sandbox-exec` on macOS, Linux namespaces + bind mounts via the vendored `srt-launcher` helper on Linux) and proxy-based network filtering. It can be used to sandbox the behaviour of agents, local MCP servers, bash commands and arbitrary processes.
 
 > **Beta Research Preview**
 >
@@ -105,7 +105,7 @@ Now the MCP server will be blocked from writing to the denied path:
 The sandbox uses OS-level primitives to enforce restrictions that apply to the entire process tree:
 
 - **macOS**: Uses `sandbox-exec` with dynamically generated [Seatbelt profiles](https://reverse.put.as/wp-content/uploads/2011/09/Apple-Sandbox-Guide-v1.0.pdf)
-- **Linux**: Uses [bubblewrap](https://github.com/containers/bubblewrap) for containerization with network namespace isolation
+- **Linux**: Uses the vendored `srt-launcher` helper (Linux namespaces + bind mounts + seccomp; no external runtime dependencies)
 
 ![0d1c612947c798aef48e6ab4beb7e8544da9d41a-4096x2305](https://github.com/user-attachments/assets/76c838a9-19ef-4d0b-90bb-cbe1917b3551)
 
@@ -149,7 +149,7 @@ src/
     ├── sandbox-utils.ts      # Shared sandbox utilities
     ├── http-proxy.ts         # HTTP/HTTPS proxy for network filtering
     ├── socks-proxy.ts        # SOCKS5 proxy for network filtering
-    ├── linux-sandbox-utils.ts # Linux bubblewrap sandboxing
+    ├── linux-sandbox-utils.ts # Linux sandbox argv assembly (srt-launcher run)
     └── macos-sandbox-utils.ts # macOS sandbox-exec sandboxing
 ```
 
@@ -419,43 +419,27 @@ Watchman accesses files outside the sandbox boundaries, which will trigger permi
 ## Platform Support
 
 - **macOS**: Uses `sandbox-exec` with custom profiles (no additional dependencies)
-- **Linux**: Uses `bubblewrap` (bwrap) for containerization
+- **Linux**: Uses the vendored `srt-launcher` helper (a single statically linked binary shipped with this package — no external runtime dependencies)
 - **Windows**: Not yet supported
 
 ### Platform-Specific Dependencies
 
 **Linux requires:**
 
-- `bubblewrap` - Container runtime
-  - Ubuntu/Debian: `apt-get install bubblewrap`
-  - Fedora: `dnf install bubblewrap`
-  - Arch: `pacman -S bubblewrap`
-- `socat` - Socket relay for proxy bridging
-  - Ubuntu/Debian: `apt-get install socat`
-  - Fedora: `dnf install socat`
-  - Arch: `pacman -S socat`
 - `ripgrep` - Fast search tool for deny path detection
   - Ubuntu/Debian: `apt-get install ripgrep`
   - Fedora: `dnf install ripgrep`
   - Arch: `pacman -S ripgrep`
 
-**Ubuntu 24.04+ note:** These releases enable `kernel.apparmor_restrict_unprivileged_userns` by default, which allows `unshare(CLONE_NEWUSER)` but strips capabilities from the resulting namespace. Both bubblewrap and the seccomp isolation layer need capability-bearing user namespaces. Disable the restriction with:
+The `srt-launcher` binary itself has no runtime dependencies (statically linked against musl). Prebuilt binaries are bundled for x86-64 and arm64.
+
+**Ubuntu 24.04+ note:** These releases enable `kernel.apparmor_restrict_unprivileged_userns` by default, which allows `unshare(CLONE_NEWUSER)` but strips capabilities from the resulting namespace. `srt-launcher` needs capability-bearing user namespaces to set up the mount namespace. Disable the restriction with:
 
 ```bash
 sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 ```
 
-or add an AppArmor profile that grants `userns` to the relevant binaries.
-
-**Optional Linux dependencies (for seccomp fallback):**
-
-The package includes pre-generated seccomp BPF filters for x86-64 and arm architectures. These dependencies are only needed if you are on a different architecture where pre-generated filters are not available:
-
-- `gcc` or `clang` - C compiler
-- `libseccomp-dev` - Seccomp library development files
-  - Ubuntu/Debian: `apt-get install gcc libseccomp-dev`
-  - Fedora: `dnf install gcc libseccomp-devel`
-  - Arch: `pacman -S gcc libseccomp`
+or add an AppArmor profile that grants `userns` to the `srt-launcher` binary.
 
 **macOS requires:**
 
@@ -485,9 +469,14 @@ npm run lint
 npm run format
 ```
 
-### Building Seccomp Binaries
+### Building srt-launcher
 
-The BPF filter and `apply-seccomp` loader are compiled from C source in `vendor/seccomp-src/` via `npm run build:seccomp` (Linux only; needs `gcc` and `libseccomp-dev`). CI runs it before tests on each Linux arch, and the release workflow builds both arches and bundles them into the published package.
+`srt-launcher` is built from `vendor/srt-launcher-rs/` via `npm run build:launcher` (Linux only). The build needs:
+
+- `rustup` with the `<arch>-unknown-linux-musl` target installed
+- `gcc` and `libseccomp-dev` (build-time only — the BPF filter that blocks `socket(AF_UNIX, ...)` and `io_uring` is generated by `vendor/seccomp-src/seccomp-unix-block.c` and baked into the Rust binary as a byte array)
+
+CI runs the build before tests on each Linux arch, and the release workflow builds both arches and bundles the binaries under `vendor/srt-launcher/{x64,arm64}/` in the published package.
 
 ## Implementation Details
 
@@ -501,7 +490,9 @@ The sandbox runs HTTP and SOCKS5 proxy servers on the host machine that filter a
 
 **Platform-specific proxy communication:**
 
-- **Linux**: Requests are routed via the filesystem over Unix domain sockets (using `socat` for bridging). The network namespace is removed from the bubblewrap container, ensuring all network traffic must go through the proxies.
+- **Linux**: The proxies listen on Unix domain sockets in a private mode-0700 directory, and `srt-launcher run` creates an isolated network namespace (`--unshare-net`) for the sandboxed command. Inside that namespace, `srt-launcher` forks lightweight relays on `127.0.0.1:3128` / `:1080` that forward connections over the bind-mounted Unix sockets to the host proxies — so tools see ordinary `HTTP_PROXY` / `ALL_PROXY` env vars and the only path to the network is through the filtered proxies.
+
+  When `network.httpProxyPort` / `socksProxyPort` is configured (an external proxy), `srt-launcher relay` runs on the host as a Unix-socket→TCP bridge to that port; the in-sandbox path is identical.
 
 - **macOS**: The Seatbelt profile allows communication only to specific localhost ports where the proxies listen. All other network access is blocked.
 
@@ -510,7 +501,7 @@ The sandbox runs HTTP and SOCKS5 proxy servers on the host machine that filter a
 Filesystem restrictions are enforced at the OS level:
 
 - **macOS**: Uses `sandbox-exec` with dynamically generated Seatbelt profiles that specify allowed read/write paths
-- **Linux**: Uses `bubblewrap` with bind mounts, marking directories as read-only or read-write based on configuration
+- **Linux**: `srt-launcher run` creates a fresh mount namespace, pivots to a new root, and applies bind mounts that mark directories read-only or read-write based on configuration
 
 **Default filesystem permissions:**
 
@@ -553,7 +544,7 @@ $ srt 'echo "bad" > .git/hooks/pre-commit'
 /bin/bash: .git/hooks/pre-commit: Operation not permitted
 ```
 
-**Note (Linux):** On Linux, mandatory deny paths only block files that already exist. Non-existent files in these patterns cannot be blocked by bubblewrap's bind-mount approach. macOS uses glob patterns which block both existing and new files.
+**Note (Linux):** On Linux, mandatory deny paths only block files that already exist. Non-existent files in these patterns cannot be blocked by the bind-mount approach. macOS uses glob patterns which block both existing and new files.
 
 **Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance. You can configure this with `mandatoryDenySearchDepth`:
 
@@ -577,25 +568,13 @@ On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to block Uni
 
 **How it works:**
 
-1. **Baked-in BPF filter**: The package ships a static `apply-seccomp` binary for x64 and arm64 with the seccomp BPF filter compiled in. The filter is architecture-specific but libc-independent, so the binary works with both glibc and musl.
+1. **Baked-in BPF filter**: The seccomp BPF filter is compiled into `srt-launcher` per architecture. The filter is libc-independent, so the binary works on glibc and musl hosts.
 
-2. **Runtime detection**: The sandbox automatically detects your system's architecture and uses the matching `apply-seccomp` binary.
+2. **Syscall filtering**: The filter intercepts `socket()` and returns `EPERM` for `AF_UNIX`, preventing sandboxed code from creating new Unix domain sockets.
 
-3. **Syscall filtering**: The BPF filter intercepts the `socket()` syscall and blocks creation of `AF_UNIX` sockets by returning `EPERM`. This prevents sandboxed code from creating new Unix domain sockets.
-
-4. **Two-stage application using apply-seccomp binary**:
-   - Outer bwrap creates the sandbox with filesystem, network, and PID namespace restrictions
-   - Network bridging processes (socat) start inside the sandbox (need Unix sockets)
-   - apply-seccomp creates a nested user+PID+mount namespace and remounts `/proc`
-   - Inside the nested namespace, apply-seccomp acts as PID 1 (non-dumpable init/reaper)
-   - apply-seccomp forks, applies the seccomp filter via `prctl()`, and execs the user command
-   - User command runs with all sandbox restrictions plus Unix socket creation blocking
-
-**PID namespace isolation**: The nested PID namespace ensures the user command cannot see or address any process that runs without the seccomp filter (bwrap's init, the shell wrapper, or the socat helpers). This keeps the seccomp boundary intact regardless of `kernel.yama.ptrace_scope`, since unfiltered helpers are not reachable via `ptrace` or `/proc/N/mem`. The inner PID 1 sets `PR_SET_DUMPABLE=0` so it is not ptraceable either. If nested namespace creation fails, apply-seccomp aborts rather than running without isolation.
+3. **Single-layer application**: `srt-launcher run` creates one user/mount/pid (and optionally net) namespace, becomes PID 1 inside it, sets `PR_SET_DUMPABLE=0`, forks the proxy relays, and forks the worker. The worker applies the seccomp filter via `prctl()` and execs the user command. The relays run *without* the filter (they need `socket(AF_UNIX)` to reach the host proxy socket) but inherit `PR_SET_DUMPABLE=0`, so the seccomp'd worker cannot `ptrace` them or write `/proc/N/mem` against them regardless of `kernel.yama.ptrace_scope`. If namespace creation fails, `srt-launcher` aborts rather than running without isolation.
 
 **Security limitations**: The filter blocks `socket(AF_UNIX, ...)` and the `io_uring_setup`/`io_uring_enter`/`io_uring_register` syscalls (the latter three because `IORING_OP_SOCKET` on Linux 5.19+ would otherwise bypass the `socket()` rule). It does not prevent operations on Unix socket file descriptors inherited from parent processes or passed via `SCM_RIGHTS`. For most sandboxing scenarios, blocking socket creation is sufficient to prevent unauthorized IPC.
-
-**Zero runtime dependencies**: Pre-built static apply-seccomp binaries and pre-generated BPF filters are included for x64 and arm64 architectures. No compilation tools or external dependencies required at runtime.
 
 **Architecture support**: x64 and arm64 are fully supported with pre-built binaries. Other architectures are not currently supported. To use sandboxing without Unix socket blocking on unsupported architectures, set `allowAllUnixSockets: true` in your configuration.
 
