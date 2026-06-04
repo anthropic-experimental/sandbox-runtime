@@ -490,6 +490,10 @@ function generateSandboxProfile({
           '; Apple Events - opt-in; needed for open/osascript to talk to other apps (appleeventsd)',
           '(allow appleevent-send)',
           '(allow mach-lookup (global-name "com.apple.coreservices.appleevents"))',
+          '; Launch Services on macOS 14 (Sonoma) routes open through coreservicesd',
+          '; instead of launchservicesd - without it open fails with -10822',
+          '; kLSServerCommunicationErr',
+          '(allow mach-lookup (global-name "com.apple.CoreServices.coreservicesd"))',
         ]
       : []),
     ...(allowMachLookup && allowMachLookup.length > 0
