@@ -64,29 +64,45 @@ describe.if(isMacOS)(
   },
 )
 
-describe.if(isMacOS)('macOS Seatbelt allowAppleEvents end to end', () => {
-  // `open -g -a Finder .` requires sending an Apple Event to Finder via
-  // appleeventsd. It does not require a TCC automation prompt, so it is a
-  // deterministic probe for the Seatbelt layer.
-  const openCommand = 'open -g -a Finder .'
+// `open -g -a Finder .` requires sending an Apple Event to Finder via
+// appleeventsd, so it probes the Seatbelt layer. Some CI runners cannot run
+// it at all (no usable GUI session / TCC automation grant for the runner
+// user) — there the failure sits in front of Seatbelt, so only assert the
+// sandbox's behavior when the probe works outside the sandbox.
+const openCommand = 'open -g -a Finder .'
+const baselineOpenWorks =
+  isMacOS &&
+  spawnSync(openCommand, { shell: true, encoding: 'utf8', timeout: 15000 })
+    .status === 0
 
-  it('blocks `open` by default', () => {
-    const result = spawnSync(wrapCommand(openCommand), {
-      shell: true,
-      encoding: 'utf8',
-      timeout: 15000,
+describe.if(isMacOS && baselineOpenWorks)(
+  'macOS Seatbelt allowAppleEvents end to end',
+  () => {
+    it('blocks `open` by default', () => {
+      const result = spawnSync(wrapCommand(openCommand), {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 15000,
+      })
+
+      expect(result.status).not.toBe(0)
     })
 
-    expect(result.status).not.toBe(0)
-  })
+    it('allows `open` when allowAppleEvents is true', () => {
+      const result = spawnSync(wrapCommand(openCommand, true), {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 15000,
+      })
 
-  it('allows `open` when allowAppleEvents is true', () => {
-    const result = spawnSync(wrapCommand(openCommand, true), {
-      shell: true,
-      encoding: 'utf8',
-      timeout: 15000,
+      expect(result.status).toBe(0)
     })
+  },
+)
 
-    expect(result.status).toBe(0)
-  })
-})
+describe.if(isMacOS && !baselineOpenWorks)(
+  'macOS Seatbelt allowAppleEvents end to end (environment cannot send Apple Events)',
+  () => {
+    it.skip('skipped: `open -g -a Finder .` fails outside the sandbox in this environment', () => {})
+  },
+)
