@@ -95,6 +95,21 @@ describe.if(isMacOS && baselineOpenWorks)(
         timeout: 15000,
       })
 
+      if (result.status !== 0) {
+        // Surface what failed: open's own error plus any Seatbelt denials
+        // (deny messages carry the profile's CMD64_ log tag).
+        console.error(
+          `open probe failed (status ${result.status})\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+        )
+        const denials = spawnSync(
+          `log show --last 1m --style compact --predicate 'eventMessage CONTAINS "CMD64_"'`,
+          { shell: true, encoding: 'utf8', timeout: 30000 },
+        )
+        console.error(
+          `sandbox denials:\n${(denials.stdout ?? '').slice(-6000)}`,
+        )
+      }
+
       expect(result.status).toBe(0)
     })
   },
