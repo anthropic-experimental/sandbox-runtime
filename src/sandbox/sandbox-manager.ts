@@ -798,6 +798,7 @@ async function wrapWithSandbox(
 
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
   const allowPty = customConfig?.allowPty ?? config?.allowPty
+  const allowGPU = customConfig?.allowGPU ?? config?.allowGPU
 
   switch (platform) {
     case 'macos':
@@ -819,6 +820,7 @@ async function wrapWithSandbox(
         allowPty,
         allowGitConfig: getAllowGitConfig(),
         enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
+        allowGPU,
         binShell,
       })
 
