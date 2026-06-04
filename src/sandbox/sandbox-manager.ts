@@ -652,6 +652,10 @@ function getEnableWeakerNetworkIsolation(): boolean | undefined {
   return config?.enableWeakerNetworkIsolation
 }
 
+function getAllowAppleEvents(): boolean | undefined {
+  return config?.allowAppleEvents
+}
+
 function getRipgrepConfig(): { command: string; args?: string[] } {
   return config?.ripgrep ?? { command: 'rg' }
 }
@@ -819,6 +823,7 @@ async function wrapWithSandbox(
         allowPty,
         allowGitConfig: getAllowGitConfig(),
         enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
+        allowAppleEvents: getAllowAppleEvents(),
         binShell,
       })
 

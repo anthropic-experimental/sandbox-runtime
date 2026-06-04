@@ -176,6 +176,27 @@ describe('Config Validation', () => {
     }
   })
 
+  test('should validate config with allowAppleEvents', () => {
+    const config = {
+      network: {
+        allowedDomains: ['example.com'],
+        deniedDomains: [],
+      },
+      filesystem: {
+        denyRead: [],
+        allowWrite: [],
+        denyWrite: [],
+      },
+      allowAppleEvents: true,
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data.allowAppleEvents).toBe(true)
+    }
+  })
+
   test('should validate config with custom ripgrep command', () => {
     const config = {
       network: {

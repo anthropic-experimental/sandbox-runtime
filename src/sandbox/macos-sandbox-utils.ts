@@ -37,6 +37,7 @@ export interface MacOSSandboxParams {
   allowPty?: boolean
   allowGitConfig?: boolean
   enableWeakerNetworkIsolation?: boolean
+  allowAppleEvents?: boolean
   binShell?: string
 }
 
@@ -425,6 +426,7 @@ function generateSandboxProfile({
   allowPty,
   allowGitConfig = false,
   enableWeakerNetworkIsolation = false,
+  allowAppleEvents = false,
   logTag,
 }: {
   readConfig: FsReadRestrictionConfig | undefined
@@ -439,6 +441,7 @@ function generateSandboxProfile({
   allowPty?: boolean
   allowGitConfig?: boolean
   enableWeakerNetworkIsolation?: boolean
+  allowAppleEvents?: boolean
   logTag: string
 }): string {
   const profile: string[] = [
@@ -480,6 +483,13 @@ function generateSandboxProfile({
       ? [
           '; trustd.agent - needed for Go TLS certificate verification (weaker network isolation)',
           '(allow mach-lookup (global-name "com.apple.trustd.agent"))',
+        ]
+      : []),
+    ...(allowAppleEvents
+      ? [
+          '; Apple Events - opt-in; needed for open/osascript to talk to other apps (appleeventsd)',
+          '(allow appleevent-send)',
+          '(allow mach-lookup (global-name "com.apple.coreservices.appleevents"))',
         ]
       : []),
     ...(allowMachLookup && allowMachLookup.length > 0
@@ -738,6 +748,7 @@ export function wrapCommandWithSandboxMacOS(
     allowPty,
     allowGitConfig = false,
     enableWeakerNetworkIsolation = false,
+    allowAppleEvents = false,
     binShell,
   } = params
 
@@ -771,6 +782,7 @@ export function wrapCommandWithSandboxMacOS(
     allowPty,
     allowGitConfig,
     enableWeakerNetworkIsolation,
+    allowAppleEvents,
     logTag,
   })
 
