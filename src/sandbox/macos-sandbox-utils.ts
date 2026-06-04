@@ -490,9 +490,10 @@ function generateSandboxProfile({
           '; Apple Events - opt-in; needed for open/osascript to talk to other apps (appleeventsd)',
           '(allow appleevent-send)',
           '(allow mach-lookup (global-name "com.apple.coreservices.appleevents"))',
-          '; Launch Services on macOS 14 (Sonoma) routes open through coreservicesd',
-          '; and the quarantine resolver instead of just launchservicesd - without',
-          '; them open fails with -10822 kLSServerCommunicationErr',
+          '; Launch Services open requests need the lsopen operation plus, on',
+          '; macOS 14/15, coreservicesd and the quarantine resolver - without',
+          '; these open fails with -10822 kLSServerCommunicationErr or -54',
+          '(allow lsopen)',
           '(allow mach-lookup (global-name "com.apple.CoreServices.coreservicesd"))',
           '(allow mach-lookup (global-name "com.apple.coreservices.quarantine-resolver"))',
         ]
