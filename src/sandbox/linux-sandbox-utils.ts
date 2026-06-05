@@ -949,16 +949,6 @@ async function generateFilesystemArgs(
     if (readDenyStat.isDirectory()) {
       args.push('--tmpfs', normalizedPath)
 
-      // tmpfs wiped any earlier write binds under this path — restore them.
-      for (const writePath of allowedWritePaths) {
-        if (writePath.startsWith(denySep) || writePath === normalizedPath) {
-          args.push('--bind', writePath, writePath)
-          logForDebugging(
-            `[Sandbox Linux] Re-bound write path wiped by denyRead tmpfs: ${writePath}`,
-          )
-        }
-      }
-
       // Re-allow specific paths within the denied directory (allowRead overrides denyRead).
       // After mounting tmpfs over the denied dir, bind back the allowed subdirectories
       // so they are readable again.
@@ -987,6 +977,16 @@ async function generateFilesystemArgs(
           args.push('--ro-bind', allowPath, allowPath)
           logForDebugging(
             `[Sandbox Linux] Re-allowed read access within denied region: ${allowPath}`,
+          )
+        }
+      }
+
+      // tmpfs wiped any earlier write binds under this path — restore them.
+      for (const writePath of allowedWritePaths) {
+        if (writePath.startsWith(denySep) || writePath === normalizedPath) {
+          args.push('--bind', writePath, writePath)
+          logForDebugging(
+            `[Sandbox Linux] Re-bound write path wiped by denyRead tmpfs: ${writePath}`,
           )
         }
       }
