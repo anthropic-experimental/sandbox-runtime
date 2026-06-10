@@ -118,7 +118,7 @@ Both filesystem and network isolation are required for effective sandboxing. Wit
 - **Read** (deny-then-allow pattern): By default, read access is allowed everywhere. You can deny broad regions (e.g., `/Users`) and then re-allow specific paths within them (e.g., `.`). `allowRead` takes precedence over `denyRead` — the opposite of write, where `denyWrite` takes precedence over `allowWrite`.
 - **Write** (allow-only pattern): By default, write access is denied everywhere. You must explicitly allow paths (e.g., `.`, `/tmp`). An empty allow list means no write access.
 
-**Network Isolation** (allow-only pattern): By default, all network access is denied. You must explicitly allow domains. An empty allowedDomains list means no network access. Network traffic is routed through proxy servers running on the host:
+**Network Isolation** (allow-only pattern): By default, network isolation is enabled and all network access is denied. You must explicitly allow domains. An empty allowedDomains list means no network access. Set `network.enabled` to `false` to disable network isolation/filtering and allow unrestricted direct network access while continuing to enforce filesystem isolation. When network isolation is enabled, network traffic is routed through proxy servers running on the host:
 
 - **Linux**: Requests are routed via the filesystem over a Unix domain socket. The network namespace of the sandboxed process is removed entirely, so all network traffic must go through the proxies running on the host (listening on Unix sockets that are bind-mounted into the sandbox)
 
@@ -281,8 +281,9 @@ srt --settings /path/to/srt-settings.json <command>
 
 #### Network Configuration
 
-Uses an **allow-only pattern** - all network access is denied by default.
+Uses an **allow-only pattern** - network isolation is enabled by default, and all network access is denied unless explicitly allowed.
 
+- `network.enabled` - Whether network isolation/filtering is enabled (boolean, default: true). Set to `false` to allow unrestricted direct network access while still applying filesystem restrictions.
 - `network.allowedDomains` - Array of allowed domains (supports wildcards like `*.example.com`). Empty array = no network access.
 - `network.deniedDomains` - Array of denied domains (checked first, takes precedence over allowedDomains)
 - `network.allowLocalBinding` - Allow binding to local ports (boolean, default: false)
@@ -407,6 +408,26 @@ Examples:
 ```
 
 This denies reading anything under `/Users` (or `/home` on Linux), then re-allows the current working directory. System paths (`/usr`, `/lib`, etc.) remain readable.
+
+**Filesystem isolation with unrestricted network:**
+
+```json
+{
+  "network": {
+    "enabled": false,
+    "allowedDomains": [],
+    "deniedDomains": []
+  },
+  "filesystem": {
+    "denyRead": ["~"],
+    "allowRead": ["."],
+    "allowWrite": ["."],
+    "denyWrite": [".env"]
+  }
+}
+```
+
+This allows direct network access without SRT domain filtering, while keeping filesystem read/write restrictions in place.
 
 ### Common Issues and Tips
 

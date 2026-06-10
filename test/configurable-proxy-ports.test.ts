@@ -17,6 +17,30 @@ describe('Configurable Proxy Ports Integration Tests', () => {
     await SandboxManager.reset()
   })
 
+  describe('Network isolation disabled', () => {
+    it('should not start proxies when network.enabled is false', async () => {
+      const config: SandboxRuntimeConfig = {
+        network: {
+          enabled: false,
+          allowedDomains: [],
+          deniedDomains: [],
+        },
+        filesystem: {
+          denyRead: [],
+          allowWrite: [],
+          denyWrite: [],
+        },
+      }
+
+      await SandboxManager.initialize(config)
+
+      expect(SandboxManager.getProxyPort()).toBeUndefined()
+      expect(SandboxManager.getSocksProxyPort()).toBeUndefined()
+
+      await SandboxManager.reset()
+    })
+  })
+
   describe('External HTTP proxy + local SOCKS', () => {
     it('should use external HTTP proxy when httpProxyPort is provided', async () => {
       const config: SandboxRuntimeConfig = {

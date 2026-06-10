@@ -115,6 +115,12 @@ const ParentProxyConfigSchema = z.object({
  * Network configuration schema for validation
  */
 export const NetworkConfigSchema = z.object({
+  enabled: z
+    .boolean()
+    .optional()
+    .describe(
+      'Whether network isolation/filtering is enabled. Defaults to true. Set to false to allow unrestricted direct network access while filesystem restrictions still apply.',
+    ),
   allowedDomains: z
     .array(domainPatternSchema)
     .describe('List of allowed domains (e.g., ["github.com", "*.npmjs.org"])'),

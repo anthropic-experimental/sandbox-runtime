@@ -39,17 +39,20 @@ export interface FsWriteRestrictionConfig {
  * Network restriction config (internal structure built from permission rules).
  *
  * This uses an "allow-only" pattern (like write restrictions):
+ * - `enabled: false` = network isolation disabled (allow direct network)
  * - `allowedHosts` = hosts that are explicitly allowed
  * - `deniedHosts` = hosts that are explicitly denied (checked first, before allowedHosts)
  *
  * Semantics:
  * - `undefined` = maximally restrictive (deny all network)
+ * - `{enabled: false}` = unrestricted network access
  * - `{allowedHosts: [], deniedHosts: []}` = maximally restrictive (nothing allowed)
  * - `{allowedHosts: [...], deniedHosts: [...]}` = apply allow/deny rules
  *
  * Note: Empty `allowedHosts` means NO hosts are allowed (unlike read's empty denyOnly).
  */
 export interface NetworkRestrictionConfig {
+  enabled?: boolean
   allowedHosts?: string[]
   deniedHosts?: string[]
 }

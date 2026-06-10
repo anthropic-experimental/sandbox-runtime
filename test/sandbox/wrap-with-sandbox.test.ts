@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
+import { describe, it, expect, beforeAll, afterAll, afterEach } from 'bun:test'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
@@ -166,6 +166,68 @@ describe.if(isSupportedPlatform)('wrapWithSandbox customConfig', () => {
 
       expect(wrapped).not.toBe(command)
     })
+
+    it('can disable network isolation for a custom command', async () => {
+      const command = 'echo test'
+      const wrapped = await SandboxManager.wrapWithSandbox(command, undefined, {
+        network: {
+          enabled: false,
+          allowedDomains: [],
+          deniedDomains: [],
+        },
+        filesystem: {
+          denyRead: [],
+          allowWrite: [],
+          denyWrite: [],
+        },
+      })
+
+      expect(wrapped).not.toBe(command)
+      expect(wrapped).not.toContain('HTTP_PROXY=')
+      expect(wrapped).not.toContain('HTTPS_PROXY=')
+      expect(wrapped).not.toContain('ALL_PROXY=')
+      if (isLinux) {
+        expect(wrapped).not.toContain('--unshare-net')
+      }
+      if (isMacOS) {
+        expect(wrapped).toContain('(allow network*)')
+      }
+    })
+  })
+})
+
+describe.if(isSupportedPlatform)('wrapWithSandbox network.enabled', () => {
+  afterEach(async () => {
+    await SandboxManager.reset()
+  })
+
+  it('keeps filesystem isolation while allowing direct network', async () => {
+    const command = 'echo hello'
+    await SandboxManager.initialize({
+      network: {
+        enabled: false,
+        allowedDomains: [],
+        deniedDomains: [],
+      },
+      filesystem: {
+        denyRead: [],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    })
+
+    const wrapped = await SandboxManager.wrapWithSandbox(command)
+
+    expect(wrapped).not.toBe(command)
+    expect(wrapped).not.toContain('HTTP_PROXY=')
+    expect(wrapped).not.toContain('HTTPS_PROXY=')
+    expect(wrapped).not.toContain('ALL_PROXY=')
+    if (isLinux) {
+      expect(wrapped).not.toContain('--unshare-net')
+    }
+    if (isMacOS) {
+      expect(wrapped).toContain('(allow network*)')
+    }
   })
 })
 

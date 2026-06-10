@@ -90,6 +90,7 @@ describe('Config Validation', () => {
   test('should validate config with optional fields', () => {
     const config = {
       network: {
+        enabled: true,
         allowedDomains: ['example.com'],
         deniedDomains: [],
         allowUnixSockets: ['/var/run/docker.sock'],
@@ -111,6 +112,27 @@ describe('Config Validation', () => {
 
     const result = SandboxRuntimeConfigSchema.safeParse(config)
     expect(result.success).toBe(true)
+  })
+
+  test('should validate config with network isolation disabled', () => {
+    const config = {
+      network: {
+        enabled: false,
+        allowedDomains: [],
+        deniedDomains: [],
+      },
+      filesystem: {
+        denyRead: [],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data.network.enabled).toBe(false)
+    }
   })
 
   test('should reject missing required fields', () => {
