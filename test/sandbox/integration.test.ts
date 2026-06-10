@@ -5,6 +5,7 @@ import {
   mkdirSync,
   rmSync,
   readFileSync,
+  writeFileSync,
 } from 'node:fs'
 import type { Server } from 'node:net'
 import { tmpdir } from 'node:os'
@@ -1273,8 +1274,12 @@ describe.if(isLinux)('Git over SSH through sandbox proxy', () => {
     // Must be set (issue #161: was empty on Linux)
     expect(gitSshCommand).not.toBe('')
     // Must route through socat HTTP CONNECT proxy
-    expect(gitSshCommand).toContain('ssh -o ProxyCommand=')
+    expect(gitSshCommand).toContain('-o ProxyCommand=')
     expect(gitSshCommand).toContain('socat - PROXY:localhost:')
+    // Must disable SSH connection multiplexing: a mux socket configured in the
+    // user's ssh config can't be used inside the sandbox, and OpenSSH treats
+    // mux socket failures as fatal.
+    expect(gitSshCommand).toContain('-o ControlMaster=no -o ControlPath=none')
   })
 
   it('should resolve DNS and connect when running git over SSH', async () => {
@@ -1303,6 +1308,42 @@ describe.if(isLinux)('Git over SSH through sandbox proxy', () => {
     // With /dev/null as the only identity, github rejects auth after a
     // successful TCP connect + SSH handshake. Reaching this error proves
     // DNS resolution and the proxy tunnel both worked.
+    expect(output).toContain('permission denied (publickey)')
+  }, 20000)
+
+  it('should run git over SSH when the user ssh config enables ControlMaster', async () => {
+    // SSH connection multiplexing breaks inside the sandbox: with a ControlPath
+    // configured, ssh creates an AF_UNIX socket for the mux client before
+    // connecting, and the seccomp filter blocks socket(AF_UNIX, ...), which
+    // ssh treats as fatal — it dies before the SSH handshake even starts.
+    // The injected GIT_SSH_COMMAND must neutralize ControlMaster/ControlPath
+    // from the user's ssh config (command-line options take precedence).
+    const sshConfigPath = join(TEST_DIR, 'ssh_config_controlmaster')
+    writeFileSync(
+      sshConfigPath,
+      `Host *\n  ControlMaster auto\n  ControlPath ${TEST_DIR}/mux-%C\n`,
+    )
+
+    const command = await SandboxManager.wrapWithSandbox(
+      `GIT_SSH_COMMAND="$GIT_SSH_COMMAND -F ${sshConfigPath} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -i /dev/null" ` +
+        'git ls-remote ssh://git@github.com/anthropic-experimental/sandbox-runtime.git HEAD 2>&1',
+    )
+
+    const result = await spawnAsync(command, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 15000,
+    })
+
+    const output = (result.stdout + result.stderr).toLowerCase()
+
+    // Without the ControlMaster override, ssh exits before authentication:
+    // "muxclient: socket(): Operation not permitted".
+    expect(output).not.toContain('muxclient')
+    expect(output).not.toContain('control socket')
+
+    // Reaching the publickey rejection proves the SSH handshake completed
+    // through the proxy despite the ControlMaster config.
     expect(output).toContain('permission denied (publickey)')
   }, 20000)
 })

@@ -198,6 +198,27 @@ describe('Config Validation', () => {
     }
   })
 
+  test('should validate config with allowAppleEvents', () => {
+    const config = {
+      network: {
+        allowedDomains: ['example.com'],
+        deniedDomains: [],
+      },
+      filesystem: {
+        denyRead: [],
+        allowWrite: [],
+        denyWrite: [],
+      },
+      allowAppleEvents: true,
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data.allowAppleEvents).toBe(true)
+    }
+  })
+
   test('should validate config with custom ripgrep command', () => {
     const config = {
       network: {
@@ -339,6 +360,50 @@ describe('Config Validation', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,
         bwrapPath: '',
+      })
+      expect(result.success).toBe(false)
+    })
+  })
+
+  describe('network.tlsTerminate', () => {
+    const base = {
+      network: { allowedDomains: [], deniedDomains: [] },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    }
+
+    test('is optional — config without it validates', () => {
+      expect(SandboxRuntimeConfigSchema.safeParse(base).success).toBe(true)
+    })
+
+    test('accepts caCertPath + caKeyPath', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          ...base.network,
+          tlsTerminate: { caCertPath: '/etc/ca.crt', caKeyPath: '/etc/ca.key' },
+        },
+      })
+      expect(result.success).toBe(true)
+    })
+
+    test('rejects when caKeyPath is missing', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          ...base.network,
+          tlsTerminate: { caCertPath: '/etc/ca.crt' },
+        },
+      })
+      expect(result.success).toBe(false)
+    })
+
+    test('rejects empty caCertPath', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        network: {
+          ...base.network,
+          tlsTerminate: { caCertPath: '', caKeyPath: '/etc/ca.key' },
+        },
       })
       expect(result.success).toBe(false)
     })

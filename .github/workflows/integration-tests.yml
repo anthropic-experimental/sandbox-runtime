@@ -27,6 +27,14 @@ jobs:
           - arch: arm64
             runner: macos-14
             os: macos
+          # Windows legs build srt-win, run the Rust smoke scripts,
+          # then the TS integration suite (test/sandbox/winsrt.test.ts).
+          - arch: x86-64
+            runner: windows-latest
+            os: windows
+          - arch: arm64
+            runner: windows-11-arm
+            os: windows
 
     steps:
       - name: Checkout code
@@ -35,12 +43,68 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
+          # Node 20 (Active LTS): Node 18 has no official windows-arm64
+          # build, so setup-node fails on the win/arm64 leg. engines is
+          # >=18.0.0 — this only pins the CI test version, not the floor.
+          node-version: '20'
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.1
+          bun-version: 1.3.14
+
+      # ─── Windows: srt-win helper binary ─────────────────────────────
+      # GitHub-hosted Windows runners run as a member of Administrators
+      # with UAC disabled, so NetLocalGroup* and Fwpm* calls succeed
+      # without an explicit elevation step.
+      - name: Setup Rust (Windows)
+        if: matrix.os == 'windows'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Build srt-win (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          # pwsh does NOT fail the step on a native command's non-zero
+          # exit by default — without this, `cargo test` failing would
+          # be masked by `cargo clippy` exiting 0 on the next line.
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo build  --release --manifest-path vendor/srt-win/Cargo.toml
+          cargo test   --release --manifest-path vendor/srt-win/Cargo.toml
+          cargo clippy --release --manifest-path vendor/srt-win/Cargo.toml --all-targets -- -D warnings
+
+      - name: Smoke-test srt-win group + wfp lifecycle (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win/ci/smoke.ps1 vendor\srt-win\target\release\srt-win.exe
+
+      - name: Smoke-test srt-win exec (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win/ci/smoke-exec.ps1 vendor\srt-win\target\release\srt-win.exe
+
+      - name: TS integration tests (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          # winsrt.test.ts resolves the helper binary via this.
+          SRT_WIN_PATH: ${{ github.workspace }}\vendor\srt-win\target\release\srt-win.exe
+          # Husky's prepare hook chokes on Windows runners; skip it.
+          HUSKY: '0'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm ci
+          npm run build
+          bun test test/sandbox/winsrt.test.ts
+
+      - name: Cleanup srt-win state (Windows)
+        if: always() && matrix.os == 'windows'
+        shell: pwsh
+        run: pwsh vendor/srt-win/ci/cleanup.ps1 vendor\srt-win\target\release\srt-win.exe
 
       - name: Install system dependencies (Linux)
         if: matrix.os == 'linux'
@@ -68,6 +132,7 @@ jobs:
           brew install ripgrep zsh
 
       - name: Install Node dependencies
+        if: matrix.os != 'windows'
         run: npm install
 
       - name: Build seccomp binaries (Linux)
@@ -75,12 +140,15 @@ jobs:
         run: npm run build:seccomp
 
       - name: Build project
+        if: matrix.os != 'windows'
         run: npm run build
 
       - name: Run tests
+        if: matrix.os != 'windows'
         run: npm test
 
       - name: Run Node.js fallback tests
+        if: matrix.os != 'windows'
         run: node test/utils/which-node-test.mjs
 
       - name: Upload test results

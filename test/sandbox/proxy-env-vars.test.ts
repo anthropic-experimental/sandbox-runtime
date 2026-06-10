@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'bun:test'
-import { generateProxyEnvVars } from '../../src/sandbox/sandbox-utils.js'
+import {
+  generateProxyEnvVars,
+  CA_TRUST_VARS,
+} from '../../src/sandbox/sandbox-utils.js'
 
 describe('generateProxyEnvVars', () => {
   it('sets CLOUDSDK_PROXY_TYPE to http (gcloud rejects "https")', () => {
@@ -18,5 +21,30 @@ describe('generateProxyEnvVars', () => {
     const env = generateProxyEnvVars(undefined, 1080)
 
     expect(env.some(v => v.startsWith('CLOUDSDK_PROXY_'))).toBe(false)
+  })
+
+  describe('caCertPath', () => {
+    it('sets all trust env vars to the CA path when provided', () => {
+      const env = generateProxyEnvVars(3128, 1080, '/etc/srt/ca.crt')
+      for (const v of CA_TRUST_VARS) {
+        expect(env).toContain(`${v}=/etc/srt/ca.crt`)
+      }
+    })
+
+    it('sets trust env vars even when no proxy ports are configured', () => {
+      // tlsTerminate implies network restriction in practice, but the env-var
+      // helper should not couple the two.
+      const env = generateProxyEnvVars(undefined, undefined, '/etc/srt/ca.crt')
+      for (const v of CA_TRUST_VARS) {
+        expect(env).toContain(`${v}=/etc/srt/ca.crt`)
+      }
+    })
+
+    it('omits trust env vars when caCertPath is not provided', () => {
+      const env = generateProxyEnvVars(3128, 1080)
+      for (const v of CA_TRUST_VARS) {
+        expect(env.some(e => e.startsWith(`${v}=`))).toBe(false)
+      }
+    })
   })
 })

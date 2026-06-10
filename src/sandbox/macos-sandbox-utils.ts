@@ -25,6 +25,8 @@ export interface MacOSSandboxParams {
   needsNetworkRestriction: boolean
   httpProxyPort?: number
   socksProxyPort?: number
+  /** Path to the TLS-termination CA cert; injected as trust env vars. */
+  caCertPath?: string
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
@@ -35,6 +37,7 @@ export interface MacOSSandboxParams {
   allowPty?: boolean
   allowGitConfig?: boolean
   enableWeakerNetworkIsolation?: boolean
+  allowAppleEvents?: boolean
   binShell?: string
 }
 
@@ -423,6 +426,7 @@ function generateSandboxProfile({
   allowPty,
   allowGitConfig = false,
   enableWeakerNetworkIsolation = false,
+  allowAppleEvents = false,
   logTag,
 }: {
   readConfig: FsReadRestrictionConfig | undefined
@@ -437,6 +441,7 @@ function generateSandboxProfile({
   allowPty?: boolean
   allowGitConfig?: boolean
   enableWeakerNetworkIsolation?: boolean
+  allowAppleEvents?: boolean
   logTag: string
 }): string {
   const profile: string[] = [
@@ -478,6 +483,19 @@ function generateSandboxProfile({
       ? [
           '; trustd.agent - needed for Go TLS certificate verification (weaker network isolation)',
           '(allow mach-lookup (global-name "com.apple.trustd.agent"))',
+        ]
+      : []),
+    ...(allowAppleEvents
+      ? [
+          '; Apple Events - opt-in; needed for open/osascript to talk to other apps (appleeventsd)',
+          '(allow appleevent-send)',
+          '(allow mach-lookup (global-name "com.apple.coreservices.appleevents"))',
+          '; Launch Services open requests need the lsopen operation plus, on',
+          '; macOS 14/15, coreservicesd and the quarantine resolver - without',
+          '; these open fails with -10822 kLSServerCommunicationErr or -54',
+          '(allow lsopen)',
+          '(allow mach-lookup (global-name "com.apple.CoreServices.coreservicesd"))',
+          '(allow mach-lookup (global-name "com.apple.coreservices.quarantine-resolver"))',
         ]
       : []),
     ...(allowMachLookup && allowMachLookup.length > 0
@@ -726,6 +744,7 @@ export function wrapCommandWithSandboxMacOS(
     needsNetworkRestriction,
     httpProxyPort,
     socksProxyPort,
+    caCertPath,
     allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,
@@ -735,6 +754,7 @@ export function wrapCommandWithSandboxMacOS(
     allowPty,
     allowGitConfig = false,
     enableWeakerNetworkIsolation = false,
+    allowAppleEvents = false,
     binShell,
   } = params
 
@@ -768,11 +788,16 @@ export function wrapCommandWithSandboxMacOS(
     allowPty,
     allowGitConfig,
     enableWeakerNetworkIsolation,
+    allowAppleEvents,
     logTag,
   })
 
   // Generate proxy environment variables using shared utility
-  const proxyEnvArgs = generateProxyEnvVars(httpProxyPort, socksProxyPort)
+  const proxyEnvArgs = generateProxyEnvVars(
+    httpProxyPort,
+    socksProxyPort,
+    caCertPath,
+  )
 
   // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
   // Resolve the full path to the shell binary

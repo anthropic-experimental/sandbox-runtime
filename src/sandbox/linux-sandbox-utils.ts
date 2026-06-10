@@ -39,6 +39,8 @@ export interface LinuxSandboxParams {
   socksSocketPath?: string
   httpProxyPort?: number
   socksProxyPort?: number
+  /** Path to the TLS-termination CA cert; injected as trust env vars. */
+  caCertPath?: string
   readConfig?: FsReadRestrictionConfig
   writeConfig?: FsWriteRestrictionConfig
   enableWeakerNestedSandbox?: boolean
@@ -513,11 +515,12 @@ export async function initializeLinuxNetworkBridge(
     stdio: 'ignore',
   })
 
-  if (!httpBridgeProcess.pid) {
-    throw new Error('Failed to start HTTP bridge process')
-  }
-
-  // Add error and exit handlers to monitor bridge health
+  // Add error and exit handlers to monitor bridge health. These must be
+  // registered before the !pid check: when spawn fails (e.g. socat is
+  // missing or not executable), the ChildProcess emits an asynchronous
+  // 'error' event, and throwing first would leave that event without a
+  // listener — surfacing as an uncaughtException instead of the rejection
+  // below.
   httpBridgeProcess.on('error', err => {
     logForDebugging(`HTTP bridge process error: ${err}`, { level: 'error' })
   })
@@ -527,6 +530,10 @@ export async function initializeLinuxNetworkBridge(
       { level: code === 0 ? 'info' : 'error' },
     )
   })
+
+  if (!httpBridgeProcess.pid) {
+    throw new Error('Failed to start HTTP bridge process')
+  }
 
   // Start SOCKS bridge
   const socksSocatArgs = [
@@ -540,6 +547,18 @@ export async function initializeLinuxNetworkBridge(
     stdio: 'ignore',
   })
 
+  // Add error and exit handlers to monitor bridge health — registered
+  // before the !pid check for the same reason as the HTTP bridge above.
+  socksBridgeProcess.on('error', err => {
+    logForDebugging(`SOCKS bridge process error: ${err}`, { level: 'error' })
+  })
+  socksBridgeProcess.on('exit', (code, signal) => {
+    logForDebugging(
+      `SOCKS bridge process exited with code ${code}, signal ${signal}`,
+      { level: code === 0 ? 'info' : 'error' },
+    )
+  })
+
   if (!socksBridgeProcess.pid) {
     // Clean up HTTP bridge
     if (httpBridgeProcess.pid) {
@@ -551,17 +570,6 @@ export async function initializeLinuxNetworkBridge(
     }
     throw new Error('Failed to start SOCKS bridge process')
   }
-
-  // Add error and exit handlers to monitor bridge health
-  socksBridgeProcess.on('error', err => {
-    logForDebugging(`SOCKS bridge process error: ${err}`, { level: 'error' })
-  })
-  socksBridgeProcess.on('exit', (code, signal) => {
-    logForDebugging(
-      `SOCKS bridge process exited with code ${code}, signal ${signal}`,
-      { level: code === 0 ? 'info' : 'error' },
-    )
-  })
 
   // Wait for both sockets to be ready
   const maxAttempts = 5
@@ -1071,6 +1079,7 @@ export async function wrapCommandWithSandboxLinux(
     socksSocketPath,
     httpProxyPort,
     socksProxyPort,
+    caCertPath,
     readConfig,
     writeConfig,
     enableWeakerNestedSandbox,
@@ -1172,6 +1181,7 @@ export async function wrapCommandWithSandboxLinux(
         const proxyEnv = generateProxyEnvVars(
           3128, // Internal HTTP listener port
           1080, // Internal SOCKS listener port
+          caCertPath,
         )
         bwrapArgs.push(
           ...proxyEnv.flatMap((env: string) => {

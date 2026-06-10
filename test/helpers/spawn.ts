@@ -5,6 +5,7 @@ type RunOpts = {
   encoding?: 'utf8'
   timeout?: number
   cwd?: string
+  env?: NodeJS.ProcessEnv
 }
 
 export type RunResult = {
@@ -36,8 +37,8 @@ export async function spawnAsync(
   const args = Array.isArray(argsOrOpts) ? argsOrOpts : undefined
   const opts = (Array.isArray(argsOrOpts) ? maybeOpts : argsOrOpts) ?? {}
   const child = args
-    ? spawn(cmd, args, { cwd: opts.cwd })
-    : spawn(cmd, { shell: opts.shell ?? true, cwd: opts.cwd })
+    ? spawn(cmd, args, { cwd: opts.cwd, env: opts.env })
+    : spawn(cmd, { shell: opts.shell ?? true, cwd: opts.cwd, env: opts.env })
 
   // Match spawnSync's default: when no `input` is given, the child sees
   // EOF on stdin immediately. Without this, things like `su` wait for a

@@ -1,6 +1,6 @@
 {
   "name": "@anthropic-ai/sandbox-runtime",
-  "version": "0.0.50",
+  "version": "0.0.54",
   "description": "Anthropic Sandbox Runtime (ASRT) - A general-purpose tool for wrapping security boundaries around arbitrary processes",
   "type": "module",
   "main": "./dist/index.js",
@@ -26,13 +26,15 @@
   "dependencies": {
     "@pondwader/socks5-server": "^1.0.10",
     "commander": "^12.1.0",
-    "shell-quote": "^1.8.3",
+    "node-forge": "^1.4.0",
+    "shell-quote": "^1.8.4",
     "zod": "^3.24.1"
   },
   "devDependencies": {
     "@eslint/js": "^9.14.0",
     "@types/bun": "^1.3.2",
     "@types/node": "^18",
+    "@types/node-forge": "^1.3.14",
     "@types/shell-quote": "^1.7.5",
     "eslint": "^9.14.0",
     "eslint-config-prettier": "^8.10.0",

@@ -27,9 +27,41 @@ export type {
   NetworkHostPattern,
 } from './sandbox/sandbox-schemas.js'
 
+// Per-request filter
+export type {
+  FilterRequestCallback,
+  RequestDecision,
+} from './sandbox/request-filter.js'
+
 // Platform-specific utilities
 export type { SandboxViolationEvent } from './sandbox/macos-sandbox-utils.js'
 export { type SandboxDependencyCheck } from './sandbox/linux-sandbox-utils.js'
+
+// Windows install/status API
+export {
+  getSrtWinPath,
+  getWindowsGroupStatus,
+  getWindowsWfpStatus,
+  installWindowsSandbox,
+  uninstallWindowsSandbox,
+  createWindowsGroup,
+  deleteWindowsGroup,
+  createWindowsWfp,
+  windowsInstallInstructions,
+  DEFAULT_WINDOWS_GROUP_NAME,
+  DEFAULT_WINDOWS_PROXY_PORT_RANGE,
+} from './sandbox/windows-sandbox-utils.js'
+export type {
+  WindowsGroupRef,
+  WindowsInstallOptions,
+  WindowsInstallResult,
+  WindowsGroupStatus,
+  WindowsGroupStatusResult,
+  WindowsWfpStatus,
+  WindowsWfpStatusResult,
+} from './sandbox/windows-sandbox-utils.js'
+export type { WindowsConfig } from './sandbox/sandbox-config.js'
+export { WindowsConfigSchema } from './sandbox/sandbox-config.js'
 
 // Utility functions
 export { getDefaultWritePaths } from './sandbox/sandbox-utils.js'

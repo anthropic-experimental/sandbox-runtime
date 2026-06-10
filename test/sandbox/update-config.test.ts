@@ -162,6 +162,20 @@ describe('SandboxManager.updateConfig', () => {
     expect(fullConfig).toBeDefined()
     expect(fullConfig?.network.allowedDomains).toEqual([])
   })
+
+  it('preserves filterRequest across updateConfig (structuredClone cannot clone functions)', () => {
+    const filterRequest = async () => ({ action: 'allow' as const })
+    // Must not throw: structuredClone(fn) throws DataCloneError; the
+    // function is pulled out, the rest is cloned, then the reference is
+    // restored.
+    SandboxManager.updateConfig({
+      network: { allowedDomains: [], deniedDomains: [], filterRequest },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+    expect(SandboxManager.getConfig()?.network.filterRequest).toBe(
+      filterRequest,
+    )
+  })
 })
 
 describe('SandboxManager.updateConfig proxy filtering', () => {
