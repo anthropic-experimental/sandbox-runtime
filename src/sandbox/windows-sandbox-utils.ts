@@ -176,6 +176,17 @@ function runSrtWinJson<T>(args: string[]): T {
   }
 }
 
+export function isWindowsAccessDeniedStatusError(message: string): boolean {
+  const normalized = message.toLowerCase()
+  return (
+    normalized.includes('wfp status') &&
+    (normalized.includes('access is denied') ||
+      normalized.includes('access denied') ||
+      normalized.includes('0x00000005') ||
+      normalized.includes('e_accessdenied'))
+  )
+}
+
 // ────────────────────────────────────────────────────────────────────
 // Status / install API
 // ────────────────────────────────────────────────────────────────────
@@ -595,7 +606,14 @@ export function checkWindowsDependencies(
   try {
     ws = getWindowsWfpStatus({ sublayerGuid })
   } catch (e) {
-    errors.push(`srt-win wfp status failed: ${(e as Error).message}`)
+    const message = (e as Error).message
+    if (isWindowsAccessDeniedStatusError(message)) {
+      warnings.push(
+        `srt-win WFP status could not be verified without administrator rights: ${message}`,
+      )
+      return { errors, warnings }
+    }
+    errors.push(`srt-win wfp status failed: ${message}`)
     return { errors, warnings }
   }
   if (ws.state !== 'installed') {
