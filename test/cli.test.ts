@@ -1,5 +1,7 @@
 import { describe, test, expect } from 'bun:test'
 import { spawnSync } from 'node:child_process'
+import * as fs from 'node:fs'
+import * as os from 'node:os'
 import { join } from 'node:path'
 
 /**
@@ -114,6 +116,50 @@ describe('CLI', () => {
       // not shell syntax (use -c for shell semantics).
       const result = runCli(['printf', '%s', '$HOME;|&'])
       expect(result.stdout).toBe('$HOME;|&')
+      expect(result.status).toBe(0)
+    })
+  })
+
+  describe('option passthrough to wrapped commands', () => {
+    test('does not consume -s flag from wrapped command', () => {
+      // Regression: -s is SRT's --settings shorthand, but after the command
+      // name it should pass through to the wrapped command, not be parsed
+      const result = runCli(['echo', '-s', 'silent'])
+      expect(result.stdout.trim()).toBe('-s silent')
+      expect(result.status).toBe(0)
+    })
+
+    test('does not consume -d flag from wrapped command', () => {
+      // -d is SRT's --debug shorthand, but after the command name it should
+      // pass through
+      const result = runCli(['echo', '-d', 'debug'])
+      expect(result.stdout.trim()).toBe('-d debug')
+      expect(result.status).toBe(0)
+    })
+
+    test('SRT -s/--settings still works before command', () => {
+      // SRT's own -s should still be parsed when it appears before the
+      // wrapped command. Use a real config file to avoid silent-fallback issues.
+      const tmpDir = fs.mkdtempSync(join(os.tmpdir(), 'srt-test-'))
+      const configPath = join(tmpDir, 'config.json')
+      const validConfig = {
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      }
+      fs.writeFileSync(configPath, JSON.stringify(validConfig))
+
+      try {
+        const result = runCli(['-s', configPath, 'echo', 'hello'])
+        expect(result.stdout.trim()).toBe('hello')
+        expect(result.status).toBe(0)
+      } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true })
+      }
+    })
+
+    test('-- separator still works for backwards compatibility', () => {
+      const result = runCli(['--', 'echo', '-s', 'test'])
+      expect(result.stdout.trim()).toBe('-s test')
       expect(result.status).toBe(0)
     })
   })
