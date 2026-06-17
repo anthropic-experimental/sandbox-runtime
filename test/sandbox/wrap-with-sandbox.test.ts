@@ -7,6 +7,7 @@ import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { isLinux, isMacOS, isSupportedPlatform } from '../helpers/platform.js'
+import { getProfileFromWrappedCommand } from '../helpers/profile.js'
 
 /**
  * Create a test configuration with network access
@@ -646,7 +647,10 @@ describe('allowWrite glob suffix handling', () => {
       const result = await SandboxManager.wrapWithSandbox(command)
 
       expect(result).not.toBe(command)
-      expect(result).toContain(testDir)
+      // On macOS the profile rides in a temp file (sandbox-exec -f), so the
+      // paths appear in the profile contents rather than the command string.
+      const rules = isMacOS ? getProfileFromWrappedCommand(result) : result
+      expect(rules).toContain(testDir)
     } finally {
       await SandboxManager.reset()
       rmSync(testDir, { recursive: true, force: true })
@@ -672,8 +676,9 @@ describe('allowWrite glob suffix handling', () => {
       const result = await SandboxManager.wrapWithSandbox(command)
 
       expect(result).not.toBe(command)
-      expect(result).toContain(parentDir)
-      expect(result).toContain(childDir)
+      const rules = isMacOS ? getProfileFromWrappedCommand(result) : result
+      expect(rules).toContain(parentDir)
+      expect(rules).toContain(childDir)
     } finally {
       await SandboxManager.reset()
       rmSync(parentDir, { recursive: true, force: true })

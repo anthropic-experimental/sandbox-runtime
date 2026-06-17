@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 import { isMacOS } from '../helpers/platform.js'
+import { getProfileFromWrappedCommand } from '../helpers/profile.js'
 import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
@@ -708,8 +709,9 @@ describe.if(isMacOS)(
         writeConfig,
       })
 
-      expect(wrappedCommand).toContain('deny file-write-create')
-      expect(wrappedCommand).toContain('deny file-write-unlink')
+      const profile = getProfileFromWrappedCommand(wrappedCommand)
+      expect(profile).toContain('deny file-write-create')
+      expect(profile).toContain('deny file-write-unlink')
     })
 
     it('should block creating a symlink at a non-existent protected ancestor', () => {
@@ -994,11 +996,12 @@ describe.if(isMacOS)('macOS Seatbelt allowMachLookup', () => {
       writeConfig: undefined,
     })
 
-    expect(wrappedCommand).toContain(
-      '(allow mach-lookup (global-name \\"com.apple.CoreSimulator.CoreSimulatorService\\"))',
+    const profile = getProfileFromWrappedCommand(wrappedCommand)
+    expect(profile).toContain(
+      '(allow mach-lookup (global-name "com.apple.CoreSimulator.CoreSimulatorService"))',
     )
-    expect(wrappedCommand).toContain(
-      '(allow mach-lookup (global-name-prefix \\"2BUA8C4S2C.com.1password.\\"))',
+    expect(profile).toContain(
+      '(allow mach-lookup (global-name-prefix "2BUA8C4S2C.com.1password."))',
     )
   })
 

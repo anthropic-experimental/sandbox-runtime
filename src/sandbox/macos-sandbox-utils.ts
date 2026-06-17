@@ -1,5 +1,8 @@
 import shellquote from 'shell-quote'
 import { spawn } from 'child_process'
+import { randomBytes } from 'crypto'
+import * as fs from 'fs'
+import { tmpdir } from 'os'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
@@ -369,8 +372,17 @@ function generateWriteRules(
   logTag: string,
   allowGitConfig = false,
 ): string[] {
+  // Always denied, even without write restrictions: the profile files read by
+  // sandbox-exec -f for subsequent commands. A sandboxed command that can
+  // overwrite one controls the policy applied to the next sandboxed command.
+  const profileFileDenyPaths = [getMacOSProfileFileDir()]
+
   if (!config) {
-    return [`(allow file-write*)`]
+    return [
+      `(allow file-write*)`,
+      ...generateDenyWriteRules(profileFileDenyPaths, logTag),
+      ...generateMoveBlockingRules(profileFileDenyPaths, logTag),
+    ]
   }
 
   const rules: string[] = []
@@ -401,8 +413,22 @@ function generateWriteRules(
   const denyPaths = [
     ...(config.denyWithinAllow || []),
     ...macGetMandatoryDenyPatterns(allowGitConfig),
+    ...profileFileDenyPaths,
   ]
 
+  rules.push(...generateDenyWriteRules(denyPaths, logTag))
+
+  // Block file movement to prevent bypass via mv/rename
+  rules.push(...generateMoveBlockingRules(denyPaths, logTag))
+
+  return rules
+}
+
+/**
+ * Generate (deny file-write*) rules for the given path patterns
+ */
+function generateDenyWriteRules(denyPaths: string[], logTag: string): string[] {
+  const rules: string[] = []
   for (const pathPattern of denyPaths) {
     const normalizedPath = normalizePathForSandbox(pathPattern)
 
@@ -423,10 +449,6 @@ function generateWriteRules(
       )
     }
   }
-
-  // Block file movement to prevent bypass via mv/rename
-  rules.push(...generateMoveBlockingRules(denyPaths, logTag))
-
   return rules
 }
 
@@ -753,6 +775,78 @@ function escapePath(pathStr: string): string {
   return JSON.stringify(pathStr)
 }
 
+// Profile files are only read by sandbox-exec at startup, milliseconds after
+// the wrapped command is spawned. Anything older than this is garbage from a
+// previous command (or a crashed process) and is swept on the next wrap call.
+// Generous so that a wrap → spawn gap (scheduling, machine sleep) can't delete
+// a profile before sandbox-exec reads it.
+const PROFILE_FILE_MAX_AGE_MS = 5 * 60 * 1000
+const PROFILE_FILE_RE = /^srt-\d+-(\d+)-[0-9a-f]+\.sb$/
+
+/**
+ * Directory holding seatbelt profile files passed to sandbox-exec -f.
+ *
+ * Every generated profile denies writes under this directory (see
+ * generateWriteRules), because a sandboxed command that can modify a profile
+ * file controls the policy applied to the next sandboxed command — a sandbox
+ * escape. The uid suffix keeps the directory per-user when TMPDIR falls back
+ * to a world-writable /tmp.
+ */
+export function getMacOSProfileFileDir(): string {
+  // Resolve symlinks (/var/folders → /private/var/folders) so the deny rule
+  // matches the canonical path seatbelt evaluates, even before the profile
+  // directory itself exists.
+  let tmp = tmpdir()
+  try {
+    tmp = fs.realpathSync(tmp)
+  } catch {
+    // Keep the unresolved path; normalizePathForSandbox handles the rest.
+  }
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 0
+  return path.join(tmp, `srt-profiles-${uid}`)
+}
+
+/**
+ * Write a seatbelt profile to a per-user temp file for sandbox-exec -f, and
+ * sweep stale profile files left by earlier commands or crashed processes.
+ * Returns the absolute path of the written file. Throws if the directory is
+ * not exclusively ours or the file cannot be created (caller falls back to
+ * inline -p).
+ */
+export function writeMacOSProfileFile(profile: string): string {
+  const profileDir = getMacOSProfileFileDir()
+  fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 })
+  // mkdirSync does not error when the directory already exists, so verify we
+  // own it and nobody else can write to it (a pre-created directory in a
+  // shared /tmp could let another user swap profile files).
+  const dirStat = fs.lstatSync(profileDir)
+  const uid = typeof process.getuid === 'function' ? process.getuid() : 0
+  if (
+    !dirStat.isDirectory() ||
+    dirStat.uid !== uid ||
+    (dirStat.mode & 0o022) !== 0
+  ) {
+    throw new Error(`Profile directory ${profileDir} is not exclusively ours`)
+  }
+  const now = Date.now()
+  for (const name of fs.readdirSync(profileDir)) {
+    const match = PROFILE_FILE_RE.exec(name)
+    if (match && now - Number(match[1]) > PROFILE_FILE_MAX_AGE_MS) {
+      try {
+        fs.unlinkSync(path.join(profileDir, name))
+      } catch {
+        // A concurrent sweep already removed it; ignore.
+      }
+    }
+  }
+  const profileFile = path.join(
+    profileDir,
+    `srt-${process.pid}-${now}-${randomBytes(8).toString('hex')}.sb`,
+  )
+  fs.writeFileSync(profileFile, profile, { mode: 0o600 })
+  return profileFile
+}
+
 /**
  * Wrap command with macOS sandbox
  */
@@ -829,14 +923,31 @@ export function wrapCommandWithSandboxMacOS(
     throw new Error(`Shell '${shellName}' not found in PATH`)
   }
 
+  // Pass the (often ~50-100KB) profile to sandbox-exec via a temp file (-f)
+  // instead of inline argv (-p). The inline form costs tens of milliseconds per
+  // command: the outer shell has to re-parse the quoted profile and the kernel
+  // copies it through argv twice. With -f, the wrapped command string stays ~1KB.
+  // Only sandbox-exec (which runs unsandboxed, before applying the profile)
+  // reads the file, milliseconds after spawn — writeMacOSProfileFile() sweeps
+  // stale files from earlier commands on each call, so no shell-side cleanup
+  // (an extra `rm` process per command) is needed. The generated profile denies
+  // writes under the profile directory, so the sandboxed command cannot tamper
+  // with the policy file of a subsequent command.
+  // Falls back to inline -p if the temp file can't be written.
+  let profileArgs = ['-p', profile]
+  try {
+    profileArgs = ['-f', writeMacOSProfileFile(profile)]
+  } catch {
+    // Temp dir unavailable; fall back to passing the profile inline.
+  }
+
   // Use `env` command to set environment variables - each VAR=value is a separate
   // argument that shellquote handles properly, avoiding shell quoting issues
   const wrappedCommand = shellquote.quote([
     'env',
     ...proxyEnvArgs,
     '/usr/bin/sandbox-exec',
-    '-p',
-    profile,
+    ...profileArgs,
     shell,
     '-c',
     command,

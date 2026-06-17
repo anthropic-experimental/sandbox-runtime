@@ -2,6 +2,7 @@ import { describe, it, expect } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 import { isMacOS } from '../helpers/platform.js'
+import { getProfileFromWrappedCommand } from '../helpers/profile.js'
 
 /**
  * Tests for the opt-in allowAppleEvents option (macOS only).
@@ -34,20 +35,24 @@ describe.if(isMacOS)(
       expect(wrapped).not.toContain('com.apple.coreservices.appleevents')
     })
 
-    it('generates an identical command when unset and when explicitly false', () => {
-      const unset = wrapCommand('echo test')
-      const explicitFalse = wrapCommand('echo test', false)
+    it('generates an identical profile when unset and when explicitly false', () => {
+      // The wrapped commands differ (each carries a unique sandbox-exec -f
+      // profile file path), so compare the profile contents instead.
+      const unset = getProfileFromWrappedCommand(wrapCommand('echo test'))
+      const explicitFalse = getProfileFromWrappedCommand(
+        wrapCommand('echo test', false),
+      )
 
       expect(explicitFalse).toBe(unset)
     })
 
     it('includes Apple Events rules when enabled', () => {
-      const wrapped = wrapCommand('echo test', true)
+      const profile = getProfileFromWrappedCommand(
+        wrapCommand('echo test', true),
+      )
 
-      // The wrapped command is shell-quoted, so quotes inside the profile are
-      // escaped — match the rule fragments rather than the exact profile lines.
-      expect(wrapped).toContain('(allow appleevent-send)')
-      expect(wrapped).toContain('com.apple.coreservices.appleevents')
+      expect(profile).toContain('(allow appleevent-send)')
+      expect(profile).toContain('com.apple.coreservices.appleevents')
     })
 
     it('produces a profile that sandbox-exec accepts when enabled', () => {
