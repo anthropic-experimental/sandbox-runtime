@@ -645,18 +645,22 @@ function generateSandboxProfile({
   if (!needsNetworkRestriction) {
     profile.push('(allow network*)')
   } else {
-    // Allow local binding if requested
-    // Use "*:*" instead of "localhost:*" because modern runtimes (Java, etc.) create
-    // IPv6 dual-stack sockets by default. When binding such a socket to 127.0.0.1,
-    // the kernel represents it as ::ffff:127.0.0.1 (IPv4-mapped IPv6). Seatbelt's
-    // "localhost" filter only matches 127.0.0.1 and ::1, NOT ::ffff:127.0.0.1.
-    // Using (local ip "*:*") is safe because it only matches the LOCAL endpoint —
-    // internet-bound connections originate from non-loopback interfaces, so they
-    // remain blocked by (deny default).
+    // Allow local binding if requested. Use "*:*" rather than "localhost:*" for
+    // bind/inbound: modern runtimes (Java, etc.) bind 127.0.0.1 via IPv6
+    // dual-stack sockets, which the kernel presents as ::ffff:127.0.0.1 — a form
+    // Seatbelt's "localhost" filter does not match.
+    //
+    // Intentionally NO network-outbound rule here. (local ip "*:*") matches a
+    // socket's LOCAL/source endpoint, and every outbound connection has one, so a
+    // wildcard outbound rule grants arbitrary direct egress and bypasses the
+    // proxy. (This block historically carried such a rule, widened from
+    // "localhost:*" to "*:*" alongside the dual-stack bind fix — do not re-add it.)
+    // Outbound stays limited to the proxy-specific (remote ip "localhost:<port>")
+    // rules below, keeping allowedDomains an OS-enforced boundary even for clients
+    // that ignore proxy env vars.
     if (allowLocalBinding) {
       profile.push('(allow network-bind (local ip "*:*"))')
       profile.push('(allow network-inbound (local ip "*:*"))')
-      profile.push('(allow network-outbound (local ip "*:*"))')
     }
     // Unix domain sockets for local IPC (SSH agent, Docker, Gradle, etc.)
     // Three separate operations must be allowed:
