@@ -620,7 +620,7 @@ function getCredentialRestrictions(
 }
 
 function getFsReadConfig(): FsReadRestrictionConfig {
-  if (!config) {
+  if (!config || config.filesystem.unrestricted) {
     return { denyOnly: [], allowWithinDeny: [] }
   }
 
@@ -675,6 +675,10 @@ function getFsReadConfig(): FsReadRestrictionConfig {
 function getFsWriteConfig(): FsWriteRestrictionConfig {
   if (!config) {
     return { allowOnly: getDefaultWritePaths(), denyWithinAllow: [] }
+  }
+
+  if (config.filesystem.unrestricted) {
+    return { allowOnly: ['/'], denyWithinAllow: [] }
   }
 
   // Filter out glob patterns on Linux/WSL for allowWrite (bubblewrap doesn't support globs)
@@ -823,6 +827,28 @@ async function wrapWithSandbox(
 ): Promise<string> {
   const platform = getPlatform()
 
+  // filesystem.unrestricted bypasses ALL filesystem rule generation. Both
+  // platform wrappers treat readConfig/writeConfig === undefined as "no
+  // filesystem restrictions" (seatbelt emits `(allow file-write*)`; bwrap
+  // skips the `--ro-bind / /` root and all path binds).
+  //
+  // Precedence: when a caller passes a per-call filesystem override at all,
+  // its `unrestricted` (defaulting to false) wins outright. A global
+  // unrestricted=true must not silently discard a per-call tightening that
+  // omits the new key.
+  const fsUnrestricted =
+    customConfig?.filesystem !== undefined
+      ? (customConfig.filesystem.unrestricted ?? false)
+      : (config?.filesystem.unrestricted ?? false)
+
+  // Credential env handling is independent of filesystem policy: unsetEnvVars /
+  // setEnvVars must be applied even when fsUnrestricted (the credential file
+  // deny-reads are dropped, but env scrubbing still happens).
+  const credentialRestrictions = getCredentialRestrictions(
+    customConfig?.credentials ?? config?.credentials,
+    customConfig?.network?.allowedDomains ?? config?.network?.allowedDomains,
+  )
+
   // Get configs - use custom if provided, otherwise fall back to main config
   // If neither exists, defaults to empty arrays (most restrictive)
   // Always include default system write paths (like /dev/null, /tmp/claude)
@@ -830,71 +856,75 @@ async function wrapWithSandbox(
   // Strip trailing /** and filter remaining globs on Linux (bwrap needs
   // real paths, not globs; macOS subpath matching is also recursive so
   // stripping is harmless there).
-  const stripWriteGlobs = (paths: string[]): string[] =>
-    paths
-      .map(p => removeTrailingGlobSuffix(p))
-      .filter(p => {
-        if (getPlatform() === 'linux' && containsGlobChars(p)) {
-          logForDebugging(
-            `[Sandbox] Skipping glob write pattern on Linux: ${p}`,
-          )
-          return false
-        }
-        return true
-      })
-  const userAllowWrite = stripWriteGlobs(
-    customConfig?.filesystem?.allowWrite ?? config?.filesystem.allowWrite ?? [],
-  )
-  const writeConfig = {
-    allowOnly: [...getDefaultWritePaths(), ...userAllowWrite],
-    denyWithinAllow: stripWriteGlobs(
-      customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
-    ),
-  }
-  // Credential file denies and env unsets derived from the credentials
-  // section. The deny paths are unioned with the caller's denyRead — never
-  // replacing it — so explicit filesystem restrictions always survive.
-  const credentialRestrictions = getCredentialRestrictions(
-    customConfig?.credentials ?? config?.credentials,
-    customConfig?.network?.allowedDomains ?? config?.network?.allowedDomains,
-  )
-  const rawDenyRead = [
-    ...new Set([
-      ...(customConfig?.filesystem?.denyRead ??
-        config?.filesystem.denyRead ??
-        []),
-      ...credentialRestrictions.denyReadPaths,
-    ]),
-  ]
-  const expandedDenyRead: string[] = []
-  for (const p of rawDenyRead) {
-    const stripped = removeTrailingGlobSuffix(p)
-    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-      expandedDenyRead.push(...expandGlobPattern(p))
-    } else {
-      expandedDenyRead.push(stripped)
+  let writeConfig: FsWriteRestrictionConfig | undefined
+  let readConfig: FsReadRestrictionConfig | undefined
+  if (!fsUnrestricted) {
+    const stripWriteGlobs = (paths: string[]): string[] =>
+      paths
+        .map(p => removeTrailingGlobSuffix(p))
+        .filter(p => {
+          if (getPlatform() === 'linux' && containsGlobChars(p)) {
+            logForDebugging(
+              `[Sandbox] Skipping glob write pattern on Linux: ${p}`,
+            )
+            return false
+          }
+          return true
+        })
+    const userAllowWrite = stripWriteGlobs(
+      customConfig?.filesystem?.allowWrite ??
+        config?.filesystem.allowWrite ??
+        [],
+    )
+    writeConfig = {
+      allowOnly: [...getDefaultWritePaths(), ...userAllowWrite],
+      denyWithinAllow: stripWriteGlobs(
+        customConfig?.filesystem?.denyWrite ??
+          config?.filesystem.denyWrite ??
+          [],
+      ),
     }
-  }
-  const rawAllowRead =
-    customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? []
-  const expandedAllowRead: string[] = []
-  for (const p of rawAllowRead) {
-    const stripped = removeTrailingGlobSuffix(p)
-    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-      expandedAllowRead.push(...expandGlobPattern(p))
-    } else {
-      expandedAllowRead.push(stripped)
+
+    // Credential deny paths are unioned with the caller's denyRead — never
+    // replacing it — so explicit filesystem restrictions always survive.
+    const rawDenyRead = [
+      ...new Set([
+        ...(customConfig?.filesystem?.denyRead ??
+          config?.filesystem.denyRead ??
+          []),
+        ...credentialRestrictions.denyReadPaths,
+      ]),
+    ]
+    const expandedDenyRead: string[] = []
+    for (const p of rawDenyRead) {
+      const stripped = removeTrailingGlobSuffix(p)
+      if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
+        expandedDenyRead.push(...expandGlobPattern(p))
+      } else {
+        expandedDenyRead.push(stripped)
+      }
     }
-  }
-  // The TLS-termination CA cert must be readable by the child so the trust
-  // env vars (NODE_EXTRA_CA_CERTS etc.) resolve, even if its path falls
-  // under a user-configured denyRead.
-  if (mitmCA) {
-    expandedAllowRead.push(mitmCA.certPath)
-  }
-  const readConfig = {
-    denyOnly: expandedDenyRead,
-    allowWithinDeny: expandedAllowRead,
+    const rawAllowRead =
+      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? []
+    const expandedAllowRead: string[] = []
+    for (const p of rawAllowRead) {
+      const stripped = removeTrailingGlobSuffix(p)
+      if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
+        expandedAllowRead.push(...expandGlobPattern(p))
+      } else {
+        expandedAllowRead.push(stripped)
+      }
+    }
+    // The TLS-termination CA cert must be readable by the child so the trust
+    // env vars (NODE_EXTRA_CA_CERTS etc.) resolve, even if its path falls
+    // under a user-configured denyRead.
+    if (mitmCA) {
+      expandedAllowRead.push(mitmCA.certPath)
+    }
+    readConfig = {
+      denyOnly: expandedDenyRead,
+      allowWithinDeny: expandedAllowRead,
+    }
   }
 
   // Check if network config is specified - this determines if we need network restrictions
@@ -1342,7 +1372,7 @@ function annotateStderrWithSandboxFailures(
 function getLinuxGlobPatternWarnings(): string[] {
   // Only warn on Linux/WSL (bubblewrap doesn't support globs)
   // macOS supports glob patterns via regex conversion
-  if (getPlatform() !== 'linux' || !config) {
+  if (getPlatform() !== 'linux' || !config || config.filesystem.unrestricted) {
     return []
   }
 

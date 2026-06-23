@@ -1017,7 +1017,10 @@ async function generateFilesystemArgs(
   // Always hide /etc/ssh/ssh_config.d to avoid permission issues with OrbStack
   // SSH is very strict about config file permissions and ownership, and they can
   // appear wrong inside the sandbox causing "Bad owner or permissions" errors
-  if (fs.existsSync('/etc/ssh/ssh_config.d')) {
+  //
+  // Skipped when readConfig is undefined (filesystem.unrestricted): no read
+  // policy means no implicit read denies either.
+  if (readConfig && fs.existsSync('/etc/ssh/ssh_config.d')) {
     readDenyPaths.push('/etc/ssh/ssh_config.d')
   }
 
