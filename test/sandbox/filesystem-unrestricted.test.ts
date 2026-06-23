@@ -29,12 +29,17 @@ describe.if(isSupportedPlatform)('filesystem.unrestricted', () => {
 
   // allowWrite deliberately points somewhere ELSE so TEST_DIR is not
   // covered by any configured write rule. Without unrestricted, writing
-  // to TEST_FILE would be blocked.
+  // to TEST_WRITE_FILE would be blocked.
+  //
+  // denyRead is NOT set on the shared base config: on Linux a directory
+  // read-deny mounts a writable tmpfs over the path, which would let the
+  // control test's redirect succeed (exit 0) inside the namespace. The
+  // 'ignores denyRead' test supplies its own denyRead.
   const baseConfig = (unrestricted: boolean): SandboxRuntimeConfig => ({
     network: { allowedDomains: [], deniedDomains: [] },
     filesystem: {
       unrestricted,
-      denyRead: [TEST_DIR],
+      denyRead: [],
       allowWrite: ['/nonexistent-allow-write'],
       denyWrite: [],
     },
@@ -104,7 +109,13 @@ describe.if(isSupportedPlatform)('filesystem.unrestricted', () => {
 
   it('ignores denyRead when unrestricted is true', async () => {
     await SandboxManager.reset()
-    await SandboxManager.initialize(baseConfig(true))
+    await SandboxManager.initialize({
+      ...baseConfig(true),
+      filesystem: {
+        ...baseConfig(true).filesystem,
+        denyRead: [TEST_DIR],
+      },
+    })
 
     // TEST_READ_FILE is created in beforeAll; TEST_DIR is in denyRead.
     const wrapped = await SandboxManager.wrapWithSandbox(
