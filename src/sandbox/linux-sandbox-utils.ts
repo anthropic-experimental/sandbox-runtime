@@ -1018,7 +1018,7 @@ async function generateFilesystemArgs(
   // SSH is very strict about config file permissions and ownership, and they can
   // appear wrong inside the sandbox causing "Bad owner or permissions" errors
   //
-  // Skipped when readConfig is undefined (filesystem.unrestricted): no read
+  // Skipped when readConfig is undefined (filesystem.disabled): no read
   // policy means no implicit read denies either.
   if (readConfig && fs.existsSync('/etc/ssh/ssh_config.d')) {
     readDenyPaths.push('/etc/ssh/ssh_config.d')

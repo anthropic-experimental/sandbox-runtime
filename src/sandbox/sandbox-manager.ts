@@ -620,7 +620,7 @@ function getCredentialRestrictions(
 }
 
 function getFsReadConfig(): FsReadRestrictionConfig {
-  if (!config || config.filesystem.unrestricted) {
+  if (!config || config.filesystem.disabled) {
     return { denyOnly: [], allowWithinDeny: [] }
   }
 
@@ -677,7 +677,7 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
     return { allowOnly: getDefaultWritePaths(), denyWithinAllow: [] }
   }
 
-  if (config.filesystem.unrestricted) {
+  if (config.filesystem.disabled) {
     return { allowOnly: ['/'], denyWithinAllow: [] }
   }
 
@@ -827,22 +827,22 @@ async function wrapWithSandbox(
 ): Promise<string> {
   const platform = getPlatform()
 
-  // filesystem.unrestricted bypasses ALL filesystem rule generation. Both
+  // filesystem.disabled bypasses ALL filesystem rule generation. Both
   // platform wrappers treat readConfig/writeConfig === undefined as "no
   // filesystem restrictions" (seatbelt emits `(allow file-write*)`; bwrap
   // skips the `--ro-bind / /` root and all path binds).
   //
   // Precedence: when a caller passes a per-call filesystem override at all,
-  // its `unrestricted` (defaulting to false) wins outright. A global
-  // unrestricted=true must not silently discard a per-call tightening that
+  // its `disabled` (defaulting to false) wins outright. A global
+  // disabled=true must not silently discard a per-call tightening that
   // omits the new key.
-  const fsUnrestricted =
+  const fsDisabled =
     customConfig?.filesystem !== undefined
-      ? (customConfig.filesystem.unrestricted ?? false)
-      : (config?.filesystem.unrestricted ?? false)
+      ? (customConfig.filesystem.disabled ?? false)
+      : (config?.filesystem.disabled ?? false)
 
   // Credential env handling is independent of filesystem policy: unsetEnvVars /
-  // setEnvVars must be applied even when fsUnrestricted (the credential file
+  // setEnvVars must be applied even when fsDisabled (the credential file
   // deny-reads are dropped, but env scrubbing still happens).
   const credentialRestrictions = getCredentialRestrictions(
     customConfig?.credentials ?? config?.credentials,
@@ -858,7 +858,7 @@ async function wrapWithSandbox(
   // stripping is harmless there).
   let writeConfig: FsWriteRestrictionConfig | undefined
   let readConfig: FsReadRestrictionConfig | undefined
-  if (!fsUnrestricted) {
+  if (!fsDisabled) {
     const stripWriteGlobs = (paths: string[]): string[] =>
       paths
         .map(p => removeTrailingGlobSuffix(p))
@@ -1372,7 +1372,7 @@ function annotateStderrWithSandboxFailures(
 function getLinuxGlobPatternWarnings(): string[] {
   // Only warn on Linux/WSL (bubblewrap doesn't support globs)
   // macOS supports glob patterns via regex conversion
-  if (getPlatform() !== 'linux' || !config || config.filesystem.unrestricted) {
+  if (getPlatform() !== 'linux' || !config || config.filesystem.disabled) {
     return []
   }
 

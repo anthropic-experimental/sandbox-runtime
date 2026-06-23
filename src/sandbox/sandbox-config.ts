@@ -343,7 +343,7 @@ export const NetworkConfigSchema = z.object({
  * Filesystem configuration schema for validation
  */
 export const FilesystemConfigSchema = z.object({
-  unrestricted: z
+  disabled: z
     .boolean()
     .optional()
     .describe(
