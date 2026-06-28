@@ -16,11 +16,20 @@ describe('--control-fd', () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'control-fd-test-'))
   })
 
-  afterEach(() => {
+  afterEach(async () => {
     if (child && !child.killed) {
       child.kill('SIGKILL')
     }
     fs.rmSync(tmpDir, { recursive: true, force: true })
+    // Bun's node:child_process shim implements extra stdio 'pipe' entries
+    // (fd 3 here) via a unix socket, and tears that socket down
+    // asynchronously after the child exits. The tests above all hit the
+    // 2000ms safety timeout and SIGKILL their child, so on a fast runner
+    // the next test's spawn can race that teardown and Bun's
+    // #createStdioObject throws `Failed to connect` (connect ENOENT) —
+    // observed on linux/arm64. Yield briefly so the prior child's stdio
+    // cleanup settles before the next spawn.
+    await new Promise(r => setTimeout(r, 50))
   })
 
   it('should update config when receiving valid JSON on control fd', async () => {
