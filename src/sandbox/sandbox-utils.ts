@@ -1,6 +1,7 @@
 import { homedir } from 'os'
 import * as path from 'path'
 import * as fs from 'fs'
+import shellquote from 'shell-quote'
 import { getPlatform } from '../utils/platform.js'
 import { logForDebugging } from '../utils/debug.js'
 
@@ -549,6 +550,44 @@ export function generateProxyEnvVars(
   // already carries the route for clients that read it.
 
   return envVars
+}
+
+/**
+ * shellquote.quote() with two corrections for how a real shell re-parses
+ * the output:
+ *
+ * - When an element contains a single quote plus whitespace or a double
+ *   quote, quote() wraps it in double quotes and escapes `!` as `\!` —
+ *   but `\!` inside double quotes has no portable meaning. POSIX shells
+ *   and bash (every mode; "The backslash preceding the ! is not
+ *   removed") keep the backslash, so the program receives `\!`;
+ *   interactive zsh removes it. No double-quoted serialization of `!`
+ *   is correct for both, so elements that quote() would double-quote
+ *   are serialized with single quotes instead (`'` becomes `'\''`).
+ *   Inside single quotes `!` is inert in every mode of every
+ *   POSIX-family shell, including interactive bash and zsh. (The lone
+ *   exception, csh/tcsh, expands `!` through single quotes too — but
+ *   csh cannot parse this output format at all: `\"`, `\$` and
+ *   newlines inside quotes are csh syntax errors.)
+ *
+ * - A bare element starting with `~` is left unquoted and tilde-expands
+ *   on re-parse; prefix a backslash. (Fixed upstream in shell-quote
+ *   1.9.0; this keeps us correct on 1.8.x and is a no-op after a bump —
+ *   1.9.0's bare output already starts with `\~`.)
+ */
+export function quoteForShell(args: readonly string[]): string {
+  return args
+    .map(arg => {
+      const q = shellquote.quote([arg])
+      if (q.startsWith('"')) {
+        return `'${arg.replace(/'/g, "'\\''")}'`
+      }
+      if (q.startsWith('~')) {
+        return `\\${q}`
+      }
+      return q
+    })
+    .join(' ')
 }
 
 /**

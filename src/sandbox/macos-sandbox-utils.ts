@@ -1,10 +1,10 @@
-import shellquote from 'shell-quote'
 import { spawn } from 'child_process'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import {
   normalizePathForSandbox,
+  quoteForShell,
   generateProxyEnvVars,
   encodeSandboxedCommand,
   decodeSandboxedCommand,
@@ -912,8 +912,8 @@ export function wrapCommandWithSandboxMacOS(
   )
 
   // Use `env` command to set environment variables - each VAR=value is a separate
-  // argument that shellquote handles properly, avoiding shell quoting issues
-  const wrappedCommand = shellquote.quote([
+  // argument that quoteForShell handles properly, avoiding shell quoting issues
+  const wrappedCommand = quoteForShell([
     'env',
     ...unsetEnvArgs,
     ...setEnvArgs,
