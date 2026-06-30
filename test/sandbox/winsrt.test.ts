@@ -23,6 +23,7 @@ import {
   getWindowsWfpStatus,
   getWindowsSandboxUserStatus,
   installWindowsSandbox,
+  isWindowsAccessDeniedStatusError,
   uninstallWindowsSandbox,
   verifyWindowsWfpEgress,
   deleteWindowsGroup,
@@ -66,6 +67,39 @@ const PORT_RANGE: readonly [number, number] = DEFAULT_WINDOWS_PROXY_PORT_RANGE
 // msys2 wget only exists on runners with msys2 installed.
 const GIT_BASH = 'C:\\Program Files\\Git\\usr\\bin\\bash.exe'
 const MSYS2_WGET = 'C:\\msys64\\usr\\bin\\wget.exe'
+
+describe('Windows sandbox: WFP status access-denied detection', () => {
+  it('recognizes access denied errors from wfp status', () => {
+    expect(
+      isWindowsAccessDeniedStatusError(
+        'srt-win wfp status exited 1: srt-win: error: FwpmEngineOpen0 failed: 0x00000005',
+      ),
+    ).toBe(true)
+    expect(
+      isWindowsAccessDeniedStatusError(
+        'srt-win wfp status exited 1: srt-win: error: Access is denied.',
+      ),
+    ).toBe(true)
+    expect(
+      isWindowsAccessDeniedStatusError(
+        'srt-win wfp status exited 1: E_ACCESSDENIED',
+      ),
+    ).toBe(true)
+  })
+
+  it('does not classify unrelated wfp status failures as access denied', () => {
+    expect(
+      isWindowsAccessDeniedStatusError(
+        'srt-win wfp status exited 1: unparseable JSON output',
+      ),
+    ).toBe(false)
+    expect(
+      isWindowsAccessDeniedStatusError(
+        'srt-win group status exited 1: Access is denied.',
+      ),
+    ).toBe(false)
+  })
+})
 
 /** True if `name` resolves on PATH (via `where.exe`). */
 function hasTool(name: string): boolean {
