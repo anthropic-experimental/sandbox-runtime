@@ -148,6 +148,7 @@ src/
     ├── sandbox-violation-store.ts # Violation tracking
     ├── sandbox-utils.ts      # Shared sandbox utilities
     ├── http-proxy.ts         # HTTP/HTTPS proxy for network filtering
+    ├── parent-proxy.ts       # Upstream/parent proxy chaining
     ├── socks-proxy.ts        # SOCKS5 proxy for network filtering
     ├── linux-sandbox-utils.ts # Linux bubblewrap sandboxing
     └── macos-sandbox-utils.ts # macOS sandbox-exec sandboxing
@@ -257,6 +258,11 @@ srt --settings /path/to/srt-settings.json <command>
       "*.npmjs.org"
     ],
     "deniedDomains": ["malicious.com"],
+    "parentProxy": {
+      "http": "http://proxy.corp:3128",
+      "https": "http://proxy.corp:3128",
+      "noProxy": "localhost,127.0.0.1,*.internal.corp"
+    },
     "allowUnixSockets": ["/var/run/docker.sock"],
     "allowLocalBinding": false
   },
@@ -286,6 +292,10 @@ Uses an **allow-only pattern** - all network access is denied by default.
 - `network.allowedDomains` - Array of allowed domains (supports wildcards like `*.example.com`). Empty array = no network access.
 - `network.deniedDomains` - Array of denied domains (checked first, takes precedence over allowedDomains)
 - `network.allowLocalBinding` - Allow binding to local ports (boolean, default: false)
+- `network.parentProxy` - Upstream HTTP proxy for outbound connections (object, optional). When set, the sandbox's built-in proxy tunnels traffic through this parent proxy instead of connecting directly. Falls back to `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment variables if unset.
+  - `http` - Proxy URL for plain HTTP traffic (e.g., `"http://proxy.corp:3128"`)
+  - `https` - Proxy URL for HTTPS/CONNECT traffic (falls back to `http` if unset)
+  - `noProxy` - Comma-separated bypass list: hostname suffixes and CIDR ranges that connect directly
 
 **TLS termination** (`network.tlsTerminate`, experimental): when set, HTTPS CONNECTs are terminated in-process so SRT can see (and filter, via `network.filterRequest`) the decrypted requests. The sandboxed process is pointed at a trust bundle containing the MITM CA (`caCertPath`/`caKeyPath`, or an ephemeral CA if omitted) plus the host's regular roots, so proxy-minted certificates and real upstream certificates both verify.
 
@@ -549,6 +559,8 @@ The sandbox runs HTTP and SOCKS5 proxy servers on the host machine that filter a
 - **Linux**: Requests are routed via the filesystem over Unix domain sockets (using `socat` for bridging). The network namespace is removed from the bubblewrap container, ensuring all network traffic must go through the proxies.
 
 - **macOS**: The Seatbelt profile allows communication only to specific localhost ports where the proxies listen. All other network access is blocked.
+
+**Parent/upstream proxy chaining:** When running behind a corporate proxy, configure `network.parentProxy` (or set `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` environment variables) to chain the sandbox's proxies through an upstream proxy. Both HTTP and SOCKS5 traffic will tunnel through the parent proxy via CONNECT. Destinations matching `noProxy` patterns bypass the parent and connect directly.
 
 ### Filesystem Isolation
 
