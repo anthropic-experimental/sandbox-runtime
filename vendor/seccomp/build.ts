@@ -17,7 +17,17 @@ function toCArray(bytes: Buffer): string {
   return lines.join('\n')
 }
 
-const cflags = ['-static', '-O2', '-Wall', '-Wextra']
+// Hardening: netns-config runs HOST-side; stack protector + FORTIFY are
+// cheap insurance on all three binaries (static PIE is not portable
+// across old glibc, so RELRO/PIE stay distro-default).
+const cflags = [
+  '-static',
+  '-O2',
+  '-Wall',
+  '-Wextra',
+  '-fstack-protector-strong',
+  '-D_FORTIFY_SOURCE=2',
+]
 
 const gen = join(OUT, 'seccomp-unix-block')
 run([
@@ -66,4 +76,14 @@ run([
 run(['strip', join(OUT, 'apply-seccomp')])
 rmSync(header)
 
+run([
+  'gcc',
+  ...cflags,
+  '-o',
+  join(OUT, 'netns-config'),
+  join(SRC, 'netns-config.c'),
+])
+run(['strip', join(OUT, 'netns-config')])
+
 console.log('built ' + join(OUT, 'apply-seccomp'))
+console.log('built ' + join(OUT, 'netns-config'))

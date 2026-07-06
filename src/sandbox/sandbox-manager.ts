@@ -13,6 +13,7 @@ import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
+import { existsSync as fsExistsSync } from 'node:fs'
 import { randomBytes, X509Certificate } from 'node:crypto'
 import type {
   CredentialsConfig,
@@ -29,6 +30,8 @@ import type {
 import {
   wrapCommandWithSandboxLinux,
   initializeLinuxNetworkBridge,
+  initializeNetnsRendezvous,
+  type NetnsRendezvousContext,
   type LinuxNetworkBridgeContext,
   checkLinuxDependencies,
   type SandboxDependencyCheck,
@@ -69,6 +72,12 @@ import {
   resolveParentProxy,
 } from './parent-proxy.js'
 import { matchesDomainPattern } from './domain-pattern.js'
+import { isFakePoolIp } from './transparent-net-helper.js'
+import {
+  setTransparentOverridePaths,
+  getProtectedTokensFilePath,
+  writeProtectedTokensFile,
+} from './transparent-net.js'
 import type { ChildProcess } from 'node:child_process'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import { EOL } from 'node:os'
@@ -77,6 +86,7 @@ interface HostNetworkManagerContext {
   httpProxyPort: number
   socksProxyPort: number
   linuxBridge: LinuxNetworkBridgeContext | undefined
+  netnsRendezvous: NetnsRendezvousContext | undefined
 }
 
 // ============================================================================
@@ -150,6 +160,24 @@ function registerCleanup(): void {
   cleanupRegistered = true
 }
 
+/**
+ * Reduce an IPv4-mapped IPv6 spelling to its dotted-v4 form so v4-range
+ * checks (the transparent fake-pool deny) can't be dodged by the mapped
+ * encodings: `::ffff:198.18.0.5` (dotted) or `::ffff:c612:5` (the
+ * hex-groups form canonicalizeHost emits). Non-mapped inputs pass through.
+ */
+function unmapV4(host: string): string {
+  const dotted = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(host)
+  if (dotted) return dotted[1]!
+  const hex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(host)
+  if (hex) {
+    const hi = parseInt(hex[1]!, 16)
+    const lo = parseInt(hex[2]!, 16)
+    return `${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`
+  }
+  return host
+}
+
 async function filterNetworkRequest(
   port: number,
   host: string,
@@ -178,6 +206,17 @@ async function filterNetworkRequest(
   // or `127.1` slips past a denylist entry for the dotted-decimal form.
   const canonicalHost = canonicalizeHost(host) ?? host
 
+  // The transparent fake-IP pool (198.18.0.0/15) only has meaning INSIDE
+  // the sandbox namespace. A CONNECT naming one of those literals (e.g. a
+  // workload replaying a stub-DNS answer through the env-var path) must
+  // never reach an ask prompt or a real-network dial — the benchmark
+  // range can be routable in some networks. Linux only: that is where the
+  // stub resolver hands these addresses out.
+  if (getPlatform() === 'linux' && isFakePoolIp(unmapV4(canonicalHost))) {
+    logForDebugging(`Denying transparent fake-pool literal: ${host}:${port}`)
+    return false
+  }
+
   // Check denied domains first
   for (const deniedDomain of config.network.deniedDomains) {
     if (matchesDomainPattern(canonicalHost, deniedDomain)) {
@@ -203,7 +242,10 @@ async function filterNetworkRequest(
 
   logForDebugging(`No matching config rule, asking user: ${host}:${port}`)
   try {
-    const userAllowed = await sandboxAskCallback({ host, port })
+    // The callback gets the CANONICAL host: showing the raw spelling lets
+    // obfuscated numerics (`2130706433`, `0x7f000001`) prompt the user for
+    // an address they can't recognize while the dial goes to 127.0.0.1.
+    const userAllowed = await sandboxAskCallback({ host: canonicalHost, port })
     if (userAllowed) {
       logForDebugging(`User allowed: ${host}:${port}`)
       return true
@@ -253,9 +295,14 @@ function getMitmSocketPath(host: string): string | undefined {
 
   const { socketPath, domains } = config.network.mitmProxy
 
+  // Canonicalize like the filter does: a trailing-dot spelling
+  // ('api.example.com.') is the same origin to DNS but dodged the raw
+  // string match, keeping an allowlisted host OUT of mitm capture.
+  const canonicalHost = canonicalizeHost(host) ?? host
+
   for (const pattern of domains) {
-    if (matchesDomainPattern(host, pattern)) {
-      logForDebugging(`Host ${host} matches MITM pattern ${pattern}`)
+    if (matchesDomainPattern(canonicalHost, pattern)) {
+      logForDebugging(`Host ${canonicalHost} matches MITM pattern ${pattern}`)
       return socketPath
     }
   }
@@ -401,12 +448,41 @@ async function initialize(
     ? createMitmCA(runtimeConfig.network.tlsTerminate)
     : undefined
 
+  // A 198.18.0.0/15 literal in allowedDomains can never be honored on
+  // Linux: the range is the transparent DNS pool, and the filter denies
+  // pool literals outright (an allow would alias live pool slots). Warn
+  // loudly at config time instead of denying silently per-request.
+  if (getPlatform() === 'linux') {
+    for (const entry of runtimeConfig.network.allowedDomains) {
+      if (isFakePoolIp(entry)) {
+        logForDebugging(
+          `allowedDomains entry ${entry} is inside 198.18.0.0/15, which ` +
+            'is reserved by the sandbox DNS layer on Linux — the entry ' +
+            'will never match',
+          { level: 'warn' },
+        )
+      }
+    }
+  }
+
+  // Register bundled-consumer component locations BEFORE the dependency
+  // check consults them.
+  setTransparentOverridePaths({
+    netnsConfigPath: runtimeConfig.seccomp?.netnsConfigPath,
+    transparentHelperPath: runtimeConfig.seccomp?.transparentHelperPath,
+  })
+
   // Check dependencies
   const deps = checkDependencies()
   if (deps.errors.length > 0) {
     throw new Error(
       `Sandbox dependencies not available: ${deps.errors.join(', ')}`,
     )
+  }
+  for (const warning of deps.warnings) {
+    logForDebugging(`Sandbox dependency warning: ${warning}`, {
+      level: 'warn',
+    })
   }
 
   // Start log monitor for macOS if enabled
@@ -564,6 +640,10 @@ async function initialize(
 
   // Initialize network infrastructure
   initializationPromise = (async () => {
+    // Hoisted so the catch can tear down partially-created infrastructure
+    // (reset() cannot: managerContext is never assigned on this path).
+    let linuxBridge: LinuxNetworkBridgeContext | undefined
+    let netnsRendezvous: NetnsRendezvousContext | undefined
     try {
       // On Windows the WFP loopback permit covers a fixed port
       // range, so the proxies must bind inside it. Other platforms
@@ -602,24 +682,51 @@ async function initialize(
       }
 
       // Initialize platform-specific infrastructure
-      let linuxBridge: LinuxNetworkBridgeContext | undefined
       if (getPlatform() === 'linux') {
         linuxBridge = await initializeLinuxNetworkBridge(
           httpProxyPort,
           socksProxyPort,
           config.socatPath,
         )
+        // Hard requirement: networked sandboxing has no shape without the
+        // host-side netns configuration. Dependencies (incl. taking the
+        // protected helper copy before any sandboxed command runs) were
+        // already verified by checkDependencies() in initialize().
+        // Dedicated secret: the rendezvous is srt infrastructure even
+        // when an external proxy handles filtering (no proxyAuthToken).
+        const netnsToken = randomBytes(16).toString('hex')
+        // The rendezvous resolves netns-config through the identity-
+        // verified protected-asset layer on every connection.
+        netnsRendezvous = await initializeNetnsRendezvous(netnsToken)
+        // Secrets travel via a 0600 file in the protected asset dir, not
+        // through world-readable argv/cmdline.
+        writeProtectedTokensFile({
+          netns: netnsToken,
+          proxy: proxyAuthToken ?? '',
+        })
       }
 
       const context: HostNetworkManagerContext = {
         httpProxyPort,
         socksProxyPort,
         linuxBridge,
+        netnsRendezvous,
       }
       managerContext = context
       logForDebugging('Network infrastructure initialized')
       return context
     } catch (error) {
+      // Tear down partially-created infrastructure directly — reset()
+      // can't see it (managerContext was never assigned on this path).
+      if (netnsRendezvous) await netnsRendezvous.close().catch(() => {})
+      if (linuxBridge) {
+        try {
+          linuxBridge.httpBridgeProcess.kill('SIGKILL')
+          linuxBridge.socksBridgeProcess.kill('SIGKILL')
+        } catch {
+          // best effort
+        }
+      }
       // Clear state on error so initialization can be retried
       initializationPromise = undefined
       managerContext = undefined
@@ -633,6 +740,48 @@ async function initialize(
   })()
 
   await initializationPromise
+}
+
+/**
+ * The rendezvous socket lives under the protected session dir; external
+ * deletion of that dir (tmp reaper) takes the socket with it. Self-heal
+ * at wrap time: recreate the rendezvous instead of failing every
+ * networked command until re-initialize.
+ */
+let netnsHealInFlight: Promise<string> | undefined
+
+async function ensureNetnsRendezvousAlive(): Promise<string | undefined> {
+  const owner = managerContext
+  if (owner === undefined) return undefined
+  const current = owner.netnsRendezvous
+  if (current === undefined) return undefined
+  if (fsExistsSync(current.socketPath)) return current.socketPath
+  // Single-flight: concurrent wraps must not each recreate a rendezvous
+  // (the losers' servers/sockets would leak).
+  if (netnsHealInFlight === undefined) {
+    netnsHealInFlight = (async () => {
+      logForDebugging(
+        'netns rendezvous socket vanished — recreating (asset dir was ' +
+          'externally removed)',
+        { level: 'warn' },
+      )
+      await current.close().catch(() => {})
+      const replacement = await initializeNetnsRendezvous(current.token)
+      if (managerContext !== owner) {
+        // reset() raced the heal — possibly followed by a fresh
+        // initialize(): the replacement belongs to a dead generation
+        // (assigning it would clobber a new context's own rendezvous
+        // and carry the OLD token). Close it and fail this wrap loud.
+        await replacement.close().catch(() => {})
+        throw new Error('sandbox was reset during rendezvous recovery')
+      }
+      owner.netnsRendezvous = replacement
+      return replacement.socketPath
+    })().finally(() => {
+      netnsHealInFlight = undefined
+    })
+  }
+  return netnsHealInFlight
 }
 
 function isSupportedPlatform(): boolean {
@@ -1272,6 +1421,14 @@ async function wrapWithSandbox(
         socksSocketPath: needsNetworkProxy
           ? getLinuxSocksSocketPath()
           : undefined,
+        netnsSocketPath: needsNetworkProxy
+          ? await ensureNetnsRendezvousAlive()
+          : undefined,
+        // Resolved per wrap: the protected-asset layer re-materializes
+        // (at a fresh path) if the dir was externally disturbed.
+        tokensFilePath: needsNetworkProxy
+          ? (getProtectedTokensFilePath() ?? undefined)
+          : undefined,
         httpProxyPort: needsNetworkProxy
           ? managerContext?.httpProxyPort
           : undefined,
@@ -1668,13 +1825,29 @@ async function reset(): Promise<void> {
     logMonitorShutdown = undefined
   }
 
-  if (managerContext?.linuxBridge) {
+  // Detach the context SYNCHRONOUSLY before the first teardown await:
+  // an in-flight rendezvous heal compares object identity against
+  // managerContext, and a reset that only clears it at the END leaves a
+  // window where the heal assigns a fresh listener into a context being
+  // torn down (the replacement would leak past reset).
+  const teardownContext = managerContext
+  managerContext = undefined
+
+  if (teardownContext?.netnsRendezvous) {
+    await teardownContext.netnsRendezvous.close().catch((err: Error) => {
+      logForDebugging(`netns rendezvous close error: ${err.message}`, {
+        level: 'error',
+      })
+    })
+  }
+
+  if (teardownContext?.linuxBridge) {
     const {
       httpSocketPath,
       socksSocketPath,
       httpBridgeProcess,
       socksBridgeProcess,
-    } = managerContext.linuxBridge
+    } = teardownContext.linuxBridge
 
     // Kill both bridges and wait for them to exit
     await Promise.all([

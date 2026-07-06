@@ -159,7 +159,7 @@ jobs:
         with:
           name: seccomp-arm64
           path: vendor/seccomp/arm64
-      - run: chmod +x vendor/seccomp/*/apply-seccomp
+      - run: chmod +x vendor/seccomp/*/apply-seccomp vendor/seccomp/*/netns-config
 
       - uses: actions/download-artifact@v4
         with:
@@ -184,7 +184,7 @@ jobs:
           echo "::group::tarball contents"
           echo "$LIST"
           echo "::endgroup::"
-          for f in vendor/srt-win/x64/srt-win.exe vendor/srt-win/arm64/srt-win.exe vendor/seccomp/x64/apply-seccomp vendor/seccomp/arm64/apply-seccomp; do
+          for f in vendor/srt-win/x64/srt-win.exe vendor/srt-win/arm64/srt-win.exe vendor/seccomp/x64/apply-seccomp vendor/seccomp/arm64/apply-seccomp vendor/seccomp/x64/netns-config vendor/seccomp/arm64/netns-config; do
             grep -q "^package/$f$" <<<"$LIST" || { echo "::error::missing $f in tarball"; exit 1; }
           done
           if grep -qE '^package/vendor/(srt-win-src|seccomp-src)/' <<<"$LIST"; then

@@ -160,22 +160,37 @@ function getLocalSeccompPaths(filename: string): string[] {
 export function getApplySeccompBinaryPath(
   seccompBinaryPath?: string,
 ): string | null {
-  const cacheKey = seccompBinaryPath ?? ''
+  return getVendorSeccompBinaryPath('apply-seccomp', seccompBinaryPath)
+}
+
+/**
+ * Generic resolver for binaries shipped under vendor/seccomp/<arch>/
+ * (apply-seccomp, netns-config). Same candidate order and caching as
+ * apply-seccomp has always used.
+ */
+export function getVendorSeccompBinaryPath(
+  filename: string,
+  explicitPath?: string,
+): string | null {
+  const cacheKey = `${filename}\0${explicitPath ?? ''}`
   if (applySeccompPathCache.has(cacheKey)) {
     return applySeccompPathCache.get(cacheKey)!
   }
 
-  const result = findApplySeccompPath(seccompBinaryPath)
+  const result = findVendorBinaryPath(filename, explicitPath)
   applySeccompPathCache.set(cacheKey, result)
   return result
 }
 
-function findApplySeccompPath(seccompBinaryPath?: string): string | null {
+function findVendorBinaryPath(
+  filename: string,
+  seccompBinaryPath?: string,
+): string | null {
   // Check explicit path first (highest priority)
   if (seccompBinaryPath) {
     if (fs.existsSync(seccompBinaryPath)) {
       logForDebugging(
-        `[SeccompFilter] Using apply-seccomp binary from explicit path: ${seccompBinaryPath}`,
+        `[SeccompFilter] Using ${filename} binary from explicit path: ${seccompBinaryPath}`,
       )
       return seccompBinaryPath
     }
@@ -187,20 +202,20 @@ function findApplySeccompPath(seccompBinaryPath?: string): string | null {
   const arch = getVendorArchitecture()
   if (!arch) {
     logForDebugging(
-      `[SeccompFilter] Cannot find apply-seccomp binary: unsupported architecture ${process.arch}`,
+      `[SeccompFilter] Cannot find ${filename} binary: unsupported architecture ${process.arch}`,
     )
     return null
   }
 
   logForDebugging(
-    `[SeccompFilter] Looking for apply-seccomp binary for architecture: ${arch}`,
+    `[SeccompFilter] Looking for ${filename} binary for architecture: ${arch}`,
   )
 
   // Check local paths first (bundled or package install)
-  for (const binaryPath of getLocalSeccompPaths('apply-seccomp')) {
+  for (const binaryPath of getLocalSeccompPaths(filename)) {
     if (fs.existsSync(binaryPath)) {
       logForDebugging(
-        `[SeccompFilter] Found apply-seccomp binary: ${binaryPath} (${arch})`,
+        `[SeccompFilter] Found ${filename} binary: ${binaryPath} (${arch})`,
       )
       return binaryPath
     }
@@ -208,23 +223,17 @@ function findApplySeccompPath(seccompBinaryPath?: string): string | null {
 
   // Fallback: check global npm install (for native builds without bundled vendor)
   for (const globalBase of getGlobalNpmPaths()) {
-    const binaryPath = join(
-      globalBase,
-      'vendor',
-      'seccomp',
-      arch,
-      'apply-seccomp',
-    )
+    const binaryPath = join(globalBase, 'vendor', 'seccomp', arch, filename)
     if (fs.existsSync(binaryPath)) {
       logForDebugging(
-        `[SeccompFilter] Found apply-seccomp binary in global install: ${binaryPath} (${arch})`,
+        `[SeccompFilter] Found ${filename} binary in global install: ${binaryPath} (${arch})`,
       )
       return binaryPath
     }
   }
 
   logForDebugging(
-    `[SeccompFilter] apply-seccomp binary not found in any expected location (${arch})`,
+    `[SeccompFilter] ${filename} binary not found in any expected location (${arch})`,
   )
   return null
 }

@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import * as which from '../../src/utils/which.js'
 import * as seccomp from '../../src/sandbox/generate-seccomp-filter.js'
+import * as transparent from '../../src/sandbox/transparent-net.js'
 import {
   checkLinuxDependencies,
   getLinuxDependencyStatus,
@@ -11,6 +12,7 @@ import {
 // linux-sandbox-utils' own imports see the replacement.
 let whichSpy: ReturnType<typeof spyOn>
 let applySpy: ReturnType<typeof spyOn>
+let transparentSpy: ReturnType<typeof spyOn>
 
 beforeEach(() => {
   whichSpy = spyOn(which, 'whichSync').mockImplementation(
@@ -19,11 +21,19 @@ beforeEach(() => {
   applySpy = spyOn(seccomp, 'getApplySeccompBinaryPath').mockReturnValue(
     '/path/to/apply-seccomp',
   )
+  // These tests assert exact error sets for the base deps; the network
+  // component check depends on built vendor binaries, so pin it to
+  // "available".
+  transparentSpy = spyOn(
+    transparent,
+    'checkTransparentDependencies',
+  ).mockReturnValue({ errors: [] })
 })
 
 afterEach(() => {
   whichSpy.mockRestore()
   applySpy.mockRestore()
+  transparentSpy.mockRestore()
 })
 
 describe('checkLinuxDependencies', () => {

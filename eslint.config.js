@@ -22,6 +22,7 @@ export default [
           allowDefaultProject: [
             'eslint.config.js',
             'test/utils/which-node-test.mjs',
+            'test/node-leg/capture-pipeline-node.mts',
             'vendor/build-common.ts',
             'vendor/seccomp/build.ts',
             'vendor/srt-win/build.ts',

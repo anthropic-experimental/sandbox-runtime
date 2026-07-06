@@ -15,6 +15,7 @@ import {
 } from 'node:https'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { connect, isIP } from 'node:net'
+import { vettedLookup } from './parent-proxy.js'
 import { unlink } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -32,21 +33,23 @@ import { stripHopByHop } from './parent-proxy.js'
 /**
  * True if `buf` starts with a TLS Handshake record header.
  *
- * Three bytes: content type 0x16 (Handshake) + legacy_record_version
- * 0x03,0x00–0x03. RFC 8446 §5.1 froze the record-layer version (TLS 1.3+
- * negotiate via the supported_versions extension, the wire header stays
- * ≤0x0303), so this holds for current and future TLS. Same predicate as
- * mitmproxy `starts_like_tls_record`; nginx `ssl_preread` routes on byte 0
- * alone and HAProxy `req.ssl_hello_type` reads 9 bytes to also extract the
- * handshake type — 3 is the established middle ground for "is this TLS".
+ * Content type 0x16 (Handshake) + record-version MAJOR 0x03 (3-byte
+ * minimum read, matching peekForClientHello's buffering).
+ * The minor byte is deliberately not checked — see inline comment.
  *
- * Routing heuristic, not a security check: a non-TLS stream that happens to
- * start 16 03 0x is handed to the TLS server, which then rejects it properly.
+ * Routing heuristic that must fail TOWARD termination: a non-TLS stream
+ * that happens to start 16 03 is handed to the TLS server, which rejects
+ * it properly; a TLS stream misrouted to the opaque tunnel would bypass
+ * filtering.
  */
 export function looksLikeClientHello(buf: Buffer): boolean {
-  return (
-    buf.length >= 3 && buf[0] === 0x16 && buf[1] === 0x03 && buf[2]! <= 0x03
-  )
+  // Deliberately no minor-version check: the record-layer minor byte is
+  // sender-controlled and widely ignored by servers, so `<= 0x03` let a
+  // crafted 16 03 04 hello dodge termination into an opaque tunnel.
+  // Ambiguity must fail TOWARD termination — a non-TLS stream handed to
+  // the TLS server is rejected properly, while a TLS stream that dodges
+  // the sniff bypasses filtering entirely.
+  return buf.length >= 3 && buf[0] === 0x16 && buf[1] === 0x03
 }
 
 /**
@@ -210,6 +213,10 @@ async function forwardUpstream(
   // the CONNECT-verified target stays authoritative (same rationale as the
   // Host-header note below).
   const path = originFormPath(req.url)
+  // Server-wide OPTIONS: '*' is a distinct resource (RFC 9110 §7.1).
+  // The FILTER URL uses the normalized '/', but the upstream request
+  // keeps the client's asterisk-form.
+  const upstreamPath = req.method === 'OPTIONS' && req.url === '*' ? '*' : path
   let body: Readable = req
   if (filterRequest) {
     const ac = new AbortController()
@@ -261,7 +268,7 @@ async function forwardUpstream(
     {
       host: target.hostname,
       port: target.port,
-      path,
+      path: upstreamPath,
       method: req.method,
       headers: fwdHeaders,
       // We're a TLS-terminating proxy, not a trust boundary for the upstream
@@ -272,6 +279,8 @@ async function forwardUpstream(
       // omitting the key, so spread conditionally.
       ...(isIP(target.hostname) ? {} : { servername: target.hostname }),
       ...(target.upstreamCA ? { ca: target.upstreamCA } : {}),
+      // Rebinding guard (same as the plain-forward path).
+      lookup: vettedLookup as never,
       // No global agent: a proxy's outbound leg shouldn't share a connection
       // pool keyed on the proxy process. Also works around a Bun quirk where
       // the first request's `ca:` value is cached on the global agent and
@@ -308,8 +317,12 @@ function originFormPath(reqUrl: string | undefined): string {
     const u = new URL(raw)
     return `${u.pathname}${u.search}` || '/'
   } catch {
-    // asterisk-form (`OPTIONS *`) or anything else non-absolute — pass through.
-    return raw
+    // Asterisk-form (`OPTIONS *`) or malformed: normalize to '/'.
+    // Passing `*` through concatenated onto `https://${host}` corrupted
+    // the filterRequest hostname to `<host>*` — the filter
+    // URL must always be well-formed, and '/' is the closest
+    // origin-form for a server-wide OPTIONS.
+    return '/'
   }
 }
 

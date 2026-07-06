@@ -307,6 +307,13 @@ Uses an **allow-only pattern** - all network access is denied by default.
 }
 ```
 
+**Transparent networking** (Linux): the network sandboxing implementation. The sandbox's network namespace is configured **by the host from outside** (the vendored `netns-config` binary joins it via `setns` — no namespace is ever created, so the design adds no userns-creation requirement beyond bwrap's own (pending hardware verification on stock Ubuntu 24.04's AppArmor-restricted configuration)). Inside, a stub DNS resolver answers every hostname with a deterministic per-hostname fake IP from `198.18.0.0/15` and TCP ports 80/443 are transparently captured, so **proxy-unaware** clients (raw sockets, SDKs that ignore proxy env vars, raw-IP destinations) are routed through the filtering proxy without relying on `HTTP_PROXY`/`HTTPS_PROXY`. Proxy-aware tools keep using the env-var front door exactly as before. There is no setting and no fallback shape: missing components fail loudly, and the outer interface-less namespace remains the fail-closed boundary — a setup failure means no connectivity, never wider access.
+
+- Captured connections stay subject to the domain allow/deny lists, the ask callback, TLS termination, and `network.filterRequest` (captured plain HTTP is parsed through the same request pipeline as proxied requests; denied requests get a readable 403).
+- Nothing inside the sandbox ever holds capabilities, and no `iproute2`/`util-linux` dependency exists; `netns-config` ships in `vendor/seccomp/<arch>/`, built alongside `apply-seccomp`.
+- Connections to uncaptured ports fail immediately with `ECONNREFUSED` (instead of hanging). Raw-IP destinations reach the filter as IP literals and are denied unless explicitly allowlisted. Ports 80/443 are reserved by the capture listeners inside the namespace.
+- Not supported: setuid-bwrap installs (legacy Debian with unprivileged userns disabled) — the sandbox's namespaces are root-owned there and the host cannot configure them; networked commands fail with a clear error.
+
 **Unix Socket Settings** (platform-specific behavior):
 
 | Setting                        | macOS                     | Linux                                    |

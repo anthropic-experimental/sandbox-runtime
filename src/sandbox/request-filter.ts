@@ -76,6 +76,13 @@ export async function decideAndRespond(
   url: string,
   signal: AbortSignal,
 ): Promise<Readable | null> {
+  // A client abort mid-body destroys req with an 'aborted' error; without
+  // a listener that becomes an uncaughtException that kills the embedding
+  // host process. Same for the tee branch below.
+  req.on('error', err => {
+    logForDebugging(`[request-filter] request error: ${err.message}`)
+  })
+
   let forCallback: ReadableStream<Uint8Array> | undefined
   let forUpstream: Readable = req
   if (!BODYLESS_METHODS.has(req.method ?? 'GET')) {
@@ -83,6 +90,9 @@ export async function decideAndRespond(
     const [a, b] = web.tee()
     forCallback = a
     forUpstream = Readable.fromWeb(b)
+    forUpstream.on('error', err => {
+      logForDebugging(`[request-filter] upstream branch error: ${err.message}`)
+    })
   }
 
   let webReq: Request
@@ -99,8 +109,8 @@ export async function decideAndRespond(
       action: 'deny',
       reason: `malformed request: ${(err as Error).message}`,
     })
-    void forCallback?.cancel()
-    forUpstream.destroy()
+    forCallback?.cancel().catch(() => {})
+    discardDeniedBody(req, res, forUpstream)
     return null
   }
 
@@ -118,7 +128,9 @@ export async function decideAndRespond(
   // buffering bytes nobody will consume. If it did, the tee already buffered
   // whatever was read; the upstream branch sees the same bytes.
   if (forCallback && !webReq.bodyUsed) {
-    void forCallback.cancel()
+    // cancel() rejects if the branch already errored (client abort) —
+    // an unhandled rejection here is host-fatal under node.
+    forCallback.cancel().catch(() => {})
   }
 
   if (decision.action === 'allow') {
@@ -127,8 +139,45 @@ export async function decideAndRespond(
   }
 
   deny(res, decision)
-  forUpstream.destroy()
+  discardDeniedBody(req, res, forUpstream)
   return null
+}
+
+/**
+ * Dispose of a denied request's body WITHOUT killing the connection.
+ * `forUpstream` is `req` itself for bodyless methods, and
+ * `IncomingMessage.destroy()` destroys the underlying socket — on a
+ * keep-alive connection (notably captured plain-HTTP tunnels, where many
+ * requests share one backend socket) that tears down the queued 403 and
+ * any in-flight responses to OTHER requests. Draining preserves keep-alive
+ * semantics; the tee branch (a detached stream) is safe to destroy.
+ */
+function discardDeniedBody(
+  req: IncomingMessage,
+  res: ServerResponse,
+  forUpstream: Readable,
+): void {
+  if (forUpstream === (req as unknown as Readable)) {
+    // Bodyless method: drain (a no-op read) and keep the connection
+    // reusable — the 403 was queued by deny() above.
+    req.resume()
+    return
+  }
+  // Body-carrying request: draining through the tee would buffer the
+  // entire remaining body in the abandoned callback branch (it cannot be
+  // cancelled once the filter held its reader). Deliver the 403, then
+  // close the connection — keep-alive is not worth an unbounded buffer.
+  //
+  // Teardown order matters: Readable.toWeb's pump throws
+  // ERR_INVALID_STATE (uncaught, host-fatal) if a queued 'data' event
+  // lands after the tee controller closed. pause() stops further reads,
+  // and the branch destroy is deferred one tick so any already-emitted
+  // chunk drains into the still-open controller first.
+  req.pause()
+  setImmediate(() => forUpstream.destroy())
+  // The 403 must flush before the connection dies (destroy discards
+  // unwritten data); 'close' fires after the response is done either way.
+  res.once('close', () => req.destroy())
 }
 
 function deny(res: ServerResponse, decision: RequestDecision): void {

@@ -2,9 +2,12 @@
  * Seccomp BPF filter generator to block Unix domain socket creation
  *
  * This program generates a seccomp-bpf filter that blocks the socket() syscall
- * when called with AF_UNIX as the domain argument. This prevents creation of
- * Unix domain sockets while allowing all other socket types (AF_INET, AF_INET6, etc.)
- * and all other syscalls.
+ * when called with AF_UNIX as the domain argument, and socketpair() for the
+ * AF_UNIX datagram-class types (SOCK_DGRAM/SOCK_RAW, which connect(AF_UNSPEC)
+ * can turn into unconnected, retargetable sockets). This prevents creation of
+ * reachable Unix domain sockets while allowing all other socket types
+ * (AF_INET, AF_INET6, stream/seqpacket socketpairs, etc.) and all other
+ * syscalls.
  *
  * The filter is exported in a format compatible with bubblewrap's --seccomp flag.
  *
@@ -102,6 +105,29 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Error: Failed to add seccomp rule: %s\n", strerror(-rc));
         seccomp_release(ctx);
         return 1;
+    }
+
+    /* socketpair(AF_UNIX, SOCK_DGRAM/SOCK_RAW): the kernel disconnects a
+     * unix datagram socket on connect(AF_UNSPEC), turning one half of a
+     * pair into an UNCONNECTED datagram socket — functionally the same
+     * object socket(AF_UNIX, SOCK_DGRAM) would have minted, able to
+     * sendto() any path-visible unix dgram service. unix_create()
+     * aliases SOCK_RAW to SOCK_DGRAM, so both types are covered.
+     * SOCK_STREAM/SOCK_SEQPACKET pairs stay allowed: stream sockets
+     * cannot be disconnected/retargeted this way, and blocking them
+     * breaks libuv/node child_process, python multiprocessing, and
+     * most runtimes. arg1 is masked to the type bits so SOCK_CLOEXEC/
+     * SOCK_NONBLOCK cannot dodge the comparison. */
+    int retargetable_types[] = { SOCK_DGRAM, SOCK_RAW };
+    for (size_t i = 0; i < sizeof(retargetable_types) / sizeof(retargetable_types[0]); i++) {
+        rc = seccomp_rule_add(ctx, SCMP_ACT_ERRNO(EPERM), SCMP_SYS(socketpair), 2,
+                              SCMP_A0(SCMP_CMP_MASKED_EQ, 0xffffffff, AF_UNIX),
+                              SCMP_A1(SCMP_CMP_MASKED_EQ, 0xf, retargetable_types[i]));
+        if (rc < 0) {
+            fprintf(stderr, "Error: Failed to add socketpair rule: %s\n", strerror(-rc));
+            seccomp_release(ctx);
+            return 1;
+        }
     }
 
     /* Block io_uring entirely. IORING_OP_SOCKET (Linux 5.19+) creates sockets

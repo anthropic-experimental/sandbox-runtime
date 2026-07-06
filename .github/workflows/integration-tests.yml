@@ -10,6 +10,7 @@ jobs:
   integration-tests:
     name: Tests (${{ matrix.os }} / ${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
 
     strategy:
       fail-fast: false
@@ -161,7 +162,18 @@ jobs:
 
       - name: Build seccomp binaries (Linux)
         if: matrix.os == 'linux'
-        run: npm run build:seccomp
+        run: |
+          npm run build:seccomp
+          # The transparent-networking tests silently skip when these are
+          # missing — assert presence (and that netns-config actually works
+          # on the runner) so a build regression can't go green. Loop:
+          # `test -x glob` breaks if the glob ever matches multiple paths.
+          for f in vendor/seccomp/*/apply-seccomp vendor/seccomp/*/netns-config; do
+            test -x "$f" || { echo "missing or not executable: $f"; exit 1; }
+          done
+          # Smoke: the binary must execute and refuse bad usage.
+          out="$(vendor/seccomp/*/netns-config 2>&1 || true)"
+          case "$out" in usage:*) ;; *) echo "netns-config smoke failed: $out"; exit 1;; esac
 
       - name: Build project
         if: matrix.os != 'windows'
@@ -174,6 +186,14 @@ jobs:
       - name: Run Node.js fallback tests
         if: matrix.os != 'windows'
         run: node test/utils/which-node-test.mjs
+
+      - name: Capture pipeline on node host (production runtime)
+        # Unit tests run under bun; the production embedder hosts the
+        # proxy on node. Drive the crash-sensitive capture paths there.
+        if: matrix.os != 'windows'
+        run: |
+          bun build ./test/node-leg/capture-pipeline-node.mts --target=node --outfile=/tmp/capture-node.mjs
+          node /tmp/capture-node.mjs
 
       - name: Upload test results
         if: always()
@@ -188,6 +208,7 @@ jobs:
   docker-tests:
     name: Tests (docker / ${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
 
     strategy:
       fail-fast: false

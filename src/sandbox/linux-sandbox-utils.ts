@@ -2,9 +2,15 @@ import { quote } from '../utils/shell-quote.js'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { randomBytes } from 'node:crypto'
+import { timingSafeTokenEqual } from '../utils/timing-safe.js'
 import * as fs from 'fs'
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
+import {
+  createServer as createNetServer,
+  type Socket as NetSocket,
+} from 'node:net'
+import type { Stream } from 'node:stream'
 import { tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { ripGrep } from '../utils/ripgrep.js'
@@ -20,8 +26,20 @@ import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
 } from './sandbox-schemas.js'
-import { getApplySeccompBinaryPath } from './generate-seccomp-filter.js'
+import {
+  getApplySeccompBinaryPath,
+  getVendorSeccompBinaryPath,
+} from './generate-seccomp-filter.js'
 import type { SeccompConfig } from './sandbox-config.js'
+import {
+  DEFAULT_TRANSPARENT_TCP_PORTS,
+  checkTransparentDependencies,
+  getProtectedHelperPath,
+  getSandboxResolvConfPath,
+  getTransparentAssetDir,
+  getNetnsConfigBytes,
+  transparentAssetParentCandidates,
+} from './transparent-net.js'
 
 export interface LinuxNetworkBridgeContext {
   httpSocketPath: string
@@ -37,6 +55,18 @@ export interface LinuxSandboxParams {
   needsNetworkRestriction: boolean
   httpSocketPath?: string
   socksSocketPath?: string
+  /**
+   * Host rendezvous socket the in-sandbox helper dials so the host
+   * configures the sandbox netns (netns-config). REQUIRED whenever the
+   * bridge sockets are provided — there is no networking shape without it.
+   */
+  netnsSocketPath?: string
+  /**
+   * 0600 file in the protected asset dir holding per-session secrets
+   * (netns=…, proxy=…). When set, tokens travel via SRT_TP_TOKEN_FILE
+   * instead of the (cmdline-visible) script env assignments.
+   */
+  tokensFilePath?: string
   httpProxyPort?: number
   socksProxyPort?: number
   /** Per-session proxy auth token; embedded in proxy env URLs. */
@@ -457,6 +487,13 @@ export function checkLinuxDependencies(
   const errors: string[] = []
   const warnings: string[] = []
 
+  // The netns-config binary and the in-sandbox helper are hard
+  // requirements for networked sandboxing — there is no other shape.
+  {
+    const tp = checkTransparentDependencies()
+    errors.push(...tp.errors)
+  }
+
   // An explicit override is a directive, not a hint — if it doesn't exist,
   // surface that rather than silently falling back to PATH.
   if (bwrapPath) {
@@ -509,6 +546,308 @@ export function checkLinuxDependencies(
  *
  * DEPENDENCIES: Requires bwrap (bubblewrap) and socat
  */
+export interface NetnsRendezvousContext {
+  socketPath: string
+  /** Secret the helper must present in its hello line. */
+  token: string
+  close(): Promise<void>
+}
+
+/**
+ * Host-side netns rendezvous: a dedicated unix listener the in-sandbox
+ * helper dials as its FIRST act. Protocol: the helper sends one line
+ * `<token> <netns-inode>\n`; the host validates the session token, then
+ * hands the connected socket to the vendored netns-config binary, which
+ * derives the target pid from SO_PEERCRED (never from the request),
+ * verifies the requester's self-reported netns inode against the netns it
+ * actually opens (pid-reuse race → refusal), refuses the host's own
+ * netns, joins the sandbox netns via its owner userns (owner-uid rule —
+ * no namespace creation, works wherever bwrap works), configures lo +
+ * `local default` routes + ip_unprivileged_port_start=53, and writes
+ * "OK\n" back on the connection. The helper treats anything else as
+ * fatal for the command.
+ *
+ * This binary is not a privilege boundary (it is unprivileged and grants
+ * nothing its invoker lacks); the checks protect the host's decision to
+ * act on a request from an arbitrary same-uid connector.
+ */
+export async function initializeNetnsRendezvous(
+  token: string,
+): Promise<NetnsRendezvousContext> {
+  // The socket lives in its own 0700 dir UNDER the protected asset
+  // parent: other uids cannot traverse it, and cross-session sandboxes
+  // cannot delete/squat it through a rw /tmp bind (the parent is
+  // tmpfs-shadowed in every sandbox; the socket file itself is bound
+  // back in explicitly by the wrapper AFTER that shadow).
+  const dir = fs.mkdtempSync(join(getTransparentAssetDir(), 'rdv-'))
+  fs.chmodSync(dir, 0o700)
+  const socketPath = join(dir, 'rendezvous.sock')
+  // Per-child stderr goes to a shared append-only file, NOT a 'pipe':
+  // in the fd-exhaustion band node's spawn allocates the stderr
+  // socketpair before failing and never releases it (child.stderr
+  // unreachable) — one PERMANENT host fd per failed spawn; numeric-fd
+  // stdio slots leak zero there.
+  const stderrSinkPath = join(dir, 'netns-config.stderr')
+
+  const tokenBuf = Buffer.from(token, 'utf8')
+
+  // Master staged fd: unlinked + content-verified ONCE; reopened per
+  // connection via /proc/self/fd (same inode — the master pins it).
+  let stagedMasterFd: number | undefined
+  let rendezvousClosed = false
+  const ensureStagedNetnsConfig = (): number => {
+    if (rendezvousClosed) throw new Error('rendezvous closed')
+    if (stagedMasterFd !== undefined) return stagedMasterFd
+    const bytes = getNetnsConfigBytes()
+    if (bytes === null) throw new Error('netns-config bytes unavailable')
+    // Stage INSIDE the protected session dir: it is tmpfs-hidden and
+    // ro-rebound in every sandbox, so even the sub-millisecond window
+    // between write and unlink is unreachable from in-sandbox. 0500 is
+    // belt on top.
+    const stageDir = getTransparentAssetDir()
+    const binPath = join(stageDir, `nc-${randomBytes(6).toString('hex')}`)
+    let fd: number | undefined
+    try {
+      fs.writeFileSync(binPath, bytes, { mode: 0o500, flag: 'wx' })
+      fd = fs.openSync(binPath, 'r')
+      fs.rmSync(binPath)
+      const onDisk = Buffer.alloc(bytes.length + 1)
+      const n = fs.readSync(fd, onDisk, 0, onDisk.length, 0)
+      if (n !== bytes.length || !onDisk.subarray(0, n).equals(bytes)) {
+        throw new Error('netns-config content verification failed')
+      }
+    } catch (err) {
+      if (fd !== undefined) {
+        try {
+          fs.closeSync(fd)
+        } catch {
+          // best effort
+        }
+      }
+      try {
+        fs.rmSync(binPath, { force: true })
+      } catch {
+        // cleanup must never throw
+      }
+      throw err
+    }
+    stagedMasterFd = fd
+    return fd
+  }
+  const liveSockets = new Set<NetSocket>()
+  const liveChildren = new Set<ChildProcess>()
+
+  const server = createNetServer(sock => {
+    liveSockets.add(sock)
+    sock.once('close', () => liveSockets.delete(sock))
+    sock.setNoDelay(true)
+    let buf = Buffer.alloc(0)
+    const timer = setTimeout(() => sock.destroy(), 10_000)
+    timer.unref()
+    sock.on('error', () => {})
+    sock.on('data', chunk => {
+      buf = Buffer.concat([buf, chunk])
+      const nl = buf.indexOf(0x0a)
+      if (nl === -1) {
+        if (buf.length > 256) sock.destroy()
+        return
+      }
+      clearTimeout(timer)
+      sock.pause()
+      sock.removeAllListeners('data')
+      const line = buf.subarray(0, nl).toString('utf8').trim()
+      const sp = line.indexOf(' ')
+      const peerToken = Buffer.from(
+        sp === -1 ? line : line.slice(0, sp),
+        'utf8',
+      )
+      const inode = sp === -1 ? '' : line.slice(sp + 1)
+      const tokenOk = timingSafeTokenEqual(peerToken, tokenBuf)
+      if (!tokenOk || !/^[0-9]{1,20}$/.test(inode)) {
+        logForDebugging('netns rendezvous: bad token or inode, dropping', {
+          level: 'error',
+        })
+        sock.destroy()
+        return
+      }
+      // Execute netns-config from an UNLINKED, content-verified fd. The
+      // staging (write to a fresh path in the protected session dir,
+      // open, delete, verify the bytes THROUGH the fd) happens ONCE per
+      // rendezvous lifetime — a 12-byte request must not cost ~1.7MB of
+      // synchronous host I/O per connection under a request flood. Per
+      // connection the master fd is reopened via /proc/self/fd (same
+      // inode, kernel-guaranteed — the master fd pins it), so each child
+      // still gets its own fd and no path ever exists at exec time.
+      let passFd: number | undefined
+      let sinkFd: number | undefined
+      try {
+        const master = ensureStagedNetnsConfig()
+        passFd = fs.openSync(`/proc/self/fd/${master}`, 'r')
+        sinkFd = fs.openSync(stderrSinkPath, 'a', 0o600)
+        // Bound the shared diagnostic file (many failures over a long
+        // session); interleaved truncation between children only costs
+        // diagnostics, never correctness.
+        if (fs.fstatSync(sinkFd).size > 65_536) fs.ftruncateSync(sinkFd, 0)
+      } catch (err) {
+        // EMFILE lands HERE (a clean shed) instead of inside spawn's
+        // unrecoverable stderr-socketpair allocation.
+        if (passFd !== undefined) {
+          try {
+            fs.closeSync(passFd)
+          } catch {
+            // best effort
+          }
+        }
+        logForDebugging(
+          `netns-config staging failed: ${(err as Error).message}`,
+          { level: 'error' },
+        )
+        sock.destroy()
+        return
+      }
+      // Single-owner close with per-runtime rules (see the branch after
+      // spawn below): a second close on a reused fd number would hit an
+      // unrelated host fd, so every close funnels through this guard.
+      let passFdClosed = false
+      const closePassFd = () => {
+        if (passFdClosed) return
+        passFdClosed = true
+        for (const fd of [passFd, sinkFd]) {
+          try {
+            fs.closeSync(fd!)
+          } catch {
+            // best effort
+          }
+        }
+      }
+      // Hand the connection itself to netns-config: the target pid comes
+      // from the socket's peercred, so the request cannot name a victim.
+      // fd 3 in the child is the verified binary; /proc/self/fd/3 names
+      // it for execve (works for unlinked files, both runtimes).
+      let child: ReturnType<typeof spawn>
+      try {
+        child = spawn('/proc/self/fd/3', [inode], {
+          stdio: [sock as unknown as Stream, 'ignore', sinkFd, passFd],
+        })
+      } catch (err) {
+        // Both runtimes can throw synchronously for some stdio/errno
+        // shapes — the long-lived host must shed the connection, not die.
+        closePassFd()
+        logForDebugging(`netns-config spawn threw: ${(err as Error).message}`, {
+          level: 'error',
+        })
+        sock.destroy()
+        return
+      }
+      if (process.versions.bun) {
+        // bun's Subprocess finalizer owns a caller-provided numeric
+        // stdio fd — but ONLY once 'spawn' fires. After success, any
+        // manual close frees the number early and the deferred
+        // finalizer close kills whatever unrelated fd reused it
+        // (measured: 40/50 unrelated fds killed in soak). On a FAILED spawn no
+        // finalizer exists, so never-closing leaks one fd per failure —
+        // an EMFILE ratchet under rendezvous floods. Mirror the
+        // runtime's ownership rule exactly:
+        child.once('spawn', () => {
+          passFdClosed = true // handed off — never touch it again
+        })
+        child.once('error', () => {
+          closePassFd() // no-op if 'spawn' already handed off
+        })
+      } else {
+        child.on('spawn', closePassFd)
+        child.on('error', closePassFd)
+      }
+      liveChildren.add(child)
+      // Watchdog: netns-config is milliseconds of work; a hang must not
+      // outlive the helper's 15s budget or block reset().
+      const watchdog = setTimeout(() => child.kill('SIGKILL'), 15_000)
+      watchdog.unref()
+      const readSinkTail = (): string => {
+        try {
+          const st = fs.statSync(stderrSinkPath)
+          const fd = fs.openSync(stderrSinkPath, 'r')
+          try {
+            const start = Math.max(0, st.size - 4096)
+            const buf = Buffer.alloc(Math.min(st.size, 4096))
+            const n = fs.readSync(fd, buf, 0, buf.length, start)
+            return buf.subarray(0, n).toString('utf8')
+          } finally {
+            fs.closeSync(fd)
+          }
+        } catch {
+          return ''
+        }
+      }
+      child.on('error', err => {
+        clearTimeout(watchdog)
+        liveChildren.delete(child)
+        logForDebugging(`netns-config spawn failed: ${err.message}`, {
+          level: 'error',
+        })
+        sock.destroy()
+      })
+      child.on('exit', code => {
+        clearTimeout(watchdog)
+        liveChildren.delete(child)
+        if (code !== 0) {
+          logForDebugging(
+            `netns-config exited ${code}: ${readSinkTail().trim()}`,
+            { level: 'error' },
+          )
+        }
+        // netns-config wrote OK (or nothing) directly on the socket; the
+        // host side of the fd can be dropped either way.
+        sock.destroy()
+      })
+    })
+  })
+
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(socketPath, () => {
+      server.removeListener('error', reject)
+      resolve()
+    })
+  })
+  // Persistent handler: an accept-time EMFILE/ENFILE must log and shed,
+  // not crash the (long-lived) embedding process as uncaughtException.
+  server.on('error', err => {
+    logForDebugging(`netns rendezvous server error: ${err.message}`, {
+      level: 'error',
+    })
+  })
+  fs.chmodSync(socketPath, 0o600)
+  server.unref()
+  logForDebugging(`netns rendezvous listening on ${socketPath}`)
+
+  return {
+    socketPath,
+    token,
+    async close(): Promise<void> {
+      rendezvousClosed = true
+      if (stagedMasterFd !== undefined) {
+        try {
+          fs.closeSync(stagedMasterFd)
+        } catch {
+          // best effort
+        }
+        stagedMasterFd = undefined
+      }
+      for (const child of liveChildren) child.kill('SIGKILL')
+      liveChildren.clear()
+      for (const sock of liveSockets) sock.destroy()
+      liveSockets.clear()
+      await new Promise<void>(resolve => server.close(() => resolve()))
+      try {
+        fs.rmSync(dir, { recursive: true, force: true })
+      } catch {
+        // best effort
+      }
+    },
+  }
+}
+
 export async function initializeLinuxNetworkBridge(
   httpProxyPort: number,
   socksProxyPort: number,
@@ -663,65 +1002,148 @@ export async function initializeLinuxNetworkBridge(
 }
 
 /**
- * Resolve how to invoke apply-seccomp: either a standalone binary path, or a
- * multicall-binary prefix that dispatches on the ARGV0 env var.
- *
- * Returns a shell-ready string ending in a trailing space — callers append
- * quote([shell, '-c', cmd]). Returns undefined when seccomp is
- * unavailable (no argv0, no binary found).
+ * Resolve how to invoke apply-seccomp: either a standalone binary path, or
+ * a multicall binary that dispatches on the ARGV0 env var. Returns
+ * undefined when seccomp is unavailable (no argv0, no binary found).
  *
  * When argv0 is set, applyPath is used verbatim (no existence check); the
  * caller is responsible for ensuring it resolves inside the bwrap namespace.
  */
-function resolveApplySeccompPrefix(
+function resolveApplySeccomp(
   applyPath: string | undefined,
   argv0: string | undefined,
-): string | undefined {
+): { binPath: string; argv0?: string } | undefined {
   if (argv0) {
     if (!applyPath) {
       throw new Error('seccompConfig.argv0 requires seccompConfig.applyPath')
     }
-    return `ARGV0=${quote([argv0])} ${quote([applyPath])} `
+    return { binPath: applyPath, argv0 }
   }
   const binary = getApplySeccompBinaryPath(applyPath)
-  return binary ? `${quote([binary])} ` : undefined
+  return binary ? { binPath: binary } : undefined
+}
+
+/** Shell-prefix form for the non-network branch (`shell -c` slot). */
+function applySeccompPrefix(
+  applySeccomp: { binPath: string; argv0?: string } | undefined,
+): string {
+  if (!applySeccomp) return ''
+  const argv0Env = applySeccomp.argv0
+    ? `ARGV0=${quote([applySeccomp.argv0])} `
+    : ''
+  return `${argv0Env}${quote([applySeccomp.binPath])} `
 }
 
 /**
- * Build the command that runs inside the sandbox.
- * Sets up HTTP proxy on port 3128 and SOCKS proxy on port 1080
+ * The in-sandbox socat listeners that back the proxy env vars (HTTP on
+ * 3128, SOCKS on 1080). When the host serves both protocols on one mux
+ * port, socksSocketPath equals httpSocketPath and the second socat is
+ * just a redundant listener on the same unix socket. No reaper needed:
+ * the script execs into the helper (pid 1 of the pid namespace), so the
+ * namespace SIGKILLs the socats when the command exits.
  */
-function buildSandboxCommand(
+function socatListenerLines(
+  socatPath: string | undefined,
   httpSocketPath: string,
   socksSocketPath: string,
-  userCommand: string,
-  applySeccompPrefix: string | undefined,
-  shell?: string,
-  socatPath?: string,
-): string {
-  // Default to bash for backward compatibility
-  const shellPath = shell || 'bash'
-  // Host filesystem is bind-mounted into the sandbox, so an explicit
-  // socatPath resolves to the same binary inside bwrap.
-  const socat = quote([socatPath ?? 'socat'])
-  const socatCommands = [
-    `${socat} TCP-LISTEN:3128,fork,reuseaddr UNIX-CONNECT:${httpSocketPath} >/dev/null 2>&1 &`,
-    `${socat} TCP-LISTEN:1080,fork,reuseaddr UNIX-CONNECT:${socksSocketPath} >/dev/null 2>&1 &`,
-    'trap "kill %1 %2 2>/dev/null; exit" EXIT',
+): string[] {
+  // Resolve socat host-side, canonical locations before PATH: it runs
+  // pre-seccomp and a workload-writable PATH dir must never supply it.
+  const socat = quote([
+    socatPath ??
+      ['/usr/bin/socat', '/bin/socat', '/usr/local/bin/socat'].find(
+        isExecutable,
+      ) ??
+      whichSync('socat') ??
+      'socat',
+  ])
+  // Address arguments are shell-quoted: the socket path comes from the
+  // host tmpdir and must never be parsed by the shell. (socat itself still
+  // treats ',' and ':' in the path specially — that fails closed.)
+  return [
+    `${socat} TCP-LISTEN:3128,fork,reuseaddr ${quote([`UNIX-CONNECT:${httpSocketPath}`])} >/dev/null 2>&1 &`,
+    `${socat} TCP-LISTEN:1080,fork,reuseaddr ${quote([`UNIX-CONNECT:${socksSocketPath}`])} >/dev/null 2>&1 &`,
   ]
+}
 
-  // apply-seccomp runs after socat so socat can still create Unix sockets.
-  if (applySeccompPrefix) {
-    const applySeccompCmd =
-      applySeccompPrefix + quote([shellPath, '-c', userCommand])
-    const innerScript = [...socatCommands, applySeccompCmd].join('\n')
-    return `${shellPath} -c ${quote([innerScript])}`
-  } else {
-    const innerScript = [...socatCommands, `eval ${quote([userCommand])}`].join(
-      '\n',
-    )
-    return `${shellPath} -c ${quote([innerScript])}`
-  }
+/**
+ * Build the in-sandbox script for network-restricted commands — the ONLY
+ * network sandboxing shape on Linux (no classic/transparent split, no
+ * fallback):
+ *
+ *   socat 3128/1080 listeners            # env-var proxy front door
+ *   SRT_TP_* env … exec node transparent-net-helper -- [apply-seccomp] shell -c <cmd>
+ *
+ * The helper's first act is the netns rendezvous: it dials the dedicated
+ * host socket (SRT_TP_NETNS) and asks the HOST to configure bwrap's netns
+ * from outside via the vendored netns-config (setns; no namespace is ever
+ * created, so this works wherever bwrap works — including hosts that
+ * forbid unprivileged userns CREATION). On the host's OK it binds the
+ * stub DNS (127.0.0.1:53) and the capture listeners (:80/:443 wildcard —
+ * the `local default dev lo` route delivers every destination locally and
+ * getsockname() reports the original dst), then spawns the user command,
+ * so listener readiness happens-before the command with no polling. A
+ * rendezvous failure is FATAL for the command; individual capture/DNS
+ * listener binds are per-listener best-effort (a lost listener only
+ * narrows compatibility — the env-var front door never depends on them).
+ *
+ * Returned as the raw script for the assembly's single `shell -c` slot:
+ * the user command crosses exactly two quote() layers (helper argv here,
+ * outer bwrap string), which keeps quote growth at classic parity and
+ * clear of MAX_ARG_STRLEN.
+ */
+function buildNetworkSandboxCommand(opts: {
+  httpSocketPath: string
+  socksSocketPath: string
+  netnsSocketPath: string
+  tokensFilePath: string | undefined
+  userCommand: string
+  applySeccomp: { binPath: string; argv0?: string } | undefined
+  shell: string
+  socatPath?: string
+}): string {
+  const {
+    httpSocketPath,
+    socksSocketPath,
+    netnsSocketPath,
+    tokensFilePath,
+    userCommand,
+    applySeccomp,
+    shell,
+    socatPath,
+  } = opts
+
+  // The PROTECTED copy of the helper (asset dir, ro-bound over itself by
+  // the caller) — never the dist/source file, which can be workload-
+  // writable in dev-checkout configurations.
+  const helperPath = getProtectedHelperPath()!
+
+  // The helper spawns this argv directly (no intermediate shell): the
+  // user command stays a single argv element all the way down.
+  const childArgv = applySeccomp
+    ? [applySeccomp.binPath, shell, '-c', userCommand]
+    : [shell, '-c', userCommand]
+
+  // Secrets go through the 0400 token file when available (argv/cmdline
+  // is world-readable on the host; the asset dir is 0700).
+  const helperEnv =
+    `SRT_TP_BRIDGE=${quote([`unix:${httpSocketPath}`])} ` +
+    `SRT_TP_NETNS=${quote([`unix:${netnsSocketPath}`])} ` +
+    // Secrets travel ONLY via the 0400 tokens file — there is no raw-env
+    // fallback (it would ride world-readable cmdline; the raw-token env was removed
+    // the dead netnsToken plumbing).
+    (tokensFilePath ? `SRT_TP_TOKEN_FILE=${quote([tokensFilePath])} ` : '') +
+    `SRT_TP_PORTS=${quote([DEFAULT_TRANSPARENT_TCP_PORTS.join(',')])} ` +
+    (applySeccomp?.argv0
+      ? `SRT_TP_CHILD_ARGV0=${quote([applySeccomp.argv0])} `
+      : '') +
+    (process.env.SRT_TP_DEBUG ? `SRT_TP_DEBUG=1 ` : '')
+
+  return [
+    ...socatListenerLines(socatPath, httpSocketPath, socksSocketPath),
+    helperEnv +
+      `exec ${quote([process.execPath, helperPath, '--', ...childArgv])}`,
+  ].join('\n')
 }
 
 /**
@@ -1253,6 +1675,8 @@ export async function wrapCommandWithSandboxLinux(
     needsNetworkRestriction,
     httpSocketPath,
     socksSocketPath,
+    netnsSocketPath,
+    tokensFilePath,
     httpProxyPort,
     socksProxyPort,
     proxyAuthToken,
@@ -1286,6 +1710,40 @@ export async function wrapCommandWithSandboxLinux(
     (unsetEnvVars !== undefined && unsetEnvVars.length > 0) ||
     (setEnvVars !== undefined && Object.keys(setEnvVars).length > 0)
 
+  // Networked commands exec the helper with process.execPath INSIDE the
+  // sandbox; a denyRead covering the runtime would fail every such
+  // command with a raw shell error. Refuse loudly instead of silently
+  // overriding the user's read policy.
+  if (needsNetworkRestriction && httpSocketPath && readConfig) {
+    // Check BOTH spellings: the script execs the literal
+    // process.execPath, but deny mounts land on the spelled entry —
+    // a deny covering a symlink spelling (/usr/local/bin/node ->
+    // /opt/node/bin/node) erases the exec path even though the
+    // realpath is uncovered.
+    const runtime = fs.realpathSync(process.execPath)
+    const spelled = normalizePathForSandbox(process.execPath)
+    const targets = spelled === runtime ? [runtime] : [runtime, spelled]
+    const allows = (readConfig.allowWithinDeny || []).map(p =>
+      normalizePathForSandbox(p),
+    )
+    for (const p of readConfig.denyOnly) {
+      const deny = normalizePathForSandbox(p)
+      const covers = (base: string, target: string) =>
+        target === base ||
+        target.startsWith(base.endsWith('/') ? base : base + '/')
+      const hit = targets.find(
+        t => covers(deny, t) && !allows.some(a => covers(a, t)),
+      )
+      if (hit !== undefined) {
+        throw new Error(
+          `filesystem.denyRead ${p} covers the JavaScript runtime ` +
+            `(${hit}) that networked sandboxed commands execute — ` +
+            'exempt it via allowWithinDeny or narrow the deny path',
+        )
+      }
+    }
+  }
+
   // Check if we need any sandboxing
   if (
     !needsNetworkRestriction &&
@@ -1305,19 +1763,19 @@ export async function wrapCommandWithSandboxLinux(
   activeSandboxCount++
 
   const bwrapArgs: string[] = ['--new-session', '--die-with-parent']
-  let applySeccompPrefix: string | undefined
+  let applySeccomp: { binPath: string; argv0?: string } | undefined
 
   try {
     // ========== SECCOMP FILTER (Unix Socket Blocking) ==========
     // apply-seccomp wraps the workload and applies the baked-in BPF filter
     // that blocks socket(AF_UNIX, ...). Skipped when allowAllUnixSockets is true.
     if (!allowAllUnixSockets) {
-      applySeccompPrefix = resolveApplySeccompPrefix(
+      applySeccomp = resolveApplySeccomp(
         seccompConfig?.applyPath,
         seccompConfig?.argv0,
       )
 
-      if (!applySeccompPrefix) {
+      if (!applySeccomp) {
         logForDebugging(
           '[Sandbox Linux] apply-seccomp binary not available - unix socket blocking disabled. ' +
             'Install @anthropic-ai/sandbox-runtime globally for full protection.',
@@ -1374,14 +1832,24 @@ export async function wrapCommandWithSandboxLinux(
           )
         }
 
-        // Bind both sockets into the sandbox
-        bwrapArgs.push('--bind', httpSocketPath, httpSocketPath)
-        // When the mux serves both protocols, socksSocketPath is the same
-        // file as httpSocketPath; bwrap rejects a duplicate --bind of the
-        // same source→target.
-        if (socksSocketPath !== httpSocketPath) {
-          bwrapArgs.push('--bind', socksSocketPath, socksSocketPath)
+        // The netns rendezvous socket: the helper's first act is asking
+        // the host (through this socket) to configure the sandbox netns.
+        if (netnsSocketPath === undefined) {
+          throw new Error(
+            'netnsSocketPath is required when bridge sockets are provided — ' +
+              'Linux network sandboxing has no shape without the host netns ' +
+              'rendezvous (create it with initializeNetnsRendezvous())',
+          )
         }
+        if (!fs.existsSync(netnsSocketPath)) {
+          throw new Error(
+            `Linux netns rendezvous socket does not exist: ${netnsSocketPath}. ` +
+              'Try reinitializing the sandbox.',
+          )
+        }
+        // NOTE: the socket --bind args are emitted AFTER fsArgs (below,
+        // with the resolv/asset binds) — a denyRead tmpfs over /tmp must
+        // not shadow the bridge sockets out of the sandbox.
 
         // Add proxy environment variables
         // HTTP_PROXY points to the socat listener inside the sandbox (port 3128)
@@ -1435,6 +1903,111 @@ export async function wrapCommandWithSandboxLinux(
     )
     bwrapArgs.push(...fsArgs)
 
+    // Networked sandboxing (bridge sockets present) has exactly one
+    // shape; its components are hard requirements — errors here fail the
+    // wrap loudly (same class as a missing bwrap), nothing degrades.
+    const networkActive =
+      needsNetworkRestriction &&
+      httpSocketPath !== undefined &&
+      socksSocketPath !== undefined
+    if (networkActive) {
+      const deps = checkTransparentDependencies()
+      if (deps.errors.length > 0) {
+        throw new Error(
+          `Linux network sandboxing unavailable: ${deps.errors.join('; ')}`,
+        )
+      }
+    }
+
+    // Point the sandbox at the in-namespace stub resolver. Emitted after
+    // fsArgs so it overlays the root ro-bind. bwrap rejects symlink bind
+    // destinations (see resolveSymlinkDenyDest), so the bind lands on the
+    // resolved target (e.g. systemd-resolved's stub-resolv.conf). A missing
+    // resolv.conf is left alone — glibc then defaults to the loopback
+    // resolver, which is exactly the stub.
+    if (networkActive) {
+      const resolvDest = resolveSymlinkDenyDest('/etc/resolv.conf')
+      if (fs.existsSync(resolvDest)) {
+        bwrapArgs.push('--ro-bind', getSandboxResolvConfPath(), resolvDest)
+      }
+    }
+    // INVARIANT: the asset dir (resolv stub + the copies the sandbox
+    // executes AND the netns-config copy the HOST executes) must never be
+    // writable from inside ANY sandbox — including non-networked wraps
+    // whose allowWrite covers tmpdir. Same pattern and
+    // ordering as maskedFileStoreDir below: emitted after every --bind
+    // that could cover it (e.g. allowWrite /tmp).
+    {
+      // Protect EVERY asset-parent candidate — including ones that do
+      // not exist yet: a sandbox wrapped before a parent is created must
+      // not gain a live rw view of it later (the wrap-time
+      // existence snapshot). A --tmpfs at the path both hides/blocks the
+      // real host files if present and pre-shadows the path if absent
+      // (bwrap creates the mountpoint; /tmp and tmpdir() always exist,
+      // and the /run/user candidate is only listed when its runtime dir
+      // does). The former ro-bind was dead argv (immediately shadowed by
+      // the tmpfs) and is gone. Networked wraps then rebind their OWN
+      // session dir read-only on top so helper/tokens/resolv stay
+      // visible.
+      if (networkActive) getTransparentAssetDir() // ensure ours exists
+      // ONE snapshot for both loops: the /run/user candidate is
+      // existence-gated, so recomputing for the remount-ro pass could
+      // miss a candidate that vanished mid-wrap (XDG teardown at
+      // logout), leaving its tmpfs mounted but UNSEALED (rw).
+      const assetParents = transparentAssetParentCandidates()
+      for (const parent of assetParents) {
+        // The tmpfs mountpoint must EXIST on the host: bwrap cannot
+        // mkdir it when the surrounding tree is read-only in the
+        // sandbox (default write config on a systemd host pins the
+        // asset parent under /run/user/<uid>, so the /tmp candidate is
+        // otherwise never created). 0o700 matters: the asset layer
+        // refuses group/other-writable parents.
+        try {
+          fs.mkdirSync(parent, { recursive: true, mode: 0o700 })
+        } catch {
+          // a genuinely uncreatable parent fails at bwrap, loudly
+        }
+        bwrapArgs.push('--tmpfs', parent)
+      }
+      if (networkActive) {
+        const sessionDir = getTransparentAssetDir()
+        bwrapArgs.push('--ro-bind', sessionDir, sessionDir)
+        // Bridge + rendezvous sockets: emitted AFTER fsArgs AND after
+        // the parent tmpfs stack — nothing may shadow them out of the
+        // sandbox (the rendezvous socket lives under the parent).
+        bwrapArgs.push('--bind', httpSocketPath!, httpSocketPath!)
+        // When the mux serves both protocols, socksSocketPath is the
+        // same file; bwrap rejects duplicate --bind of the same pair.
+        if (socksSocketPath !== httpSocketPath) {
+          bwrapArgs.push('--bind', socksSocketPath!, socksSocketPath!)
+        }
+        bwrapArgs.push('--bind', netnsSocketPath!, netnsSocketPath!)
+      }
+      // Seal the candidate tmpfs mounts read-only (a rw tmpfs would let
+      // in-sandbox processes stage decoys at those paths; child mounts
+      // emitted above are separate mounts and stay as configured).
+      for (const parent of assetParents) {
+        bwrapArgs.push('--remount-ro', parent)
+      }
+      // The vendored binaries dir: the host reads netns-config bytes from
+      // here (once, at initialize) — a sandbox must not be able to
+      // pre-tamper the file another session's host process will read
+      // Residual: installs at OTHER paths are not enumerable.
+      const vendorProbe =
+        getVendorSeccompBinaryPath('netns-config') ??
+        getApplySeccompBinaryPath(undefined)
+      if (vendorProbe !== null) {
+        const vendorDir = path.dirname(path.dirname(vendorProbe))
+        try {
+          if (fs.lstatSync(vendorDir).isDirectory()) {
+            bwrapArgs.push('--ro-bind', vendorDir, vendorDir)
+          }
+        } catch {
+          // absent
+        }
+      }
+    }
+
     // Always bind /dev
     bwrapArgs.push('--dev', '/dev')
 
@@ -1475,36 +2048,88 @@ export async function wrapCommandWithSandboxLinux(
     if (!shell) {
       throw new Error(`Shell '${shellName}' not found in PATH`)
     }
-    bwrapArgs.push('--', shell, '-c')
+    // The OUTER shell runs PRE-seccomp (it starts socat and execs the
+    // helper) — it must never source user-writable startup files, or an
+    // allowWrite-home workload gets pre-seccomp code execution
+    // (~/.zshenv class). zsh sources ~/.zshenv even for -c: -f (NO_RCS)
+    // suppresses it. bash honors $BASH_ENV for non-interactive shells:
+    // unset it (and POSIX ENV) process-wide. The USER's shell — spawned
+    // by the helper under apply-seccomp — is a separate invocation and
+    // keeps its normal behavior apart from the env unsets.
+    bwrapArgs.push(
+      '--unsetenv',
+      'BASH_ENV',
+      '--unsetenv',
+      'ENV',
+      '--unsetenv',
+      'SHELLOPTS',
+      '--unsetenv',
+      'BASHOPTS',
+    )
+    // The OUTER slot always uses a FIXED POSIX shell: matching startup
+    // suppression flags per user shell is a losing game (zsh behind a
+    // symlinked name, csh/tcsh have no suppression at all). The outer
+    // script is plain POSIX; the USER's shell still runs their command
+    // (inside apply-seccomp), so shell semantics are preserved where
+    // they matter.
+    // Probe canonical root-owned locations BEFORE PATH: the outer shell
+    // executes pre-seccomp, and a workload-writable PATH dir must never
+    // supply it. --norc for bash: it sources ~/.bashrc even
+    // non-interactively when it thinks it's under rsh/ssh (SSH_CLIENT).
+    const outerShell =
+      ['/bin/bash', '/usr/bin/bash', '/bin/sh', '/usr/bin/sh'].find(
+        isExecutable,
+      ) ??
+      whichSync('bash') ??
+      whichSync('sh')
+    if (!outerShell) {
+      throw new Error('no POSIX shell (bash/sh) found for the sandbox wrapper')
+    }
+    if (path.basename(outerShell) === 'bash') {
+      bwrapArgs.push('--', outerShell, '--norc', '-c')
+    } else {
+      bwrapArgs.push('--', outerShell, '-c')
+    }
 
-    // With network restrictions, route the command through buildSandboxCommand
-    // so socat starts before seccomp is applied. Otherwise invoke apply-seccomp
-    // directly if we have a binary.
-    if (needsNetworkRestriction && httpSocketPath && socksSocketPath) {
-      const sandboxCommand = buildSandboxCommand(
-        httpSocketPath,
-        socksSocketPath,
-        command,
-        applySeccompPrefix,
-        shell,
-        socatPath,
+    // Networked commands run the single network script (socat env-var
+    // listeners + the helper, which rendezvouses with the host for netns
+    // configuration and then supervises the user command). Everything
+    // else runs the command directly, under apply-seccomp when available.
+    if (networkActive) {
+      bwrapArgs.push(
+        buildNetworkSandboxCommand({
+          httpSocketPath: httpSocketPath!,
+          socksSocketPath: socksSocketPath!,
+          netnsSocketPath: netnsSocketPath!,
+          tokensFilePath,
+          userCommand: command,
+          applySeccomp,
+          shell,
+          socatPath,
+        }),
       )
-      bwrapArgs.push(sandboxCommand)
-    } else if (applySeccompPrefix) {
-      const applySeccompCmd = applySeccompPrefix + quote([shell, '-c', command])
+    } else if (applySeccomp) {
+      const applySeccompCmd =
+        applySeccompPrefix(applySeccomp) + quote([shell, '-c', command])
       bwrapArgs.push(applySeccompCmd)
     } else {
-      bwrapArgs.push(command)
+      // No seccomp available in this config: still run the user command
+      // under the USER's shell (the fixed outer shell is only wrapper
+      // plumbing; user shell semantics must not silently change).
+      bwrapArgs.push(quote([shell, '-c', command]))
     }
 
     const wrappedCommand = quote([bwrapPath ?? 'bwrap', ...bwrapArgs])
 
     const restrictions = []
-    if (needsNetworkRestriction) restrictions.push('network')
+    if (needsNetworkRestriction)
+      restrictions.push(
+        networkActive ? 'network(transparent)' : 'network(blocked)',
+      )
     if (hasReadRestrictions || hasWriteRestrictions)
       restrictions.push('filesystem')
     if (hasEnvRestrictions) restrictions.push('env')
-    if (applySeccompPrefix) restrictions.push('seccomp(unix-block)')
+    if (applySeccomp) restrictions.push('seccomp(unix-block)')
 
     logForDebugging(
       `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,

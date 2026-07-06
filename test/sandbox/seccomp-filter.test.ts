@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'bun:test'
+import * as fs from 'node:fs'
 import { existsSync } from 'node:fs'
 import { whichSync } from '../../src/utils/which.js'
 import { getApplySeccompBinaryPath } from '../../src/sandbox/generate-seccomp-filter.js'
@@ -53,6 +54,23 @@ describe.if(isLinux)('Apply Seccomp Binary', () => {
   })
 })
 
+describe.if(isLinux)('unix-block filter source invariants', () => {
+  it('keeps the AF_UNIX socketpair rules (datagram/raw pairs blocked)', () => {
+    // The kernel lets a connected AF_UNIX datagram socketpair half be
+    // re-targeted via connect(AF_UNSPEC) into a general unix datagram
+    // socket, so the block must cover socketpair() as well as socket().
+    // The BPF header is build-time-ephemeral — pin the SOURCE so a
+    // filter edit cannot silently drop the rule with no CI signal.
+    const src = fs.readFileSync(
+      'vendor/seccomp-src/seccomp-unix-block.c',
+      'utf8',
+    )
+    expect(src).toContain('SCMP_SYS(socketpair)')
+    expect(src).toMatch(/socketpair[\s\S]{0,600}SOCK_DGRAM/)
+    expect(src).toMatch(/socketpair[\s\S]{0,600}SOCK_RAW/)
+  })
+})
+
 describe.if(isLinux)('Sandbox Integration', () => {
   it('wraps filesystem-restricted commands with bwrap', async () => {
     if (checkLinuxDependencies().errors.length > 0) return
@@ -94,7 +112,11 @@ describe.if(isLinux)('Sandbox Integration', () => {
     })
 
     expect(wrappedCommand).toContain('ARGV0=apply-seccomp /proc/self/fd/3 ')
-    expect(wrappedCommand).not.toContain('vendor/seccomp')
+    // argv0 mode must not EXECUTE any on-disk vendor binary. The vendor
+    // dir may appear as a protective ro-bind MOUNT arg, so assert on the
+    // exec tail (everything after bwrap's `--` separator) instead.
+    const execTail = wrappedCommand.slice(wrappedCommand.indexOf(' -- ') + 4)
+    expect(execTail).not.toContain('vendor/seccomp')
   })
 
   it('argv0 mode: shell-quotes argv0 and applyPath', async () => {
