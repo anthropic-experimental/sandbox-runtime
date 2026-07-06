@@ -135,9 +135,15 @@ describe.if(hasPrereqs())('rendezvous fd lifecycle', () => {
     }
     // Let the runtime run its deferred releases.
     if (typeof Bun !== 'undefined') {
-      Bun.gc(true)
-      await new Promise(r => setTimeout(r, 200))
-      Bun.gc(true)
+      // bun's Subprocess finalizers release caller-provided stdio fds
+      // LAZILY; canary builds vary in how many GC passes that takes.
+      // Poll until the table settles (bounded) instead of assuming two
+      // passes suffice.
+      for (let i = 0; i < 20; i++) {
+        Bun.gc(true)
+        await new Promise(r => setTimeout(r, 100))
+        if (fdCount() - canaries.length - baseline < CONNS / 2) break
+      }
     }
     let dead = 0
     for (const c of canaries) {
