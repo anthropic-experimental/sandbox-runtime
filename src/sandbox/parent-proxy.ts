@@ -17,6 +17,7 @@
 
 import type { Socket } from 'node:net'
 import type { IncomingHttpHeaders } from 'node:http'
+import * as dns from 'node:dns'
 import { BlockList, connect as netConnect, isIP } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
 import { URL } from 'node:url'
@@ -482,6 +483,221 @@ export function canonicalizeHost(h: string): string | undefined {
   }
 }
 
+/** Parse an IPv6 string to 16 bytes; null when unparseable. */
+function ipv6ToBytes(addr: string): Uint8Array | null {
+  let a = addr
+  let embeddedV4: number[] | null = null
+  const dq = /^(.*:)(\d{1,3}(?:\.\d{1,3}){3})$/.exec(a)
+  if (dq) {
+    // Strict dotted quad (inet_pton parity): no leading zeros/signs.
+    const quad = dq[2]!.split('.')
+    if (quad.some(p => !/^(0|[1-9]\d{0,2})$/.test(p) || Number(p) > 255)) {
+      return null
+    }
+    embeddedV4 = quad.map(Number)
+    a = dq[1]! + '0:0' // placeholder, replaced below
+  }
+  const halves = a.split('::')
+  if (halves.length > 2) return null
+  const head = halves[0] === '' ? [] : halves[0]!.split(':')
+  const tail =
+    halves.length === 2 ? (halves[1] === '' ? [] : halves[1]!.split(':')) : []
+  const groups = halves.length === 2 ? head.length + tail.length : head.length
+  if (halves.length === 1 && groups !== 8) return null
+  if (groups > 8) return null
+  const words: number[] = []
+  const parseGroups = (gs: string[]) => {
+    for (const g of gs) {
+      if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return false
+      words.push(parseInt(g, 16))
+    }
+    return true
+  }
+  if (!parseGroups(head)) return null
+  const fill = 8 - groups
+  // RFC 4291 / inet_pton: '::' must stand for at least ONE zero group —
+  // 8-explicit-groups-plus-'::' spellings are kernel-invalid and must
+  // refuse (fail closed) rather than parse.
+  if (halves.length === 2 && fill < 1) return null
+  for (let i = 0; i < (halves.length === 2 ? fill : 0); i++) words.push(0)
+  if (!parseGroups(tail)) return null
+  if (words.length !== 8) return null
+  const bytes = new Uint8Array(16)
+  for (let i = 0; i < 8; i++) {
+    bytes[2 * i] = words[i]! >> 8
+    bytes[2 * i + 1] = words[i]! & 0xff
+  }
+  if (embeddedV4) {
+    bytes[12] = embeddedV4[0]!
+    bytes[13] = embeddedV4[1]!
+    bytes[14] = embeddedV4[2]!
+    bytes[15] = embeddedV4[3]!
+  }
+  return bytes
+}
+
+function isBlockedV4Octets(o: number[]): boolean {
+  if (o[0] === 127 || o[0] === 0) return true // loopback, "this network"
+  if (o[0] === 169 && o[1] === 254) return true // link-local + metadata
+  // Azure WireServer: a fixed PUBLIC-range address serving the
+  // metadata/agent plane on Azure VMs (Microsoft-documented).
+  if (o[0] === 168 && o[1] === 63 && o[2] === 129 && o[3] === 16) return true
+  if (o[0] === 198 && (o[1] === 18 || o[1] === 19)) return true // fake pool
+  // CGNAT 100.64/10 policy — DELIBERATE, mirrors the RFC1918 decision:
+  // resolved-to-private is allowed BY DESIGN (intranet/tailnet names
+  // legitimately resolve there; Tailscale assigns across the ENTIRE /10,
+  // so there is no narrower tailnet carve-out), but documented metadata
+  // services inside the range are denied. Known: Alibaba Cloud metadata
+  // (100.100.100.200) and its internal-service /16. If another cloud
+  // ships CGNAT-hosted metadata, extend THIS list — do not widen to the
+  // full /10 without also blocking RFC1918, or the policy is incoherent.
+  if (o[0] === 100 && o[1] === 100) return true // Alibaba 100.100/16
+  if (o[0]! >= 224 && o[0]! <= 239) return true // multicast 224/4
+  // Class E 240/4 unicast is ALLOWED (same resolved-to-private policy
+  // as RFC1918/CGNAT above: Kubernetes fabrics use it as pod/service
+  // space) — only the limited-broadcast address is refused.
+  if (o[0] === 255 && o[1] === 255 && o[2] === 255 && o[3] === 255) {
+    return true
+  }
+  return false
+}
+
+/**
+ * True for address ranges the proxy must never dial as the result of a
+ * NAME resolution: DNS rebinding would otherwise turn one approved
+ * hostname into host-loopback/link-local (cloud metadata) reach — the
+ * exact resources netns isolation withholds. IP LITERALS are exempt by
+ * design: the filter saw the literal and allowed it explicitly (tests
+ * and intranet configs legitimately allow 127.0.0.1 or 10.x).
+ * IPv6 is classified on PARSED BYTES: every spelling form —
+ * compressed, uncompressed, mixed case, hex-mapped, v4-compatible —
+ * lands on the same rules; unparseable v6 fails closed.
+ */
+export function isBlockedResolvedAddress(addr: string): boolean {
+  const a = addr.toLowerCase()
+  if (!a.includes(':')) {
+    // Strict dotted-quad: digits only, no leading zeros (inet_pton
+    // parity — '1e2'/'+66'/'0177' spellings refuse rather than parse).
+    const parts = a.split('.')
+    if (
+      parts.length !== 4 ||
+      parts.some(p2 => !/^(0|[1-9]\d{0,2})$/.test(p2) || Number(p2) > 255)
+    ) {
+      return true
+    }
+    return isBlockedV4Octets(parts.map(Number))
+  }
+  const b = ipv6ToBytes(a)
+  if (b === null) return true // unparseable v6: refuse
+  const allZero = (from: number, to: number) => {
+    for (let i = from; i < to; i++) if (b[i] !== 0) return false
+    return true
+  }
+  // :: and ::1
+  if (allZero(0, 15) && (b[15] === 0 || b[15] === 1)) return true
+  // v4-mapped ::ffff:0:0/96 and v4-compatible ::/96 → v4 rules
+  if (allZero(0, 10) && b[10] === 0xff && b[11] === 0xff) {
+    return isBlockedV4Octets([b[12]!, b[13]!, b[14]!, b[15]!])
+  }
+  if (allZero(0, 12)) {
+    return isBlockedV4Octets([b[12]!, b[13]!, b[14]!, b[15]!])
+  }
+  // SIIT "IPv4-translated" ::ffff:0:a.b.c.d (RFC 2765) → v4 rules too.
+  if (
+    allZero(0, 8) &&
+    b[8] === 0xff &&
+    b[9] === 0xff &&
+    b[10] === 0 &&
+    b[11] === 0
+  ) {
+    return isBlockedV4Octets([b[12]!, b[13]!, b[14]!, b[15]!])
+  }
+  // NAT64 64:ff9b::/96
+  if (
+    b[0] === 0 &&
+    b[1] === 0x64 &&
+    b[2] === 0xff &&
+    b[3] === 0x9b &&
+    allZero(4, 12)
+  ) {
+    return true
+  }
+  if (b[0] === 0xff) return true // multicast ff00::/8
+  if (b[0] === 0xfe && (b[1]! & 0xc0) === 0x80) return true // fe80::/10
+  if (b[0] === 0xfe && (b[1]! & 0xc0) === 0xc0) return true // fec0::/10
+  if ((b[0]! & 0xfe) === 0xfc) return true // ULA fc00::/7
+  if (b[0] === 0x20 && b[1] === 0x02) return true // 6to4 2002::/16
+  if (b[0] === 0x20 && b[1] === 0x01 && b[2] === 0 && b[3] === 0) return true // Teredo
+  return false
+}
+
+/**
+ * dns.lookup wrapper that refuses blocked resolved addresses. Passed as
+ * the `lookup` option on every direct-egress dial; node skips it for IP
+ * literals (which stay the filter's explicit responsibility). localhost
+ * is exempt like a literal: allowing the NAME localhost is unambiguous.
+ */
+export function vettedLookup(
+  hostname: string,
+  optionsOrCallback:
+    | dns.LookupOptions
+    | number
+    | ((
+        err: NodeJS.ErrnoException | null,
+        address: string | dns.LookupAddress[],
+        family?: number,
+      ) => void),
+  maybeCallback?: (
+    err: NodeJS.ErrnoException | null,
+    address: string | dns.LookupAddress[],
+    family?: number,
+  ) => void,
+): void {
+  // Normalize dns.lookup's legacy arities: (host, cb) and (host, family,
+  // cb) — silently dropping a family constraint would change dial
+  // behavior for callers using the old forms.
+  const callback =
+    typeof optionsOrCallback === 'function' ? optionsOrCallback : maybeCallback!
+  const options: dns.LookupOptions =
+    typeof optionsOrCallback === 'function'
+      ? {}
+      : typeof optionsOrCallback === 'number'
+        ? { family: optionsOrCallback as 4 | 6 }
+        : optionsOrCallback
+  // localhost names are EXPECTED to be loopback (RFC 6761) — enforce
+  // that intent instead of exempting them entirely: only loopback
+  // results pass, so a resolver answering a public IP for *.localhost
+  // is refused too.
+  // DNS names are case-insensitive (RFC 4343) and the allowlist
+  // matcher already folds case — fold here too or 'LOCALHOST' skips
+  // the exemption and refuses where a plain dial connected.
+  const hn = hostname.toLowerCase()
+  const localhostName = hn === 'localhost' || hn.endsWith('.localhost')
+  dns.lookup(hostname, { ...options, all: true }, (err, addresses) => {
+    if (err) {
+      callback(err, options.all ? [] : '', 4)
+      return
+    }
+    const isLoopback = (addr: string) =>
+      addr === '::1' || /^127\./.test(addr) || addr === '::ffff:127.0.0.1'
+    const list = (addresses as dns.LookupAddress[]).filter(a =>
+      localhostName
+        ? isLoopback(a.address)
+        : !isBlockedResolvedAddress(a.address),
+    )
+    if (list.length === 0) {
+      const e = new Error(
+        `refusing to dial ${hostname}: resolves only to blocked address ranges (loopback/link-local/reserved)`,
+      ) as NodeJS.ErrnoException
+      e.code = 'ERT_BLOCKED_RESOLVE'
+      callback(e, options.all ? [] : '', 4)
+      return
+    }
+    if (options.all) callback(null, list)
+    else callback(null, list[0]!.address, list[0]!.family)
+  })
+}
+
 /**
  * Dial `host:port` directly with a bounded timeout. Shared by the HTTP and
  * SOCKS direct-connect paths so they get the same timeout behaviour as the
@@ -493,7 +709,11 @@ export function dialDirect(
   timeoutMs = CONNECT_TIMEOUT_MS,
 ): Promise<Socket> {
   return new Promise((resolve, reject) => {
-    const s = netConnect(port, host)
+    const s = netConnect({
+      port,
+      host,
+      lookup: vettedLookup as never,
+    })
     let settled = false
     const done = (err?: Error) => {
       if (settled) return

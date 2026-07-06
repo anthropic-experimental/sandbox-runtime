@@ -30,6 +30,17 @@ describe('looksLikeClientHello', () => {
     )
     expect(looksLikeClientHello(Buffer.from([0x16, 0x03, 0x00]))).toBe(true)
   })
+  it('treats out-of-range minor version bytes as TLS (fail toward termination)', () => {
+    // The minor byte is sender-controlled and widely ignored by servers;
+    // a crafted 16 03 04 hello must not dodge termination into an
+    // opaque tunnel.
+    expect(looksLikeClientHello(Buffer.from([0x16, 0x03, 0x04, 0x00]))).toBe(
+      true,
+    )
+    expect(looksLikeClientHello(Buffer.from([0x16, 0x03, 0xff]))).toBe(true)
+    // Wrong MAJOR version is still rejected (not plausibly TLS).
+    expect(looksLikeClientHello(Buffer.from([0x16, 0x02, 0x01]))).toBe(false)
+  })
   it('rejects an SSH banner', () => {
     expect(looksLikeClientHello(Buffer.from('SSH-2.0-OpenSSH_9.7\r\n'))).toBe(
       false,

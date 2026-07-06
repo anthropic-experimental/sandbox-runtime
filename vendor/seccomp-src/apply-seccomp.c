@@ -40,6 +40,8 @@
 #include <sched.h>
 #include <signal.h>
 #include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <linux/capability.h>
 #include <sys/wait.h>
 #include <sys/mount.h>
 #include <linux/seccomp.h>
@@ -267,6 +269,64 @@ int main(int argc, char *argv[]) {
     }
 
     /* ---- Worker (inner PID 2): apply seccomp and exec. ---- */
+
+    /* Drop the bounding set so a uid-0 workload cannot regenerate
+     * capabilities at execve: the root-exec rule refills permitted and
+     * effective from the bounding set, and NO_NEW_PRIVS does not prevent
+     * that. For uid != 0 execve clears everything anyway. EPERM means we
+     * hold no CAP_SETPCAP — then our capability sets are already empty
+     * and a uid != 0 exec keeps nothing; treat as done rather than
+     * failing capability-less configurations. */
+    /* Clear the INHERITABLE set: with CAP_SETPCAP in a --cap-add style
+     * grant, pI could survive exec and re-arm file-caps binaries.
+     * Lowering one's own pI never requires privilege. Raw capset(2): no
+     * libcap dependency. */
+    {
+        struct __user_cap_header_struct hdr = {
+            .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0,
+        };
+        struct __user_cap_data_struct data[2];
+        if (syscall(SYS_capget, &hdr, data) == 0) {
+            data[0].inheritable = 0;
+            data[1].inheritable = 0;
+            if (syscall(SYS_capset, &hdr, data) != 0) {
+                die("apply-seccomp: capset(clear inheritable)");
+            }
+        }
+        /* capget failure: fall through — the bounding-set verification
+         * below still refuses dangerous states for uid 0. */
+    }
+
+    int drop_eperm = 0;
+    for (int cap = 0;; cap++) {
+        if (prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) == 0) continue;
+        if (errno == EINVAL) break; /* past the highest capability */
+        if (errno == EPERM) { drop_eperm = 1; break; }
+        die("apply-seccomp: prctl(PR_CAPBSET_DROP)");
+    }
+    if (drop_eperm) {
+        /* EPERM means no CAP_SETPCAP. That is only safe when the bounding
+         * set is ALREADY empty-of-consequence — a caller that granted us
+         * caps without CAP_SETPCAP (bwrap --cap-add configurations) would
+         * otherwise let a uid-0 workload regenerate them at execve.
+         * Verify the premise instead of assuming it. */
+        for (int cap = 0;; cap++) {
+            int r = prctl(PR_CAPBSET_READ, cap, 0, 0, 0);
+            if (r < 0) {
+                if (errno == EINVAL) break; /* past the highest capability */
+                die("apply-seccomp: prctl(PR_CAPBSET_READ)");
+            }
+            if (r == 1 && geteuid() == 0) {
+                fprintf(stderr,
+                        "apply-seccomp: cannot drop bounding set "
+                        "(no CAP_SETPCAP) but cap %d is still present and "
+                        "euid is 0 — refusing to exec a workload that "
+                        "would regain capabilities\n", cap);
+                _exit(1);
+            }
+        }
+    }
+
     if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
         die("apply-seccomp: prctl(PR_SET_NO_NEW_PRIVS)");
     }

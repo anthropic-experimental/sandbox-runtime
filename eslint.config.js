@@ -7,7 +7,14 @@ import prettierRecommended from 'eslint-plugin-prettier/recommended'
 
 export default [
   {
-    ignores: ['node_modules/', 'dist/', '**/*.d.ts'],
+    ignores: [
+      'node_modules/',
+      'dist/',
+      '**/*.d.ts',
+      // In-sandbox runtime fixtures: plain CommonJS executed with bare
+      // node inside bwrap — not project sources.
+      'test/fixtures/transparent/*.cjs',
+    ],
   },
   {
     files: ['**/*.{js,ts}'],
@@ -22,6 +29,7 @@ export default [
           allowDefaultProject: [
             'eslint.config.js',
             'test/utils/which-node-test.mjs',
+            'test/node-leg/capture-pipeline-node.mts',
             'vendor/build-common.ts',
             'vendor/seccomp/build.ts',
             'vendor/srt-win/build.ts',

@@ -612,6 +612,20 @@ export const WindowsConfigSchema = z.object({
  */
 export const SeccompConfigSchema = z.object({
   applyPath: z.string().optional().describe('Path to the apply-seccomp binary'),
+  netnsConfigPath: z
+    .string()
+    .optional()
+    .describe(
+      'Path to the netns-config binary. Defaults to the vendored copy; ' +
+        'bundled consumers that relocate vendor binaries must set this.',
+    ),
+  transparentHelperPath: z
+    .string()
+    .optional()
+    .describe(
+      'Path to the transparent-net-helper script. Defaults to the copy ' +
+        'shipped next to this module; bundled consumers must set this.',
+    ),
   argv0: z
     .string()
     .optional()

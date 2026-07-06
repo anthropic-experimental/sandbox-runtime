@@ -292,14 +292,17 @@ describe('restriction pattern semantics', () => {
     it.if(isLinux)('uses socatPath inside the sandbox script', async () => {
       const httpSock = join(tmpdir(), `srt-test-http-${process.pid}.sock`)
       const socksSock = join(tmpdir(), `srt-test-socks-${process.pid}.sock`)
+      const netnsSock = join(tmpdir(), `srt-test-netns-${process.pid}.sock`)
       writeFileSync(httpSock, '')
       writeFileSync(socksSock, '')
+      writeFileSync(netnsSock, '')
       try {
         const result = await wrapCommandWithSandboxLinux({
           command,
           needsNetworkRestriction: true,
           httpSocketPath: httpSock,
           socksSocketPath: socksSock,
+          netnsSocketPath: netnsSock,
           readConfig: { denyOnly: [] },
           writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
           socatPath: '/opt/sc/socat',
@@ -310,6 +313,7 @@ describe('restriction pattern semantics', () => {
       } finally {
         rmSync(httpSock, { force: true })
         rmSync(socksSock, { force: true })
+        rmSync(netnsSock, { force: true })
       }
     })
   })
@@ -449,10 +453,12 @@ describe('restriction pattern semantics', () => {
         const tmpDir = os.tmpdir()
         const httpSocket = path.join(tmpDir, `test-http-${Date.now()}.sock`)
         const socksSocket = path.join(tmpDir, `test-socks-${Date.now()}.sock`)
+        const netnsSocket = path.join(tmpDir, `test-netns-${Date.now()}.sock`)
 
         // Create dummy socket files
         fs.writeFileSync(httpSocket, '')
         fs.writeFileSync(socksSocket, '')
+        fs.writeFileSync(netnsSocket, '')
 
         try {
           const result = await wrapCommandWithSandboxLinux({
@@ -460,6 +466,7 @@ describe('restriction pattern semantics', () => {
             needsNetworkRestriction: true,
             httpSocketPath: httpSocket,
             socksSocketPath: socksSocket,
+            netnsSocketPath: netnsSocket,
             httpProxyPort: 3128,
             socksProxyPort: 1080,
             readConfig: { denyOnly: [] },
@@ -477,6 +484,7 @@ describe('restriction pattern semantics', () => {
           // Cleanup
           fs.unlinkSync(httpSocket)
           fs.unlinkSync(socksSocket)
+          fs.unlinkSync(netnsSocket)
         }
       },
     )

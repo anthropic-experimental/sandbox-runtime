@@ -1,7 +1,8 @@
 import type { Socket } from 'node:net'
 import type { Duplex, Readable } from 'node:stream'
-import type { Server } from 'node:http'
+import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import { Agent, createServer } from 'node:http'
+import { timingSafeTokenEqual } from '../utils/timing-safe.js'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { connect } from 'node:net'
@@ -18,8 +19,10 @@ import {
   terminateAndForward,
 } from './tls-terminate-proxy.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
+import { formatConnectHost } from './transparent-net-helper.js'
 import {
   connectViaParentProxy,
+  vettedLookup,
   dialDirect,
   openConnectTunnel,
   proxyAuthHeader,
@@ -116,13 +119,111 @@ export interface HttpProxyServerOptions {
 export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
   const server = createServer()
 
+  // Tunnels flagged by the transparent helper as captured plain HTTP
+  // (X-SRT-Captured-Plaintext on an authenticated CONNECT). Instead of an
+  // opaque byte tunnel, each origin-form request inside them goes through
+  // the normal request pipeline — filterRequest, plaintext credential
+  // injection, readable 403 bodies — addressed to the CONNECT target.
+  // The flag can only make filtering STRICTER: a client setting it on a
+  // non-HTTP stream just gets its bytes parsed (and rejected) instead of
+  // blindly tunnelled.
+  //
+  // Mechanically, the tunnel is piped into a private 127.0.0.1 HTTP
+  // backend owned by this proxy (`server.emit('connection', socket)` would
+  // be free, but bun's http.Server doesn't implement that injection path —
+  // same constraint the mux works around). The CONNECT target travels
+  // across the hop keyed by the self-dial's local port: registered before
+  // any tunnel bytes are written, so no request can be parsed untagged.
+  // Keyed by the socket OBJECT (not net.Socket-typed): bun's http server
+  // hands out its own socket class, so instanceof checks would miss.
+  const capturedTunnelTargets = new WeakMap<
+    object,
+    { hostname: string; port: number }
+  >()
+  const pendingCapturedDials = new Map<
+    number,
+    { hostname: string; port: number }
+  >()
+  const capturedBackendSockets = new WeakSet<object>()
+  let capturedBackend: Server | undefined
+  let capturedBackendPort: Promise<number> | undefined
+  let proxyClosed = false
+
+  function ensureCapturedBackend(): Promise<number> {
+    // A flagged CONNECT parked in the filter (ask-callback) can outlive
+    // reset(); never resurrect a backend for a closed proxy.
+    if (proxyClosed) {
+      return Promise.reject(new Error('proxy is closed'))
+    }
+    if (capturedBackendPort) return capturedBackendPort
+    capturedBackendPort = new Promise<number>((resolve, reject) => {
+      const backend = createServer()
+      capturedBackend = backend
+      backend.on('connection', sock => {
+        // Mark provenance only. The target lookup happens lazily at
+        // request time: this event can fire BEFORE the dialing side's
+        // 'connect' callback registers the mapping, but request bytes
+        // only flow after registration, so the request-time lookup is
+        // race-free. Restricting the lookup to backend-accepted sockets
+        // keeps a front-door client from ever matching a pending dial by
+        // remote-port coincidence. Only 127.0.0.1 peers count: a local
+        // process forging a 127.0.0.2 source must not be able
+        // to steal a pending dial's identity.
+        if (sock.remoteAddress !== '127.0.0.1') {
+          sock.destroy()
+          return
+        }
+        capturedBackendSockets.add(sock)
+      })
+      backend.on('request', handleRequest)
+      // reject only matters pre-settle; afterwards this keeps a backend
+      // 'error' from becoming an uncaught exception, with a trace.
+      backend.on('error', err => {
+        logForDebugging(`captured backend error: ${err.message}`, {
+          level: 'error',
+        })
+        reject(err)
+      })
+      backend.listen(0, '127.0.0.1', () => {
+        const addr = backend.address()
+        if (addr === null || typeof addr === 'string') {
+          reject(new Error('captured backend: no address'))
+          return
+        }
+        backend.unref()
+        resolve(addr.port)
+      })
+    })
+    // A transient listen failure must not permanently poison the cache
+    // (every later flagged CONNECT would 500 forever).
+    capturedBackendPort.catch(() => {
+      capturedBackendPort = undefined
+      capturedBackend = undefined
+    })
+    return capturedBackendPort
+  }
+
+  // The private backend lives and dies with the proxy server.
+  server.on('close', () => {
+    proxyClosed = true
+    capturedBackend?.close()
+    if (typeof capturedBackend?.closeAllConnections === 'function') {
+      capturedBackend.closeAllConnections()
+    }
+    capturedBackend = undefined
+    capturedBackendPort = undefined
+  })
+
   const checkAuth = (got: string | undefined): boolean => {
     if (!options.proxyAuthToken) return true
     const m = /^basic\s+([a-z0-9+/=]+)\s*$/i.exec(got ?? '')
     if (!m) return false
     const decoded = Buffer.from(m[1]!, 'base64').toString('utf8')
     const sep = decoded.indexOf(':')
-    return sep > 0 && decoded.slice(sep + 1) === options.proxyAuthToken
+    if (sep <= 0) return false
+    const presented = Buffer.from(decoded.slice(sep + 1), 'utf8')
+    const expected = Buffer.from(options.proxyAuthToken, 'utf8')
+    return timingSafeTokenEqual(presented, expected)
   }
 
   // Handle CONNECT requests for HTTPS traffic
@@ -168,6 +269,56 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             '\r\n' +
             'Connection blocked by network allowlist',
         )
+        return
+      }
+
+      // Transparently captured plain-HTTP tunnel: pipe the tunnel into the
+      // private backend so each request inside it runs the full request
+      // pipeline instead of an opaque tunnel. The CONNECT was
+      // authenticated and allowlist-filtered above; the per-request path
+      // re-filters and rewrites Host to the CONNECT target.
+      if (req.headers['x-srt-captured-plaintext'] === '1' && port !== 443) {
+        const backendPort = await ensureCapturedBackend()
+        if (clientGone) return
+        const self = connect(backendPort, '127.0.0.1')
+        let dialKey: number | undefined
+        let tunnelOpen = false
+        const pendingEntry = { hostname, port }
+        self.once('connect', () => {
+          // Register the CONNECT target BEFORE any tunnel bytes flow, so
+          // the backend can never parse an untagged captured request.
+          // Capture the key now — localPort is undefined again after the
+          // handle closes, which would leak the pending entry.
+          dialKey = self.localPort!
+          pendingCapturedDials.set(dialKey, pendingEntry)
+          tunnelOpen = true
+          socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+          if (head.length) self.write(head)
+          socket.pipe(self)
+          self.pipe(socket)
+        })
+        self.on('error', err => {
+          logForDebugging(`captured backend dial failed: ${err.message}`, {
+            level: 'error',
+          })
+          // Mirror the classic CONNECT contract: a failure before the 200
+          // gets an HTTP status, not a bare RST.
+          if (!tunnelOpen) socket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n')
+          else socket.destroy()
+        })
+        self.on('close', () => {
+          // Identity-checked: a stale close (backpressure-parked socket whose
+          // port the kernel already recycled) must not evict a NEWER tunnel's
+          // registration under the same key.
+          if (
+            dialKey !== undefined &&
+            pendingCapturedDials.get(dialKey) === pendingEntry
+          ) {
+            pendingCapturedDials.delete(dialKey)
+          }
+          socket.destroy()
+        })
+        socket.on('close', () => self.destroy())
         return
       }
 
@@ -285,15 +436,60 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
     }
   })
 
-  // Handle regular HTTP requests
-  server.on('request', async (req, res) => {
+  // Handle regular HTTP requests (front door and the captured backend).
+  const handleRequest = async (
+    req: IncomingMessage,
+    res: ServerResponse,
+  ): Promise<void> => {
+    // Attach BEFORE any await: a client abort mid-body emits 'aborted' on
+    // req, and with no listener that is an uncaughtException that kills
+    // the embedding host process (bun surfaces it even earlier than node).
+    req.on('error', err => {
+      logForDebugging(`proxy request error: ${err.message}`)
+    })
+    res.on('error', err => {
+      logForDebugging(`proxy response error: ${err.message}`)
+    })
     try {
-      if (!checkAuth(req.headers['proxy-authorization'])) {
+      // Requests inside a captured plain-HTTP tunnel were authenticated at
+      // CONNECT time and are origin-form, addressed to the CONNECT target.
+      // Everything else must be an authenticated absolute-URI proxy
+      // request. The target lookup is lazy (see the backend 'connection'
+      // comment) and scoped to sockets the captured backend accepted.
+      let captured = capturedTunnelTargets.get(req.socket)
+      if (
+        !captured &&
+        capturedBackendSockets.has(req.socket) &&
+        req.socket.remoteAddress === '127.0.0.1' &&
+        req.socket.remotePort !== undefined
+      ) {
+        captured = pendingCapturedDials.get(req.socket.remotePort)
+        if (captured) {
+          pendingCapturedDials.delete(req.socket.remotePort)
+          capturedTunnelTargets.set(req.socket, captured)
+        }
+      }
+      if (!captured && !checkAuth(req.headers['proxy-authorization'])) {
         res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="srt"' })
         res.end()
         return
       }
-      const url = new URL(req.url!)
+      let url: URL
+      if (captured) {
+        if (!req.url?.startsWith('/')) {
+          // Only origin-form may ride a captured tunnel — an absolute-URI
+          // here would re-route the request away from the filtered CONNECT
+          // target.
+          res.writeHead(400, { 'Content-Type': 'text/plain' })
+          res.end('Captured tunnels accept origin-form requests only')
+          return
+        }
+        url = new URL(
+          `http://${formatConnectHost(captured.hostname)}:${captured.port}${req.url}`,
+        )
+      } else {
+        url = new URL(req.url!)
+      }
       const hostname = stripBrackets(url.hostname)
       const port = url.port
         ? parseInt(url.port, 10)
@@ -301,7 +497,15 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           ? 443
           : 80
 
-      const allowed = await options.filter(port, hostname, req.socket)
+      // Captured tunnels skip the host-level filter per request: the URL
+      // is forced to the CONNECT target that the filter (and possibly the
+      // ask callback) already approved at tunnel establishment, so
+      // re-checking the identical tuple would only turn one keep-alive
+      // connection into N ask prompts. This matches the TLS-terminate
+      // contract, where in-tunnel requests run filterRequest only.
+      const allowed = captured
+        ? true
+        : await options.filter(port, hostname, req.socket)
       if (!allowed) {
         logForDebugging(`HTTP request blocked to ${hostname}:${port}`, {
           level: 'error',
@@ -407,6 +611,13 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             path: url.pathname + url.search,
             method: req.method,
             headers: fwdHeaders,
+            // Rebinding guard: names resolving to loopback/link-local/
+            // reserved ranges are refused at dial time (IP literals are
+            // exempt — the filter allowed them explicitly). agent: false
+            // so a pooled keep-alive socket can never skip the vetted
+            // lookup (the global agent would reuse by host:port).
+            lookup: vettedLookup as never,
+            agent: false,
           },
           proxyRes => {
             res.writeHead(proxyRes.statusCode!, stripHopByHop(proxyRes.headers))
@@ -440,7 +651,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         res.destroy()
       }
     }
-  })
+  }
+  server.on('request', handleRequest)
 
   return server
 }
@@ -452,8 +664,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
 function parseConnectTarget(
   target: string,
 ): { hostname: string; port: number } | undefined {
+  // Restrict to the charsets the URL parser and dialers agree on, so the
+  // CONNECT-time filter string can never diverge from the per-request /
+  // dial interpretation (e.g. `a@b` or `a/b` pseudo-hosts).
   const m =
-    /^\[([^\]]+)\]:(\d+)$/.exec(target) ?? /^([^:]+):(\d+)$/.exec(target)
+    /^\[([0-9A-Fa-f:.]+)\]:(\d+)$/.exec(target) ??
+    /^([A-Za-z0-9._-]+):(\d+)$/.exec(target)
   if (!m) return undefined
   const port = Number(m[2])
   if (!Number.isInteger(port) || port < 1 || port > 65535) return undefined

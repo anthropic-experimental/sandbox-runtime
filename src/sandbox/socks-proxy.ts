@@ -1,4 +1,5 @@
 import type { Socket } from 'net'
+import { timingSafeTokenEqual } from '../utils/timing-safe.js'
 import { createServer } from '@pondwader/socks5-server'
 import { logForDebugging } from '../utils/debug.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
@@ -48,8 +49,13 @@ export function createSocksProxyServer(
   const socksServer = createServer()
 
   if (options.proxyAuthToken) {
+    const expected = Buffer.from(options.proxyAuthToken, 'utf8')
     socksServer.setAuthHandler((conn, accept, deny) => {
-      if (conn.username === 'srt' && conn.password === options.proxyAuthToken) {
+      const presented = Buffer.from(String(conn.password ?? ''), 'utf8')
+      if (
+        conn.username === 'srt' &&
+        timingSafeTokenEqual(presented, expected)
+      ) {
         accept()
       } else {
         logForDebugging('SOCKS auth rejected', { level: 'error' })
