@@ -237,4 +237,95 @@ describe('SOCKS destination-token auth', () => {
     client.write(Buffer.from([0x04, 0x01]))
     await waitClose(client)
   })
+
+  // --- TCP framing: the parser must be indifferent to how the kernel
+  // chunks the byte stream. These two tests pin the extremes; everything
+  // real lands in between.
+
+  it('handles the entire handshake drip-fed one byte per write', async () => {
+    const client = await dial()
+    // Collector attached BEFORE any reply can arrive: replies land
+    // interleaved with our writes here, and Bun sockets drop segments that
+    // arrive while no 'data' listener exists (readN-after-write is safe in
+    // the other tests only because they attach in the same tick as the
+    // write).
+    const collected: Buffer[] = []
+    client.on('data', c => collected.push(c))
+    const full = Buffer.concat([
+      greeting(0x00),
+      connectRequest(`${TOKEN}.127.0.0.1`, echo.port),
+    ])
+    for (const byte of full) {
+      client.write(Buffer.from([byte]))
+      // Yield so each byte arrives as its own data event.
+      await new Promise(resolve => setTimeout(resolve, 0))
+    }
+    client.write('drip')
+    const want = 2 + 10 + 'drip'.length
+    const deadline = Date.now() + 4000
+    while (Buffer.concat(collected).length < want && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+    const all = Buffer.concat(collected)
+    expect([...all.subarray(0, 2)]).toEqual([0x05, 0x00]) // greeting reply
+    expect(all[3]).toBe(0x00) // request reply REP byte
+    expect(all.subarray(12).toString()).toBe('drip') // echoed payload
+    client.destroy()
+  })
+
+  it('handles the entire handshake plus payload coalesced into one write', async () => {
+    const client = await dial()
+    client.write(
+      Buffer.concat([
+        greeting(0x00),
+        connectRequest(`${TOKEN}.127.0.0.1`, echo.port),
+        Buffer.from('early payload'),
+      ]),
+    )
+    const replies = await readN(client, 12)
+    expect([...replies.subarray(0, 2)]).toEqual([0x05, 0x00])
+    expect(replies[3]).toBe(0x00)
+    // The payload bytes that rode in with the handshake must reach the
+    // destination, not be swallowed by the parser.
+    expect((await readN(client, 'early payload'.length)).toString()).toBe(
+      'early payload',
+    )
+    client.destroy()
+  })
+
+  it('never grants a tunnel on random garbage (fuzz)', async () => {
+    // Random byte salads must end in refusal or teardown — never in a
+    // REPLY_SUCCEEDED and never in a filter call that could dial out.
+    // Seeded LCG so a failure is reproducible from the log line.
+    let seed = 0x2f6e2b1
+    const rand = (): number => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff
+      return seed
+    }
+    for (let i = 0; i < 200; i++) {
+      const len = (rand() % 64) + 1
+      const bytes = Buffer.alloc(len)
+      for (let j = 0; j < len; j++) bytes[j] = rand() % 256
+      // Half the runs start with a valid-looking greeting so the fuzz
+      // reaches the request parser instead of dying at the version byte.
+      const payload =
+        i % 2 === 0 ? bytes : Buffer.concat([greeting(0x00), bytes])
+      const client = await dial()
+      const received: Buffer[] = []
+      client.on('data', c => received.push(c))
+      client.write(payload)
+      client.end()
+      await waitClose(client)
+      const all = Buffer.concat(received)
+      // Scan every reply-shaped position: no REPLY_SUCCEEDED may appear.
+      for (let j = 0; j + 1 < all.length; j += 2) {
+        if (all[j] === 0x05 && j > 0) {
+          expect(all[j + 1]).not.toBe(0x00 /* REPLY_SUCCEEDED */)
+        }
+      }
+    }
+    // The filter only ever saw hosts that survived the token gate — and
+    // random bytes cannot contain the 33-byte prefix.
+    expect(filterCalls).toEqual([])
+  }, 20_000)
 })
