@@ -1005,6 +1005,48 @@ describe.if(isSupportedPlatform)(
             rmSync(cleanDir, { recursive: true, force: true })
           }
         })
+
+        it('preserves ENOENT for non-existent mandatory directories', async () => {
+          const cleanDir = join(TEST_DIR, 'missing-mandatory-dir')
+          mkdirSync(join(cleanDir, '.claude'), { recursive: true })
+
+          const originalDir = process.cwd()
+          process.chdir(cleanDir)
+
+          try {
+            const writeConfig = {
+              allowOnly: ['.'],
+              denyWithinAllow: [] as string[],
+            }
+
+            const wrappedCommand = await wrapCommandWithSandboxLinux({
+              command:
+                'if [ -e .claude/commands ]; then echo exists; else echo missing; fi',
+              needsNetworkRestriction: false,
+              readConfig: undefined,
+              writeConfig,
+              enableWeakerNestedSandbox: true,
+              allowAllUnixSockets: true,
+            })
+
+            const result = spawnSync(wrappedCommand, {
+              shell: true,
+              encoding: 'utf8',
+              timeout: 10000,
+            })
+
+            cleanupBwrapMountPoints()
+
+            expect(result.status).toBe(0)
+            expect(result.stdout.trim()).toBe('missing')
+            expect(existsSync(join(cleanDir, '.claude', 'commands'))).toBe(
+              false,
+            )
+          } finally {
+            process.chdir(originalDir)
+            rmSync(cleanDir, { recursive: true, force: true })
+          }
+        })
       },
     )
 
