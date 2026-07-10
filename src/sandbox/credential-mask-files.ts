@@ -17,8 +17,11 @@
  * that parses the file (JSON/YAML/.netrc) still sees valid syntax. See
  * {@link extractAndSubstitute} and {@link CredentialFileConfigSchema}.
  *
- * On macOS, SBPL cannot redirect reads, so masked files degrade to
- * `mode: "deny"` (see macos-sandbox-utils.ts).
+ * On macOS, SBPL cannot redirect reads: the real path is read-denied
+ * (the security boundary) and, when the credmask DYLD interposer is
+ * available, cooperative processes' reads are redirected to the fake;
+ * otherwise the mask degrades to `mode: "deny"` (see
+ * macos-sandbox-utils.ts and credmask-interposer.ts).
  */
 
 import * as fs from 'node:fs'
