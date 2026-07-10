@@ -196,9 +196,12 @@ describe('wrapCommandWithSandboxMacOS interposer injection', () => {
   })
 
   test('the export assignments round-trip through a real shell', () => {
-    // Linux-runnable proof of the quoting mechanics used for the inner
+    // Proof of the quoting mechanics used for the inner
     // `export …; <command>` string: a map with spaces and quotes must
-    // reach the child process byte-identical.
+    // reach the child process byte-identical. A stand-in name replaces
+    // DYLD_INSERT_LIBRARIES here — exporting a real DYLD_* var pointing
+    // at this garbage fixture makes dyld abort any non-SIP shell it
+    // spawns, and the quoting under test is name-agnostic.
     const map = encodeCredmaskMap([
       {
         realPath: "/Users/o'brien/My Tokens/token",
@@ -206,7 +209,7 @@ describe('wrapCommandWithSandboxMacOS interposer injection', () => {
       },
     ])
     const assignments = quote([
-      `DYLD_INSERT_LIBRARIES=${DYLIB}`,
+      `NOT_DYLD_INSERT_LIBRARIES=${DYLIB}`,
       `${CREDMASK_MAP_ENV}=${map}`,
     ])
     const r = spawnSync(
