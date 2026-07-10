@@ -1,7 +1,7 @@
 import * as fs from 'node:fs'
 import * as net from 'node:net'
 import * as path from 'node:path'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { once } from 'node:events'
 import { fileURLToPath } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
@@ -612,6 +612,7 @@ function runSrtWin(args: string[], opts: RunOpts = {}): RunResult {
   const { exe, prependArgs } = opts.srtWin ?? resolveSrtWin()
   const r = spawnSync(exe, [...prependArgs, ...args], {
     encoding: 'utf8',
+    windowsHide: true,
     timeout: opts.timeoutMs ?? 15_000,
     ...(opts.stdin !== undefined ? { input: opts.stdin } : {}),
   })
@@ -645,8 +646,68 @@ function runSrtWin(args: string[], opts: RunOpts = {}): RunResult {
   }
 }
 
-function runSrtWinJson<T>(args: string[], opts?: RunOpts): T {
-  const r = runSrtWin(args, opts)
+/**
+ * Async twin of {@link runSrtWin}: same signature, same result shape,
+ * but the event loop stays live. Prefer it for any call reachable
+ * from a UI/render path — the sync variant `spawnSync`-blocks, which
+ * on Windows can be seconds when Defender cold-scans `srt-win.exe`.
+ */
+function runSrtWinAsync(
+  args: string[],
+  opts: RunOpts = {},
+): Promise<RunResult> {
+  const { exe, prependArgs } = opts.srtWin ?? resolveSrtWin()
+  const timeoutMs = opts.timeoutMs ?? 15_000
+  return new Promise((resolve, reject) => {
+    const child = spawn(exe, [...prependArgs, ...args], {
+      windowsHide: true,
+    })
+    // Manual timer instead of spawn's `timeout` option so a timeout
+    // is distinguishable from an external kill — parity with the
+    // sync variant's ETIMEDOUT branch (same code, same message).
+    let timedOut = false
+    const timer =
+      timeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true
+            child.kill()
+          }, timeoutMs)
+        : undefined
+    let stdout = ''
+    let stderr = ''
+    child.stdout?.setEncoding('utf8').on('data', d => (stdout += d))
+    child.stderr?.setEncoding('utf8').on('data', d => (stderr += d))
+    // Swallow EPIPE if the child dies before the stdin write drains.
+    child.stdin?.on('error', () => {}).end(opts.stdin)
+    child.once('error', e => {
+      clearTimeout(timer)
+      reject(
+        new WindowsSandboxError(
+          'spawn_failed',
+          `srt-win ${args[0]}: spawn failed: ${e.message}`,
+          args[0],
+        ),
+      )
+    })
+    child.once('close', (status, signal) => {
+      clearTimeout(timer)
+      if (timedOut) {
+        reject(
+          new WindowsSandboxError(
+            'srt_win_timeout',
+            `srt-win ${args.join(' ')} timed out after ${timeoutMs}ms` +
+              (signal ? ` (killed by ${signal})` : ''),
+            args[0],
+          ),
+        )
+        return
+      }
+      resolve({ status, signal, stdout: stdout.trim(), stderr: stderr.trim() })
+    })
+  })
+}
+
+function parseSrtWinJson<T>(args: string[], r: RunResult): T {
   if (r.status !== 0) {
     throw new WindowsSandboxError(
       'srt_win_nonzero',
@@ -664,6 +725,17 @@ function runSrtWinJson<T>(args: string[], opts?: RunOpts): T {
       args[0],
     )
   }
+}
+
+function runSrtWinJson<T>(args: string[], opts?: RunOpts): T {
+  return parseSrtWinJson(args, runSrtWin(args, opts))
+}
+
+async function runSrtWinJsonAsync<T>(
+  args: string[],
+  opts?: RunOpts,
+): Promise<T> {
+  return parseSrtWinJson(args, await runSrtWinAsync(args, opts))
 }
 
 /**
@@ -702,6 +774,12 @@ type RawWfpStatus = {
   port_range?: [number, number]
   user_sid?: string
   hint?: string
+}
+
+function wfpStatusArgs(sublayerGuid?: string): string[] {
+  const args = ['wfp', 'status']
+  if (sublayerGuid) args.push('--sublayer-guid', sublayerGuid)
+  return args
 }
 
 function mapWfpStatus(raw: RawWfpStatus): WindowsWfpStatusResult {
@@ -776,6 +854,19 @@ export function checkWindowsSandboxStatus(
   return { user: mapUserStatus(raw.user), wfp: mapWfpStatus(raw.wfp) }
 }
 
+/** Async twin of {@link checkWindowsSandboxStatus}. */
+export async function checkWindowsSandboxStatusAsync(
+  opts: { sublayerGuid?: string; srtWin?: SrtWinSpawn } = {},
+): Promise<WindowsSandboxStatus> {
+  const args = ['status']
+  if (opts.sublayerGuid) args.push('--sublayer-guid', opts.sublayerGuid)
+  const raw = await runSrtWinJsonAsync<{
+    user: RawUserStatus
+    wfp: RawWfpStatus
+  }>(args, { srtWin: opts.srtWin })
+  return { user: mapUserStatus(raw.user), wfp: mapWfpStatus(raw.wfp) }
+}
+
 /**
  * Query the WFP filter set under the given sublayer via live BFE
  * enumeration. `installed` means at least one srt-win-tagged
@@ -786,14 +877,28 @@ export function checkWindowsSandboxStatus(
  * BFE enumeration is admin-gated — a non-elevated caller gets
  * `state:"cannot-read"` with a `hint` (not an error). The
  * non-elevated readiness check is {@link verifyWindowsWfpEgress}.
+ *
+ * Prefer {@link getWindowsWfpStatusAsync}; this variant
+ * `spawnSync`-blocks the event loop.
  */
 export function getWindowsWfpStatus(
   opts: { sublayerGuid?: string; srtWin?: SrtWinSpawn } = {},
 ): WindowsWfpStatusResult {
-  const args = ['wfp', 'status']
-  if (opts.sublayerGuid) args.push('--sublayer-guid', opts.sublayerGuid)
   return mapWfpStatus(
-    runSrtWinJson<RawWfpStatus>(args, { srtWin: opts.srtWin }),
+    runSrtWinJson<RawWfpStatus>(wfpStatusArgs(opts.sublayerGuid), {
+      srtWin: opts.srtWin,
+    }),
+  )
+}
+
+/** Async twin of {@link getWindowsWfpStatus}. */
+export async function getWindowsWfpStatusAsync(
+  opts: { sublayerGuid?: string; srtWin?: SrtWinSpawn } = {},
+): Promise<WindowsWfpStatusResult> {
+  return mapWfpStatus(
+    await runSrtWinJsonAsync<RawWfpStatus>(wfpStatusArgs(opts.sublayerGuid), {
+      srtWin: opts.srtWin,
+    }),
   )
 }
 
@@ -913,12 +1018,26 @@ export async function verifyWindowsWfpEgress(
  * is independently observed so a half-provisioned install (e.g.
  * user exists but credential file missing) is distinguishable.
  * Does not require elevation.
+ *
+ * Prefer {@link getWindowsSandboxUserStatusAsync}; this variant
+ * `spawnSync`-blocks the event loop.
  */
 export function getWindowsSandboxUserStatus(
   opts: { srtWin?: SrtWinSpawn } = {},
 ): WindowsSandboxUserStatus {
   return mapUserStatus(
     runSrtWinJson<RawUserStatus>(['user', 'status'], { srtWin: opts.srtWin }),
+  )
+}
+
+/** Async twin of {@link getWindowsSandboxUserStatus}. */
+export async function getWindowsSandboxUserStatusAsync(
+  opts: { srtWin?: SrtWinSpawn } = {},
+): Promise<WindowsSandboxUserStatus> {
+  return mapUserStatus(
+    await runSrtWinJsonAsync<RawUserStatus>(['user', 'status'], {
+      srtWin: opts.srtWin,
+    }),
   )
 }
 
@@ -1007,6 +1126,15 @@ export interface WindowsInstallOptions {
    * overwriting.
    */
   force?: boolean
+  /**
+   * How long to wait for the self-elevating install subprocess.
+   * Default 120 000 ms — the Windows UAC consent dialog auto-
+   * dismisses after ~2 minutes, so anything shorter risks killing
+   * the subprocess while a legitimate approval is still pending
+   * (elevation is not retracted when the parent dies, so a late
+   * approval after we've timed out would half-complete).
+   */
+  timeoutMs?: number
   /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
   srtWin?: SrtWinSpawn
 }
@@ -1025,28 +1153,14 @@ export interface WindowsInstallResult {
 }
 
 /**
- * One-shot install: provisions the `srt-sandbox` user account and
- * installs the user-SID-keyed WFP filter set — all in a single
- * self-elevating process (one UAC prompt). Idempotent; re-running
- * rotates the sandbox user's password.
- *
- * Network for the calling user is **not disrupted**: the filters key
- * on the `srt-sandbox` user's SID, so the broker, services, and
- * every other principal fall through to default-permit. No logout
- * is required.
- *
- * Returns the post-call WFP + sandbox-user state. If the user
- * cancels the UAC prompt this returns `{cancelled: true, …}` rather
- * than throwing — cancellation is a user choice, not an error.
- *
- * @throws on user/WFP creation failure, or if filters already exist
- *   under `sublayerGuid` with a different port range and `force` is
- *   not set.
+ * Effective spawn budget for the self-elevating install/uninstall —
+ * see {@link WindowsInstallOptions.timeoutMs} for the 120 s rationale.
  */
-export function installWindowsSandbox(
-  opts: WindowsInstallOptions = {},
-): WindowsInstallResult {
-  const srtWin = opts.srtWin ?? resolveSrtWin()
+function installTimeoutMs(opts: { timeoutMs?: number }): number {
+  return opts.timeoutMs ?? 120_000
+}
+
+function installArgs(opts: WindowsInstallOptions): string[] {
   const args = ['install']
   if (opts.sublayerGuid) args.push('--sublayer-guid', opts.sublayerGuid)
   if (opts.proxyPortRange) {
@@ -1057,39 +1171,40 @@ export function installWindowsSandbox(
   }
   if (opts.sandboxUser) args.push('--sandbox-user', opts.sandboxUser)
   if (opts.force) args.push('--force')
+  return args
+}
 
-  let r: RunResult
-  try {
-    r = runSrtWin(args, { timeoutMs: 60_000, srtWin })
-  } catch (e) {
-    if (e instanceof WindowsSandboxError && e.code === 'srt_win_timeout') {
-      throw new WindowsSandboxError(
-        'install_timeout',
-        `srt-win install timed out — the UAC prompt may still be open. ` +
-          `Re-run when ready to grant elevation. (${e.message})`,
-      )
-    }
-    throw e
+/**
+ * Re-throw a `srt_win_timeout` from the install spawn as the more
+ * specific `install_timeout` (the UAC prompt is the usual cause).
+ * Shared by the sync and async install variants.
+ */
+function remapInstallTimeout(e: unknown): never {
+  if (e instanceof WindowsSandboxError && e.code === 'srt_win_timeout') {
+    throw new WindowsSandboxError(
+      'install_timeout',
+      `srt-win install timed out — the UAC prompt may still be open. ` +
+        `Re-run when ready to grant elevation. (${e.message})`,
+    )
   }
+  throw e
+}
+
+// srt-win install exit-code contract:
+//   0  ok
+//   10 user cancelled UAC elevation
+//   12 WFP install failed
+//   13 already installed with different config (use --force)
+//   14 sandbox-user provisioning failed
+//   1  other error (stderr has detail)
+// Throws on any failure code; the caller reads back state on 0/10.
+function throwOnInstallFailure(r: RunResult): void {
   logForDebugging(
     `[Sandbox Windows] install exit=${r.status}: ${r.stderr || r.stdout}`,
   )
-
-  // srt-win install exit-code contract:
-  //   0  ok
-  //   10 user cancelled UAC elevation
-  //   12 WFP install failed
-  //   13 already installed with different config (use --force)
-  //   14 sandbox-user provisioning failed
-  //   1  other error (stderr has detail)
+  if (r.status === 0 || r.status === 10) return
   const out = r.stderr || r.stdout
-  const readBack = () =>
-    checkWindowsSandboxStatus({ sublayerGuid: opts.sublayerGuid, srtWin })
   switch (r.status) {
-    case 0:
-      return readBack()
-    case 10:
-      return { ...readBack(), cancelled: true }
     case 12:
       throw new WindowsSandboxError(
         'install_wfp_failed',
@@ -1117,6 +1232,77 @@ export function installWindowsSandbox(
 }
 
 /**
+ * One-shot install: provisions the `srt-sandbox` user account and
+ * installs the user-SID-keyed WFP filter set — all in a single
+ * self-elevating process (one UAC prompt). Idempotent; re-running
+ * rotates the sandbox user's password.
+ *
+ * Network for the calling user is **not disrupted**: the filters key
+ * on the `srt-sandbox` user's SID, so the broker, services, and
+ * every other principal fall through to default-permit. No logout
+ * is required.
+ *
+ * Returns the post-call WFP + sandbox-user state. If the user
+ * cancels the UAC prompt this returns `{cancelled: true, …}` rather
+ * than throwing — cancellation is a user choice, not an error.
+ *
+ * Prefer {@link installWindowsSandboxAsync}; this variant
+ * `spawnSync`-blocks the event loop for the full UAC-prompt wait
+ * (up to `timeoutMs`).
+ *
+ * @throws on user/WFP creation failure, or if filters already exist
+ *   under `sublayerGuid` with a different port range and `force` is
+ *   not set.
+ */
+export function installWindowsSandbox(
+  opts: WindowsInstallOptions = {},
+): WindowsInstallResult {
+  const srtWin = opts.srtWin ?? resolveSrtWin()
+  let r: RunResult
+  try {
+    r = runSrtWin(installArgs(opts), {
+      timeoutMs: installTimeoutMs(opts),
+      srtWin,
+    })
+  } catch (e) {
+    remapInstallTimeout(e)
+  }
+  throwOnInstallFailure(r)
+  const state = checkWindowsSandboxStatus({
+    sublayerGuid: opts.sublayerGuid,
+    srtWin,
+  })
+  return r.status === 10 ? { ...state, cancelled: true } : state
+}
+
+/**
+ * Async twin of {@link installWindowsSandbox}. Same options, same
+ * return type, same throw semantics. The UAC prompt is still modal,
+ * but the event loop stays live — spinners keep painting and timers
+ * keep firing.
+ */
+export async function installWindowsSandboxAsync(
+  opts: WindowsInstallOptions = {},
+): Promise<WindowsInstallResult> {
+  const srtWin = opts.srtWin ?? resolveSrtWin()
+  let r: RunResult
+  try {
+    r = await runSrtWinAsync(installArgs(opts), {
+      timeoutMs: installTimeoutMs(opts),
+      srtWin,
+    })
+  } catch (e) {
+    remapInstallTimeout(e)
+  }
+  throwOnInstallFailure(r)
+  const state = await checkWindowsSandboxStatusAsync({
+    sublayerGuid: opts.sublayerGuid,
+    srtWin,
+  })
+  return r.status === 10 ? { ...state, cancelled: true } : state
+}
+
+/**
  * Remove the WFP filter set under `sublayerGuid` and the
  * `srt-sandbox` account, its credential file, and the setup marker
  * (one UAC prompt). Idempotent.
@@ -1127,6 +1313,11 @@ export function uninstallWindowsSandbox(
   opts: {
     sublayerGuid?: string
     keepUser?: boolean
+    /**
+     * How long to wait for the self-elevating uninstall subprocess.
+     * Default 120 000 ms — see {@link WindowsInstallOptions.timeoutMs}.
+     */
+    timeoutMs?: number
     srtWin?: SrtWinSpawn
   } = {},
 ): {
@@ -1135,7 +1326,10 @@ export function uninstallWindowsSandbox(
   const args = ['uninstall']
   if (opts.sublayerGuid) args.push('--sublayer-guid', opts.sublayerGuid)
   if (opts.keepUser) args.push('--keep-user')
-  const r = runSrtWin(args, { srtWin: opts.srtWin })
+  const r = runSrtWin(args, {
+    timeoutMs: installTimeoutMs(opts),
+    srtWin: opts.srtWin,
+  })
   logForDebugging(
     `[Sandbox Windows] uninstall exit=${r.status}: ${r.stderr || r.stdout}`,
   )
@@ -1583,36 +1777,38 @@ export function windowsInstallInstructions(
   )
 }
 
+function settle<T>(fn: () => T): PromiseSettledResult<T> {
+  try {
+    return { status: 'fulfilled', value: fn() }
+  } catch (e) {
+    return { status: 'rejected', reason: e }
+  }
+}
+
 /**
- * Check the Windows backend is ready to sandbox. Errors block
- * `initialize()`; warnings are informational.
+ * Interpret the two probe results into a {@link SandboxDependencyCheck}.
+ * Shared by the sync and async `checkWindowsDependencies*` variants so
+ * both produce byte-identical `errors[]` for the same underlying state.
+ *
+ * `getWfp` is lazy: the sync caller's thunk spawns `wfp status` on
+ * demand (preserving the short-circuit — no second spawn when
+ * `user status` already failed); the async caller has already run
+ * both probes concurrently and its thunk returns the settled result.
  */
-export function checkWindowsDependencies(
-  opts: { sublayerGuid?: string; srtWin?: SrtWinSpawn } = {},
+function interpretDependencyProbes(
+  sublayerGuid: string | undefined,
+  user: PromiseSettledResult<WindowsSandboxUserStatus>,
+  getWfp: () => PromiseSettledResult<WindowsWfpStatusResult>,
 ): SandboxDependencyCheck {
-  const { sublayerGuid } = opts
   const errors: string[] = []
   const warnings: string[] = []
 
-  // 1. Binary present. The argless `resolveSrtWin()` throws (no
-  // implicit vendor fallback) — surfaced as a dependency error
-  // telling the caller to thread an explicit path.
-  let srtWin: SrtWinSpawn
-  try {
-    srtWin = opts.srtWin ?? resolveSrtWin()
-  } catch (e) {
-    return { errors: [(e as Error).message], warnings }
-  }
-  logForDebugging(`[Sandbox Windows] using srt-win at ${srtWin.exe}`)
-
   // 2. Sandbox user provisioned + credential readable.
-  let us: WindowsSandboxUserStatus
-  try {
-    us = getWindowsSandboxUserStatus({ srtWin })
-  } catch (e) {
-    errors.push(`srt-win user status failed: ${(e as Error).message}`)
+  if (user.status === 'rejected') {
+    errors.push(`srt-win user status failed: ${(user.reason as Error).message}`)
     return { errors, warnings }
   }
+  const us = user.value
   if (!us.provisioned || !us.credPresent) {
     errors.push(
       `Sandbox user is not provisioned (user=${us.provisioned}, ` +
@@ -1625,13 +1821,12 @@ export function checkWindowsDependencies(
   // admin-gated; `cannot-read` is informational only — the
   // BEHAVIORAL check (`verifyWindowsWfpEgress`) runs at
   // `initialize()` and is what actually fails closed.
-  let ws: WindowsWfpStatusResult
-  try {
-    ws = getWindowsWfpStatus({ sublayerGuid, srtWin })
-  } catch (e) {
-    errors.push(`srt-win wfp status failed: ${(e as Error).message}`)
+  const wfp = getWfp()
+  if (wfp.status === 'rejected') {
+    errors.push(`srt-win wfp status failed: ${(wfp.reason as Error).message}`)
     return { errors, warnings }
   }
+  const ws = wfp.value
   if (ws.state === 'cannot-read') {
     logForDebugging(
       `[Sandbox Windows] wfp status cannot-read (non-elevated): ${ws.hint}`,
@@ -1654,4 +1849,58 @@ export function checkWindowsDependencies(
   }
 
   return { errors, warnings }
+}
+
+/**
+ * Check the Windows backend is ready to sandbox. Errors block
+ * `initialize()`; warnings are informational.
+ *
+ * Prefer {@link checkWindowsDependenciesAsync}; this variant
+ * `spawnSync`-blocks the event loop on two `srt-win.exe` spawns
+ * (Windows Defender cold-scan can add seconds).
+ */
+export function checkWindowsDependencies(
+  opts: { sublayerGuid?: string; srtWin?: SrtWinSpawn } = {},
+): SandboxDependencyCheck {
+  // 1. Binary present. The argless `resolveSrtWin()` throws (no
+  // implicit vendor fallback) — surfaced as a dependency error
+  // telling the caller to thread an explicit path.
+  let srtWin: SrtWinSpawn
+  try {
+    srtWin = opts.srtWin ?? resolveSrtWin()
+  } catch (e) {
+    return { errors: [(e as Error).message], warnings: [] }
+  }
+  logForDebugging(`[Sandbox Windows] using srt-win at ${srtWin.exe}`)
+  return interpretDependencyProbes(
+    opts.sublayerGuid,
+    settle(() => getWindowsSandboxUserStatus({ srtWin })),
+    // Lazy: spawned only if user-status succeeded (short-circuit).
+    () =>
+      settle(() =>
+        getWindowsWfpStatus({ sublayerGuid: opts.sublayerGuid, srtWin }),
+      ),
+  )
+}
+
+/**
+ * Async twin of {@link checkWindowsDependencies}. Same result for the
+ * same underlying state; runs the two `srt-win` probes concurrently
+ * and never blocks the event loop.
+ */
+export async function checkWindowsDependenciesAsync(
+  opts: { sublayerGuid?: string; srtWin?: SrtWinSpawn } = {},
+): Promise<SandboxDependencyCheck> {
+  let srtWin: SrtWinSpawn
+  try {
+    srtWin = opts.srtWin ?? resolveSrtWin()
+  } catch (e) {
+    return { errors: [(e as Error).message], warnings: [] }
+  }
+  logForDebugging(`[Sandbox Windows] using srt-win at ${srtWin.exe}`)
+  const [user, wfp] = await Promise.allSettled([
+    getWindowsSandboxUserStatusAsync({ srtWin }),
+    getWindowsWfpStatusAsync({ sublayerGuid: opts.sublayerGuid, srtWin }),
+  ])
+  return interpretDependencyProbes(opts.sublayerGuid, user, () => wfp)
 }

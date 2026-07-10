@@ -1,5 +1,15 @@
-import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  spyOn,
+} from 'bun:test'
+import * as child_process from 'node:child_process'
 import { spawn, spawnSync } from 'node:child_process'
+import { EventEmitter } from 'node:events'
 import {
   existsSync,
   mkdtempSync,
@@ -14,15 +24,24 @@ import type { AddressInfo } from 'node:net'
 import { isMacOS, isWindows } from '../helpers/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
-import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
+import type {
+  SandboxRuntimeConfig,
+  SrtWinConfig,
+} from '../../src/sandbox/sandbox-config.js'
 import { WindowsConfigSchema } from '../../src/sandbox/sandbox-config.js'
 import { CA_TRUST_VARS } from '../../src/sandbox/sandbox-utils.js'
 import {
   getSrtWinPath,
   getWindowsWfpStatus,
+  getWindowsWfpStatusAsync,
   getWindowsSandboxUserStatus,
+  getWindowsSandboxUserStatusAsync,
   checkWindowsSandboxStatus,
+  checkWindowsSandboxStatusAsync,
+  checkWindowsDependencies,
+  checkWindowsDependenciesAsync,
   installWindowsSandbox,
+  installWindowsSandboxAsync,
   uninstallWindowsSandbox,
   WindowsSandboxError,
   verifyWindowsWfpEgress,
@@ -330,7 +349,11 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     expect(() => resolveSrtWin()).toThrow(
       /set windows\.srtWin\.path[\s\S]*VENDORED_SRT_WIN_EXE/,
     )
-    expect(() => resolveSrtWin({})).toThrow(/VENDORED_SRT_WIN_EXE/)
+    // {} (path absent at runtime despite the type) hits the same
+    // no-path branch; cast keeps tsc-test clean.
+    expect(() => resolveSrtWin({} as SrtWinConfig)).toThrow(
+      /VENDORED_SRT_WIN_EXE/,
+    )
   })
 
   it('VENDORED_SRT_WIN_EXE: absolute path to the arch-specific vendored exe', () => {
@@ -597,6 +620,399 @@ describe('buildGitConfigEnv (pure, all platforms)', () => {
   )
 })
 
+// ════════════════════════════════════════════════════════════════════
+// Async variants — sync/async parity (pure, all platforms)
+// ════════════════════════════════════════════════════════════════════
+// These pin the *Async twins to the same argv shape and result mapping
+// as the sync originals by spying on child_process.spawn/spawnSync.
+// The srtWin handle points at the test runner's own executable so
+// resolveSrtWin's existence check passes on non-Windows hosts; the
+// spies intercept before any real process is spawned.
+
+describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
+  const RAW_USER = JSON.stringify({
+    user: {
+      exists: true,
+      sid: 'S-1-5-21-1',
+      group_exists: true,
+      group_sid: 'S-1-5-21-2',
+      in_builtin_users: true,
+      in_sandbox_group: true,
+      hidden_from_logon: true,
+    },
+    cred_present: true,
+    marker_version: 1,
+    real_user_sid: 'S-1-5-21-3',
+    ca_cert_thumb: null,
+    ca_cert_pem: null,
+  })
+  const RAW_WFP = JSON.stringify({
+    state: 'installed',
+    filters: 4,
+    port_range: [60080, 60089],
+    user_sid: 'S-1-5-21-1',
+  })
+  // `srt-win status` (combined readback after install).
+  const RAW_STATUS = JSON.stringify({
+    user: JSON.parse(RAW_USER),
+    wfp: JSON.parse(RAW_WFP),
+  })
+  const stdoutFor = (argv: readonly string[]): string =>
+    argv.includes('user')
+      ? RAW_USER
+      : argv.includes('wfp')
+        ? RAW_WFP
+        : argv.includes('status')
+          ? RAW_STATUS
+          : ''
+
+  let spawnSpy: ReturnType<typeof spyOn>
+  let spawnSyncSpy: ReturnType<typeof spyOn>
+
+  // Minimal ChildProcess stand-in for runSrtWinAsync's surface:
+  // stdout/stderr readable-like, stdin writable-like, once/on,
+  // close, kill. `delayMs: Infinity` = never closes on its own
+  // (only via kill(), which closes with (null, 'SIGTERM') the way
+  // a real killed child does).
+  function mkFakeChild(
+    stdout: string,
+    status: number,
+    delayMs = 0,
+    onClose?: () => void,
+  ) {
+    const mkStream = () => {
+      const s = new EventEmitter() as EventEmitter & {
+        setEncoding(e: string): typeof s
+        end(d?: string): void
+      }
+      s.setEncoding = () => s
+      s.end = () => {}
+      return s
+    }
+    const child = new EventEmitter() as EventEmitter & {
+      stdout: ReturnType<typeof mkStream>
+      stderr: ReturnType<typeof mkStream>
+      stdin: ReturnType<typeof mkStream>
+      kill(): boolean
+    }
+    child.stdout = mkStream()
+    child.stderr = mkStream()
+    child.stdin = mkStream()
+    child.kill = () => {
+      setImmediate(() => child.emit('close', null, 'SIGTERM'))
+      return true
+    }
+    const fire = () => {
+      onClose?.()
+      child.stdout.emit('data', stdout)
+      child.emit('close', status, null)
+    }
+    if (delayMs === Infinity) {
+      // wait for kill()
+    } else if (delayMs > 0) setTimeout(fire, delayMs)
+    else setImmediate(fire)
+    return child
+  }
+
+  const stubSpawn = (
+    behaviour: (argv: readonly string[]) => { status: number; stdout: string },
+    delayMs = 0,
+    onClose?: () => void,
+  ) => {
+    spawnSyncSpy = spyOn(child_process, 'spawnSync').mockImplementation(((
+      _exe: string,
+      argv: readonly string[],
+    ) => {
+      const b = behaviour(argv)
+      return { status: b.status, stdout: b.stdout, stderr: '', error: null }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    }) as any)
+    spawnSpy = spyOn(child_process, 'spawn').mockImplementation(((
+      _exe: string,
+      argv: readonly string[],
+    ) => {
+      const b = behaviour(argv)
+      return mkFakeChild(b.stdout, b.status, delayMs, onClose)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    }) as any)
+  }
+
+  afterEach(() => {
+    spawnSpy?.mockRestore()
+    spawnSyncSpy?.mockRestore()
+  })
+
+  it('getWindowsSandboxUserStatus{,Async}: identical argv + identical result', async () => {
+    stubSpawn(argv => ({ status: 0, stdout: stdoutFor(argv) }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const sync = getWindowsSandboxUserStatus({ srtWin })
+    const asyn = await getWindowsSandboxUserStatusAsync({ srtWin })
+    expect(asyn).toEqual(sync)
+    expect(spawnSyncSpy.mock.calls[0].slice(0, 2)).toEqual(
+      spawnSpy.mock.calls[0].slice(0, 2),
+    )
+    expect(spawnSpy.mock.calls[0][1]).toEqual([
+      SRT_WIN_DISPATCH_ARG1,
+      'user',
+      'status',
+    ])
+    expect(spawnSpy.mock.calls[0][2]).toMatchObject({ windowsHide: true })
+  })
+
+  it('getWindowsWfpStatus{,Async}: identical argv + identical result', async () => {
+    stubSpawn(argv => ({ status: 0, stdout: stdoutFor(argv) }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const sl = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const sync = getWindowsWfpStatus({ sublayerGuid: sl, srtWin })
+    const asyn = await getWindowsWfpStatusAsync({ sublayerGuid: sl, srtWin })
+    expect(asyn).toEqual(sync)
+    expect(spawnSpy.mock.calls[0][1]).toEqual(spawnSyncSpy.mock.calls[0][1])
+    expect(spawnSpy.mock.calls[0][1]).toEqual([
+      SRT_WIN_DISPATCH_ARG1,
+      'wfp',
+      'status',
+      '--sublayer-guid',
+      sl,
+    ])
+  })
+
+  it('checkWindowsSandboxStatus{,Async}: identical argv + identical result', async () => {
+    stubSpawn(argv => ({ status: 0, stdout: stdoutFor(argv) }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const sl = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const sync = checkWindowsSandboxStatus({ sublayerGuid: sl, srtWin })
+    const asyn = await checkWindowsSandboxStatusAsync({
+      sublayerGuid: sl,
+      srtWin,
+    })
+    expect(asyn).toEqual(sync)
+    expect(spawnSpy.mock.calls[0][1]).toEqual(spawnSyncSpy.mock.calls[0][1])
+    expect(spawnSpy.mock.calls[0][1]).toEqual([
+      SRT_WIN_DISPATCH_ARG1,
+      'status',
+      '--sublayer-guid',
+      sl,
+    ])
+  })
+
+  it('installWindowsSandbox{,Async}: identical install argv (all opts)', async () => {
+    stubSpawn(argv => ({ status: 0, stdout: stdoutFor(argv) }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const opts = {
+      sublayerGuid: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      proxyPortRange: [60080, 60089] as const,
+      sandboxUser: 'srt-sb-test',
+      force: true,
+      srtWin,
+    }
+    const sync = installWindowsSandbox(opts)
+    const asyn = await installWindowsSandboxAsync(opts)
+    expect(asyn).toEqual(sync)
+    // First call to each spy is the `install` invocation.
+    const syncArgv = spawnSyncSpy.mock.calls[0][1]
+    const asynArgv = spawnSpy.mock.calls[0][1]
+    expect(asynArgv).toEqual(syncArgv)
+    expect(asynArgv).toEqual([
+      SRT_WIN_DISPATCH_ARG1,
+      'install',
+      '--sublayer-guid',
+      opts.sublayerGuid,
+      '--proxy-port-range',
+      '60080-60089',
+      '--sandbox-user',
+      'srt-sb-test',
+      '--force',
+    ])
+  })
+
+  it('installWindowsSandbox: default timeout ≥ UAC TTL; opts.timeoutMs overrides', () => {
+    stubSpawn(argv => ({ status: 0, stdout: stdoutFor(argv) }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    // Default: 120 s (matches UAC consent auto-dismiss). The async
+    // variant computes its budget through the same installTimeoutMs
+    // helper (it arms its own timer instead of a spawn option, so
+    // there is no opts.timeout to observe there).
+    installWindowsSandbox({ srtWin })
+    expect(spawnSyncSpy.mock.calls[0][2].timeout).toBe(120_000)
+    // Explicit override.
+    installWindowsSandbox({ srtWin, timeoutMs: 300_000 })
+    expect(spawnSyncSpy.mock.calls.at(-2)?.[2].timeout).toBe(300_000)
+  })
+
+  it('installWindowsSandbox{,Async}: timeout → identical install_timeout error', async () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    // Sync: spawnSync kills at `timeout` and reports ETIMEDOUT.
+    spawnSyncSpy = spyOn(child_process, 'spawnSync').mockImplementation(
+      (() => ({
+        status: null,
+        signal: 'SIGTERM',
+        stdout: '',
+        stderr: '',
+        error: Object.assign(new Error('spawnSync ETIMEDOUT'), {
+          code: 'ETIMEDOUT',
+        }),
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      })) as any,
+    )
+    // Async: child never closes on its own; runSrtWinAsync's own
+    // timer kills it (close(null, 'SIGTERM')).
+    spawnSpy = spyOn(child_process, 'spawn').mockImplementation(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (() => mkFakeChild('', 0, Infinity)) as any,
+    )
+    const grab = async (fn: () => unknown): Promise<WindowsSandboxError> => {
+      try {
+        await fn()
+      } catch (e) {
+        return e as WindowsSandboxError
+      }
+      throw new Error('expected a timeout throw')
+    }
+    const syncErr = await grab(() =>
+      installWindowsSandbox({ srtWin, timeoutMs: 30 }),
+    )
+    const asynErr = await grab(() =>
+      installWindowsSandboxAsync({ srtWin, timeoutMs: 30 }),
+    )
+    for (const e of [syncErr, asynErr]) {
+      expect(e).toBeInstanceOf(WindowsSandboxError)
+      expect(e.code).toBe('install_timeout')
+      expect(e.message).toMatch(/UAC prompt may still be open/)
+      expect(e.message).toMatch(/timed out after 30ms \(killed by SIGTERM\)/)
+    }
+    expect(asynErr.message).toBe(syncErr.message)
+  })
+
+  it('getWindowsSandboxUserStatus{,Async}: non-zero exit → identical typed error', async () => {
+    stubSpawn(() => ({ status: 1, stdout: '' }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const errs: WindowsSandboxError[] = []
+    try {
+      getWindowsSandboxUserStatus({ srtWin })
+    } catch (e) {
+      errs.push(e as WindowsSandboxError)
+    }
+    try {
+      await getWindowsSandboxUserStatusAsync({ srtWin })
+    } catch (e) {
+      errs.push(e as WindowsSandboxError)
+    }
+    expect(errs).toHaveLength(2)
+    for (const e of errs) {
+      expect(e).toBeInstanceOf(WindowsSandboxError)
+      expect(e.code).toBe('srt_win_nonzero')
+      expect(e.subcommand).toBe('user')
+    }
+    expect(errs[1].message).toBe(errs[0].message)
+  })
+
+  it('installWindowsSandbox{,Async}: exit 10 → both return {cancelled:true}', async () => {
+    stubSpawn(argv => ({
+      status: argv[1] === 'install' ? 10 : 0,
+      stdout: stdoutFor(argv),
+    }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const sync = installWindowsSandbox({ srtWin })
+    const asyn = await installWindowsSandboxAsync({ srtWin })
+    expect(sync.cancelled).toBe(true)
+    expect(asyn).toEqual(sync)
+  })
+
+  it('installWindowsSandbox{,Async}: exit 13 → both throw the same message', async () => {
+    stubSpawn(() => ({ status: 13, stdout: '' }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    let syncMsg = ''
+    let asynMsg = ''
+    try {
+      installWindowsSandbox({ srtWin })
+    } catch (e) {
+      syncMsg = (e as Error).message
+    }
+    try {
+      await installWindowsSandboxAsync({ srtWin })
+    } catch (e) {
+      asynMsg = (e as Error).message
+    }
+    expect(syncMsg).toMatch(/already exist.*different/i)
+    expect(asynMsg).toBe(syncMsg)
+  })
+
+  it('installWindowsSandbox{,Async}: exit 13 → both throw install_config_conflict', async () => {
+    stubSpawn(() => ({ status: 13, stdout: '' }))
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const codes: string[] = []
+    try {
+      installWindowsSandbox({ srtWin })
+    } catch (e) {
+      codes.push((e as WindowsSandboxError).code)
+    }
+    try {
+      await installWindowsSandboxAsync({ srtWin })
+    } catch (e) {
+      codes.push((e as WindowsSandboxError).code)
+    }
+    expect(codes).toEqual([
+      'install_config_conflict',
+      'install_config_conflict',
+    ])
+  })
+
+  it('checkWindowsDependencies{,Async}: identical result (ok, unprovisioned, spawn-fail)', async () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    // ok
+    stubSpawn(argv => ({ status: 0, stdout: stdoutFor(argv) }))
+    expect(await checkWindowsDependenciesAsync({ srtWin })).toEqual(
+      checkWindowsDependencies({ srtWin }),
+    )
+    spawnSpy.mockRestore()
+    spawnSyncSpy.mockRestore()
+    // user not provisioned → same errors[]
+    const unprov = JSON.stringify({
+      ...JSON.parse(RAW_USER),
+      user: { ...JSON.parse(RAW_USER).user, exists: false },
+      cred_present: false,
+    })
+    stubSpawn(argv => ({
+      status: 0,
+      stdout: argv.includes('user') ? unprov : RAW_WFP,
+    }))
+    const sync = checkWindowsDependencies({ srtWin })
+    const asyn = await checkWindowsDependenciesAsync({ srtWin })
+    expect(sync.errors.length).toBe(1)
+    expect(asyn).toEqual(sync)
+    spawnSpy.mockRestore()
+    spawnSyncSpy.mockRestore()
+    // user-status probe non-zero → same short-circuit; sync variant
+    // must NOT spawn wfp-status (pins the pre-existing behaviour).
+    stubSpawn(argv => ({
+      status: argv.includes('user') ? 1 : 0,
+      stdout: argv.includes('user') ? '' : RAW_WFP,
+    }))
+    const syncFail = checkWindowsDependencies({ srtWin })
+    expect(spawnSyncSpy.mock.calls.length).toBe(1)
+    const asynFail = await checkWindowsDependenciesAsync({ srtWin })
+    expect(syncFail.errors[0]).toMatch(/user status failed/)
+    expect(asynFail).toEqual(syncFail)
+  })
+
+  it('checkWindowsDependenciesAsync: probes run concurrently', async () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    let inFlight = 0
+    let maxInFlight = 0
+    stubSpawn(
+      argv => {
+        inFlight++
+        maxInFlight = Math.max(maxInFlight, inFlight)
+        return { status: 0, stdout: stdoutFor(argv) }
+      },
+      20,
+      () => inFlight--,
+    )
+    await checkWindowsDependenciesAsync({ srtWin })
+    expect(maxInFlight).toBe(2)
+  })
+})
+
 describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
   it('getSrtWinPath resolves to an existing binary', () => {
     const p = getSrtWinPath()
@@ -625,6 +1041,29 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     expect(ws.state).toBe('absent')
     expect(ws.filters).toBe(0)
   })
+
+  it('async twins: real-spawn parity with sync (status + dependency check)', async () => {
+    // No spies — this drives the real srt-win.exe via spawn() and
+    // spawnSync() and asserts the async result equals the sync one.
+    const sl = '11111111-2222-3333-4444-555555555555'
+    expect(
+      await getWindowsWfpStatusAsync({
+        sublayerGuid: sl,
+        srtWin: TEST_SRT_WIN,
+      }),
+    ).toEqual(getWindowsWfpStatus({ sublayerGuid: sl, srtWin: TEST_SRT_WIN }))
+    expect(
+      await getWindowsSandboxUserStatusAsync({ srtWin: TEST_SRT_WIN }),
+    ).toEqual(getWindowsSandboxUserStatus({ srtWin: TEST_SRT_WIN }))
+    expect(
+      await checkWindowsDependenciesAsync({
+        sublayerGuid: sl,
+        srtWin: TEST_SRT_WIN,
+      }),
+    ).toEqual(
+      checkWindowsDependencies({ sublayerGuid: sl, srtWin: TEST_SRT_WIN }),
+    )
+  }, 30_000)
 
   // The non-elevated readiness check that initialize() runs.
   // Hermetic sublayer + full-uninstall in finally so the

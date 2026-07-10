@@ -56,6 +56,7 @@ import {
 } from './linux-violation-monitor.js'
 import {
   checkWindowsDependencies,
+  checkWindowsDependenciesAsync,
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
   expandWindowsFsPaths,
@@ -63,7 +64,7 @@ import {
   restoreWindowsAcl,
   grantWindowsAcl,
   revokeWindowsAcl,
-  getWindowsSandboxUserStatus,
+  getWindowsSandboxUserStatusAsync,
   getWindowsSandboxCaCert,
   verifyWindowsWfpEgress,
   resolveSrtWin,
@@ -465,7 +466,7 @@ async function initialize(
     : undefined
 
   // Check dependencies
-  const deps = checkDependencies()
+  const deps = await checkDependenciesAsync()
   if (deps.errors.length > 0) {
     throw new Error(
       `Sandbox dependencies not available: ${deps.errors.join(', ')}`,
@@ -512,7 +513,7 @@ async function initialize(
     // Resolve once (stats disk); captured module-level for wrap/reset.
     srtWinSpawn = resolveSrtWin(runtimeConfig.windows?.srtWin)
     const srtWin = srtWinSpawn
-    const u = getWindowsSandboxUserStatus({ srtWin })
+    const u = await getWindowsSandboxUserStatusAsync({ srtWin })
     if (!u.provisioned || !u.credPresent) {
       config = undefined
       throw new WindowsSandboxError(
@@ -761,16 +762,19 @@ function isSandboxingEnabled(): boolean {
 }
 
 /**
- * Check sandbox dependencies for the current platform
- * @param ripgrepConfig - Ripgrep command to check. If not provided, uses config from initialization or defaults to 'rg'
- * @returns { warnings, errors } - errors mean sandbox cannot run, warnings mean degraded functionality
+ * Platform-independent part of the dependency check. Returns either
+ * a finished result (POSIX, unsupported platform, or a Windows
+ * srt-win resolution failure) or the inputs for the Windows probe —
+ * the only platform where the sync and async variants differ.
  */
-function checkDependencies(ripgrepConfig?: {
+function checkDependenciesCommon(ripgrepConfig?: {
   command: string
   args?: string[]
-}): SandboxDependencyCheck {
+}):
+  | { done: SandboxDependencyCheck }
+  | { windows: { sublayerGuid?: string; srtWin: SrtWinSpawn } } {
   if (!isSupportedPlatform()) {
-    return { errors: ['Unsupported platform'], warnings: [] }
+    return { done: { errors: ['Unsupported platform'], warnings: [] } }
   }
 
   const errors: string[] = []
@@ -794,23 +798,53 @@ function checkDependencies(ripgrepConfig?: {
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
   } else if (platform === 'windows') {
-    let srtWin: SrtWinSpawn | undefined
+    let srtWin: SrtWinSpawn
     try {
       srtWin = resolveSrtWin(config?.windows?.srtWin)
     } catch (e) {
       errors.push((e as Error).message)
-      return { errors, warnings }
+      return { done: { errors, warnings } }
     }
-    const winDeps = checkWindowsDependencies({
-      sublayerGuid:
-        config?.windows?.sublayerGuid ?? config?.windows?.wfpSublayerGuid,
-      srtWin,
-    })
-    errors.push(...winDeps.errors)
-    warnings.push(...winDeps.warnings)
+    return {
+      windows: {
+        sublayerGuid:
+          config?.windows?.sublayerGuid ?? config?.windows?.wfpSublayerGuid,
+        srtWin,
+      },
+    }
   }
 
-  return { errors, warnings }
+  return { done: { errors, warnings } }
+}
+
+/**
+ * Check sandbox dependencies for the current platform
+ * @param ripgrepConfig - Ripgrep command to check. If not provided, uses config from initialization or defaults to 'rg'
+ * @returns { warnings, errors } - errors mean sandbox cannot run, warnings mean degraded functionality
+ */
+function checkDependencies(ripgrepConfig?: {
+  command: string
+  args?: string[]
+}): SandboxDependencyCheck {
+  const common = checkDependenciesCommon(ripgrepConfig)
+  if ('done' in common) return common.done
+  return checkWindowsDependencies(common.windows)
+}
+
+/**
+ * Async variant of {@link checkDependencies} — same result for the
+ * same underlying state. On Windows the srt-win probes run via
+ * `spawn` (never blocking the event loop) and concurrently; on other
+ * platforms the checks are native and this simply wraps the sync
+ * result. Windows callers should prefer this variant.
+ */
+async function checkDependenciesAsync(ripgrepConfig?: {
+  command: string
+  args?: string[]
+}): Promise<SandboxDependencyCheck> {
+  const common = checkDependenciesCommon(ripgrepConfig)
+  if ('done' in common) return common.done
+  return checkWindowsDependenciesAsync(common.windows)
 }
 
 /**
@@ -2008,6 +2042,10 @@ export interface ISandboxManager {
     command: string
     args?: string[]
   }): SandboxDependencyCheck
+  checkDependenciesAsync(ripgrepConfig?: {
+    command: string
+    args?: string[]
+  }): Promise<SandboxDependencyCheck>
   getFsReadConfig(): FsReadRestrictionConfig
   getFsWriteConfig(): FsWriteRestrictionConfig
   getNetworkRestrictionConfig(): NetworkRestrictionConfig
@@ -2061,6 +2099,7 @@ export const SandboxManager: ISandboxManager = {
   isSupportedPlatform,
   isSandboxingEnabled,
   checkDependencies,
+  checkDependenciesAsync,
   getFsReadConfig,
   getFsWriteConfig,
   getNetworkRestrictionConfig,
