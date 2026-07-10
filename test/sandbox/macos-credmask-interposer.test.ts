@@ -199,22 +199,19 @@ int main(int argc, char **argv) {
     expect(r.stdout).toBe(sentinel)
   })
 
-  test('a SIP binary (/bin/cat) bypasses the interposer and hits the SBPL deny', () => {
-    // dyld strips DYLD_INSERT_LIBRARIES when loading SIP-protected
-    // /bin/cat, so it reads the REAL path — which the profile denies.
-    // Fail-closed: EPERM, never the secret, never the sentinel.
-    // Some CI images run with SIP disabled: dyld then loads the
-    // interposer into /bin/cat like any other binary and it shows the
-    // sentinel instead. Either way the secret must never appear.
-    const sip = spawnSync('csrutil', ['status'], { encoding: 'utf8' })
-    const sipEnabled = (sip.stdout ?? '').includes('enabled')
+  test('a SIP binary (/bin/cat) never sees the secret: SBPL-denied or interposed', () => {
+    // With SIP enforcing, dyld strips DYLD_INSERT_LIBRARIES when loading
+    // /bin/cat, so it reads the REAL path and hits the profile's deny.
+    // CI images vary (fully or partially disabled SIP, where dyld loads
+    // the interposer into /bin/cat like any other binary), and csrutil's
+    // "Custom Configuration" output doesn't say which way dyld behaves —
+    // so accept either outcome and assert the invariant that holds in
+    // both: the secret never appears.
     const r = runInSandbox(wrap(`/bin/cat ${SECRET_FILE}`))
-    if (sipEnabled) {
-      expect(r.status).not.toBe(0)
-      expect(r.stdout).not.toContain(sentinel)
+    if (r.status === 0) {
+      expect(r.stdout).toBe(sentinel) // dyld injected: redirected to fake
     } else {
-      expect(r.status).toBe(0)
-      expect(r.stdout).toBe(sentinel)
+      expect(r.stdout).not.toContain(sentinel) // dyld stripped: SBPL deny
     }
     expect(r.stdout).not.toContain(SECRET_CONTENT)
   })
