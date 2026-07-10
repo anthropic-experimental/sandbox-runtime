@@ -73,8 +73,7 @@ export function encodeCredmaskMap(binds: readonly MaskedFileBind[]): string {
       continue
     }
     encodable.push(b.realPath + CREDMASK_FIELD_SEP + b.fakePath)
-    const aliasRoot = PRIVATE_ALIAS_ROOTS.find(r => b.realPath.startsWith(r))
-    if (aliasRoot !== undefined) {
+    if (PRIVATE_ALIAS_ROOTS.some(r => b.realPath.startsWith(r))) {
       // '/private/var/…' → '/var/…' etc.; separator-free by construction
       // (a substring of the already-validated realPath).
       const alias = b.realPath.slice('/private'.length)
