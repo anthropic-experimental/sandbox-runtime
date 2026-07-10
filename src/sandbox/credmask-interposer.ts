@@ -41,10 +41,22 @@ export const CREDMASK_FIELD_SEP = '\x1f'
 export const CREDMASK_ENTRY_SEP = '\x1e'
 
 /**
+ * macOS top-level symlinks into /private. Bind realPaths arrive
+ * realpath'd (so under /private), but the interposer normalizes lookup
+ * paths lexically WITHOUT following symlinks — a process referencing the
+ * symlinked form (e.g. /var/… or $TMPDIR before canonicalization) would
+ * miss the map and degrade to deny. Emit an extra entry for the alias
+ * form so both spellings hit the same fake.
+ */
+const PRIVATE_ALIAS_ROOTS = ['/private/var/', '/private/tmp/', '/private/etc/']
+
+/**
  * Encode masked-file binds for the interposer. Entries containing a
  * separator byte or NUL in either path are skipped (they cannot be
  * represented, and env vars cannot carry NUL) — the skipped file simply
- * stays SBPL-denied, so the failure mode is fail-closed.
+ * stays SBPL-denied, so the failure mode is fail-closed. Binds under a
+ * /private symlink root additionally emit an alias entry (see
+ * {@link PRIVATE_ALIAS_ROOTS}); aliases are purely additive.
  */
 export function encodeCredmaskMap(binds: readonly MaskedFileBind[]): string {
   const encodable: string[] = []
@@ -61,6 +73,13 @@ export function encodeCredmaskMap(binds: readonly MaskedFileBind[]): string {
       continue
     }
     encodable.push(b.realPath + CREDMASK_FIELD_SEP + b.fakePath)
+    const aliasRoot = PRIVATE_ALIAS_ROOTS.find(r => b.realPath.startsWith(r))
+    if (aliasRoot !== undefined) {
+      // '/private/var/…' → '/var/…' etc.; separator-free by construction
+      // (a substring of the already-validated realPath).
+      const alias = b.realPath.slice('/private'.length)
+      encodable.push(alias + CREDMASK_FIELD_SEP + b.fakePath)
+    }
   }
   return encodable.join(CREDMASK_ENTRY_SEP)
 }

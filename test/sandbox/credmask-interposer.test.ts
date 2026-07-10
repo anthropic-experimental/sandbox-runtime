@@ -86,6 +86,37 @@ describe('encodeCredmaskMap', () => {
       encodeCredmaskMap([{ realPath: '/a\x00b', fakePath: '/s/0.fake' }]),
     ).toBe('')
   })
+
+  test('a realPath under a /private symlink root emits an extra alias entry', () => {
+    for (const [real, alias] of [
+      ['/private/var/folders/ab/tok', '/var/folders/ab/tok'],
+      ['/private/tmp/tok', '/tmp/tok'],
+      ['/private/etc/tok', '/etc/tok'],
+    ] as const) {
+      expect(encodeCredmaskMap([{ realPath: real, fakePath: FAKE }])).toBe(
+        real +
+          CREDMASK_FIELD_SEP +
+          FAKE +
+          CREDMASK_ENTRY_SEP +
+          alias +
+          CREDMASK_FIELD_SEP +
+          FAKE,
+      )
+    }
+  })
+
+  test('no alias entry for paths outside the /private symlink roots', () => {
+    for (const real of [
+      '/home/user/tok',
+      '/privateer/var/tok',
+      '/var/tok', // already the alias form; realpath'd input can't be this
+      '/private/other/tok',
+    ]) {
+      expect(encodeCredmaskMap([{ realPath: real, fakePath: FAKE }])).toBe(
+        real + CREDMASK_FIELD_SEP + FAKE,
+      )
+    }
+  })
 })
 
 describe('getCredmaskDylibPath', () => {
