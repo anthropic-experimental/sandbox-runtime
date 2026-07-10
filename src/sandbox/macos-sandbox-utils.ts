@@ -912,11 +912,18 @@ export function wrapCommandWithSandboxMacOS(
         `[Sandbox macOS] credential-mask interposer active for ` +
           `${maskedFileBinds.length} file(s)`,
       )
-    } else {
+    } else if (dylibPath === null) {
       logForDebugging(
         '[Sandbox macOS] file mask degrades to deny: libcredmask.dylib ' +
           'not found — build vendor/credmask (npm run build:credmask) ' +
           'to enable masked reads',
+      )
+    } else {
+      // Dylib present but no bind was encodable (separator bytes in a
+      // path) — encodeCredmaskMap already logged each skipped entry.
+      logForDebugging(
+        '[Sandbox macOS] file mask degrades to deny: no encodable ' +
+          'masked-file binds',
       )
     }
   }
