@@ -203,10 +203,20 @@ int main(int argc, char **argv) {
     // dyld strips DYLD_INSERT_LIBRARIES when loading SIP-protected
     // /bin/cat, so it reads the REAL path — which the profile denies.
     // Fail-closed: EPERM, never the secret, never the sentinel.
+    // Some CI images run with SIP disabled: dyld then loads the
+    // interposer into /bin/cat like any other binary and it shows the
+    // sentinel instead. Either way the secret must never appear.
+    const sip = spawnSync('csrutil', ['status'], { encoding: 'utf8' })
+    const sipEnabled = (sip.stdout ?? '').includes('enabled')
     const r = runInSandbox(wrap(`/bin/cat ${SECRET_FILE}`))
-    expect(r.status).not.toBe(0)
+    if (sipEnabled) {
+      expect(r.status).not.toBe(0)
+      expect(r.stdout).not.toContain(sentinel)
+    } else {
+      expect(r.status).toBe(0)
+      expect(r.stdout).toBe(sentinel)
+    }
     expect(r.stdout).not.toContain(SECRET_CONTENT)
-    expect(r.stdout).not.toContain(sentinel)
   })
 
   test('stat on the masked path succeeds and reports the fake (sentinel) size', () => {
