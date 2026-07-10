@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
@@ -48,8 +49,15 @@ if (isMacOS && !clangAvailable) {
 }
 
 describe.if(isMacOS && clangAvailable)('macOS credmask interposer', () => {
-  const TEST_DIR = join(tmpdir(), 'srt-credmask-macos-' + Date.now())
+  // tmpdir() is /var/folders/… on macOS — a symlink into /private/var.
+  // The host-side map keys are realpath'd and the interposer matches
+  // exactly, so the probe paths must use the canonical /private form.
+  const TEST_DIR_NAME = 'srt-credmask-macos-' + Date.now()
+  const TEST_DIR = join(realpathSync(tmpdir()), TEST_DIR_NAME)
   const SECRET_FILE = join(TEST_DIR, 'gh-token')
+  // The un-canonicalized /var spelling of the same file, covered by the
+  // alias entries encodeCredmaskMap emits for /private symlink roots.
+  const SECRET_FILE_ALIAS = join(tmpdir(), TEST_DIR_NAME, 'gh-token')
   const SECRET_CONTENT = 'ghp_macos_real_secret_0123456789'
   const CONTROL_FILE = join(TEST_DIR, 'control.txt')
   const PROBE = join(TEST_DIR, 'credmask-probe')
@@ -217,6 +225,13 @@ int main(int argc, char **argv) {
     expect(r.status).toBe(0)
     expect(r.stdout.trim()).toBe(binds[0]!.realPath)
     expect(r.stdout).not.toContain(store.dirPath!)
+  })
+
+  test('the un-canonicalized /var alias of the masked path is redirected too', () => {
+    const r = runInSandbox(wrap(`${PROBE} read ${SECRET_FILE_ALIAS}`))
+    expect(r.status).toBe(0)
+    expect(r.stdout).toBe(sentinel)
+    expect(r.stdout).not.toContain(SECRET_CONTENT)
   })
 
   test('a relative path to the masked file is redirected too', () => {
