@@ -13,6 +13,7 @@
   },
   "scripts": {
     "build": "tsc",
+    "build:credmask": "bun vendor/credmask/build.ts",
     "build:seccomp": "bun vendor/seccomp/build.ts",
     "build:srt-win": "bun vendor/srt-win/build.ts",
     "clean": "rm -rf dist",
@@ -51,6 +52,7 @@
   },
   "files": [
     "dist",
+    "vendor/credmask",
     "vendor/seccomp",
     "vendor/srt-win",
     "README.md",

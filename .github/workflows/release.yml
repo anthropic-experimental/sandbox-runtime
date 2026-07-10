@@ -32,6 +32,29 @@ jobs:
           path: vendor/seccomp/${{ matrix.arch }}
           if-no-files-found: error
 
+  build-credmask:
+    # The macOS DYLD interposer for credential file masking. One
+    # universal (arm64 + x86_64) dylib, so a single non-matrix job.
+    name: Build credmask (universal)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - run: npm run build:credmask
+      - name: Verify universal dylib
+        run: |
+          archs=$(lipo -archs vendor/credmask/libcredmask.dylib)
+          echo "archs: $archs"
+          grep -q x86_64 <<<"$archs"
+          grep -q arm64 <<<"$archs"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: credmask
+          path: vendor/credmask/libcredmask.dylib
+          if-no-files-found: error
+
   build-srt-win:
     name: Build srt-win (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -121,7 +144,7 @@ jobs:
 
   publish:
     name: Publish to npm
-    needs: [build-seccomp, build-srt-win, verify-package]
+    needs: [build-seccomp, build-credmask, build-srt-win, verify-package]
     runs-on: ubuntu-latest
     environment: npm
     steps:
@@ -163,6 +186,11 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
+          name: credmask
+          path: vendor/credmask
+
+      - uses: actions/download-artifact@v4
+        with:
           name: srt-win-x64
           path: vendor/srt-win/x64
       - uses: actions/download-artifact@v4
@@ -184,10 +212,10 @@ jobs:
           echo "::group::tarball contents"
           echo "$LIST"
           echo "::endgroup::"
-          for f in vendor/srt-win/x64/srt-win.exe vendor/srt-win/arm64/srt-win.exe vendor/seccomp/x64/apply-seccomp vendor/seccomp/arm64/apply-seccomp; do
+          for f in vendor/srt-win/x64/srt-win.exe vendor/srt-win/arm64/srt-win.exe vendor/seccomp/x64/apply-seccomp vendor/seccomp/arm64/apply-seccomp vendor/credmask/libcredmask.dylib; do
             grep -q "^package/$f$" <<<"$LIST" || { echo "::error::missing $f in tarball"; exit 1; }
           done
-          if grep -qE '^package/vendor/(srt-win-src|seccomp-src)/' <<<"$LIST"; then
+          if grep -qE '^package/vendor/(srt-win-src|seccomp-src|credmask-src)/' <<<"$LIST"; then
             echo "::error::source dirs leaked into tarball"; exit 1
           fi
           if grep -q '^package/dist/vendor/' <<<"$LIST"; then
