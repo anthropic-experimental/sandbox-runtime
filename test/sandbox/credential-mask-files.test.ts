@@ -800,10 +800,15 @@ describe.if(isLinux)('extract no-match onExtractNoMatch on Linux', () => {
 })
 
 /**
- * macOS: SBPL cannot redirect a read, so a masked file degrades to a
- * (deny file-read* …) rule — same profile output as mode: "deny". The
- * fakePath is unused. Pure string assertion; runs on any platform.
+ * macOS without the credmask interposer dylib: SBPL cannot redirect a
+ * read, so a masked file degrades to a (deny file-read* …) rule — same
+ * profile output as mode: "deny" and the fakePath goes unused. The
+ * explicit nonexistent credmaskDylibPath pins the degrade path so these
+ * stay deterministic even on a machine where the dylib has been built
+ * (an explicit override never falls back). Pure string assertion; runs
+ * on any platform.
  */
+const NO_DYLIB = '/nonexistent-credmask/libcredmask.dylib'
 describe('file masking on macOS degrades to read-deny', () => {
   test('profile contains (deny file-read* …) for the masked path', () => {
     const wrapped = wrapCommandWithSandboxMacOS({
@@ -812,6 +817,7 @@ describe('file masking on macOS degrades to read-deny', () => {
       readConfig: undefined,
       writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
       maskedFileBinds: [{ realPath: TOKEN_FILE, fakePath: '/unused' }],
+      credmaskDylibPath: NO_DYLIB,
     })
     expect(wrapped).toContain('deny file-read*')
     expect(wrapped).toContain(TOKEN_FILE)
@@ -826,6 +832,7 @@ describe('file masking on macOS degrades to read-deny', () => {
       readConfig: undefined,
       writeConfig: undefined,
       maskedFileBinds: [{ realPath: TOKEN_FILE, fakePath: '/unused' }],
+      credmaskDylibPath: NO_DYLIB,
     })
     expect(wrapped).not.toBe('echo hi')
     expect(wrapped).toContain('deny file-read*')
@@ -855,6 +862,7 @@ describe('file masking on macOS degrades to read-deny', () => {
       readConfig: undefined,
       writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
       maskedFileBinds: binds,
+      credmaskDylibPath: NO_DYLIB,
     })
     expect(wrapped).toContain('deny file-read*')
     expect(wrapped).toContain(HOSTS_YML)

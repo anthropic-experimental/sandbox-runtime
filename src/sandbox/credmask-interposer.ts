@@ -88,9 +88,11 @@ function getLocalCredmaskPaths(): string[] {
  * (source checkout without `npm run build:credmask`, non-mac install,
  * …). Callers treat null as "keep today's degrade-to-deny behaviour".
  *
- * @param explicitPath - Optional explicit dylib path; used if it exists
- *   (test/native-build override), otherwise falls back to the standard
- *   package locations and the global npm install.
+ * @param explicitPath - Optional explicit dylib path override. Unlike
+ *   the apply-seccomp resolver, an explicit path is authoritative: if it
+ *   doesn't exist the result is null (degrade-to-deny), with no fallback
+ *   to the standard locations. This keeps an operator-pinned (or
+ *   test-pinned) path from silently resolving somewhere else.
  */
 export function getCredmaskDylibPath(explicitPath?: string): string | null {
   const cacheKey = explicitPath ?? ''
@@ -112,8 +114,9 @@ function findCredmaskDylibPath(explicitPath?: string): string | null {
       return explicitPath
     }
     logForDebugging(
-      `[credmask] Explicit dylib path provided but not found: ${explicitPath}`,
+      `[credmask] Explicit dylib path not found (no fallback): ` + explicitPath,
     )
+    return null
   }
 
   for (const p of getLocalCredmaskPaths()) {
