@@ -45,22 +45,20 @@
 //! removed when `srt-win uninstall` calls `DeleteProfileW`. `srt-win
 //! exec` does NOT touch this module.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use windows::core::{PCWSTR, PSTR};
 use windows::Win32::Security::Cryptography::{
-    CertCreateCertificateContext, CertFreeCertificateContext,
-    CertSerializeCertificateStoreElement, CryptBinaryToStringA,
-    CryptHashCertificate2, CryptStringToBinaryA, CRYPT_STRING_ANY,
-    CRYPT_STRING_BASE64HEADER, X509_ASN_ENCODING,
+    CRYPT_STRING_ANY, CRYPT_STRING_BASE64HEADER, CertCreateCertificateContext,
+    CertFreeCertificateContext, CertSerializeCertificateStoreElement, CryptBinaryToStringA,
+    CryptHashCertificate2, CryptStringToBinaryA, X509_ASN_ENCODING,
 };
 use windows::Win32::System::Registry::{HKEY_USERS, REG_BINARY};
+use windows::core::{PCWSTR, PSTR};
 
 use crate::sid;
 use crate::util::{reg_set_value, wstr};
 
-const ROOT_CERTS_REL: &str =
-    "Software\\Microsoft\\SystemCertificates\\Root\\Certificates";
+const ROOT_CERTS_REL: &str = "Software\\Microsoft\\SystemCertificates\\Root\\Certificates";
 
 /// DER-encoded X.509 certificate. Newtype so the cert bytes can't be
 /// confused with the DPAPI ciphertext, the serialized store element,
@@ -105,12 +103,8 @@ impl CertDer {
             return Ok(Self(parse_cert_span(bytes)?));
         }
         let mut len: u32 = 0;
-        unsafe {
-            CryptStringToBinaryA(
-                bytes, CRYPT_STRING_ANY, None, &mut len, None, None,
-            )
-        }
-        .context("CryptStringToBinaryA (sizing)")?;
+        unsafe { CryptStringToBinaryA(bytes, CRYPT_STRING_ANY, None, &mut len, None, None) }
+            .context("CryptStringToBinaryA (sizing)")?;
         let mut out = vec![0u8; len as usize];
         unsafe {
             CryptStringToBinaryA(
@@ -169,11 +163,7 @@ impl CertDer {
     /// `.crt` file for the env-var trust layer.
     pub fn to_pem(&self) -> Result<String> {
         let mut len: u32 = 0;
-        let r = unsafe {
-            CryptBinaryToStringA(
-                &self.0, CRYPT_STRING_BASE64HEADER, None, &mut len,
-            )
-        };
+        let r = unsafe { CryptBinaryToStringA(&self.0, CRYPT_STRING_BASE64HEADER, None, &mut len) };
         if !r.as_bool() || len == 0 {
             return Err(anyhow!(
                 "CryptBinaryToStringA (sizing): {}",
@@ -197,8 +187,7 @@ impl CertDer {
         }
         // `len` excludes the trailing NUL on the fill call.
         buf.truncate(len as usize);
-        String::from_utf8(buf)
-            .context("CryptBinaryToStringA returned non-UTF-8")
+        String::from_utf8(buf).context("CryptBinaryToStringA returned non-UTF-8")
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -212,9 +201,7 @@ impl CertDer {
 /// SEQUENCE on input; the returned span never has them. Errors if
 /// `bytes` is not a parseable X.509 cert.
 fn parse_cert_span(bytes: &[u8]) -> Result<Vec<u8>> {
-    let ctx = unsafe {
-        CertCreateCertificateContext(X509_ASN_ENCODING, bytes)
-    };
+    let ctx = unsafe { CertCreateCertificateContext(X509_ASN_ENCODING, bytes) };
     if ctx.is_null() {
         return Err(anyhow!(
             "CertCreateCertificateContext: {} (input is not a \
@@ -222,13 +209,9 @@ fn parse_cert_span(bytes: &[u8]) -> Result<Vec<u8>> {
             std::io::Error::last_os_error()
         ));
     }
-    let span = unsafe {
-        std::slice::from_raw_parts(
-            (*ctx).pbCertEncoded,
-            (*ctx).cbCertEncoded as usize,
-        )
-    }
-    .to_vec();
+    let span =
+        unsafe { std::slice::from_raw_parts((*ctx).pbCertEncoded, (*ctx).cbCertEncoded as usize) }
+            .to_vec();
     unsafe {
         let _ = CertFreeCertificateContext(Some(ctx));
     }
@@ -242,9 +225,7 @@ impl rusqlite::ToSql for CertDer {
 }
 
 impl rusqlite::types::FromSql for CertDer {
-    fn column_result(
-        v: rusqlite::types::ValueRef<'_>,
-    ) -> rusqlite::types::FromSqlResult<Self> {
+    fn column_result(v: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
         v.as_blob().map(|b| Self(b.to_vec()))
     }
 }
@@ -264,9 +245,7 @@ pub fn install_root_ca(der: &CertDer) -> Result<String> {
     // the canonical `pbCertEncoded` span, so `der.thumb()` and the
     // serialized element agree without re-reading the context's
     // span here.
-    let ctx = unsafe {
-        CertCreateCertificateContext(X509_ASN_ENCODING, der.as_bytes())
-    };
+    let ctx = unsafe { CertCreateCertificateContext(X509_ASN_ENCODING, der.as_bytes()) };
     if ctx.is_null() {
         return Err(anyhow!(
             "CertCreateCertificateContext: {}",
@@ -277,26 +256,14 @@ pub fn install_root_ca(der: &CertDer) -> Result<String> {
 
     // Serialized store element (two-call size-then-fill).
     let mut blob_len: u32 = 0;
-    let r_blob = unsafe {
-        CertSerializeCertificateStoreElement(
-            ctx,
-            0,
-            None,
-            &mut blob_len,
-        )
-    }
-    .and_then(|_| {
-        let mut buf = vec![0u8; blob_len as usize];
-        unsafe {
-            CertSerializeCertificateStoreElement(
-                ctx,
-                0,
-                Some(buf.as_mut_ptr()),
-                &mut blob_len,
-            )
-        }
-        .map(|_| buf)
-    });
+    let r_blob = unsafe { CertSerializeCertificateStoreElement(ctx, 0, None, &mut blob_len) }
+        .and_then(|_| {
+            let mut buf = vec![0u8; blob_len as usize];
+            unsafe {
+                CertSerializeCertificateStoreElement(ctx, 0, Some(buf.as_mut_ptr()), &mut blob_len)
+            }
+            .map(|_| buf)
+        });
     unsafe {
         let _ = CertFreeCertificateContext(Some(ctx));
     }
@@ -307,8 +274,7 @@ pub fn install_root_ca(der: &CertDer) -> Result<String> {
     // creates intermediate keys, so a fresh sandbox-user hive
     // (no prior Root entries) is fine. See module doc for why
     // `HKEY_USERS\<SID>` and not `HKEY_CURRENT_USER`.
-    let user_sid =
-        sid::current_user_sid().context("cert_store: own user SID")?;
+    let user_sid = sid::current_user_sid().context("cert_store: own user SID")?;
     let sub = format!("{user_sid}\\{ROOT_CERTS_REL}\\{thumb}");
     reg_set_value(HKEY_USERS, &sub, "Blob", REG_BINARY, &blob)
         .with_context(|| format!("write HKU\\{sub}"))?;
@@ -323,8 +289,7 @@ mod tests {
     /// tls-terminate tests use). `from_pem_or_der` parses it to a
     /// real `CERT_CONTEXT`, so the canonicalization step is
     /// exercised end-to-end.
-    const CA_PEM: &[u8] =
-        include_bytes!("../../../test/fixtures/tls-terminate/ca.crt");
+    const CA_PEM: &[u8] = include_bytes!("../../../test/fixtures/tls-terminate/ca.crt");
 
     #[test]
     fn pem_roundtrip_is_canonical() {

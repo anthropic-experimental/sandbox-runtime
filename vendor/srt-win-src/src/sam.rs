@@ -6,15 +6,15 @@
 //! and rejects `.\name` with `ERROR_NO_SUCH_MEMBER`, so it's
 //! avoided entirely.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::ffi::c_void;
-use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::ERROR_MEMBER_IN_ALIAS;
 use windows::Win32::NetworkManagement::NetManagement::{
-    NetApiBufferFree, NetLocalGroupAdd, NetLocalGroupAddMembers,
-    NetLocalGroupDel, NetLocalGroupGetMembers, NERR_GroupExists,
-    NERR_GroupNotFound, LOCALGROUP_INFO_1, LOCALGROUP_MEMBERS_INFO_0,
+    LOCALGROUP_INFO_1, LOCALGROUP_MEMBERS_INFO_0, NERR_GroupExists, NERR_GroupNotFound,
+    NetApiBufferFree, NetLocalGroupAdd, NetLocalGroupAddMembers, NetLocalGroupDel,
+    NetLocalGroupGetMembers,
 };
+use windows::core::{PCWSTR, PWSTR};
 
 use crate::sid::{self, LocalPsid};
 use crate::util::{pcwstr, wstr};
@@ -32,11 +32,7 @@ pub fn ensure_local_group(name: &str, comment: &str) -> Result<()> {
         lgrpi1_name: PWSTR(name_w.as_mut_ptr()),
         lgrpi1_comment: PWSTR(comment_w.as_mut_ptr()),
     };
-    let rc = unsafe {
-        NetLocalGroupAdd(
-            PCWSTR::null(), 1, &info as *const _ as *const u8, None,
-        )
-    };
+    let rc = unsafe { NetLocalGroupAdd(PCWSTR::null(), 1, &info as *const _ as *const u8, None) };
     if rc != 0 && rc != NERR_GroupExists && rc != ERROR_ALIAS_EXISTS {
         return Err(anyhow!("NetLocalGroupAdd({name}): {rc}"));
     }
@@ -59,7 +55,9 @@ pub fn delete_local_group(name: &str) -> Result<()> {
 /// `ERROR_NO_SUCH_MEMBER`) is a real failure that must surface.
 pub fn add_member(group_name: &str, member: &LocalPsid) -> Result<()> {
     let group_w = wstr(group_name);
-    let info = LOCALGROUP_MEMBERS_INFO_0 { lgrmi0_sid: member.as_psid() };
+    let info = LOCALGROUP_MEMBERS_INFO_0 {
+        lgrmi0_sid: member.as_psid(),
+    };
     let rc = unsafe {
         NetLocalGroupAddMembers(
             PCWSTR::null(),
@@ -70,9 +68,7 @@ pub fn add_member(group_name: &str, member: &LocalPsid) -> Result<()> {
         )
     };
     if rc != 0 && rc != ERROR_MEMBER_IN_ALIAS.0 {
-        return Err(anyhow!(
-            "NetLocalGroupAddMembers({group_name}, sid): {rc}"
-        ));
+        return Err(anyhow!("NetLocalGroupAddMembers({group_name}, sid): {rc}"));
     }
     Ok(())
 }
@@ -108,17 +104,12 @@ pub fn is_member_of(group_sid: &str, member_sid: &str) -> Result<bool> {
         return Ok(false);
     }
     if rc != 0 {
-        return Err(anyhow!(
-            "NetLocalGroupGetMembers({group_name}): {rc}"
-        ));
+        return Err(anyhow!("NetLocalGroupGetMembers({group_name}): {rc}"));
     }
     let mut found = false;
     if !buf.is_null() && read > 0 {
         let entries = unsafe {
-            std::slice::from_raw_parts(
-                buf as *const LOCALGROUP_MEMBERS_INFO_0,
-                read as usize,
-            )
+            std::slice::from_raw_parts(buf as *const LOCALGROUP_MEMBERS_INFO_0, read as usize)
         };
         for e in entries {
             if let Ok(s) = sid::psid_to_string(e.lgrmi0_sid)

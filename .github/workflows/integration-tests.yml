@@ -72,14 +72,6 @@ jobs:
           # the cache main pushes warm here.
           shared-key: srt-win
 
-      - name: Install sqlite3 CLI (Windows, for smoke-acl DB-poison tests)
-        if: matrix.os == 'windows'
-        shell: pwsh
-        # The smoke-acl H4/H6/H8/R2 rows only need *a* sqlite3 CLI
-        # to inspect the state DB, not a specific version. Was
-        # pinned to 3.50.4, which the community feed delisted.
-        run: choco install sqlite --no-progress -y
-
       - name: Build srt-win (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
@@ -93,7 +85,7 @@ jobs:
           cargo test   --release --manifest-path vendor/srt-win-src/Cargo.toml
           cargo clippy --release --manifest-path vendor/srt-win-src/Cargo.toml --all-targets -- -D warnings
 
-      - name: Smoke-test srt-win group + wfp lifecycle (Windows)
+      - name: Smoke-test srt-win install lifecycle (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
         run: pwsh vendor/srt-win-src/ci/smoke.ps1 vendor\srt-win-src\target\release\srt-win.exe
@@ -103,17 +95,15 @@ jobs:
         shell: pwsh
         run: pwsh vendor/srt-win-src/ci/smoke-exec.ps1 vendor\srt-win-src\target\release\srt-win.exe
 
-      - name: Smoke-test srt-win acl (Windows)
+      - name: Smoke-test srt-win additive-ACE lifecycle (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
-        run: pwsh vendor/srt-win-src/ci/smoke-acl.ps1 vendor\srt-win-src\target\release\srt-win.exe
+        run: pwsh vendor/srt-win-src/ci/smoke-aces.ps1 vendor\srt-win-src\target\release\srt-win.exe
 
       - name: TS integration tests (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
         env:
-          # winsrt.test.ts resolves the helper binary via this.
-          SRT_WIN_PATH: ${{ github.workspace }}\vendor\srt-win-src\target\release\srt-win.exe
           # Husky's prepare hook chokes on Windows runners; skip it.
           HUSKY: '0'
         run: |
@@ -121,7 +111,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           npm ci
           npm run build
-          bun test test/sandbox/winsrt.test.ts
+          bun test test/sandbox/winsrt.test.ts test/sandbox/mux-proxy.test.ts
 
       - name: Cleanup srt-win state (Windows)
         if: always() && matrix.os == 'windows'

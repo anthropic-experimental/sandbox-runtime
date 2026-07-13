@@ -1,29 +1,26 @@
-//! `srt-win runner` — the inside-the-logon half of the
-//! `--as-sandbox-user` two-hop launch.
+//! `srt-win runner` — the inside-the-logon half of the two-hop
+//! launch.
 //!
 //! The broker (running as the **real** user) decrypts the sandbox
 //! user's password and `CreateProcessWithLogonW`s **this**
 //! subcommand under the `srt-sandbox` account. The runner reads a
-//! [`RunnerCmd`] from stdin and either runs the existing
-//! [`crate::launch::run_lockdown`] under [`LaunchMode::SandboxUser`]
-//! (restricted token + job + desktop + mitigations + handle
-//! whitelist, **minus** the discriminator-group flip — the sandbox
-//! user isn't a member), or — at install time — writes the MITM CA
-//! into the sandbox user's `CurrentUser\Root` (see
+//! [`RunnerCmd`] from stdin and either runs
+//! [`crate::launch::run_lockdown`] (restricted token, job, desktop,
+//! mitigations, handle whitelist), or — at install time — writes
+//! the MITM CA into the sandbox user's `CurrentUser\Root` (see
 //! [`crate::cert_store`]). The child inherits the runner's stdio,
 //! which are the broker's pipes, so stdout/stderr flow broker ←
 //! runner ← child without an extra pump.
 //!
-//! All state-DB work (per-exec stamps, fences) happens in the
-//! **broker**, never here: the state-DB directory carries an
-//! explicit DENY for `sandbox-runtime-users`, so the runner cannot
-//! open it.
+//! All state-DB work happens in the **broker**, never here: the
+//! state-DB directory carries an explicit DENY for
+//! `sandbox-runtime-users`, so the runner cannot open it.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 
-use crate::launch::{self, LaunchMode};
+use crate::launch;
 
 /// What the broker asks the runner to do. Passed over stdin (4-byte
 /// LE length prefix + JSON). Stdin — not argv or env — because the
@@ -32,7 +29,7 @@ use crate::launch::{self, LaunchMode};
 /// broker's `%TEMP%` may not be).
 #[derive(Debug, Serialize, Deserialize)]
 pub enum RunnerCmd {
-    /// Per-exec: run the target under [`LaunchMode::SandboxUser`].
+    /// Per-exec: run the target under [`crate::launch::run_lockdown`].
     Exec(RunnerSpec),
     /// Install-time, one-shot: write the DER-encoded CA into the
     /// **sandbox user's** `CurrentUser\Root` (direct
@@ -123,11 +120,7 @@ pub fn run() -> Result<u32> {
                 );
             }
             let exe = std::path::PathBuf::from(&spec.argv[0]);
-            launch::run_lockdown(
-                &exe,
-                &spec.argv[1..],
-                &LaunchMode::SandboxUser { env_overlay: &spec.env_overlay },
-            )
+            launch::run_lockdown(&exe, &spec.argv[1..], &spec.env_overlay)
         }
         RunnerCmd::InstallCa { der } => {
             let thumb = crate::cert_store::install_root_ca(&der)?;
@@ -147,9 +140,9 @@ pub fn run() -> Result<u32> {
             // something OTHER than the WFP fence — falls through
             // to `unreachable`.
             const WSAEACCES: i32 = 10013;
-            let addr: SocketAddr = target.parse().with_context(|| {
-                format!("runner: ProbeEgress target '{target}'")
-            })?;
+            let addr: SocketAddr = target
+                .parse()
+                .with_context(|| format!("runner: ProbeEgress target '{target}'"))?;
             // stderr (not stdout): `spawn_runner` pumps the
             // runner's stdout straight to the broker's stdout, and
             // the broker writes its own JSON there. The exit code
@@ -174,7 +167,8 @@ pub fn run() -> Result<u32> {
                     eprintln!(
                         "srt-win: runner: egress probe {target}: \
                          UNREACHABLE: {e} (kind={:?}, os={:?})",
-                        e.kind(), e.raw_os_error(),
+                        e.kind(),
+                        e.raw_os_error(),
                     );
                     Ok(2)
                 }
@@ -198,8 +192,7 @@ mod tests {
             u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize,
             bytes.len() - 4
         );
-        let back: RunnerCmd =
-            serde_json::from_slice(&bytes[4..]).unwrap();
+        let back: RunnerCmd = serde_json::from_slice(&bytes[4..]).unwrap();
         match back {
             RunnerCmd::Exec(r) => {
                 assert_eq!(r.argv, ["cmd.exe", "/c", "echo hi"]);
@@ -211,8 +204,7 @@ mod tests {
             der: crate::cert_store::CertDer::raw(vec![0x30, 0x82]),
         };
         let bytes = encode_cmd(&ca).unwrap();
-        let back: RunnerCmd =
-            serde_json::from_slice(&bytes[4..]).unwrap();
+        let back: RunnerCmd = serde_json::from_slice(&bytes[4..]).unwrap();
         assert!(matches!(
             back, RunnerCmd::InstallCa { der } if der.as_bytes() == [0x30, 0x82]
         ));
@@ -220,8 +212,7 @@ mod tests {
             target: "127.0.0.1:49999".into(),
         };
         let bytes = encode_cmd(&probe).unwrap();
-        let back: RunnerCmd =
-            serde_json::from_slice(&bytes[4..]).unwrap();
+        let back: RunnerCmd = serde_json::from_slice(&bytes[4..]).unwrap();
         assert!(matches!(
             back, RunnerCmd::ProbeEgress { target } if target == "127.0.0.1:49999"
         ));

@@ -1,5 +1,5 @@
 //! Broker-side `CreateProcessWithLogonW` wrapper for the
-//! `--as-sandbox-user` two-hop launch.
+//! broker→runner two-hop launch.
 //!
 //! Spawns `srt-win.exe runner` under the `srt-sandbox` account
 //! (via the Secondary Logon service — no
@@ -21,31 +21,27 @@
 //! broker's interactive logon SID into the runner's token. Key on
 //! the **user SID** only.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
-use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_LOGON_FAILURE, ERROR_NOT_SUPPORTED,
-    SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS,
-    WAIT_OBJECT_0,
+    CloseHandle, ERROR_LOGON_FAILURE, ERROR_NOT_SUPPORTED, HANDLE, HANDLE_FLAG_INHERIT,
+    HANDLE_FLAGS, SetHandleInformation, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    CreateProcessWithLogonW, GetExitCodeProcess, ResumeThread,
-    WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED,
-    CREATE_UNICODE_ENVIRONMENT, INFINITE, LOGON_WITH_PROFILE,
-    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+    CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessWithLogonW,
+    GetExitCodeProcess, INFINITE, LOGON_WITH_PROFILE, PROCESS_INFORMATION, ResumeThread,
+    STARTF_USESTDHANDLES, STARTUPINFOW, WaitForSingleObject,
 };
+use windows::core::{PCWSTR, PWSTR};
 
 use crate::job::Job;
-use crate::launch::{quote_arg, SpawnedChild};
-use crate::util::{wstr, OwnedHandle};
-use crate::winsta::{
-    grant_sandbox_on_session_bno, grant_sandbox_on_winsta, IsolatedDesk,
-};
+use crate::launch::{SpawnedChild, quote_arg};
+use crate::util::{OwnedHandle, wstr};
+use crate::winsta::{IsolatedDesk, grant_sandbox_on_session_bno, grant_sandbox_on_winsta};
 
 /// One anonymous pipe pair. The end the runner gets is created
 /// inheritable; the broker's end is flipped non-inheritable so the
@@ -65,8 +61,7 @@ fn make_pipe(runner_writes: bool) -> Result<PipePair> {
     let mut read = HANDLE::default();
     let mut write = HANDLE::default();
     unsafe {
-        CreatePipe(&mut read, &mut write, Some(&sa), 0)
-            .context("CreatePipe")?;
+        CreatePipe(&mut read, &mut write, Some(&sa), 0).context("CreatePipe")?;
     }
     // Wrap immediately so the `?` below can't leak either end.
     let (broker, runner) = if runner_writes {
@@ -76,10 +71,8 @@ fn make_pipe(runner_writes: bool) -> Result<PipePair> {
     };
     // Broker end must NOT be inherited by the runner.
     unsafe {
-        SetHandleInformation(
-            broker.raw(), HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0),
-        )
-        .context("SetHandleInformation(broker end)")?;
+        SetHandleInformation(broker.raw(), HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0))
+            .context("SetHandleInformation(broker end)")?;
     }
     Ok(PipePair { broker, runner })
 }
@@ -91,9 +84,7 @@ fn pump(src: HANDLE, dst: HANDLE) {
     let mut buf = [0u8; 8192];
     loop {
         let mut read = 0u32;
-        let r = unsafe {
-            ReadFile(src, Some(&mut buf), Some(&mut read), None)
-        };
+        let r = unsafe { ReadFile(src, Some(&mut buf), Some(&mut read), None) };
         if r.is_err() || read == 0 {
             break;
         }
@@ -101,11 +92,7 @@ fn pump(src: HANDLE, dst: HANDLE) {
         while off < read {
             let mut wrote = 0u32;
             let chunk = &buf[off as usize..read as usize];
-            if unsafe {
-                WriteFile(dst, Some(chunk), Some(&mut wrote), None)
-            }
-            .is_err()
-                || wrote == 0
+            if unsafe { WriteFile(dst, Some(chunk), Some(&mut wrote), None) }.is_err() || wrote == 0
             {
                 return;
             }
@@ -118,13 +105,16 @@ fn pump(src: HANDLE, dst: HANDLE) {
 /// return its exit code. `cwd` is set as the runner's working
 /// directory; `None` inherits the broker's. `sb_sid` is the
 /// `srt-sandbox` user-SID string (for the desktop DACL and the
-/// `WinSta0` station grant).
+/// `WinSta0` station grant). `quiet` suppresses the informational
+/// stderr lines (the seclogon-job note); `SANDBOX_RUNTIME_WIN_DEBUG`
+/// checkpoints are gated separately on `dbg` and are unaffected.
 pub fn spawn_runner(
     username: &str,
     password: &str,
     sb_sid: &str,
     cwd: Option<&str>,
     cmd: &crate::runner::RunnerCmd,
+    quiet: bool,
 ) -> Result<u32> {
     let cmd_bytes = crate::runner::encode_cmd(cmd)?;
     let stdin = make_pipe(false)?;
@@ -138,14 +128,7 @@ pub fn spawn_runner(
     // open until the runner exits so the kernel object survives the
     // whole two-hop chain. See `winsta.rs` module doc.
     let dbg = std::env::var_os("SANDBOX_RUNTIME_WIN_DEBUG").is_some();
-    let mut desk =
-        IsolatedDesk::new(Some(sb_sid)).context("broker IsolatedDesk")?;
-    if dbg {
-        eprintln!(
-            "srt-win: spawn_runner: desk={}",
-            String::from_utf16_lossy(desk.desktop_name_ptr_slice()),
-        );
-    }
+    let mut desk = IsolatedDesk::new(sb_sid).context("broker IsolatedDesk")?;
 
     let exe = std::env::current_exe().context("current_exe")?;
     let exe_s = exe
@@ -153,9 +136,17 @@ pub fn spawn_runner(
         .ok_or_else(|| anyhow!("current_exe is not UTF-8"))?;
     let exe_w = wstr(exe_s);
     // `lpCommandLine` is parsed via `CommandLineToArgvW`; quote
-    // argv[0] so a path with spaces survives. `runner` is the only
-    // argument.
-    let mut cmdline_w = wstr(&format!("{} runner", quote_arg(exe_s)));
+    // argv[0] so a path with spaces survives. The
+    // `SRT_WIN_DISPATCH_ARG1` sentinel at argv[1] is what a
+    // multicall embedder's dispatcher routes on (`argv[0]` cannot be
+    // spoofed across CPWLW); `run_from_args` strips it before clap so
+    // the standalone binary accepts it harmlessly. `runner` is the
+    // only real argument.
+    let mut cmdline_w = wstr(&format!(
+        "{} {} runner",
+        quote_arg(exe_s),
+        crate::cli::SRT_WIN_DISPATCH_ARG1,
+    ));
     let user_w = wstr(username);
     let domain_w = wstr(".");
     let mut pw_w = wstr(password);
@@ -215,7 +206,9 @@ pub fn spawn_runner(
     // (The UTF-8 source is zeroed by `SandboxCred::Drop`; this is a
     // separate heap allocation.) Before any `?` so the scrub runs
     // regardless of `r`.
-    for c in pw_w.iter_mut() { *c = 0; }
+    for c in pw_w.iter_mut() {
+        *c = 0;
+    }
     if let Err(e) = r {
         if e.code() == ERROR_LOGON_FAILURE.to_hresult() {
             return Err(anyhow!(
@@ -266,11 +259,13 @@ pub fn spawn_runner(
             .map(|we| we.code() == ERROR_NOT_SUPPORTED.to_hresult())
             .unwrap_or(false)
         {
-            eprintln!(
-                "srt-win: broker→runner Job assign not supported \
-                 (seclogon job); relying on runner→child Job for \
-                 kill-chain"
-            );
+            if !quiet {
+                eprintln!(
+                    "srt-win: broker→runner Job assign not supported \
+                     (seclogon job); relying on runner→child Job for \
+                     kill-chain"
+                );
+            }
         } else {
             return Err(e.context("assign runner to job"));
         }
@@ -297,13 +292,8 @@ pub fn spawn_runner(
     {
         let mut wrote = 0u32;
         unsafe {
-            WriteFile(
-                stdin.broker.raw(),
-                Some(&cmd_bytes),
-                Some(&mut wrote),
-                None,
-            )
-            .context("write RunnerCmd to runner stdin")?;
+            WriteFile(stdin.broker.raw(), Some(&cmd_bytes), Some(&mut wrote), None)
+                .context("write RunnerCmd to runner stdin")?;
         }
         if wrote as usize != cmd_bytes.len() {
             return Err(anyhow!(
@@ -328,29 +318,28 @@ pub fn spawn_runner(
     let h = |v: isize| HANDLE(v as *mut c_void);
     let t_out = std::thread::spawn(move || {
         pump(h(so), h(bout));
-        unsafe { let _ = CloseHandle(h(so)); }
+        unsafe {
+            let _ = CloseHandle(h(so));
+        }
     });
     let t_err = std::thread::spawn(move || {
         pump(h(se), h(berr));
-        unsafe { let _ = CloseHandle(h(se)); }
+        unsafe {
+            let _ = CloseHandle(h(se));
+        }
     });
 
     let rc = unsafe { WaitForSingleObject(child.process(), INFINITE) };
     if rc != WAIT_OBJECT_0 {
-        eprintln!(
-            "srt-win: WaitForSingleObject(runner) returned 0x{:x}",
-            rc.0
-        );
+        eprintln!("srt-win: WaitForSingleObject(runner) returned 0x{:x}", rc.0);
     }
     let _ = t_out.join();
     let _ = t_err.join();
     let mut code: u32 = 1;
     unsafe {
-        GetExitCodeProcess(child.process(), &mut code)
-            .context("GetExitCodeProcess(runner)")?;
+        GetExitCodeProcess(child.process(), &mut code).context("GetExitCodeProcess(runner)")?;
     }
     drop(job);
-    drop(desk);
     Ok(code)
 }
 

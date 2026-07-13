@@ -13,13 +13,11 @@ path = "src/lib.rs"
 name = "srt-win"
 path = "src/main.rs"
 
-[dependencies]
+[target.'cfg(windows)'.dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-[target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
   "Wdk_Foundation",
   "Wdk_Storage_FileSystem",
@@ -45,15 +43,15 @@ windows = { version = "0.62.2", features = [
   "Win32_UI_WindowsAndMessaging",
   "Win32_System_Registry",
 ] }
-sha2 = "0.11"
-# `bundled` compiles the sqlite3 amalgamation via `cc` — works
-# on the Windows runner (MSVC). NOTE: this means
-# `cargo check --target x86_64-pc-windows-msvc` from a
-# non-Windows host fails at the libsqlite3-sys build script
-# (no MSVC toolchain). For local mac-side validation, run
-# `cargo check` on the host target (validates clap structs +
-# `#[cfg(not(windows))]` main) and rely on the Windows runner
-# for the `#![cfg(windows)]` code.
+# `bundled` compiles the sqlite3 amalgamation via `cc` — works on the
+# Windows runner (MSVC). NOTE: `cargo check --target …-windows-msvc`
+# from a non-Windows host fails at the libsqlite3-sys build script
+# (no MSVC toolchain) unless CC/AR are stubbed. The whole library
+# (including the clap/serde-derive CLI structs in `cli.rs`) is
+# `#![cfg(windows)]`, so a host-target `cargo check` on macOS/Linux
+# compiles only the four-line `main.rs` shim — cross-target clippy
+# (stubbed CC/AR) is the ONLY local gate that compiles the
+# clap-derive structs.
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [profile.release]

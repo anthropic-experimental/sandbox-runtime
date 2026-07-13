@@ -1048,7 +1048,14 @@ describe.if(isSupportedPlatform)(
           }
         }
 
-        it('blocks symlink replacement attack on .claude directory', async () => {
+        // bwrap mount destinations resolve symlinks, so a deny path crossing
+        // a directory symlink is canonicalized and the deny applied to the
+        // resolved target (resolve-before-mask). Masking the raw symlink
+        // with /dev/null instead made bwrap abort at startup, failing every
+        // sandboxed command whenever .claude was a symlink. The guarantees
+        // around a deny path whose parent stays writable are unchanged from
+        // the non-symlink case.
+        it('denies writes through a symlinked .claude directory', async () => {
           // Setup: Create a symlink .claude -> decoy (simulating malicious git repo)
           const decoyDir = 'symlink-decoy'
           const claudeSymlink = 'symlink-claude'
@@ -1060,20 +1067,23 @@ describe.if(isSupportedPlatform)(
             // The deny path is the settings.json through the symlink
             const denyPath = join(TEST_DIR, claudeSymlink, 'settings.json')
 
-            // Attacker tries to:
-            // 1. Delete the symlink
-            // 2. Create a real directory
-            // 3. Create malicious settings.json
+            // The sandbox must start despite the directory symlink in the
+            // deny path (bwrap used to abort on the /dev/null symlink mask).
+            const benign = await runSandboxedCommandWithDenyPaths('true', [
+              denyPath,
+            ])
+            expect(benign.success).toBe(true)
+
+            // Writing through the symlink must fail: the deny lands on the
+            // resolved target, the inode the write actually reaches.
             const result = await runSandboxedCommandWithDenyPaths(
-              `rm ${claudeSymlink} && mkdir ${claudeSymlink} && echo '{"hooks":{}}' > ${claudeSymlink}/settings.json`,
+              `echo '{"hooks":{}}' > ${claudeSymlink}/settings.json`,
               [denyPath],
             )
-
-            // The attack should fail - symlink is protected with /dev/null mount
             expect(result.success).toBe(false)
-
-            // Verify the symlink still exists on host (was not deleted)
-            expect(existsSync(claudeSymlink)).toBe(true)
+            expect(readFileSync(join(decoyDir, 'settings.json'), 'utf8')).toBe(
+              '{}',
+            )
           } finally {
             // Cleanup
             rmSync(claudeSymlink, { force: true })
@@ -1081,7 +1091,7 @@ describe.if(isSupportedPlatform)(
           }
         })
 
-        it('blocks deletion of symlink in protected path', async () => {
+        it('denies writes to a file reached through a directory symlink', async () => {
           // Setup: Create a symlink
           const targetDir = 'symlink-target-dir'
           const symlinkPath = 'protected-symlink'
@@ -1092,17 +1102,29 @@ describe.if(isSupportedPlatform)(
           try {
             const denyPath = join(TEST_DIR, symlinkPath, 'file.txt')
 
-            // Try to just delete the symlink
-            const result = await runSandboxedCommandWithDenyPaths(
-              `rm ${symlinkPath}`,
-              [denyPath],
+            // Assert the sandbox starts first: a write-denied assertion alone
+            // also passes when bwrap aborts, which is the failure this deny
+            // path used to cause.
+            const benign = await runSandboxedCommandWithDenyPaths('true', [
+              denyPath,
+            ])
+            expect(benign.success).toBe(true)
+
+            // The file is write-protected both through the symlink and via
+            // its resolved path.
+            for (const writePath of [
+              `${symlinkPath}/file.txt`,
+              `${targetDir}/file.txt`,
+            ]) {
+              const result = await runSandboxedCommandWithDenyPaths(
+                `echo tampered > ${writePath}`,
+                [denyPath],
+              )
+              expect(result.success).toBe(false)
+            }
+            expect(readFileSync(join(targetDir, 'file.txt'), 'utf8')).toBe(
+              'content',
             )
-
-            // Should fail - symlink is mounted with /dev/null
-            expect(result.success).toBe(false)
-
-            // Symlink should still exist
-            expect(existsSync(symlinkPath)).toBe(true)
           } finally {
             rmSync(symlinkPath, { force: true })
             rmSync(targetDir, { recursive: true, force: true })

@@ -11,9 +11,15 @@ import forge from 'node-forge'
 import { isIP } from 'node:net'
 import { createSecureContext, type SecureContext } from 'node:tls'
 import { logForDebugging } from '../utils/debug.js'
-import type { MitmCA } from './mitm-ca.js'
+import {
+  caSubjectKeyId,
+  daysFromNow,
+  randomSerial,
+  signCertificateNative,
+  type MitmCA,
+} from './mitm-ca.js'
 
-const { pki, md, random, util } = forge
+const { pki } = forge
 
 export type LeafCert = {
   /** Leaf cert PEM followed by the CA cert PEM (full chain). */
@@ -53,11 +59,28 @@ export function mintLeafCert(ca: MitmCA, hostname: string): LeafCert {
     // Python ≥3.13 enables ssl.VERIFY_X509_STRICT by default, which enforces
     // RFC 5280's "AKI MUST be present on non-self-signed certs". curl/Go/Node
     // don't enforce this, but requests/urllib3/httpx/google-auth all reject
-    // a leaf without AKI under 3.13. See caSubjectKeyId() for why we can't
-    // just pass the CA's stored SKI value through.
+    // a leaf without AKI under 3.13. See caSubjectKeyId() in mitm-ca.ts for
+    // why we can't just pass the CA's stored SKI value through.
     { name: 'authorityKeyIdentifier', keyIdentifier: caSubjectKeyId(ca.cert) },
+    // Schannel (Windows System32 curl, git's default backend, cargo) checks
+    // revocation on the LEAF and hard-fails CRYPT_E_NO_REVOCATION_CHECK when
+    // there's no CDP to consult. Point it at the empty CRL the proxy serves
+    // on 127.0.0.1 (see MitmCA.crlDer / http-proxy.ts) so the check resolves
+    // to "not revoked" instead of "unknown". node-forge encodes CDP with the
+    // same {altNames} shape as SAN; type 6 = uniformResourceIdentifier.
+    // OpenSSL-backed clients don't check CRLs by default, so a leaf minted
+    // before the port is bound (crlUrl unset) works everywhere except
+    // Schannel-with-revocation.
+    ...(ca.crlUrl
+      ? [
+          {
+            name: 'cRLDistributionPoints',
+            altNames: [{ type: 6, value: ca.crlUrl }],
+          },
+        ]
+      : []),
   ])
-  cert.sign(ca.key, md.sha256.create())
+  signCertificateNative(cert, ca.keyPem)
 
   const leaf: LeafCert = {
     certPem: pki.certificateToPem(cert) + ca.certPem,
@@ -80,26 +103,6 @@ export function secureContextFor(ca: MitmCA, hostname: string): SecureContext {
   const ctx = createSecureContext({ cert: certPem, key: keyPem })
   ca.secureContexts.set(hostname, ctx)
   return ctx
-}
-
-/**
- * Return the CA's Subject Key Identifier as raw bytes for use as the leaf's
- * authorityKeyIdentifier.keyIdentifier.
- *
- * node-forge stores a cert's subjectKeyIdentifier extension value as a *hex
- * string* (both for in-memory certs and certs parsed from PEM), but expects
- * AKI's keyIdentifier as *raw bytes* — passing the hex through verbatim
- * encodes the ASCII hex chars as the key id and the chain fails to verify.
- * If the CA has no SKI extension (e.g. a v1 user-supplied CA), derive the
- * RFC 5280 method-1 value from its public key.
- */
-function caSubjectKeyId(caCert: forge.pki.Certificate): string {
-  const ext = caCert.getExtension('subjectKeyIdentifier') as
-    | { subjectKeyIdentifier?: string }
-    | undefined
-  return ext?.subjectKeyIdentifier
-    ? util.hexToBytes(ext.subjectKeyIdentifier)
-    : caCert.generateSubjectKeyIdentifier().getBytes()
 }
 
 function sanFor(hostname: string): {
@@ -130,18 +133,4 @@ function clampValidity(caCert: forge.pki.Certificate, notBefore: Date): Date {
   const max = new Date(notBefore)
   max.setDate(max.getDate() + 99)
   return caEnd < max ? new Date(caEnd) : max
-}
-
-function randomSerial(): string {
-  // 16 random bytes, high bit cleared so the DER INTEGER stays positive.
-  const bytes = random.getBytesSync(16)
-  const hex = util.bytesToHex(bytes)
-  const firstNibble = parseInt(hex[0]!, 16) & 0x7
-  return firstNibble.toString(16) + hex.slice(1)
-}
-
-function daysFromNow(days: number): Date {
-  const d = new Date()
-  d.setDate(d.getDate() + days)
-  return d
 }

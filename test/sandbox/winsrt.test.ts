@@ -1,13 +1,11 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import {
   existsSync,
   mkdtempSync,
-  mkdirSync,
-  writeFileSync,
   readFileSync,
   rmSync,
-  renameSync,
+  writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -17,45 +15,38 @@ import { isWindows } from '../helpers/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
+import { WindowsConfigSchema } from '../../src/sandbox/sandbox-config.js'
+import { CA_TRUST_VARS } from '../../src/sandbox/sandbox-utils.js'
 import {
   getSrtWinPath,
-  getWindowsGroupStatus,
   getWindowsWfpStatus,
   getWindowsSandboxUserStatus,
   installWindowsSandbox,
   uninstallWindowsSandbox,
   verifyWindowsWfpEgress,
-  deleteWindowsGroup,
+  windowsTrustCa,
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
-  restoreWindowsAcl,
-  expandWindowsFsDenyPaths,
+  resolveSrtWin,
+  buildGitConfigEnv,
+  SRT_WIN_DISPATCH_ARG1,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
 } from '../../src/sandbox/windows-sandbox-utils.js'
 
 /**
  * Windows network-sandbox integration tests.
  *
- * CI strategy: the discriminator group must be enabled in the
- * caller's token, but a freshly-created custom group only enters
- * `TokenGroups` at the next logon — and CI can't log out mid-job.
- * So these tests use `BUILTIN\Administrators` (S-1-5-32-544) as the
- * discriminator: the GHA runner user already has it enabled, and
- * `srt-win exec` already adds it to `SidsToDisable`. Filters install
- * under a dedicated test sublayer so they don't touch any production
- * sandbox state on the same machine.
+ * The sandboxed child runs as the dedicated `srt-sandbox` user via
+ * the two-hop launch (`CreateProcessWithLogonW`). beforeAll
+ * provisions that account + the user-SID-keyed WFP filters under a
+ * dedicated test sublayer; afterAll uninstalls.
  *
  * Real end-to-end (the actual fence) is also covered by
- * `vendor/srt-win-src/ci/smoke-exec.ps1` which runs before this file in
- * CI; this suite proves the TS layer wires correctly on top.
+ * `vendor/srt-win-src/ci/smoke-exec.ps1` which runs before this file
+ * in CI; this suite proves the TS layer wires correctly on top.
  */
 
-// `BUILTIN\Administrators` — present and enabled on the GHA Windows
-// runner; `srt-win exec` puts it in SidsToDisable regardless of the
-// configured group, so the child has it deny-only.
-const ADMINS_SID = 'S-1-5-32-544'
-
-// Dedicated test sublayer (distinct from smoke.ps1's a91b6f12-… and
+// Dedicated test sublayer (distinct from smoke.ps1's b2e8a6c4-… and
 // smoke-exec.ps1's 5b0e64f4-… so the three suites are independent).
 const TEST_SUBLAYER = '7c1f0e90-3a2b-4f5d-9e8c-1d2e3f4a5b6c'
 
@@ -67,11 +58,23 @@ const PORT_RANGE: readonly [number, number] = DEFAULT_WINDOWS_PROXY_PORT_RANGE
 const GIT_BASH = 'C:\\Program Files\\Git\\usr\\bin\\bash.exe'
 const MSYS2_WGET = 'C:\\msys64\\usr\\bin\\wget.exe'
 
+/**
+ * All PATH hits for `name` via `where.exe` (Windows only). `where`
+ * lists every match, one per line — a per-user shim
+ * (`%LOCALAPPDATA%`, `~/.cargo/bin`) can shadow a machine-wide
+ * install, so callers that need a sandbox-reachable path scan the
+ * list, not just the first hit.
+ */
+function whereAll(name: string): string[] {
+  if (!isWindows) return []
+  const r = spawnSync('where', [name], { encoding: 'utf8', timeout: 5_000 })
+  if (r.status !== 0) return []
+  return r.stdout.split(/\r?\n/).filter(s => s.trim().length > 0)
+}
+
 /** True if `name` resolves on PATH (via `where.exe`). */
 function hasTool(name: string): boolean {
-  if (!isWindows) return false
-  const r = spawnSync('where', [name], { encoding: 'utf8', timeout: 5_000 })
-  return r.status === 0
+  return whereAll(name).length > 0
 }
 
 function createTestConfig(
@@ -89,11 +92,8 @@ function createTestConfig(
       denyWrite: [],
     },
     windows: {
-      groupName: 'unused-when-sid-set',
-      groupSid: ADMINS_SID,
-      wfpSublayerGuid: TEST_SUBLAYER,
+      sublayerGuid: TEST_SUBLAYER,
       proxyPortRange: [PORT_RANGE[0], PORT_RANGE[1]],
-      asSandboxUser: false,
     },
   }
 }
@@ -101,7 +101,7 @@ function createTestConfig(
 /** Run a command inside the Windows sandbox and capture output. */
 async function runSandboxed(
   command: string,
-  timeoutMs = 30_000,
+  timeoutMs = 60_000,
   extraEnv?: Record<string, string>,
 ): Promise<{
   stdout: string
@@ -109,9 +109,9 @@ async function runSandboxed(
   status: number | null
 }> {
   const { argv, env } = await SandboxManager.wrapWithSandboxArgv(command)
-  // The child inherits the proxy set via srt-win's environment, so the
-  // spawn MUST carry `env` — srt-win exec no longer injects proxy vars.
-  // `extraEnv` lets a row add tool-specific vars on top.
+  // The child reaches the proxy via the runner's --env overlay; the
+  // returned `env` is the BROKER's spawn env (proxy vars also there
+  // for diagnostics, but the runner's overlay is what the child sees).
   return spawnAsync(argv[0], argv.slice(1), {
     timeout: timeoutMs,
     env: extraEnv ? { ...env, ...extraEnv } : env,
@@ -131,12 +131,11 @@ async function runSandboxedUntil(
   command: string,
   ok: (r: RunResult) => boolean,
   attempts = 2,
-  timeoutMs = 30_000,
-  extraEnv?: Record<string, string>,
+  timeoutMs = 60_000,
 ): Promise<RunResult> {
   let last: RunResult = { stdout: '', stderr: '', status: null }
   for (let i = 0; i < attempts; i++) {
-    last = await runSandboxed(command, timeoutMs, extraEnv)
+    last = await runSandboxed(command, timeoutMs)
     if (ok(last)) return last
   }
   return last
@@ -179,8 +178,8 @@ function listenOn(port: number): Promise<BoundListener> {
   return new Promise((resolve, reject) => {
     // Minimal HTTP/1.1 responder so a sandboxed `curl` that REACHES
     // it exits 0. A raw-TCP "ok\n" reply makes curl exit non-zero on
-    // HTTP-parse failure even though the TCP connect — the filter-2
-    // PERMIT we're proving — succeeded.
+    // HTTP-parse failure even though the TCP connect — the
+    // loopback-PERMIT we're proving — succeeded.
     const srv: Server = createServer(sock => {
       sock.on('data', () => {
         sock.end(
@@ -229,8 +228,7 @@ async function bindFirstFree(candidates: number[]): Promise<BoundListener> {
  * the assigned port lands in the range (the Windows ephemeral pool
  * 49152–65535 overlaps it), close and retry — capped at 5; the
  * chance of all 5 landing in a 10-port window of ~16k is
- * effectively zero. Avoids the fixed-port collisions a candidate
- * list can hit on a busy runner.
+ * effectively zero.
  */
 async function bindOutOfRange(): Promise<BoundListener> {
   for (let i = 0; i < 5; i++) {
@@ -246,61 +244,246 @@ async function bindOutOfRange(): Promise<BoundListener> {
   )
 }
 
-// Pure-JS object test — runs on all platforms (the Windows env
-// case-insensitivity bug is in the plain-object scrub, not in any
-// Windows API). SRT_WIN_PATH is pointed at any existing file so
-// getSrtWinPath() doesn't throw on non-Windows hosts.
-describe('wrapCommandWithSandboxWindows env scrub (pure, all platforms)', () => {
-  it('unsetEnvVars scrubs case-insensitively', () => {
-    const prevSrtWin = process.env.SRT_WIN_PATH
-    process.env.SRT_WIN_PATH = process.execPath
-    process.env.test_secret_lower = 'x'
-    try {
-      const { env } = wrapCommandWithSandboxWindows({
-        command: 'echo',
-        group: { groupName: 'g' },
-        unsetEnvVars: ['TEST_SECRET_LOWER'],
-      })
-      // No casing of the name should survive.
-      for (const k of Object.keys(env)) {
-        expect(k.toUpperCase()).not.toBe('TEST_SECRET_LOWER')
-      }
-      expect(env.test_secret_lower).toBeUndefined()
-      expect(env.TEST_SECRET_LOWER).toBeUndefined()
-    } finally {
-      delete process.env.test_secret_lower
-      if (prevSrtWin === undefined) delete process.env.SRT_WIN_PATH
-      else process.env.SRT_WIN_PATH = prevSrtWin
+// Pure-JS object test — runs on all platforms. `srtWin.path` is
+// pointed at the test runner's own executable so binary resolution
+// passes its existence check on non-Windows hosts.
+describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
+  it('argv shape: srtWin.path → [path, --srt-win, exec, …]; --env overlay before --', () => {
+    // Mirrors real usage: SandboxManager.initialize() resolves once
+    // and threads the SrtWinSpawn handle to every spawn site.
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const on = wrapCommandWithSandboxWindows({
+      command: 'exit 0',
+      httpProxyPort: 60080,
+      srtWin,
+    })
+    // `path` verbatim at argv[0]; the multicall sentinel at argv[1]
+    // is what an embedder's dispatcher routes on. `run_from_args`
+    // strips it, so the standalone binary accepts it harmlessly.
+    expect(on.argv[0]).toBe(process.execPath)
+    expect(on.argv[1]).toBe(SRT_WIN_DISPATCH_ARG1)
+    expect(on.argv[2]).toBe('exec')
+    // Two-hop overlay rides on --env: PATH + the single-sourced
+    // proxy set. Values follow each --env as KEY=VALUE.
+    const envArgs = on.argv.filter((_, i) => on.argv[i - 1] === '--env')
+    expect(envArgs.some(e => e.startsWith('PATH='))).toBe(true)
+    expect(envArgs).toContain('HTTP_PROXY=http://localhost:60080')
+    // No caCertPath passed → CA-bundle vars absent from the overlay.
+    // (G1 below covers the caCertPath-set case.)
+    expect(envArgs.some(e => e.startsWith('NODE_EXTRA_CA_CERTS='))).toBe(false)
+    // Every --env must precede `--` (clap stops parsing after it).
+    expect(on.argv.lastIndexOf('--env')).toBeLessThan(on.argv.indexOf('--'))
+    // Obsolete same-user flags must NOT appear.
+    for (const dead of [
+      '--as-sandbox-user',
+      '--group-sid',
+      '--name',
+      '--holder-pid',
+      '--skip-group-check',
+    ]) {
+      expect(on.argv).not.toContain(dead)
     }
+  })
+
+  it('argv: --quiet on by default, before --; quiet:false omits it', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const on = wrapCommandWithSandboxWindows({ command: 'x', srtWin })
+    expect(on.argv).toContain('--quiet')
+    expect(on.argv.indexOf('--quiet')).toBeLessThan(on.argv.indexOf('--'))
+    const off = wrapCommandWithSandboxWindows({
+      command: 'x',
+      quiet: false,
+      srtWin,
+    })
+    expect(off.argv).not.toContain('--quiet')
+  })
+
+  it('resolveSrtWin: explicit path → sentinel prepend; unset → packaged binary, no sentinel', () => {
+    const set = resolveSrtWin({ path: process.execPath })
+    expect(set.exe).toBe(process.execPath)
+    expect(set.prependArgs).toEqual([SRT_WIN_DISPATCH_ARG1])
+    // The TS const must mirror the Rust `srt_win::SRT_WIN_DISPATCH_ARG1`.
+    expect(SRT_WIN_DISPATCH_ARG1).toBe('--srt-win')
+  })
+
+  it('resolveSrtWin: missing explicit path is named (no fallback)', () => {
+    expect(() => resolveSrtWin({ path: '/nonexistent/srt-win.exe' })).toThrow(
+      /windows\.srtWin\.path is set to '.+' but the file does not exist/,
+    )
+  })
+
+  it('drops NO_PROXY/no_proxy from the --env overlay (WFP fences direct loopback)', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const { argv } = wrapCommandWithSandboxWindows({
+      command: 'curl http://127.0.0.1:9000/',
+      httpProxyPort: 60080,
+      socksProxyPort: 60080,
+      srtWin,
+    })
+    const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
+    // On POSIX, NO_PROXY=localhost,127.0.0.1,… lets the child connect
+    // directly (seatbelt/bwrap allow loopback). On Windows the WFP
+    // fence blocks direct loopback outside the proxy-port PERMIT
+    // range, so NO_PROXY would make every localhost request fail. The
+    // returned `env` is the BROKER spawn env (spreads process.env, so
+    // may inherit a host NO_PROXY — irrelevant, srt-win runs as the
+    // real user); only the `--env` overlay reaches the sandboxed child.
+    expect(envArgs.some(e => e.startsWith('NO_PROXY='))).toBe(false)
+    expect(envArgs.some(e => e.startsWith('no_proxy='))).toBe(false)
+    // The proxy vars themselves survive — only the bypass list is dropped.
+    expect(envArgs.some(e => e.startsWith('HTTPS_PROXY='))).toBe(true)
   })
 })
 
 describe('parseWindowsBinShell (pure, all platforms)', () => {
-  it('maps tokens/paths and rejects the rest', () => {
-    expect(parseWindowsBinShell(undefined)).toEqual({ kind: 'cmd' })
-    expect(parseWindowsBinShell('cmd')).toEqual({ kind: 'cmd' })
-    expect(parseWindowsBinShell('pwsh')).toEqual({ kind: 'pwsh' })
-    expect(parseWindowsBinShell('PowerShell')).toEqual({ kind: 'powershell' })
+  it('maps tokens/paths to {exe,args} and rejects the rest', () => {
+    // Default + bare tokens.
+    const cmd = parseWindowsBinShell(undefined)
+    expect(cmd.exe).toMatch(/System32[\\/]cmd\.exe$/)
+    expect(cmd.args).toEqual(['/d', '/s', '/c'])
+    expect(parseWindowsBinShell('cmd')).toEqual(cmd)
+    expect(parseWindowsBinShell('pwsh')).toEqual({
+      exe: 'pwsh.exe',
+      args: ['-NoProfile', '-Command'],
+    })
+    expect(parseWindowsBinShell('PowerShell').exe).toMatch(
+      /System32[\\/]WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/,
+    )
+    // Absolute bash/sh path → keep verbatim, `-c`.
     for (const p of [
       'C:\\Program Files\\Git\\bin\\bash.exe',
       'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
       'C:\\Program Files\\Git\\bin\\sh.exe',
     ]) {
-      expect(parseWindowsBinShell(p)).toEqual({ kind: 'bash', path: p })
+      expect(parseWindowsBinShell(p)).toEqual({ exe: p, args: ['-c'] })
     }
-    // Bare/relative bash token: caller must pass the resolved absolute
-    // install path (PATH-resolved 'bash' could be WSL, not Git Bash).
+    // Absolute pwsh/powershell path → keep verbatim, PS flags.
+    // (Formerly threw — now the caller's resolved install is honoured.)
+    const pwshAbs = 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'
+    expect(parseWindowsBinShell(pwshAbs)).toEqual({
+      exe: pwshAbs,
+      args: ['-NoProfile', '-Command'],
+    })
+    // Object form: passthrough with absolute-exe validation only.
+    const obj = { exe: pwshAbs, args: ['-NoProfile', '-EncodedCommand'] }
+    expect(parseWindowsBinShell(obj)).toBe(obj)
+    expect(() =>
+      parseWindowsBinShell({ exe: 'pwsh.exe', args: ['-Command'] }),
+    ).toThrow(/binShell\.exe must be an absolute path/)
+    // Bare bash: caller must pass the resolved absolute install path
+    // (PATH-resolved 'bash' could be WSL, not Git Bash).
     expect(() => parseWindowsBinShell('bash')).toThrow(/absolute/)
+    // Relative-with-directory: never silently degrade.
+    expect(() => parseWindowsBinShell('bin\\bash.exe')).toThrow(
+      /bare token or an absolute path/,
+    )
     // Unknown values fail loud rather than silently routing to cmd.exe.
     expect(() => parseWindowsBinShell('zsh')).toThrow(/unrecognised binShell/)
     expect(() =>
       parseWindowsBinShell('C:\\Program Files\\Git\\git-bash.exe'),
     ).toThrow(/unrecognised binShell/)
-    // An absolute path to pwsh/cmd is NOT a token — reject rather than
-    // silently dropping the caller's path and degrading to PATH lookup.
-    expect(() =>
-      parseWindowsBinShell('C:\\Program Files\\PowerShell\\7\\pwsh.exe'),
-    ).toThrow(/unrecognised binShell/)
+  })
+})
+
+describe('WindowsConfigSchema.sandboxUser (pure, all platforms)', () => {
+  it('accepts a valid name and rejects empty / >20 chars', () => {
+    expect(
+      WindowsConfigSchema.safeParse({ sandboxUser: 'srt-sb-custom' }).success,
+    ).toBe(true)
+    expect(WindowsConfigSchema.safeParse({}).success).toBe(true)
+    // Windows local usernames are capped at 20 (LM20_UNLEN).
+    expect(
+      WindowsConfigSchema.safeParse({ sandboxUser: 'a'.repeat(21) }).success,
+    ).toBe(false)
+    expect(WindowsConfigSchema.safeParse({ sandboxUser: '' }).success).toBe(
+      false,
+    )
+  })
+})
+
+describe('buildGitConfigEnv (pure, all platforms)', () => {
+  it('emits safe.directory (dir + dir/*) + schannel knobs; forward slashes; deduped', () => {
+    const env = buildGitConfigEnv({
+      safeDirs: ['C:\\work\\repo', 'C:/work/repo', 'C:\\other'],
+      schannelCa: true,
+    })
+    // 2 unique dirs × (exact + `<dir>/*`) + 2 schannel knobs = 6.
+    expect(env.GIT_CONFIG_COUNT).toBe('6')
+    expect(env.GIT_CONFIG_KEY_0).toBe('safe.directory')
+    expect(env.GIT_CONFIG_VALUE_0).toBe('C:/work/repo')
+    expect(env.GIT_CONFIG_VALUE_1).toBe('C:/work/repo/*')
+    expect(env.GIT_CONFIG_VALUE_2).toBe('C:/other')
+    expect(env.GIT_CONFIG_VALUE_3).toBe('C:/other/*')
+    expect(env.GIT_CONFIG_KEY_4).toBe('http.schannelUseSSLCAInfo')
+    expect(env.GIT_CONFIG_VALUE_4).toBe('true')
+    expect(env.GIT_CONFIG_KEY_5).toBe('http.schannelCheckRevoke')
+    expect(env.GIT_CONFIG_VALUE_5).toBe('false')
+  })
+
+  it('composes with an existing GIT_CONFIG_COUNT in baseEnv', () => {
+    const env = buildGitConfigEnv({
+      safeDirs: ['C:/w'],
+      schannelCa: false,
+      baseEnv: { GIT_CONFIG_COUNT: '2' },
+    })
+    // Continues numbering at 2; new total 4 (dir + dir/*). KEY_0/1
+    // are the caller's.
+    expect(env.GIT_CONFIG_KEY_2).toBe('safe.directory')
+    expect(env.GIT_CONFIG_VALUE_2).toBe('C:/w')
+    expect(env.GIT_CONFIG_VALUE_3).toBe('C:/w/*')
+    expect(env.GIT_CONFIG_COUNT).toBe('4')
+    expect(env.GIT_CONFIG_KEY_0).toBeUndefined()
+  })
+
+  it('collapses to safe.directory=* above the wildcard threshold', () => {
+    const env = buildGitConfigEnv({
+      safeDirs: Array.from({ length: 20 }, (_, i) => `C:/d${i}`),
+      schannelCa: false,
+    })
+    expect(env.GIT_CONFIG_COUNT).toBe('1')
+    expect(env.GIT_CONFIG_VALUE_0).toBe('*')
+  })
+
+  it('returns {} when nothing to emit', () => {
+    expect(buildGitConfigEnv({ safeDirs: [], schannelCa: false })).toEqual({})
+  })
+
+  it('wrapCommandWithSandboxWindows: GIT_CONFIG_* rides the --env overlay', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const { argv } = wrapCommandWithSandboxWindows({
+      command: 'git status',
+      cwd: 'C:\\work\\repo',
+      allowWrite: ['C:\\work\\other'],
+      caCertPath: 'C:/bundle.pem',
+      srtWin,
+    })
+    const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
+    // safe.directory (dir + dir/*) for cwd + each allowWrite entry,
+    // then the two schannel knobs (schannelCa keyed on caCertPath).
+    expect(envArgs).toContain('GIT_CONFIG_COUNT=6')
+    expect(envArgs).toContain('GIT_CONFIG_KEY_0=safe.directory')
+    expect(envArgs).toContain('GIT_CONFIG_VALUE_0=C:/work/repo')
+    expect(envArgs).toContain('GIT_CONFIG_VALUE_1=C:/work/repo/*')
+    expect(envArgs).toContain('GIT_CONFIG_VALUE_2=C:/work/other')
+    expect(envArgs).toContain('GIT_CONFIG_KEY_4=http.schannelUseSSLCAInfo')
+    expect(envArgs).toContain('GIT_CONFIG_KEY_5=http.schannelCheckRevoke')
+    // All --env precede `--` (clap stops parsing after it).
+    expect(argv.lastIndexOf('--env')).toBeLessThan(argv.indexOf('--'))
+  })
+
+  it('drive-root safeDir keeps its trailing slash; explicit COUNT=0 is an opt-out', () => {
+    const env = buildGitConfigEnv({ safeDirs: ['C:\\'], schannelCa: false })
+    // `C:` alone is drive-relative-cwd, not the root — git wants `C:/`.
+    expect(env.GIT_CONFIG_VALUE_0).toBe('C:/')
+    expect(env.GIT_CONFIG_VALUE_1).toBe('C://*')
+    // Explicit GIT_CONFIG_COUNT=0 in baseEnv → respect the opt-out.
+    expect(
+      buildGitConfigEnv({
+        safeDirs: ['C:/w'],
+        schannelCa: true,
+        baseEnv: { GIT_CONFIG_COUNT: '0' },
+      }),
+    ).toEqual({})
   })
 })
 
@@ -311,30 +494,12 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     expect(p).toMatch(/srt-win\.exe$/i)
   })
 
-  it('getWindowsGroupStatus reports BUILTIN\\Administrators as ready', () => {
-    // The GHA runner is admin; this is the precondition smoke-exec
-    // already asserted.
-    const gs = getWindowsGroupStatus({ groupSid: ADMINS_SID })
-    expect(gs.state).toBe('ready')
-    expect(gs.sid).toBe(ADMINS_SID)
-  })
-
-  it('getWindowsGroupStatus reports a non-existent SID as absent', () => {
-    const gs = getWindowsGroupStatus({ groupSid: 'S-1-5-32-9999' })
-    expect(gs.state).toBe('absent')
-  })
-
-  it('wrapCommandWithSandboxWindows: binShell={kind:bash} → [path, -c, cmd] (not cmd.exe)', () => {
-    // The bash arm treats binShell.path as the literal exe to invoke
-    // (Git Bash has no fixed install path). The command string — bash
-    // metachars and all — must land as the single argv element after
-    // `-c`, untouched.
+  it('wrapCommandWithSandboxWindows: binShell={exe,args} → [exe, ...args, cmd] (not cmd.exe)', () => {
     const cmd = `echo 'a b' && printf '%s' x | cat`
     const bashPath = 'C:\\Program Files\\Git\\bin\\bash.exe'
     const { argv } = wrapCommandWithSandboxWindows({
       command: cmd,
-      group: { groupSid: ADMINS_SID },
-      binShell: { kind: 'bash', path: bashPath },
+      binShell: parseWindowsBinShell(bashPath),
     })
     expect(argv.slice(-3)).toEqual([bashPath, '-c', cmd])
     expect(argv).not.toContain('/c')
@@ -349,23 +514,12 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     expect(ws.filters).toBe(0)
   })
 
-  it('initialize() throws with install instructions when group is absent', async () => {
-    const cfg = createTestConfig()
-    cfg.windows!.groupSid = 'S-1-5-32-9999' // valid form, definitely absent
-    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
-    await expect(SandboxManager.initialize(cfg)).rejects.toThrow(
-      /one-time install.*npx sandbox-runtime windows-install/is,
-    )
-    await SandboxManager.reset()
-  })
-
   // The non-elevated readiness check that initialize() runs.
   // Hermetic sublayer + full-uninstall in finally so the
   // round-trips test below starts from an unprovisioned state.
   it('verifyWindowsWfpEgress: blocked after install; throws after uninstall --keep-user', async () => {
     const sl = '6a1e0f80-2b3c-4d5e-9f8a-1b2c3d4e5f60'
     installWindowsSandbox({
-      groupSid: ADMINS_SID,
       sublayerGuid: sl,
       proxyPortRange: PORT_RANGE,
     })
@@ -393,28 +547,21 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     }
   }, 60_000)
 
-  it('installWindowsSandbox round-trips group + wfp under a fresh sublayer', () => {
-    // Use a unique group name + sublayer so this test is hermetic.
+  it('installWindowsSandbox round-trips user + wfp under a fresh sublayer', () => {
     // The runner is admin (precondition asserted by smoke-exec.ps1),
     // so srt-win install runs without a UAC prompt and `cancelled`
-    // is never set. The cancelled path (exit 10) can't be exercised
-    // in CI — no interactive desktop for the UAC dialog.
-    const grp = `srt-ts-test-${process.pid}`
+    // is never set.
     const sl = '8d2f1e91-4b3c-5a6e-af9d-2e3f4a5b6c7d'
     try {
       const r = installWindowsSandbox({
-        groupName: grp,
         sublayerGuid: sl,
         proxyPortRange: PORT_RANGE,
       })
       expect(r.cancelled).toBeUndefined()
-      // No logout in CI → group exists in SAM but not on the
-      // caller's token. That's the documented post-install state.
-      expect(r.group.state).toBe('created-not-on-token')
-      expect(r.group.sid).toMatch(/^S-1-5-/)
       expect(r.wfp.state).toBe('installed')
+      expect(r.wfp.filters).toBeGreaterThanOrEqual(4)
       expect(r.wfp.portRange).toEqual([PORT_RANGE[0], PORT_RANGE[1]])
-      // Sandbox user provisioned alongside the group + WFP.
+      // Sandbox user provisioned alongside the WFP.
       expect(r.user.provisioned).toBe(true)
       expect(r.user.sid).toMatch(/^S-1-5-21-/)
       expect(r.user.groupExists).toBe(true)
@@ -422,29 +569,18 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect(r.user.inSandboxGroup).toBe(true)
       expect(r.user.credPresent).toBe(true)
       expect(r.user.markerVersion).toBe(1)
-      // user-SID-keyed filter set present alongside the group set,
-      // tagged with the provisioned SID.
-      expect(r.wfp.userFilters).toBeGreaterThanOrEqual(4)
       expect(r.wfp.userSid).toBe(r.user.sid)
       // Idempotent re-run with the SAME config also succeeds.
       const r2 = installWindowsSandbox({
-        groupName: grp,
         sublayerGuid: sl,
         proxyPortRange: PORT_RANGE,
       })
       expect(r2.cancelled).toBeUndefined()
       expect(r2.wfp.state).toBe('installed')
     } finally {
-      // uninstall removes filters only; group is kept by design.
-      const u = uninstallWindowsSandbox({ sublayerGuid: sl })
-      expect(u.cancelled).toBeUndefined()
-      deleteWindowsGroup({ groupName: grp })
+      uninstallWindowsSandbox({ sublayerGuid: sl })
     }
-    // After uninstall+delete, all three gone (group, WFP, sandbox
-    // user). Discriminator group needed explicit delete; sandbox
-    // user is removed by uninstall (no --keep-user).
     expect(getWindowsWfpStatus({ sublayerGuid: sl }).state).toBe('absent')
-    expect(getWindowsGroupStatus({ groupName: grp }).state).toBe('absent')
     const u = getWindowsSandboxUserStatus()
     expect(u.provisioned).toBe(false)
     expect(u.credPresent).toBe(false)
@@ -452,26 +588,19 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
   })
 
   it('installWindowsSandbox refuses different-config without force (exit 13)', () => {
-    const grp = `srt-ts-test-13-${process.pid}`
     const sl = '9e3a2fa2-5c4d-6b7f-ba0e-3f4a5b6c7d8e'
     try {
-      installWindowsSandbox({
-        groupName: grp,
-        sublayerGuid: sl,
-        proxyPortRange: PORT_RANGE,
-      })
+      installWindowsSandbox({ sublayerGuid: sl, proxyPortRange: PORT_RANGE })
       // Re-install with a DIFFERENT port range under the same
       // sublayer without force → exit 13 → throw.
       expect(() =>
         installWindowsSandbox({
-          groupName: grp,
           sublayerGuid: sl,
           proxyPortRange: [PORT_RANGE[0], PORT_RANGE[0] + 1],
         }),
-      ).toThrow(/already exist.*different config/i)
+      ).toThrow(/already exist.*different/i)
       // With force → succeeds and replaces.
       const r = installWindowsSandbox({
-        groupName: grp,
         sublayerGuid: sl,
         proxyPortRange: [PORT_RANGE[0], PORT_RANGE[0] + 1],
         force: true,
@@ -479,49 +608,70 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect(r.wfp.portRange).toEqual([PORT_RANGE[0], PORT_RANGE[0] + 1])
     } finally {
       uninstallWindowsSandbox({ sublayerGuid: sl })
-      deleteWindowsGroup({ groupName: grp })
     }
   })
+
+  it('initialize() throws when sandbox user is not provisioned', async () => {
+    // After the previous uninstall, the user is absent.
+    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
+    await expect(SandboxManager.initialize(createTestConfig())).rejects.toThrow(
+      /sandbox user is not provisioned.*windows-install/is,
+    )
+    await SandboxManager.reset()
+  })
+
+  it('initialize() with filesystem.denyRead applies the DENY ACE', async () => {
+    // Re-provision so the not-provisioned gate doesn't fire first.
+    installWindowsSandbox({
+      sublayerGuid: TEST_SUBLAYER,
+      proxyPortRange: PORT_RANGE,
+    })
+    const scratch = mkdtempSync(join(tmpdir(), 'srt-fsdeny-'))
+    const f = join(scratch, 'secret.txt')
+    writeFileSync(f, 'x')
+    try {
+      const cfg = createTestConfig()
+      cfg.filesystem.denyRead = [f]
+      await SandboxManager.initialize(cfg)
+      // The DENY-ACE mechanism is now wired (no longer throws); the
+      // actual deny enforcement is covered by H6. Here we just
+      // assert the lifecycle (initialize → reset) round-trips.
+      await SandboxManager.reset()
+    } finally {
+      rmSync(scratch, { recursive: true, force: true })
+      // Leave the install in place for the network describe below.
+    }
+    // 60s: install + initialize() runs verifyWindowsWfpEgress(); first
+    // call after a fresh user-provision creates the seclogon profile
+    // (~8s on the CI runner), same budget as the verify test above.
+  }, 60_000)
 })
 
 describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
-  let exe: string
+  let sbSid: string
 
   beforeAll(async () => {
     // Checkpoints to stderr (flushed synchronously) so that if the
-    // runtime faults mid-setup — e.g. bun 1.3.1 segfaults here on
-    // win-arm64 — the LAST line in the CI log localizes the faulting
-    // step. Harmless elsewhere (prints on every platform).
+    // runtime faults mid-setup the LAST line in the CI log
+    // localizes the faulting step.
     console.error('[winsrt beforeAll] start')
-    exe = getSrtWinPath()
-    // Install WFP filters under the test sublayer keyed on
-    // S-1-5-32-544. smoke-exec.ps1 has its own sublayer; this suite
-    // owns this one.
-    console.error('[winsrt beforeAll] wfp install: begin')
-    const inst = spawnSync(
-      exe,
-      [
-        'wfp',
-        'install',
-        '--group-sid',
-        ADMINS_SID,
-        '--sublayer-guid',
-        TEST_SUBLAYER,
-        '--proxy-port-range',
-        `${PORT_RANGE[0]}-${PORT_RANGE[1]}`,
-      ],
-      { encoding: 'utf8' },
-    )
-    if (inst.status !== 0) {
+    // Full install under the test sublayer — provisions
+    // srt-sandbox + cred + user-SID WFP filters. Idempotent (the
+    // helpers describe above may have left it installed).
+    console.error('[winsrt beforeAll] install: begin')
+    const r = installWindowsSandbox({
+      sublayerGuid: TEST_SUBLAYER,
+      proxyPortRange: PORT_RANGE,
+    })
+    if (!r.user.provisioned || !r.user.sid || !r.user.credPresent) {
       throw new Error(
-        `wfp install for test sublayer failed: ${inst.stderr || inst.stdout}`,
+        `srt-sandbox not provisioned after install: ${JSON.stringify(r.user)}`,
       )
     }
-    console.error('[winsrt beforeAll] wfp install: done')
-    const ws = getWindowsWfpStatus({ sublayerGuid: TEST_SUBLAYER })
-    expect(ws.state).toBe('installed')
-    expect(ws.filters).toBeGreaterThanOrEqual(8)
-    expect(ws.portRange).toEqual([PORT_RANGE[0], PORT_RANGE[1]])
+    sbSid = r.user.sid
+    console.error('[winsrt beforeAll] install: done')
+    expect(r.wfp.state).toBe('installed')
+    expect(r.wfp.portRange).toEqual([PORT_RANGE[0], PORT_RANGE[1]])
 
     console.error('[winsrt beforeAll] SandboxManager.initialize: begin')
     await SandboxManager.initialize(createTestConfig())
@@ -530,11 +680,7 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
 
   afterAll(async () => {
     await SandboxManager.reset()
-    // Always tear down — the runner is ephemeral on GHA but devs
-    // may run this locally.
-    spawnSync(exe, ['wfp', 'uninstall', '--sublayer-guid', TEST_SUBLAYER], {
-      encoding: 'utf8',
-    })
+    uninstallWindowsSandbox({ sublayerGuid: TEST_SUBLAYER })
   })
 
   it('wrapWithSandbox() throws on Windows (use wrapWithSandboxArgv)', async () => {
@@ -544,37 +690,21 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     )
   })
 
-  it('wrapWithSandboxArgv returns argv + env carrying the full proxy set', async () => {
-    const { argv, env } = await SandboxManager.wrapWithSandboxArgv('echo hi')
+  it('wrapWithSandboxArgv returns argv carrying the --env overlay', async () => {
+    const { argv } = await SandboxManager.wrapWithSandboxArgv('echo hi')
     expect(argv[0]).toMatch(/srt-win\.exe$/i)
     expect(argv).toContain('exec')
-    expect(argv).toContain('--group-sid')
-    expect(argv[argv.indexOf('--group-sid') + 1]).toBe(ADMINS_SID)
-
-    // Proxy ports are NO LONGER argv flags — srt-win exec is a pure
-    // passthrough; the proxy set rides in the returned env instead.
-    expect(argv).not.toContain('--http-proxy')
-    expect(argv).not.toContain('--socks-proxy')
-
-    // Standard proxy vars present and pointed at the in-range mux port.
-    // The mux serves both protocols on one port. ALL_PROXY is advertised
-    // as http:// (not socks5h://) so httpx-style clients don't try to
-    // import a SOCKS dependency; the mux still answers SOCKS on that port.
-    const httpProxy = env.HTTP_PROXY ?? env.http_proxy
-    const allProxy = env.ALL_PROXY ?? env.all_proxy
-    expect(httpProxy).toMatch(/^http:\/\/.+:\d+$/)
-    expect(allProxy).toMatch(/^http:\/\/.+:\d+$/)
+    // Proxy ports ride as --env KEY=VALUE pairs to the runner.
+    const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
+    const httpProxy = envArgs.find(e => e.startsWith('HTTP_PROXY='))
+    const allProxy = envArgs.find(e => e.startsWith('ALL_PROXY='))
+    expect(httpProxy).toMatch(/^HTTP_PROXY=http:\/\/.+:\d+$/)
+    expect(allProxy).toMatch(/^ALL_PROXY=http:\/\/.+:\d+$/)
     const httpPort = Number(httpProxy!.split(':').pop())
-    const socksPort = Number(allProxy!.split(':').pop())
     expect(httpPort).toBeGreaterThanOrEqual(PORT_RANGE[0])
     expect(httpPort).toBeLessThanOrEqual(PORT_RANGE[1])
-    expect(httpPort).toBe(socksPort)
-
-    // The FULL set rides along, not just the standard trio — assert an
-    // extra var from generateProxyEnvVars is present too.
-    expect(env.DOCKER_HTTP_PROXY).toMatch(/^http:\/\//)
-    expect(env.GRPC_PROXY ?? env.grpc_proxy).toMatch(/^socks5h:\/\//)
-
+    // The FULL set rides along, not just the standard trio.
+    expect(envArgs.some(e => e.startsWith('DOCKER_HTTP_PROXY='))).toBe(true)
     // Last element is the user's command, passed verbatim to cmd /c.
     expect(argv.slice(-4)).toEqual(['/d', '/s', '/c', 'echo hi'])
   })
@@ -589,12 +719,33 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
   })
 
   // ════════════════════════════════════════════════════════════════
+  // Group H — two-hop launch fundamentals
+  // ════════════════════════════════════════════════════════════════
+
+  it('H1: child runs as srt-sandbox (different user SID)', async () => {
+    const r = await runSandboxed('whoami /user /FO CSV /NH')
+    expectStatus('H1', r, [0])
+    expect(r.stdout).toContain(sbSid)
+  }, 60_000)
+
+  it('H2: stdout marker pipes through runner to broker', async () => {
+    const r = await runSandboxed('echo H2-STDOUT-MARK')
+    expectStatus('H2', r, [0])
+    expect(r.stdout).toContain('H2-STDOUT-MARK')
+  }, 60_000)
+
+  it('H3: USERPROFILE isolated to srt-sandbox', async () => {
+    const r = await runSandboxed('echo %USERPROFILE%')
+    expectStatus('H3', r, [0])
+    expect(r.stdout.toLowerCase()).toContain('srt-sandbox')
+  }, 60_000)
+
+  // ════════════════════════════════════════════════════════════════
   // Group B — egress via real tools (allowed → reaches host via proxy)
   // ════════════════════════════════════════════════════════════════
   // Each row that needs hosts beyond example.com calls updateConfig()
   // first: the JS proxy's filter reads config.network.allowedDomains
-  // live, so the allowlist changes without rebinding the proxies (the
-  // WFP filters reference the port RANGE, not specific ports).
+  // live, so the allowlist changes without rebinding the proxies.
 
   it('B1: curl to an allowedDomains host → 200 via proxy', async () => {
     SandboxManager.updateConfig(createTestConfig(['example.com']))
@@ -604,18 +755,15 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     )
     expectStatus('B1', r, [0])
     expect(r.stdout.trim()).toBe('200')
-  }, 60_000)
+  }, 90_000)
 
   it('B2: powershell Invoke-WebRequest to a NON-allowed host → blocked', async () => {
     SandboxManager.updateConfig(createTestConfig(['example.com']))
-    // IWR may or may not honour HTTP_PROXY depending on WinINET
-    // config. Either way the security property holds: via proxy →
-    // google.com refused (not allowlisted); direct → WFP blocks.
     const r = await runSandboxed(
       `powershell -NoProfile -Command "$ProgressPreference='SilentlyContinue'; try { (Invoke-WebRequest https://google.com -UseBasicParsing -TimeoutSec 8).StatusCode } catch { 'ERR' }"`,
     )
     expect(r.stdout.trim()).not.toBe('200')
-  }, 40_000)
+  }, 60_000)
 
   it('B3: cmd /c curl to a SECOND allowed host (github.com) → 200', async () => {
     SandboxManager.updateConfig(createTestConfig(['example.com', 'github.com']))
@@ -625,53 +773,22 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     )
     expectStatus('B3', r, [0])
     expect(r.stdout.trim()).toBe('200')
-  }, 60_000)
-
-  it.skipIf(!hasTool('git'))(
-    'B4: git ls-remote a real repo over the proxy → refs',
-    async () => {
-      SandboxManager.updateConfig(
-        createTestConfig(['example.com', 'github.com']),
-      )
-      // GIT_CURL_VERBOSE/GIT_TRACE_CURL reveal whether git tunnels via
-      // the proxy (CONNECT to 127.0.0.1:<port>) or wrongly goes DIRECT
-      // to github (→ WFP-fenced → 60s hang). Captured into the failure
-      // message so a recurrence self-explains. NO_DATA keeps the trace
-      // to headers/connection (no body dumps). 45s/attempt: git
-      // smart-HTTP is heavier than curl.
-      const REPO = 'https://github.com/anthropic-experimental/sandbox-runtime'
-      const r = await runSandboxedUntil(
-        `set GIT_TRACE=1&&set GIT_CURL_VERBOSE=1&&set GIT_TRACE_CURL=1&&set GIT_TRACE_CURL_NO_DATA=1&&git ls-remote --heads ${REPO}`,
-        x => x.status === 0 && /refs\/heads/.test(x.stdout),
-        2,
-        45_000,
-      )
-      if (r.status !== 0 || !/refs\/heads/.test(r.stdout)) {
-        throw new Error(
-          `B4 git ls-remote via proxy failed: status=${r.status} · ` +
-            `stdout=${JSON.stringify(r.stdout.slice(0, 400))} · ` +
-            `git-trace(tail)=${JSON.stringify(r.stderr.slice(-3500))}`,
-        )
-      }
-    },
-    120_000,
-  )
+  }, 90_000)
 
   it.skipIf(!hasTool('node'))(
     'B5: node https.get direct egress is BLOCKED (proxy env not honoured)',
     async () => {
       // KEY: Node's built-in https does NOT read HTTPS_PROXY, so it
-      // attempts a DIRECT connect. WFP filter-3 must refuse it. This
-      // is the load-bearing proof that WFP — not the proxy env vars —
-      // is the real network boundary.
+      // attempts a DIRECT connect. The user-SID WFP filter must
+      // refuse it. This is the load-bearing proof that WFP — not the
+      // proxy env vars — is the real network boundary.
       SandboxManager.updateConfig(createTestConfig(['example.com']))
       const r = await runSandboxed(
         `node -e "const s=Date.now();require('https').get('https://example.com',r=>{console.log('OK:'+r.statusCode);process.exit(0)}).on('error',e=>{console.log('ERR:'+e.code);process.exit(1)});setTimeout(()=>{console.log('TIMEOUT');process.exit(2)},6000)"`,
       )
-      // The direct connect must NOT succeed.
       expect(r.stdout.startsWith('OK:')).toBe(false)
     },
-    20_000,
+    60_000,
   )
 
   // ════════════════════════════════════════════════════════════════
@@ -683,36 +800,8 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     const r = await runSandboxed(
       `powershell -NoProfile -Command "$ErrorActionPreference='SilentlyContinue'; (Test-NetConnection 1.1.1.1 -Port 80 -WarningAction SilentlyContinue).TcpTestSucceeded"`,
     )
-    // Anything other than `true` is the kernel-fence pass (False, or
-    // empty if the inner probe is still hanging when curl's timeout
-    // fires — itself proof the SYN was dropped).
     expect(r.stdout.trim().toLowerCase()).not.toBe('true')
-  }, 40_000)
-
-  it.skipIf(!hasTool('nslookup'))(
-    'C2: nslookup with explicit server → direct UDP 53 blocked',
-    async () => {
-      // nslookup does its OWN direct UDP-53 query (bypasses the DNS
-      // Client service), so the child's token hits WFP filter-3.
-      // NOTE: this is the DIRECT-DNS path; resolution via getaddrinfo
-      // (Dnscache) is a separate, documented residual — see R1 below.
-      SandboxManager.updateConfig(createTestConfig(['example.com']))
-      const r = await runSandboxed('nslookup example.com 1.1.1.1')
-      // Don't lean on exit code (varies across Windows builds) or on
-      // the generic "Address:" line (nslookup prints the SERVER's own
-      // address before any answer). Assert the resolved-NAME answer
-      // section is absent AND a failure signature is present.
-      expect(r.stdout).not.toMatch(/Name:\s*example\.com/i)
-      expect(r.stdout + r.stderr).toMatch(
-        /timed out|can't find|no response|request to .* failed|server failed/i,
-      )
-    },
-    20_000,
-  )
-
-  // C3 (ping ICMP blocked) is intentionally NOT asserted as blocked:
-  // ICMP doesn't traverse FWPM_LAYER_ALE_AUTH_CONNECT, so the v1
-  // design does not fence it. Pinned as a residual (R2) instead.
+  }, 60_000)
 
   it('C4: curl --noproxy "*" strips env → WFP still BLOCKS', async () => {
     // KEY: clearing the proxy env makes curl attempt direct egress;
@@ -722,14 +811,8 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     const r = await runSandboxed(
       'curl --noproxy "*" -sS -m 5 https://example.com',
     )
-    // --noproxy strips the proxy so curl attempts a DIRECT connection;
-    // WFP (filter-3) must prevent it. The exact curl failure code
-    // varies by platform/build — x64: 6 (couldn't-resolve), arm64: 2
-    // (resolver thread won't start under the sandbox token/job) — so
-    // assert only that it did NOT succeed. Exit 0 would mean the
-    // bypass reached example.com = real regression. stderr captured.
     expectEgressBlocked('C4', r)
-  }, 20_000)
+  }, 60_000)
 
   it.skipIf(!hasTool('node'))(
     'C5: node raw socket to 1.1.1.1:80 → not CONNECTED',
@@ -740,16 +823,12 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
       )
       expect(r.stdout.includes('CONNECTED')).toBe(false)
     },
-    20_000,
+    60_000,
   )
 
-  // ── loopback port-range fence (filter-2 / filter-3) — kept ───────
+  // ── loopback port-range fence ────────────────────────────────────
 
-  it('C6: child reaches an IN-range loopback port (filter-2 PERMIT)', async () => {
-    // Bind a listener on a free IN-range port that is NOT one of the
-    // live JS proxy ports (those also live in the range). Walk the
-    // range top-down, skipping the proxy ports, so we never collide
-    // with them (which would EADDRINUSE) and never curl a proxy port.
+  it('C6: child reaches an IN-range loopback port (loopback PERMIT)', async () => {
     const httpP = SandboxManager.getProxyPort()
     const socksP = SandboxManager.getSocksProxyPort()
     const candidates: number[] = []
@@ -758,45 +837,31 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     }
     const l = await bindFirstFree(candidates)
     try {
-      // -sS so curl prints any error to stderr (captured on failure).
       const r = await runSandboxed(
         `curl -sS -m 5 -o NUL -w "%{http_code}" --noproxy "*" http://127.0.0.1:${l.port}`,
       )
-      // Exit 0 = the direct loopback connect was PERMITTED (filter-2)
-      // and the minimal HTTP responder replied 200.
       expectStatus('C6', r, [0])
     } finally {
       await l.close()
     }
-  }, 20_000)
+  }, 60_000)
 
-  it('C7: child BLOCKED from an OUT-of-range loopback port (filter-3)', async () => {
-    // Ephemeral bind, retried until the OS-assigned port falls
-    // outside the WFP-allowed proxy range — robust to both
-    // fixed-port collisions on a busy runner AND the ephemeral pool
-    // overlapping the proxy range.
+  it('C7: child BLOCKED from an OUT-of-range loopback port', async () => {
     const l = await bindOutOfRange()
     try {
-      // Sanity: genuinely outside the proxy port range.
       expect(l.port < PORT_RANGE[0] || l.port > PORT_RANGE[1]).toBe(true)
       const r = await runSandboxed(
         `curl -sS -m 5 -o NUL -w "%{http_code}" --noproxy "*" http://127.0.0.1:${l.port}`,
       )
-      // WFP filter-3 BLOCK at the TCP layer → curl can't connect.
-      // Exact failure code varies by platform; assert only not-success
-      // (exit 0 = reached the out-of-range listener = fence broken).
       expectEgressBlocked('C7', r)
     } finally {
       await l.close()
     }
-  }, 20_000)
+  }, 60_000)
 
   // ════════════════════════════════════════════════════════════════
   // Group D — the proxy port is not an open relay
   // ════════════════════════════════════════════════════════════════
-  // The shared JS proxy now requires a per-session secret (matching
-  // the donor's design): a host process without it is refused at the
-  // handshake. With the secret, the destination filter still applies.
 
   it.skipIf(!hasTool('curl'))(
     'D2: host curl --socks5 to proxy is not an open relay (disallowed host refused)',
@@ -807,16 +872,9 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
       expect(token).toBeTruthy()
 
       // Drive curl through the SOCKS proxy to a LOCAL responder via
-      // ASYNC spawn. Two reasons this must NOT use spawnSync + a live
-      // host (the original D2 bug): (1) spawnSync blocks bun's event
-      // loop, but the SOCKS proxy runs IN this process — it can't tick
-      // while curl waits → self-deadlock → timeout (see the warning in
-      // test/helpers/spawn.ts). (2) proxy-liveness checks route to
-      // 127.0.0.1, never a live host (cf. tls-terminate-proxy /
-      // parent-proxy-tunnel tests).
+      // ASYNC spawn. spawnSync blocks bun's event loop, but the SOCKS
+      // proxy runs IN this process — self-deadlock → timeout.
       const l = await listenOn(0)
-      // 127.0.0.1 is exact-matched by the proxy's domain filter; this
-      // is the network/allowlist live-swap path of updateConfig.
       SandboxManager.updateConfig(createTestConfig(['127.0.0.1']))
       const socks = (host: string, withAuth = true): string[] => [
         '--socks5-hostname',
@@ -834,7 +892,7 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
       ]
       try {
         // Host process WITHOUT the secret → refused at the SOCKS
-        // handshake, never reaches the destination filter.
+        // handshake.
         const noAuth = await spawnAsync(
           'curl',
           socks(`http://127.0.0.1:${l.port}`, false),
@@ -842,10 +900,7 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
         )
         expect(noAuth.status).not.toBe(0)
 
-        // Allowed dest (loopback responder) reached THROUGH the proxy →
-        // proves the port is up and an allowlisted dest passes the
-        // filter. All-loopback + ticking proxy = deterministic (no
-        // retry needed).
+        // Allowed dest reached THROUGH the proxy.
         const ok = await spawnAsync(
           'curl',
           socks(`http://127.0.0.1:${l.port}`),
@@ -853,20 +908,17 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
         )
         if (ok.stdout.trim() !== '200') {
           throw new Error(
-            `D2 allowed (host socks5 → 127.0.0.1:${l.port}): expected 200 · ` +
-              `status=${ok.status} · stdout=${JSON.stringify(ok.stdout)} · ` +
+            `D2 allowed: expected 200 · status=${ok.status} · ` +
+              `stdout=${JSON.stringify(ok.stdout)} · ` +
               `stderr=${JSON.stringify(ok.stderr)}`,
           )
         }
 
-        // Disallowed dest → refused by the filter PRE-DIAL (never
-        // contacted). STRICT single-shot: the real "not an open relay"
-        // property — now genuinely exercised (the old spawnSync
-        // deadlock-timeout was masking it).
+        // Disallowed dest → refused by the filter PRE-DIAL.
         const blocked = await spawnAsync('curl', socks('https://google.com'), {
           timeout: 10_000,
         })
-        expectEgressBlocked('D2 disallowed (host socks5 → google.com)', blocked)
+        expectEgressBlocked('D2 disallowed', blocked)
       } finally {
         await l.close()
       }
@@ -887,68 +939,31 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
       )
       expect(r.stdout.trim()).toBe('200')
     },
-    60_000,
-  )
-
-  it.skipIf(!existsSync(GIT_BASH) || !hasTool('git'))(
-    'E2: git-bash git ls-remote github.com → refs',
-    async () => {
-      SandboxManager.updateConfig(
-        createTestConfig(['example.com', 'github.com']),
-      )
-      // Same proxy/direct diagnosis as B4, via git-bash. Inline env
-      // prefix (bash) + GIT_*_VERBOSE trace captured on failure.
-      const r = await runSandboxedUntil(
-        `"${GIT_BASH}" -c "GIT_TRACE=1 GIT_CURL_VERBOSE=1 GIT_TRACE_CURL=1 GIT_TRACE_CURL_NO_DATA=1 git ls-remote --heads https://github.com/anthropic-experimental/sandbox-runtime"`,
-        x => x.status === 0 && /refs\/heads/.test(x.stdout),
-        2,
-        45_000,
-      )
-      if (r.status !== 0 || !/refs\/heads/.test(r.stdout)) {
-        throw new Error(
-          `E2 git-bash ls-remote via proxy failed: status=${r.status} · ` +
-            `stdout=${JSON.stringify(r.stdout.slice(0, 400))} · ` +
-            `git-trace(tail)=${JSON.stringify(r.stderr.slice(-3500))}`,
-        )
-      }
-    },
-    120_000,
+    90_000,
   )
 
   it.skipIf(!existsSync(GIT_BASH))(
-    'E4: binShell=bash.exe — direct egress BLOCKED (WFP applies under bash inner shell)',
+    'E4: binShell=bash.exe — direct egress BLOCKED',
     async () => {
-      // E1/E2 wrap git-bash inside `cmd /c "…bash.exe" -c …`. This row
-      // exercises the first-class bash inner-shell branch: srt-win
-      // spawns bash.exe DIRECTLY under the restricted token. The
-      // --noproxy strip forces a direct connect; WFP filter-3 must
-      // refuse it exactly as it does for cmd (cf. C4).
       SandboxManager.updateConfig(createTestConfig(['example.com']))
       const cmd = `curl --noproxy '*' -sS -m 5 https://example.com`
       const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
         cmd,
         GIT_BASH,
       )
-      // Sanity: routed via the bash branch, not cmd.
       expect(argv.slice(-3)).toEqual([GIT_BASH, '-c', cmd])
       const r = await spawnAsync(argv[0], argv.slice(1), {
-        timeout: 20_000,
+        timeout: 60_000,
         env,
       })
       expectEgressBlocked('E4', r)
     },
-    30_000,
+    90_000,
   )
 
   it.skipIf(!existsSync(GIT_BASH))(
     'E5: binShell=bash.exe — &&, single-quote, pipe survive argv round-trip',
     async () => {
-      // Proves bash — not cmd — evaluates the command: `printf` is a
-      // bash builtin (cmd has no `printf`), single-quotes are bash
-      // quoting (cmd would emit them literally), and `|`/`&&` chain
-      // under bash semantics. srt-win's build_cmdline takes the
-      // generic MSVCRT-quote path for non-cmd targets, so the whole
-      // string reaches bash as one argv[2].
       const cmd = `printf '%s ' one && printf '%s' two | tr a-z A-Z`
       const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
         cmd,
@@ -956,117 +971,59 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
       )
       expect(argv.slice(-3)).toEqual([GIT_BASH, '-c', cmd])
       const r = await spawnAsync(argv[0], argv.slice(1), {
-        timeout: 20_000,
+        timeout: 60_000,
         env,
       })
       expectStatus('E5', r, [0])
       expect(r.stdout.trim()).toBe('one TWO')
     },
-    30_000,
+    90_000,
   )
 
   it.skipIf(!existsSync(MSYS2_WGET))(
     'E3: msys2 wget to an allowed host → 200',
     async () => {
       SandboxManager.updateConfig(createTestConfig(['example.com']))
-      // No -q: wget's connection log (which proxy address it dialed,
-      // and any "failed: Connection refused") goes to stderr so a
-      // failure self-explains in the message below.
       const r = await runSandboxed(
         `"${MSYS2_WGET}" -O NUL --server-response --timeout=15 https://example.com`,
       )
       if (!/HTTP\/[\d.]+ 200/.test(r.stderr + r.stdout)) {
         throw new Error(
           `E3 wget via proxy: no HTTP 200 seen · status=${r.status} · ` +
-            `stdout=${JSON.stringify(r.stdout.slice(0, 400))} · ` +
             `stderr=${JSON.stringify(r.stderr.slice(-2000))}`,
         )
       }
     },
-    30_000,
-  )
-
-  // ════════════════════════════════════════════════════════════════
-  // Tool-compat matrix — real proxied fetch, allowed → ok (gated)
-  // ════════════════════════════════════════════════════════════════
-
-  it.skipIf(!hasTool('npm'))(
-    'tool/npm: npm view fetches a package version via the proxy',
-    async () => {
-      SandboxManager.updateConfig(createTestConfig(['registry.npmjs.org']))
-      const r = await runSandboxedUntil(
-        'npm view left-pad version',
-        x => x.status === 0 && /^\d+\.\d+\.\d+/.test(x.stdout.trim()),
-      )
-      expectStatus('tool/npm', r, [0])
-      expect(r.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/)
-    },
     90_000,
   )
 
-  it.skipIf(!hasTool('pip'))(
-    'tool/pip: pip download fetches a wheel via the proxy',
+  it.skipIf(!hasTool('nslookup'))(
+    'C2: nslookup with explicit server → direct UDP 53 blocked',
     async () => {
-      SandboxManager.updateConfig(
-        createTestConfig(['pypi.org', 'files.pythonhosted.org']),
+      // nslookup does its OWN direct UDP-53 query (bypasses the DNS
+      // Client service), so the child's token hits the WFP
+      // block-user filter.
+      // NOTE: this is the DIRECT-DNS path; resolution via getaddrinfo
+      // (Dnscache) is a separate, documented residual — see R1 below.
+      SandboxManager.updateConfig(createTestConfig(['example.com']))
+      const r = await runSandboxed('nslookup example.com 1.1.1.1')
+      // Don't lean on exit code (varies across Windows builds) or on
+      // the generic "Address:" line (nslookup prints the SERVER's own
+      // address before any answer). Assert the resolved-NAME answer
+      // section is absent AND a failure signature is present.
+      expect(r.stdout).not.toMatch(/Name:\s*example\.com/i)
+      expect(r.stdout + r.stderr).toMatch(
+        /timed out|can't find|no response|request to .* failed|server failed/i,
       )
-      const dest = `${process.env.TEMP ?? 'C:\\Windows\\Temp'}\\srt-pip-${process.pid}`
-      const r = await runSandboxedUntil(
-        `pip download --no-deps --dest "${dest}" six`,
-        x => x.status === 0,
-      )
-      expectStatus('tool/pip', r, [0])
-      expect(r.stdout + r.stderr).toMatch(/Saved|Downloading/i)
     },
-    120_000,
-  )
-
-  it.skipIf(!hasTool('go'))(
-    'tool/go: go list -m resolves a module via the proxy',
-    async () => {
-      SandboxManager.updateConfig(createTestConfig(['proxy.golang.org']))
-      const r = await runSandboxedUntil(
-        'go list -m rsc.io/quote@latest',
-        x => x.status === 0 && /rsc\.io\/quote/.test(x.stdout),
-      )
-      expectStatus('tool/go', r, [0])
-      expect(r.stdout).toMatch(/rsc\.io\/quote/)
-    },
-    120_000,
-  )
-
-  it.skipIf(!hasTool('cargo'))(
-    'tool/cargo: cargo search hits crates.io via the proxy',
-    async () => {
-      SandboxManager.updateConfig(
-        createTestConfig(['crates.io', 'static.crates.io']),
-      )
-      // CARGO_HTTP_CHECK_REVOKE=false: schannel's certificate
-      // revocation lookup goes through CryptoAPI/WinHTTP, which never
-      // reads proxy env vars, so under the egress sandbox it can't
-      // reach the CRL endpoint unless the runner's CRL cache happens
-      // to be warm. Standard practice behind corporate proxies; this
-      // row proves cargo's own traffic routes via the proxy, not
-      // revocation policy.
-      const r = await runSandboxedUntil(
-        'cargo search serde --limit 1',
-        x => x.status === 0 && /serde/.test(x.stdout),
-        2,
-        30_000,
-        { CARGO_HTTP_CHECK_REVOKE: 'false' },
-      )
-      expectStatus('tool/cargo', r, [0])
-      expect(r.stdout).toMatch(/serde/)
-    },
-    120_000,
+    20_000,
   )
 
   // ════════════════════════════════════════════════════════════════
   // Residual pins (documented Windows limitations — NOT bugs)
   // ════════════════════════════════════════════════════════════════
   // These fail loudly if a future change accidentally CLOSES a
-  // documented residual. See PLAN-winsrt-upstream.md known-bypass
-  // table.
+  // documented residual.
 
   it.skipIf(!hasTool('node'))(
     'R1: DNS resolution via getaddrinfo/Dnscache is NOT fenced',
@@ -1088,557 +1045,15 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
   it('R2: ICMP (ping) is NOT fenced', async () => {
     SandboxManager.updateConfig(createTestConfig(['example.com']))
     const r = await runSandboxed('ping -n 1 -w 3000 8.8.8.8')
-    // ICMP doesn't traverse ALE_AUTH_CONNECT, so the v1 design can't
+    // ICMP doesn't traverse ALE_AUTH_CONNECT, so the design can't
     // fence it. A regression that DID start blocking ICMP would make
-    // ping report "General failure" (the WFP-drop signature) rather
-    // than a network timeout — assert we never see that.
+    // ping report "General failure" — assert we never see that.
     expect(r.stdout).not.toMatch(/General failure/i)
-  }, 20_000)
-})
-
-// ────────────────────────────────────────────────────────────────────
-// Group F — file deny (denyRead/denyWrite via srt-win acl)
-// ────────────────────────────────────────────────────────────────────
-//
-// End-to-end through SandboxManager: initialize() runs `srt-win acl
-// stamp`; wrapWithSandboxArgv() passes `--holder-pid` so exec
-// engages the per-exec dir/file fence; reset() runs `acl restore
-// --json`. The per-Rust-arm cases (A1-A25, H1-H9) are covered by
-// vendor/srt-win-src/ci/smoke-acl.ps1 — these rows prove the TS layer
-// wires correctly on top.
-
-/**
- * Capture a file's effective DACL via icacls. The leading file
- * path and the per-ACE `(I)` (INHERITED_ACE) flag are stripped:
- * `(I)` is OS-managed inheritance metadata — a parent-DACL write
- * (e.g. `srt-win`'s parent stamp+restore) re-evaluates inheritance
- * for children and can flip an ACE between explicit and inherited
- * with no change to who-can-do-what. Same noise class as
- * SE_DACL_AUTO_INHERITED (which `acl::sd_equiv` already masks).
- */
-function captureEffectiveDacl(p: string): string {
-  const r = spawnSync('icacls', [p], { encoding: 'utf8', timeout: 5_000 })
-  if (r.status !== 0) {
-    throw new Error(`icacls "${p}" exit ${r.status}: ${r.stderr || r.stdout}`)
-  }
-  return r.stdout
-    .replace(p, '')
-    .replace(/\(I\)/g, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-}
-
-function createFsTestConfig(
-  fs: Partial<SandboxRuntimeConfig['filesystem']>,
-): SandboxRuntimeConfig {
-  const base = createTestConfig()
-  return { ...base, filesystem: { ...base.filesystem, ...fs } }
-}
-
-describe.if(isWindows)('Windows sandbox: file deny', () => {
-  // One scratch dir per suite under the user's temp; the parent
-  // allow-list stamp lands on this dir. cleanup.ps1 runs `acl
-  // recover --force` after the suite, so a left-over stamp from a
-  // throw mid-test is mopped up.
-  let scratch: string
-  let secret: string // denyRead target
-  let cfg: string // denyWrite target
-
-  beforeAll(async () => {
-    scratch = mkdtempSync(join(tmpdir(), 'srt-fsdeny-'))
-    secret = join(scratch, 'secret.txt')
-    cfg = join(scratch, 'config.txt')
-    writeFileSync(secret, 'TOP-SECRET')
-    writeFileSync(cfg, 'CONFIG-V1')
-    // Glob targets (F6).
-    writeFileSync(join(scratch, 'a.env'), 'ENV-A')
-    writeFileSync(join(scratch, 'b.env'), 'ENV-B')
-    // F4 impostor.
-    writeFileSync(join(scratch, 'impostor.txt'), 'IMPOSTOR')
-
-    // Reuse the network describe's WFP install (already done in CI
-    // by smoke.ps1 or the network suite's beforeAll). If filters
-    // are absent, install them — same shape as the network suite.
-    const wfp = getWindowsWfpStatus({ sublayerGuid: TEST_SUBLAYER })
-    if (wfp.state !== 'installed') {
-      installWindowsSandbox({
-        groupSid: ADMINS_SID,
-        sublayerGuid: TEST_SUBLAYER,
-        proxyPortRange: PORT_RANGE,
-      })
-    }
-
-    await SandboxManager.initialize(
-      createFsTestConfig({ denyRead: [secret], denyWrite: [cfg] }),
-    )
-  })
-
-  afterAll(async () => {
-    await SandboxManager.reset()
-    // Best-effort scratch cleanup. If a stamp was left behind
-    // (relocated/missing/…), the per-run %LOCALAPPDATA% override in
-    // smoke-acl.ps1 doesn't apply here — but cleanup.ps1 runs
-    // `acl recover --force` after the suite.
-    try {
-      rmSync(scratch, { recursive: true, force: true })
-    } catch {
-      /* left-over stamps can block this; cleanup.ps1 handles it */
-    }
-  })
-
-  it('F1: denyRead — child cannot read the secret', async () => {
-    const r = await runSandboxed(`type "${secret}"`)
-    if (r.stdout.includes('TOP-SECRET')) {
-      throw new Error(
-        `F1: child read the denyRead target — exit=${r.status} ` +
-          `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`,
-      )
-    }
-    // cmd `type` exits non-zero on access-denied; assert on the
-    // CONTENT (the line above) plus exit≠0, not on the localised
-    // error string.
-    expect(r.status).not.toBe(0)
-  })
-
-  it('F2: denyWrite — child cannot write but CAN read', async () => {
-    const w = await runSandboxed(`echo POISONED>"${cfg}"`)
-    const after = readFileSync(cfg, 'utf8')
-    if (after !== 'CONFIG-V1') {
-      throw new Error(
-        `F2: denyWrite target was modified — content=${JSON.stringify(after)} ` +
-          `exit=${w.status} stderr=${JSON.stringify(w.stderr)}`,
-      )
-    }
-    // denyWrite leaves read open.
-    const r = await runSandboxed(`type "${cfg}"`)
-    expect(r.stdout.trim()).toBe('CONFIG-V1')
-  })
-
-  it('F3: child cannot delete the denyRead target (parent allow-list)', async () => {
-    // cmd `del` exit code is UNRELIABLE on sharing-violation /
-    // access-denied — gate on existence + content, not exit code.
-    await runSandboxed(`del /f /q "${secret}"`)
-    if (!existsSync(secret) || readFileSync(secret, 'utf8') !== 'TOP-SECRET') {
-      throw new Error(`F3: child deleted the denyRead target`)
-    }
-  })
-
-  it('F4: child cannot rename over the denyWrite target', async () => {
-    const impostor = join(scratch, 'impostor.txt')
-    await runSandboxed(`move /y "${impostor}" "${cfg}"`)
-    const after = readFileSync(cfg, 'utf8')
-    if (after !== 'CONFIG-V1') {
-      throw new Error(
-        `F4: rename-over succeeded — content=${JSON.stringify(after)}`,
-      )
-    }
-    // Impostor should still be at its original path.
-    expect(existsSync(impostor)).toBe(true)
-  })
-
-  it('F8: --holder-pid reaches exec (dir-fence diag in stderr)', async () => {
-    const r = await runSandboxed('echo F8')
-    // `srt-win exec --holder-pid` emits `dir fence: N/N dir(s)
-    // fenced` to stderr when it engages. With at least one stamped
-    // file, ≥1 parent dir + the state-DB dir are fenced.
-    if (!/dir fence:\s*\d+\/\d+\s*dir/i.test(r.stderr)) {
-      throw new Error(
-        `F8: no dir-fence diag — --holder-pid not received? ` +
-          `stderr=${JSON.stringify(r.stderr)}`,
-      )
-    }
-  })
-
-  it('F6: glob denyRead — *.env all denied (point-in-time)', async () => {
-    // Re-init with a glob; the existing session must reset first.
-    await SandboxManager.reset()
-    const pattern = join(scratch, '*.env')
-    // Sanity: expansion finds both files and rejects nothing.
-    const expanded = expandWindowsFsDenyPaths([pattern])
-    expect(expanded.sort()).toEqual(
-      [join(scratch, 'a.env'), join(scratch, 'b.env')].sort(),
-    )
-    await SandboxManager.initialize(createFsTestConfig({ denyRead: [pattern] }))
-    for (const f of ['a.env', 'b.env']) {
-      const r = await runSandboxed(`type "${join(scratch, f)}"`)
-      if (/ENV-/.test(r.stdout)) {
-        throw new Error(
-          `F6: child read ${f} via glob denyRead — ` +
-            `stdout=${JSON.stringify(r.stdout)}`,
-        )
-      }
-    }
-  }, 30_000)
-
-  // F5 overlaps smoke-acl A9/A11 (the Rust-level DACL round-trip).
-  // Intentional defence-in-depth: those rows pin the srt-win
-  // behaviour; this row pins that SandboxManager calls into it
-  // correctly end-to-end (initialize→stamp, reset→restore).
-  it('F5: reset() restores a target to its pre-stamp effective DACL', async () => {
-    // The F6 session is active; reset it.
-    await SandboxManager.reset()
-    // Fresh subdir + fresh file → its parent has never been
-    // stamp-cycled by an earlier F-row, so the before/stamped/after
-    // capture is isolated from prior parent-restore inheritance
-    // re-evaluation on the suite-shared `scratch`.
-    const sub = mkdtempSync(join(scratch, 'f5-'))
-    const tgt = join(sub, 'f5.txt')
-    writeFileSync(tgt, 'F5')
-    const before = captureEffectiveDacl(tgt)
-    await SandboxManager.initialize(createFsTestConfig({ denyRead: [tgt] }))
-    const stamped = captureEffectiveDacl(tgt)
-    expect(stamped).not.toBe(before)
-    await SandboxManager.reset()
-    const after = captureEffectiveDacl(tgt)
-    if (after !== before) {
-      throw new Error(
-        `F5: post-reset effective DACL differs from pre-stamp.\n` +
-          `  before:  ${before}\n` +
-          `  stamped: ${stamped}\n` +
-          `  after:   ${after}`,
-      )
-    }
-  }, 30_000)
-
-  // F7 overlaps smoke-acl A19 (relocated → leftStamped at the
-  // Rust level). Intentional defence-in-depth at the
-  // SandboxManager↔srt-win integration boundary: smoke-acl pins
-  // the Rust behaviour; this row pins that the TS plumbing
-  // surfaces the same outcome.
-  it('F7: relocated file → restore reports relocated, stays stamped', async () => {
-    const reloc = join(scratch, 'reloc.txt')
-    const sub = join(scratch, 'moved')
-    mkdirSync(sub, { recursive: true })
-    writeFileSync(reloc, 'RELOC')
-    await SandboxManager.initialize(createFsTestConfig({ denyRead: [reloc] }))
-    // Move from OUTSIDE the sandbox (the host does this; the
-    // protection model says a file moved by the host is no longer
-    // at its recorded path → restore must fail-closed).
-    const movedTo = join(sub, 'reloc.txt')
-    renameSync(reloc, movedTo)
-    // Call restore directly so we can inspect the per-path
-    // outcome (SandboxManager.reset() only logs it). This also
-    // releases the holder, so the reset() below has nothing
-    // left to restore.
-    const out = restoreWindowsAcl({
-      group: { groupSid: ADMINS_SID },
-    })
-    expect(out).toBeDefined()
-    const entry = out!.paths.find(e => e.path.endsWith('reloc.txt'))
-    if (!entry || entry.status !== 'relocated') {
-      throw new Error(
-        `F7: expected status=relocated, got ` + `${JSON.stringify(out!.paths)}`,
-      )
-    }
-    expect(entry.leftStamped).toBe(true)
-    expect(entry.movedTo).toMatch(/reloc\.txt$/i)
-    // The relocated file must still be read-denied (stamp travels
-    // with the inode). Stamp a fresh session so runSandboxed has a
-    // sandbox to run under, then probe.
-    await SandboxManager.reset()
-    await SandboxManager.initialize(createFsTestConfig({}))
-    const r = await runSandboxed(`type "${movedTo}"`)
-    if (r.stdout.includes('RELOC')) {
-      throw new Error(
-        `F7: relocated file is readable after restore — stamp lost`,
-      )
-    }
-    // Cleanup: move it back so a later `acl recover` can clear it.
-    await SandboxManager.reset()
-    renameSync(movedTo, reloc)
-  }, 30_000)
-
-  it('F9: changing fs via reset+initialize takes effect', async () => {
-    const swap1 = join(scratch, 'swap1.txt')
-    const swap2 = join(scratch, 'swap2.txt')
-    writeFileSync(swap1, 'SWAP1')
-    writeFileSync(swap2, 'SWAP2')
-    await SandboxManager.initialize(createFsTestConfig({ denyRead: [swap1] }))
-    expect((await runSandboxed(`type "${swap1}"`)).stdout).not.toMatch(/SWAP1/)
-    expect((await runSandboxed(`type "${swap2}"`)).stdout).toMatch(/SWAP2/)
-    // updateConfig with a different denyRead does NOT live-swap
-    // (it warns); reset+initialize is the contract.
-    await SandboxManager.reset()
-    await SandboxManager.initialize(createFsTestConfig({ denyRead: [swap2] }))
-    expect((await runSandboxed(`type "${swap1}"`)).stdout).toMatch(/SWAP1/)
-    expect((await runSandboxed(`type "${swap2}"`)).stdout).not.toMatch(/SWAP2/)
-    await SandboxManager.reset()
-  }, 30_000)
-
-  it('F10: filesystem.allowWrite throws on Windows (deny-only)', async () => {
-    // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
-    await expect(
-      SandboxManager.initialize(createFsTestConfig({ allowWrite: [scratch] })),
-    ).rejects.toThrow(
-      /allowWrite is not supported on Windows without windows.asSandboxUser/,
-    )
-    await SandboxManager.reset()
-  })
-
-  it('F11: per-exec deny via customConfig — stamped, denied, restored', async () => {
-    // Session-level stamp on `secret` so we can assert it stays
-    // intact across the per-exec stamp/restore cycle.
-    writeFileSync(secret, 'TOP-SECRET')
-    await SandboxManager.initialize(createFsTestConfig({ denyRead: [secret] }))
-    const cred = join(scratch, 'f11-cred.txt')
-    const fs2 = join(scratch, 'f11-fs.txt')
-    writeFileSync(cred, 'F11-CRED')
-    writeFileSync(fs2, 'F11-FS')
-    // Pre: broker can read both (not yet stamped).
-    expect(readFileSync(cred, 'utf8')).toBe('F11-CRED')
-    // (a) credentials.files[mode=deny] — the original throw-case.
-    const { argv: a1, env: e1 } = await SandboxManager.wrapWithSandboxArgv(
-      `type "${cred}" & type "${secret}"`,
-      undefined,
-      { credentials: { files: [{ path: cred, mode: 'deny' }] } },
-    )
-    // The per-exec path made it onto the argv as a --deny-read
-    // flag; the session-level path (already stamped) did NOT.
-    expect(a1).toContain('--deny-read')
-    expect(a1[a1.indexOf('--deny-read') + 1]).toContain('f11-cred.txt')
-    expect(a1.filter(x => x === '--deny-read')).toHaveLength(1)
-    const r1 = await spawnAsync(a1[0], a1.slice(1), {
-      timeout: 30_000,
-      env: e1,
-    })
-    if (r1.stdout.includes('F11-CRED')) {
-      throw new Error(
-        `F11(a): child read the per-exec credential deny target — ` +
-          `stdout=${JSON.stringify(r1.stdout)} stderr=${JSON.stringify(r1.stderr)}`,
-      )
-    }
-    if (r1.stdout.includes('TOP-SECRET')) {
-      throw new Error(
-        `F11(a): child read the SESSION-level denyRead target — ` +
-          `session stamp lost during per-exec? ` +
-          `stderr=${JSON.stringify(r1.stderr)}`,
-      )
-    }
-    expect(r1.stderr).toMatch(/per-exec deny: holder_pid=\d+ → 1 path/)
-    // Post: per-exec stamp restored on child exit. The broker
-    // (this process) would read `cred` REGARDLESS (group enabled
-    // → matches the broker-only DACL), so prove restore via a
-    // SECOND sandboxed child with no per-exec deny — only true if
-    // the stamp was lifted.
-    const rR = await runSandboxed(`type "${cred}"`)
-    if (!rR.stdout.includes('F11-CRED')) {
-      throw new Error(
-        `F11(a): per-exec stamp NOT restored — fresh child still ` +
-          `denied. stdout=${JSON.stringify(rR.stdout)} ` +
-          `stderr=${JSON.stringify(rR.stderr)}`,
-      )
-    }
-    // Session-level stamp on `secret` survived: a fresh child
-    // (no per-exec deny) is still denied.
-    const rS = await runSandboxed(`type "${secret}"`)
-    if (rS.stdout.includes('TOP-SECRET')) {
-      throw new Error(
-        `F11(a): session-level stamp on '${secret}' was torn down ` +
-          `by the per-exec restore — refcount broken`,
-      )
-    }
-    // (b) filesystem.denyRead — same mechanism, different config
-    // key. Include the session-stamped `secret` to assert the
-    // per-exec set is filtered against `windowsFsStampedSet` —
-    // only `fs2` should reach the argv.
-    const { argv: a2, env: e2 } = await SandboxManager.wrapWithSandboxArgv(
-      `type "${fs2}"`,
-      undefined,
-      {
-        filesystem: { denyRead: [secret, fs2], allowWrite: [], denyWrite: [] },
-      },
-    )
-    const flags2 = a2.filter(x => x === '--deny-read')
-    if (flags2.length !== 1) {
-      throw new Error(
-        `F11(b): expected exactly one --deny-read (session-stamped ` +
-          `'${secret}' should be filtered out); got ${flags2.length}: ` +
-          JSON.stringify(a2),
-      )
-    }
-    expect(a2[a2.indexOf('--deny-read') + 1]).toContain('f11-fs.txt')
-    const r2 = await spawnAsync(a2[0], a2.slice(1), {
-      timeout: 30_000,
-      env: e2,
-    })
-    if (r2.stdout.includes('F11-FS')) {
-      throw new Error(
-        `F11(b): child read the per-exec filesystem.denyRead target — ` +
-          `stdout=${JSON.stringify(r2.stdout)} stderr=${JSON.stringify(r2.stderr)}`,
-      )
-    }
-    const rR2 = await runSandboxed(`type "${fs2}"`)
-    if (!rR2.stdout.includes('F11-FS')) {
-      throw new Error(
-        `F11(b): per-exec stamp NOT restored — fresh child still denied. ` +
-          `stderr=${JSON.stringify(rR2.stderr)}`,
-      )
-    }
-    await SandboxManager.reset()
-  }, 60_000)
-
-  it('F12: per-exec refuse-escalation — ReadDeny on a session-WriteDeny path fails the exec', async () => {
-    // Session holds `cfg` at WriteDeny. A per-exec ReadDeny on the
-    // same canonical path would escalate the on-disk mask; the
-    // per-exec restore would then see refcount>0 (session holder)
-    // and leave it ReadDeny for the rest of the session. The guard
-    // lives in srt-win's `ensure_stamped` (refuse_escalation) — NOT
-    // a TS string-compare — so canonical-path identity and
-    // concurrent holders are authoritative. The exec FAILS rather
-    // than silently stick the stricter mask.
-    writeFileSync(cfg, 'CONFIG-V1')
-    await SandboxManager.initialize(createFsTestConfig({ denyWrite: [cfg] }))
-    const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
-      `type "${cfg}"`,
-      undefined,
-      { filesystem: { denyRead: [cfg], allowWrite: [], denyWrite: [] } },
-    )
-    // The TS filter only drops same-or-stricter session matches;
-    // ReadDeny-on-WriteDeny is forwarded to srt-win.
-    expect(argv).toContain('--deny-read')
-    const r = await spawnAsync(argv[0], argv.slice(1), {
-      timeout: 30_000,
-      env,
-    })
-    if (r.status === 0) {
-      throw new Error(
-        `F12: exec succeeded — refuse-escalation guard did not fire. ` +
-          `stderr=${JSON.stringify(r.stderr)}`,
-      )
-    }
-    if (!/would escalate .* from WriteDeny to ReadDeny/.test(r.stderr)) {
-      throw new Error(
-        `F12: expected refuse-escalation error in stderr; got ` +
-          `status=${r.status} stderr=${JSON.stringify(r.stderr)}`,
-      )
-    }
-    // Mask was NOT escalated: a fresh child (no per-exec deny) can
-    // still read `cfg` (WriteDeny leaves read open). And the
-    // session WriteDeny stamp survived the failed batch's rollback.
-    const rR = await runSandboxed(`type "${cfg}"`)
-    if (!rR.stdout.includes('CONFIG-V1')) {
-      throw new Error(
-        `F12: child cannot read a WriteDeny-only file — mask was ` +
-          `escalated to ReadDeny despite refuse-escalation. ` +
-          `stderr=${JSON.stringify(rR.stderr)}`,
-      )
-    }
-    const rW = await runSandboxed(`echo POISON > "${cfg}"`)
-    if (readFileSync(cfg, 'utf8').includes('POISON')) {
-      throw new Error(
-        `F12: session WriteDeny stamp was torn down by the failed ` +
-          `per-exec batch's rollback. stderr=${JSON.stringify(rW.stderr)}`,
-      )
-    }
-    await SandboxManager.reset()
-  }, 60_000)
-
-  it('F13: per-exec deny self-registers — --holder-pid only when session stamped', async () => {
-    // Per-exec `--deny-*` stamps under the exec process's OWN
-    // pid (`std::process::id()`), not a flag-passed holder. The
-    // `--holder-pid` flag is the SESSION fence's holder and is
-    // independent — present iff this session ran `acl stamp`
-    // (windowsFsStampedSet set). Assert both halves so the two
-    // concerns can't be re-coupled.
-    await SandboxManager.reset()
-    const f13 = join(scratch, 'f13.txt')
-    writeFileSync(f13, 'F13')
-    // (a) No session-level fs deny → windowsFsStampedSet is
-    // undefined → no --holder-pid; per-exec deny still rides.
-    await SandboxManager.initialize(createFsTestConfig({}))
-    const { argv: aN } = await SandboxManager.wrapWithSandboxArgv(
-      'exit 0',
-      undefined,
-      { filesystem: { denyRead: [f13], allowWrite: [], denyWrite: [] } },
-    )
-    if (aN.includes('--holder-pid')) {
-      throw new Error(
-        `F13(a): --holder-pid present with no session stamp — ` +
-          `per-exec deny is not self-registering. argv=${JSON.stringify(aN)}`,
-      )
-    }
-    expect(aN).toContain('--deny-read')
-    await SandboxManager.reset()
-    // (b) Session-level stamp → --holder-pid present (session
-    // fence), independent of per-exec flags.
-    writeFileSync(secret, 'TOP-SECRET')
-    await SandboxManager.initialize(createFsTestConfig({ denyRead: [secret] }))
-    const { argv: aS } = await SandboxManager.wrapWithSandboxArgv('exit 0')
-    if (!aS.includes('--holder-pid')) {
-      throw new Error(
-        `F13(b): --holder-pid absent despite session stamp — ` +
-          `session fence not engaged. argv=${JSON.stringify(aS)}`,
-      )
-    }
-    expect(aS[aS.indexOf('--holder-pid') + 1]).toBe(`${process.pid}`)
-    expect(aS).not.toContain('--deny-read')
-    await SandboxManager.reset()
   }, 60_000)
 })
 
-// ────────────────────────────────────────────────────────────────────
-// Group H — --as-sandbox-user two-hop launch (separate-user path)
-//
-// H0 is a pure argv-shape assertion (runs on every platform). H1+ do
-// actual two-hop execs and are gated on
-// `SRT_WIN_AS_SANDBOX_USER=1`: they need the `srt-sandbox` account
-// provisioned, and the same-user E/B/C/D/F rows above must stay
-// green regardless of whether the separate-user path is enabled.
-// `vendor/srt-win-src/ci/smoke-exec.ps1` R1-R9b cover the two-hop
-// end-to-end on every CI run; this block proves the TS plumbing on
-// top once the path is enabled.
-// ────────────────────────────────────────────────────────────────────
-
-describe('Windows sandbox: --as-sandbox-user argv shape (pure, all platforms)', () => {
-  it('H0: asSandboxUser:true adds --as-sandbox-user before --, omits when false', () => {
-    const prev = process.env.SRT_WIN_PATH
-    process.env.SRT_WIN_PATH = process.execPath
-    try {
-      const on = wrapCommandWithSandboxWindows({
-        command: 'exit 0',
-        group: { groupSid: ADMINS_SID },
-        asSandboxUser: true,
-        caCertPath: 'C:/ca.pem',
-        httpProxyPort: 60080,
-      })
-      expect(on.argv).toContain('--as-sandbox-user')
-      // CA trust is install-time, NEVER on the per-exec argv.
-      expect(on.argv).not.toContain('--ca-trust')
-      // Flags must precede `--` (clap stops parsing after it).
-      expect(on.argv.indexOf('--as-sandbox-user')).toBeLessThan(
-        on.argv.indexOf('--'),
-      )
-      // Two-hop overlay rides on --env: PATH + the single-sourced
-      // proxy set. Values follow each --env as KEY=VALUE.
-      const envArgs = on.argv.filter((_, i) => on.argv[i - 1] === '--env')
-      expect(envArgs.some(e => e.startsWith('PATH='))).toBe(true)
-      expect(envArgs).toContain('HTTP_PROXY=http://localhost:60080')
-      // CA-bundle vars are NOT forwarded under asSandboxUser — the
-      // bundle lives in broker %TEMP%, unreadable by srt-sandbox.
-      // Schannel trust comes from `user trust-ca` instead.
-      expect(envArgs.some(e => e.startsWith('NODE_EXTRA_CA_CERTS='))).toBe(
-        false,
-      )
-      expect(envArgs.some(e => e.startsWith('SSL_CERT_FILE='))).toBe(false)
-      // Every --env must precede `--`.
-      expect(on.argv.lastIndexOf('--env')).toBeLessThan(on.argv.indexOf('--'))
-      const off = wrapCommandWithSandboxWindows({
-        command: 'exit 0',
-        group: { groupSid: ADMINS_SID },
-      })
-      expect(off.argv).not.toContain('--as-sandbox-user')
-      expect(off.argv).not.toContain('--env')
-    } finally {
-      if (prev === undefined) delete process.env.SRT_WIN_PATH
-      else process.env.SRT_WIN_PATH = prev
-    }
-  })
-})
-
-const asSandboxUserEnabled = process.env.SRT_WIN_AS_SANDBOX_USER === '1'
-
-describe.if(isWindows && asSandboxUserEnabled)(
-  'Windows sandbox: --as-sandbox-user two-hop (H-rows)',
+describe.if(isWindows)(
+  'Windows sandbox: two-hop sandbox-user launch (H-rows)',
   () => {
     let exe: string
     let sbSid: string
@@ -1651,8 +1066,6 @@ describe.if(isWindows && asSandboxUserEnabled)(
         exe,
         [
           'install',
-          '--group-sid',
-          ADMINS_SID,
           '--sublayer-guid',
           TEST_SUBLAYER,
           '--proxy-port-range',
@@ -1670,19 +1083,21 @@ describe.if(isWindows && asSandboxUserEnabled)(
         )
       }
       sbSid = us.sid
-    })
+    }, 60_000)
 
+    // 60s: `srt-win uninstall` removes the sandbox user account +
+    // WFP filters and can exceed bun's 5s default hook timeout
+    // when a runner child from a prior test is still draining.
     afterAll(() => {
       spawnSync(exe, ['uninstall', '--sublayer-guid', TEST_SUBLAYER], {
         encoding: 'utf8',
+        timeout: 55_000,
       })
-    })
+    }, 60_000)
 
     async function rexec(tail: string) {
       const { argv, env } = wrapCommandWithSandboxWindows({
         command: tail,
-        group: { groupSid: ADMINS_SID },
-        asSandboxUser: true,
       })
       return spawnAsync(argv[0], argv.slice(1), {
         env,
@@ -1717,7 +1132,96 @@ describe.if(isWindows && asSandboxUserEnabled)(
       expect(r.status).not.toBe(0)
     }, 60_000)
 
-    // ── H5-H8: FS parity under asSandboxUser via SandboxManager ──
+    it('H-kill-chain: taskkill /F on the broker reaps the sandboxed child (Job kill-on-close)', async () => {
+      // Proves the broker→runner→child Job kill-chain survives a
+      // hard broker kill. waitfor.exe blocks 30s for a signal that
+      // never arrives; the nonce in its cmdline lets us find OUR
+      // instance via CIM regardless of what else is on the runner.
+      const nonce = `SrtKc${process.pid}x${Date.now()}`
+      // quiet:false — the seclogon-job note in logon.rs is the
+      // breadcrumb for the documented `AssignProcessToJobObject →
+      // ERROR_NOT_SUPPORTED` degrade path; without it a flake here
+      // has zero diagnostic.
+      const { argv, env } = wrapCommandWithSandboxWindows({
+        command: `waitfor /t 30 ${nonce}`,
+        quiet: false,
+      })
+      const broker = spawn(argv[0], argv.slice(1), { env })
+      let stderr = ''
+      broker.stdout?.on('data', () => {})
+      broker.stderr?.setEncoding('utf8').on('data', d => (stderr += d))
+      const closed = new Promise<void>(r => broker.once('close', () => r()))
+      const findChild = (): number | undefined => {
+        const r = spawnSync(
+          'powershell',
+          [
+            '-NoProfile',
+            '-Command',
+            `(Get-CimInstance Win32_Process -Filter "Name='waitfor.exe'" | ` +
+              `Where-Object { $_.CommandLine -like '*${nonce}*' }).ProcessId`,
+          ],
+          { encoding: 'utf8', timeout: 10_000 },
+        )
+        const pid = parseInt((r.stdout ?? '').trim(), 10)
+        return Number.isFinite(pid) && pid > 0 ? pid : undefined
+      }
+      let childPid: number | undefined
+      try {
+        // Poll for the sandboxed waitfor.exe (up to ~15s: CPWLW +
+        // profile load can be slow on a cold runner).
+        for (let i = 0; i < 30 && childPid === undefined; i++) {
+          await new Promise(r => setTimeout(r, 500))
+          childPid = findChild()
+        }
+        if (childPid === undefined) {
+          throw new Error(
+            `H-kill-chain: sandboxed waitfor.exe (${nonce}) never appeared ` +
+              `— broker.pid=${broker.pid} stderr=${JSON.stringify(stderr)}`,
+          )
+        }
+        // Hard-kill the BROKER. The Job kill-chain (broker Job →
+        // runner → runner Job → child) must reap the whole tree; a
+        // surviving child would mean a broker crash orphans a
+        // sandboxed process.
+        const kill = spawnSync('taskkill', ['/PID', String(broker.pid), '/F'], {
+          encoding: 'utf8',
+          timeout: 10_000,
+        })
+        if (kill.status !== 0) {
+          throw new Error(
+            `taskkill /F broker(${broker.pid}) failed: ` +
+              `${kill.stderr || kill.stdout}`,
+          )
+        }
+        await closed
+        for (let i = 0; i < 20; i++) {
+          if (findChild() === undefined) {
+            // Cleared so the finally's belt-and-suspenders taskkill
+            // doesn't fire on a dead PID (which a busy runner may
+            // have already reused).
+            childPid = undefined
+            return
+          }
+          await new Promise(r => setTimeout(r, 500))
+        }
+        throw new Error(
+          `H-kill-chain: sandboxed child pid=${childPid} survived ` +
+            `taskkill /F on broker(${broker.pid}) — Job kill-chain ` +
+            `broken. stderr=${JSON.stringify(stderr)}`,
+        )
+      } finally {
+        // Belt-and-suspenders reap so a failure doesn't leak the
+        // child into the next test.
+        if (childPid !== undefined) {
+          spawnSync('taskkill', ['/PID', String(childPid), '/T', '/F'], {
+            timeout: 5_000,
+          })
+        }
+        broker.kill()
+      }
+    }, 90_000)
+
+    // ── H5-H8: FS parity via SandboxManager (grant + deny ACEs) ──
     // The G-rows in smoke-exec.ps1 exercise the srt-win primitives
     // directly; these check the SandboxManager.initialize() →
     // grant + stamp → reset() → revoke + restore plumbing.
@@ -1725,13 +1229,14 @@ describe.if(isWindows && asSandboxUserEnabled)(
     let hSecret: string
     let hSibling: string
 
-    function createSbUserFsConfig(fs: FsOverrides): SandboxRuntimeConfig {
-      const base = createFsTestConfig(fs)
-      return { ...base, windows: { ...base.windows!, asSandboxUser: true } }
+    type FsOverrides = Partial<SandboxRuntimeConfig['filesystem']>
+    function createFsTestConfig(fs: FsOverrides): SandboxRuntimeConfig {
+      const base = createTestConfig()
+      return { ...base, filesystem: { ...base.filesystem, ...fs } }
     }
 
     async function rexecSandboxed(cmd: string, fs: FsOverrides) {
-      await SandboxManager.initialize(createSbUserFsConfig(fs))
+      await SandboxManager.initialize(createFsTestConfig(fs))
       try {
         const wrapped = await SandboxManager.wrapWithSandboxArgv(cmd)
         return await spawnAsync(wrapped.argv[0], wrapped.argv.slice(1), {
@@ -1768,7 +1273,7 @@ describe.if(isWindows && asSandboxUserEnabled)(
       )
       if (r.stdout.includes('SECRET')) {
         throw new Error(
-          `H6: child read the denyRead target under asSandboxUser — ` +
+          `H6: child read the denyRead target — ` +
             `stdout=${JSON.stringify(r.stdout)}`,
         )
       }
@@ -1776,6 +1281,30 @@ describe.if(isWindows && asSandboxUserEnabled)(
         throw new Error(
           `H6: sibling unreadable post-stamp — ` +
             `stdout=${JSON.stringify(r.stdout)} stderr=${JSON.stringify(r.stderr)}`,
+        )
+      }
+    }, 90_000)
+
+    it('H-denyWrite: child cannot write the denyWrite target', async () => {
+      // Was F2 under the same-user PROTECTED-stamp; re-expressed
+      // for the additive-DENY-ACE path. Asserts the WRITE-deny
+      // half only — the "child can still read" half is covered by
+      // smoke-aces A2 (lands with the SYNCHRONIZE-strip fix in
+      // the Rust same-user-removal PR; main's `DenyMask::WriteDeny`
+      // includes SYNCHRONIZE so a synchronous read open is also
+      // denied until then).
+      const hCfg = join(hScratch, 'cfg.txt')
+      writeFileSync(hCfg, 'CONFIG-V1')
+      const w = await rexecSandboxed(`echo POISONED>"${hCfg}"`, {
+        allowWrite: [hScratch],
+        denyWrite: [hCfg],
+      })
+      const after = readFileSync(hCfg, 'utf8')
+      if (after !== 'CONFIG-V1') {
+        throw new Error(
+          `H-denyWrite: target was modified — ` +
+            `content=${JSON.stringify(after)} exit=${w.status} ` +
+            `stderr=${JSON.stringify(w.stderr)}`,
         )
       }
     }, 90_000)
@@ -1795,16 +1324,14 @@ describe.if(isWindows && asSandboxUserEnabled)(
       // before this PR a per-exec `glob-*.secret` reached
       // `srt-win exec --deny-read` raw and `canonicalize_path`
       // hard-failed; now `wrapWithSandboxArgv` routes it through
-      // `expandWindowsFsDenyPaths` (same chokepoint as session-
+      // `expandWindowsFsPaths` (same chokepoint as session-
       // level) so the child sees two concrete `--deny-read` paths.
       const dir = mkdtempSync(join(tmpdir(), 'srt-hglob-'))
       const a = join(dir, 'glob-a.secret')
       const b = join(dir, 'glob-b.secret')
       writeFileSync(a, 'GLOB-A')
       writeFileSync(b, 'GLOB-B')
-      await SandboxManager.initialize(
-        createSbUserFsConfig({ allowWrite: [dir] }),
-      )
+      await SandboxManager.initialize(createFsTestConfig({ allowWrite: [dir] }))
       try {
         const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
           `type "${a}" & echo --SEP-- & type "${b}"`,
@@ -1886,4 +1413,423 @@ describe.if(isWindows && asSandboxUserEnabled)(
   },
 )
 
-type FsOverrides = Partial<SandboxRuntimeConfig['filesystem']>
+// ────────────────────────────────────────────────────────────────────
+// Group G — tlsTerminate CA trust via env vars
+// ────────────────────────────────────────────────────────────────────
+//
+// The TLS-terminating proxy itself is platform-agnostic (covered by
+// tls-terminate-proxy.test.ts); these rows prove the sandboxed
+// CHILD trusts the proxy-minted certs
+// via the env vars `generateProxyEnvVars` emits when `caCertPath` is
+// set. Schannel-level trust (System32 curl, IWR, .NET) comes from
+// the install-time `srt-win user trust-ca` write into the sandbox
+// user's `CurrentUser\Root`; the env-var layer here covers the
+// OpenSSL-backed tools.
+//
+// Tool/row selection follows per-tool ground-truth probes run on
+// win-x64 and win-arm64. In particular: Schannel `curl.exe`
+// (System32, and the ARM64 git-bundled clangarm64 build) ignores
+// `CURL_CA_BUNDLE`, so the curl row gates on an OpenSSL build being
+// present; git defaults to the schannel backend (which ignores
+// `GIT_SSL_CAINFO`), so the git row forces `http.sslBackend=openssl`;
+// cargo's vendored Schannel libcurl honors `CARGO_HTTP_CAINFO`.
+// Schannel's revocation check on the leaf is satisfied by the CDP →
+// empty CRL the proxy serves at `/srt.crl` — no per-tool
+// `--ssl-no-revoke` / `schannelCheckRevoke=false` /
+// `CARGO_HTTP_CHECK_REVOKE=false` needed.
+
+// Committed test-only CA — see test/fixtures/tls-terminate/README.md.
+const TLS_FIXTURE_DIR = join(import.meta.dir, '..', 'fixtures', 'tls-terminate')
+const CA_CERT = join(TLS_FIXTURE_DIR, 'ca.crt')
+const CA_KEY = join(TLS_FIXTURE_DIR, 'ca.key')
+
+/**
+ * Locate a sandbox-reachable OpenSSL-backend curl. On x64
+ * git-for-windows ships `mingw64\bin\curl.exe` (typically OpenSSL);
+ * on ARM64 the bundled curl is `clangarm64\bin\curl.exe` and is
+ * Schannel — so this returns `undefined` there and G3 skips. Probed
+ * via `curl --version` since the build flavour, not the path,
+ * decides. All candidate paths are machine-wide (Program Files /
+ * msys2 root), so the sandbox user can launch them.
+ */
+function findOpenSslCurl(): string | undefined {
+  if (!isWindows) return undefined
+  for (const c of [
+    'C:\\Program Files\\Git\\mingw64\\bin\\curl.exe',
+    'C:\\Program Files\\Git\\clangarm64\\bin\\curl.exe',
+    'C:\\msys64\\mingw64\\bin\\curl.exe',
+  ]) {
+    if (!existsSync(c)) continue
+    const r = spawnSync(c, ['--version'], { encoding: 'utf8', timeout: 5_000 })
+    if (r.status === 0 && /OpenSSL/i.test(r.stdout)) return c
+  }
+  return undefined
+}
+const OPENSSL_CURL = findOpenSslCurl()
+
+/**
+ * First `where.exe` hit for `name` that lives OUTSIDE the broker's
+ * user profile — the srt-sandbox user has no rights on
+ * `C:\Users\<broker>\…`, so a per-user install (rustup's
+ * `~/.cargo/bin`, `%LOCALAPPDATA%`, py launcher shims) is
+ * unreachable from the sandboxed child even though the broker's
+ * PATH is forwarded. Scans ALL hits so a per-user shim doesn't
+ * shadow a machine-wide install further down the list. Used to
+ * gate G-rows on tools the child can actually launch.
+ */
+function sandboxReachable(name: string): string | undefined {
+  const prof = process.env.USERPROFILE?.toLowerCase()
+  for (const p of whereAll(name)) {
+    if (prof && p.toLowerCase().startsWith(prof)) continue
+    return p
+  }
+  return undefined
+}
+const GIT = sandboxReachable('git')
+const NODE = sandboxReachable('node')
+const PYTHON = sandboxReachable('python')
+const CARGO = sandboxReachable('cargo')
+
+/**
+ * True if `<mod>` imports under the sandbox-reachable python's
+ * SYSTEM site-packages. `PYTHONNOUSERSITE=1` hides the broker's
+ * per-user site (`%APPDATA%\Python`) so the probe approximates
+ * what the srt-sandbox child sees — a module installed only via
+ * `pip install --user` on the broker would otherwise pass the
+ * gate but fail inside the sandbox.
+ */
+function hasPythonModule(mod: string): boolean {
+  if (PYTHON === undefined) return false
+  const r = spawnSync(PYTHON, ['-c', `import ${mod}`], {
+    encoding: 'utf8',
+    timeout: 10_000,
+    env: { ...process.env, PYTHONNOUSERSITE: '1' },
+  })
+  return r.status === 0
+}
+
+function createTlsTestConfig(allowedDomains: string[]): SandboxRuntimeConfig {
+  const base = createTestConfig(allowedDomains)
+  return {
+    ...base,
+    network: {
+      ...base.network,
+      tlsTerminate: { caCertPath: CA_CERT, caKeyPath: CA_KEY },
+    },
+  }
+}
+
+// G1/G1b — env-injection layer (pure, all platforms). Mirrors
+// tls-terminate-trust-env.test.ts at the same assertion depth, but
+// against the Windows wrapper's `{argv, env}` shape instead of a
+// shell string.
+describe('wrapCommandWithSandboxWindows tlsTerminate trust env (pure, all platforms)', () => {
+  function wrap(caCertPath?: string): {
+    env: NodeJS.ProcessEnv
+    envArgs: string[]
+  } {
+    const r = wrapCommandWithSandboxWindows({
+      command: 'echo',
+      httpProxyPort: 60080,
+      socksProxyPort: 60080,
+      caCertPath,
+      srtWin: resolveSrtWin({ path: process.execPath }),
+    })
+    return {
+      env: r.env,
+      envArgs: r.argv.filter((_, i) => r.argv[i - 1] === '--env'),
+    }
+  }
+
+  it('G1: env carries every CA_TRUST_VARS entry, forward-slashed', () => {
+    // Probe with backslashes; the wrapper must normalise.
+    const winPath = 'C:\\srt\\trust-bundle.crt'
+    const { env, envArgs } = wrap(winPath)
+    const want = 'C:/srt/trust-bundle.crt'
+    for (const v of CA_TRUST_VARS) {
+      expect(env[v]).toBe(want)
+      // Same value rides the runner's --env overlay (what the child sees).
+      expect(envArgs).toContain(`${v}=${want}`)
+    }
+    // Forward-slash means no backslash survives anywhere in the value.
+    expect(env.SSL_CERT_FILE).not.toContain('\\')
+  })
+
+  it('G1b: env does not override CA_TRUST_VARS when caCertPath unset', () => {
+    // The returned env inherits process.env, so the var may exist
+    // (some CI runners pre-set NODE_EXTRA_CA_CERTS). What we assert
+    // is that the wrapper did not ADD it — value equals whatever
+    // the host already had, and it is NOT in the --env overlay.
+    const { env, envArgs } = wrap(undefined)
+    for (const v of CA_TRUST_VARS) {
+      expect(env[v]).toBe(process.env[v])
+      expect(envArgs.some(e => e.startsWith(`${v}=`))).toBe(false)
+    }
+  })
+})
+
+describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
+  // Allowed domains for the live tool rows. Each tool's row resets
+  // the allowlist via updateConfig (live-swap; the proxy reads it
+  // per-request) so this superset just bounds initialize().
+  const TLS_ALLOWED = [
+    'example.com',
+    'github.com',
+    'crates.io',
+    'static.crates.io',
+    'index.crates.io',
+  ]
+
+  beforeAll(async () => {
+    console.error('[winsrt G beforeAll] start')
+    // Reuse the network/file describes' WFP install (already
+    // present in CI from the earlier suites; install when running
+    // this describe in isolation).
+    const wfp = getWindowsWfpStatus({ sublayerGuid: TEST_SUBLAYER })
+    if (wfp.state !== 'installed') {
+      installWindowsSandbox({
+        sublayerGuid: TEST_SUBLAYER,
+        proxyPortRange: PORT_RANGE,
+      })
+    }
+    // tlsTerminate on Windows requires the fixture CA to be
+    // installed in the sandbox user's CurrentUser\Root
+    // (initialize() gates on the thumbprint match). Idempotent —
+    // replaces any prior install.
+    windowsTrustCa(CA_CERT)
+    await SandboxManager.initialize(createTlsTestConfig(TLS_ALLOWED))
+    // Sanity: tlsTerminate config produced a CA + trust bundle.
+    const ca = SandboxManager.getMitmCA()
+    expect(ca?.trustBundlePath).toBeTruthy()
+    console.error('[winsrt G beforeAll] done')
+    // 120s: install re-provisions the sandbox user (H-rows'
+    // afterAll uninstalled it), then trust-ca creates the user's
+    // profile (LOGON_WITH_PROFILE) on first call — both can exceed
+    // bun's 5s default hook timeout.
+  }, 120_000)
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+    // Mirror the network + H-rows describes: leave no WFP filters,
+    // sandbox user, or fixture CA behind for a subsequent local
+    // run. In CI `cleanup.ps1` sweeps regardless, but this is the
+    // last describe in the file so it owns final teardown.
+    uninstallWindowsSandbox({ sublayerGuid: TEST_SUBLAYER })
+  }, 60_000)
+
+  it('G2: child sees SSL_CERT_FILE and can read the trust bundle', async () => {
+    // Mirrors tls-terminate-trust-env.test.ts row 3. The path is
+    // emitted with forward slashes (so it survives msys2 and is
+    // accepted by every CreateFileW caller); cmd's `type` BUILTIN
+    // does its own path parsing and rejects `/`, so flip them back
+    // to `\` via cmd's `%VAR:/=\%` substitution for this one
+    // builtin. writeTrustBundle puts the CA first, then system
+    // roots — assert the path landed and the PEM header is present.
+    const r = await runSandboxed(
+      `echo %SSL_CERT_FILE% && type "%SSL_CERT_FILE:/=\\%"`,
+    )
+    expectStatus('G2', r, [0])
+    const bundle = SandboxManager.getMitmCA()!.trustBundlePath.replace(
+      /\\/g,
+      '/',
+    )
+    const out = r.stdout.replace(/\r/g, '')
+    const firstLine = out.split('\n')[0].trim()
+    expect(firstLine).toBe(bundle)
+    expect(out).toContain('-----BEGIN CERTIFICATE-----')
+  })
+
+  it.skipIf(OPENSSL_CURL === undefined)(
+    'G3: OpenSSL curl trusts the MITM CA via CURL_CA_BUNDLE',
+    async () => {
+      SandboxManager.updateConfig(createTlsTestConfig(['example.com']))
+      // -v so stderr carries `issuer:` for the MITM-proof assertion;
+      // -sS so transfer noise is suppressed but errors still print.
+      const r = await runSandboxedUntil(
+        `"${OPENSSL_CURL}" -sS -v -o NUL https://example.com/`,
+        x => x.status === 0,
+      )
+      expectStatus('G3', r, [0])
+      // The leaf is minted by our CA — issuer CN is the fixture's.
+      expect(r.stderr).toMatch(/issuer:.*srt-test-ca/i)
+    },
+    60_000,
+  )
+
+  it.skipIf(GIT === undefined)(
+    'G4: git (-c http.sslBackend=openssl) trusts the MITM CA via GIT_SSL_CAINFO',
+    async () => {
+      SandboxManager.updateConfig(
+        createTlsTestConfig(['example.com', 'github.com']),
+      )
+      // git's default backend on Windows is schannel, which IGNORES
+      // GIT_SSL_CAINFO unless `http.schannelUseSSLCAInfo=true`; the
+      // openssl backend honors it directly. git-via-proxy is heavier
+      // than curl (smart-HTTP), so 45s/attempt + 120s overall.
+      const r = await runSandboxedUntil(
+        `"${GIT}" -c http.sslBackend=openssl ls-remote https://github.com/git/git.git HEAD`,
+        x => x.status === 0 && /HEAD/.test(x.stdout),
+        2,
+        45_000,
+      )
+      expectStatus('G4', r, [0])
+      expect(r.stdout).toMatch(/HEAD/)
+    },
+    120_000,
+  )
+
+  it.skipIf(NODE === undefined)(
+    'G5: node trusts the MITM CA via NODE_EXTRA_CA_CERTS (extends)',
+    async () => {
+      SandboxManager.updateConfig(createTlsTestConfig(['example.com']))
+      // Node's built-in `fetch` (undici) does NOT honor proxy env
+      // vars, so a bare fetch goes direct and the WFP fence blocks
+      // it (the B5 row pins exactly this). To prove
+      // NODE_EXTRA_CA_CERTS is honored we tunnel explicitly:
+      // http CONNECT to the proxy (read from `HTTPS_PROXY`,
+      // including the auth token), then `https.get` over the
+      // resulting socket. `https.get` validates the proxy-minted
+      // cert against the system roots + NODE_EXTRA_CA_CERTS, so a
+      // missing/unreadable bundle surfaces as
+      // UNABLE_TO_VERIFY_LEAF_SIGNATURE on the inner request.
+      // NODE_EXTRA_CA_CERTS failures are a one-time startup
+      // warning, NOT a hard error — assert the MITM'd request
+      // returns 200, not just that node ran.
+      const bundle = SandboxManager.getMitmCA()!.trustBundlePath
+      const script = [
+        `const u=new URL(process.env.HTTPS_PROXY);`,
+        `const auth='Basic '+Buffer.from(u.username+':'+u.password).toString('base64');`,
+        `require('http').request({host:u.hostname,port:u.port,method:'CONNECT',path:'example.com:443',headers:{'Proxy-Authorization':auth}})`,
+        `.on('connect',(res,sock)=>{`,
+        ` if(res.statusCode!==200){console.error('CONNECT:'+res.statusCode);process.exit(3)}`,
+        ` require('https').get({host:'example.com',path:'/',socket:sock,agent:false},`,
+        `  r=>{console.log('STATUS:'+r.statusCode);process.exit(r.statusCode===200?0:1)})`,
+        ` .on('error',e=>{console.error('TLS:'+(e.code||e.message));process.exit(2)})`,
+        `}).on('error',e=>{console.error('CONN:'+(e.code||e.message));process.exit(3)}).end()`,
+      ].join('')
+      const r = await runSandboxedUntil(
+        `"${NODE}" -e "${script}"`,
+        x => x.status === 0,
+      )
+      expectStatus(`G5 (bundle=${bundle} exists=${existsSync(bundle)})`, r, [0])
+      expect(r.stdout).toContain('STATUS:200')
+    },
+    60_000,
+  )
+
+  it.skipIf(!hasPythonModule('requests'))(
+    'G6: python requests trusts the MITM CA via REQUESTS_CA_BUNDLE',
+    async () => {
+      SandboxManager.updateConfig(createTlsTestConfig(['example.com']))
+      const r = await runSandboxedUntil(
+        `"${PYTHON}" -c "import requests; print('STATUS:'+str(requests.get('https://example.com/').status_code))"`,
+        x => x.status === 0,
+      )
+      expectStatus('G6', r, [0])
+      expect(r.stdout).toContain('STATUS:200')
+    },
+    60_000,
+  )
+
+  it.skipIf(PYTHON === undefined)(
+    'G7: python stdlib trusts the MITM CA via SSL_CERT_FILE',
+    async () => {
+      // On Windows `SSL_CERT_FILE` is ADDITIVE for cpython
+      // (load_default_certs also loads the Windows store), unlike
+      // on POSIX where it replaces. Either way the MITM'd request
+      // verifies against our CA.
+      SandboxManager.updateConfig(createTlsTestConfig(['example.com']))
+      const r = await runSandboxedUntil(
+        `"${PYTHON}" -c "import urllib.request as u; print('STATUS:'+str(u.urlopen('https://example.com/').status))"`,
+        x => x.status === 0,
+      )
+      expectStatus('G7', r, [0])
+      expect(r.stdout).toContain('STATUS:200')
+    },
+    60_000,
+  )
+
+  it('G8: System32 curl (Schannel) trusts via the sandbox-user Root install, NOT CURL_CA_BUNDLE', async () => {
+    // Schannel curl ignores CURL_CA_BUNDLE/SSL_CERT_FILE by design
+    // — trust comes from the sandbox user's `CurrentUser\Root`,
+    // which `windowsTrustCa` populated in beforeAll. Revocation is
+    // checked on the LEAF: minted leaves carry a CDP pointing at the
+    // proxy's `/srt.crl` (empty CRL), so no `--ssl-no-revoke` needed.
+    SandboxManager.updateConfig(createTlsTestConfig(['example.com']))
+    const sysCurl = `${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\curl.exe`
+    const r = await runSandboxedUntil(
+      `"${sysCurl}" -sS -o NUL -w "%{http_code}" https://example.com/`,
+      x => x.status === 0,
+    )
+    expectStatus('G8', r, [0])
+    expect(r.stdout).toContain('200')
+  }, 60_000)
+
+  it.skipIf(GIT === undefined)(
+    'G8b: git schannel backend passes revocation via the served CRL (no schannelCheckRevoke=false)',
+    async () => {
+      // Trust: `-c http.schannelUseSSLCAInfo=true` makes git-schannel
+      // honor `GIT_SSL_CAINFO` (the trust bundle #346 emits). Without
+      // it, git-for-windows' patched http.c clears sslCAInfo so
+      // schannel reads the Windows store — but on the CI runner that
+      // path hits SEC_E_UNTRUSTED_ROOT (system-gitconfig drift; the
+      // store-trust path is proven by G8's curl row).
+      // Revocation: what this row TESTS — the leaf's CDP → empty CRL
+      // on the proxy port means NO `http.schannelCheckRevoke=false`
+      // is needed. `-c http.sslBackend=schannel` is explicit so the
+      // row is hermetic against the runner's default backend.
+      // git-via-proxy is heavier than curl (smart-HTTP), so
+      // 45s/attempt + 120s overall.
+      SandboxManager.updateConfig(
+        createTlsTestConfig(['example.com', 'github.com']),
+      )
+      const r = await runSandboxedUntil(
+        `"${GIT}" -c http.sslBackend=schannel -c http.schannelUseSSLCAInfo=true ` +
+          `ls-remote https://github.com/git/git.git HEAD`,
+        x => x.status === 0 && /HEAD/.test(x.stdout),
+        2,
+        45_000,
+      )
+      if (r.status !== 0) {
+        // Diagnostic: dump the effective git http.* config so a
+        // failure names the runner's system-gitconfig state.
+        const cfg = await runSandboxed(
+          `"${GIT}" config --list --show-origin 2>&1 | findstr /i "ssl schannel backend"`,
+        )
+        r.stderr += `\n[G8b diag: git http config]\n${cfg.stdout}${cfg.stderr}`
+      }
+      expectStatus('G8b', r, [0])
+      expect(r.stdout).toMatch(/HEAD/)
+    },
+    120_000,
+  )
+
+  it.skipIf(CARGO === undefined)(
+    'G9: cargo trusts the MITM CA via CARGO_HTTP_CAINFO',
+    async () => {
+      // cargo's vendored libcurl is Schannel but honors `CAINFO`
+      // (replace semantics). Revocation is satisfied by the leaf's
+      // CDP → empty CRL served on the proxy port, so no
+      // `CARGO_HTTP_CHECK_REVOKE=false` needed. Skips when cargo
+      // lives under the broker's profile (`~/.cargo/bin` on GHA
+      // runners) — srt-sandbox cannot read it; see
+      // `sandboxReachable`.
+      SandboxManager.updateConfig(
+        createTlsTestConfig([
+          'crates.io',
+          'static.crates.io',
+          'index.crates.io',
+        ]),
+      )
+      const r = await runSandboxedUntil(
+        `"${CARGO}" search serde --limit 1`,
+        x => x.status === 0 && /serde/.test(x.stdout),
+        2,
+        30_000,
+      )
+      expectStatus('G9', r, [0])
+      expect(r.stdout).toMatch(/serde/)
+    },
+    120_000,
+  )
+})

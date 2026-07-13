@@ -106,6 +106,7 @@ The sandbox uses OS-level primitives to enforce restrictions that apply to the e
 
 - **macOS**: Uses `sandbox-exec` with dynamically generated [Seatbelt profiles](https://reverse.put.as/wp-content/uploads/2011/09/Apple-Sandbox-Guide-v1.0.pdf)
 - **Linux**: Uses [bubblewrap](https://github.com/containers/bubblewrap) for containerization with network namespace isolation
+- **Windows**: Runs the sandboxed process under a dedicated `srt-sandbox` local user account, with a [Windows Filtering Platform](https://learn.microsoft.com/en-us/windows/win32/fwp/windows-filtering-platform-start-page) egress fence keyed on that account's SID and per-session explicit ACEs on the working tree
 
 ![0d1c612947c798aef48e6ab4beb7e8544da9d41a-4096x2305](https://github.com/user-attachments/assets/76c838a9-19ef-4d0b-90bb-cbe1917b3551)
 
@@ -123,6 +124,8 @@ Both filesystem and network isolation are required for effective sandboxing. Wit
 - **Linux**: Requests are routed via the filesystem over a Unix domain socket. The network namespace of the sandboxed process is removed entirely, so all network traffic must go through the proxies running on the host (listening on Unix sockets that are bind-mounted into the sandbox)
 
 - **macOS**: The Seatbelt profile allows communication only to a specific localhost port. The proxies listen on this port, creating a controlled channel for all network access
+
+- **Windows**: A machine-wide WFP filter set blocks all outbound connections originating from the `srt-sandbox` account except loopback to the proxy port range. The proxies listen inside that range, creating a controlled channel for all network access
 
 Both HTTP/HTTPS (via HTTP proxy) and other TCP traffic (via SOCKS5 proxy) are mediated by these proxies, which enforce your domain allowlists and denylists.
 
@@ -150,7 +153,8 @@ src/
     ├── http-proxy.ts         # HTTP/HTTPS proxy for network filtering
     ├── socks-proxy.ts        # SOCKS5 proxy for network filtering
     ├── linux-sandbox-utils.ts # Linux bubblewrap sandboxing
-    └── macos-sandbox-utils.ts # macOS sandbox-exec sandboxing
+    ├── macos-sandbox-utils.ts # macOS sandbox-exec sandboxing
+    └── windows-sandbox-utils.ts # Windows srt-win sandboxing
 ```
 
 ## Usage
@@ -292,6 +296,7 @@ Uses an **allow-only pattern** - all network access is denied by default.
 - `network.tlsTerminate.excludeDomains` - Domain patterns (same syntax as `allowedDomains`) that are **not** terminated. Matching CONNECTs are tunnelled opaquely instead: they are still subject to the domain allowlist, but the client inside the sandbox completes its own TLS handshake with the real upstream, and `filterRequest` / credential injection do not apply to their HTTPS traffic. Use this for the two cases TLS termination fundamentally breaks:
   - **mTLS upstreams** - only the in-sandbox client holds the client certificate, so the proxy cannot re-originate the connection on its behalf.
   - **Certificate-pinning clients** - clients that verify the upstream's identity themselves (custom CAs, SAN pinning) and reject the MITM certificate.
+- `network.tlsTerminate.extraCaCertPaths` - Paths to PEM CA certificate files appended to that trust bundle, after the MITM CA and the host's regular roots. Excluded (non-terminated) hosts are verified by the client inside the sandbox, and the trust env vars SRT sets (`SSL_CERT_FILE`, `GIT_SSL_CAINFO`, ...) _replace_ each tool's own trust configuration, so a site-local root (e.g. an internal mTLS CA) must be in the bundle or those hosts can never be verified. Only the `CERTIFICATE` blocks of each file are copied into the bundle (anything else, e.g. a private key in a combined PEM, is never exposed to the sandbox); files that are missing, unreadable, or contain no PEM `CERTIFICATE` block are skipped, so it is safe to list paths that exist on only some hosts.
 
 ```json
 {
@@ -299,7 +304,8 @@ Uses an **allow-only pattern** - all network access is denied by default.
     "allowedDomains": ["*.example.com", "internal-mtls.example.net"],
     "deniedDomains": [],
     "tlsTerminate": {
-      "excludeDomains": ["internal-mtls.example.net"]
+      "excludeDomains": ["internal-mtls.example.net"],
+      "extraCaCertPaths": ["/etc/internal-mtls-roots.pem"]
     }
   }
 }
@@ -440,7 +446,7 @@ Watchman accesses files outside the sandbox boundaries, which will trigger permi
 
 - **macOS**: Uses `sandbox-exec` with custom profiles (no additional dependencies)
 - **Linux**: Uses `bubblewrap` (bwrap) for containerization
-- **Windows**: Alpha — see [Windows (alpha)](#windows-alpha) below for the threat model and known limitations
+- **Windows**: Alpha — uses a bundled `srt-win.exe` helper (no additional dependencies). See [Windows (alpha)](#windows-alpha) below for setup, security model, and known limitations
 
 ### Platform-Specific Dependencies
 
@@ -483,28 +489,82 @@ The package includes pre-generated seccomp BPF filters for x86-64 and arm archit
   - Install via Homebrew: `brew install ripgrep`
   - Or download from: https://github.com/BurntSushi/ripgrep/releases
 
+**Windows requires:**
+
+- No additional dependencies. The `srt-win.exe` helper (x64 and arm64) is bundled with the npm package. A one-time elevated `windows-install` step is required — see below.
+
 ## Windows (alpha)
 
-Windows support is **alpha and the design is in flux**. The current implementation provides network egress filtering (via the Windows Filtering Platform) and file read/write denial (via ACL stamping), but it is **not a security boundary against a deliberately adversarial sandboxed process** — see [Threat model](#threat-model) below. The mechanism will be substantially revised (the sandboxed process will run under a separate sandbox user account) in a future version.
+Windows support is **alpha**. The sandboxed process runs under a dedicated `srt-sandbox` local user account, isolated from the calling user by native Windows security primitives — a Windows Filtering Platform (WFP) egress fence keyed on the sandbox account's SID, and per-session explicit ACEs that grant or deny that SID access to configured filesystem paths.
 
 ### Setup
 
-Run `npx @anthropic-ai/sandbox-runtime windows-install` once per machine (requires admin; creates the `sandbox-runtime-net` local group and installs the WFP egress filters). **Log out and log back in** for group membership to take effect on your token. After that, `SandboxManager.initialize()` and the `srt` CLI work as on other platforms.
+Run once per machine (self-elevates; one UAC prompt):
 
-### Threat model
+```powershell
+npx @anthropic-ai/sandbox-runtime windows-install
+```
 
-**Important:** the Windows sandbox runs the child as the **same user** as the host, with a restricted token (the discriminator group is flipped to deny-only). This protects against **accidental** access by well-behaved tools, and against **deliberate in-token** access by the sandboxed process itself — code running under the restricted token cannot open denied files or make direct outbound connections.
+This provisions the `srt-sandbox` local user account (with a random password stored DPAPI-encrypted under `%LOCALAPPDATA%\sandbox-runtime\state.db`), the `sandbox-runtime-users` local group, and installs a machine-wide WFP filter set keyed on the `srt-sandbox` SID. It is **idempotent** — re-running it rotates the sandbox account's password and reconciles the filter set.
 
-It does **not** protect against a sandboxed process that deliberately escapes via system-service brokering. Task Scheduler, `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` (re-parenting onto an unrestricted process such as `explorer.exe`), BITS, and certain COM out-of-process servers will spawn a process under the user's full, unrestricted interactive token. That process can then read or write any "denied" file and make unrestricted network connections. There is no same-user fix for this class of escape; the structural answer is running the sandboxed process under a **separate sandbox user account**, which is the planned next revision.
+**No logout is required.** The WFP filters key on the dedicated sandbox account's SID, so your own network, services, and every other principal on the machine are unaffected.
 
-Until that revision lands, treat the Windows sandbox as **best-effort defense against accidental access and well-behaved tooling**, not as containment for an adversarial process.
+After install, `SandboxManager.initialize()` and the `srt` CLI work as on other platforms. `initialize()` verifies the sandbox account and WFP fence are live, and fails with an actionable error if not.
+
+Programmatic install/uninstall are exported as `installWindowsSandbox()` / `uninstallWindowsSandbox()`.
+
+### Security model
+
+The sandboxed command runs **as the `srt-sandbox` account**, not as the calling user. The bundled `srt-win.exe` helper does a two-hop launch: the broker calls `CreateProcessWithLogonW` to start a runner as `srt-sandbox`, and the runner spawns the target under a restricted token inside a job object. The child inherits the sandbox account's isolated profile (`%USERPROFILE%`, `%TEMP%`, `HKCU`) and a fresh environment overlaid with only the broker's `PATH` and the generated proxy variables.
+
+Running under a distinct user SID structurally closes the surrogate-spawn class of escape (Task Scheduler, `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` onto a broker-owned process, BITS, out-of-process COM with `RunAs="Interactive User"`): any process the child manages to spawn out-of-band still carries the `srt-sandbox` SID, so it remains subject to the WFP egress fence and has no rights on the calling user's files.
+
+**Network isolation** is a two-filter WFP set at `FWPM_LAYER_ALE_AUTH_CONNECT_V4/V6`: a PERMIT for loopback destinations inside the configured proxy port range (default `60080–60089`), and a BLOCK for any connect whose token carries the `srt-sandbox` SID. The sandboxed process reaches the internet only via the JS HTTP/SOCKS5 proxies listening in that range; a process that strips its proxy environment and connects directly is blocked at the kernel.
+
+**Filesystem isolation** is enforced by NTFS discretionary ACLs. The `srt-sandbox` account has no inherent rights on the calling user's files, so at `initialize()` the sandbox writes **additive, inheriting explicit ACEs for the `srt-sandbox` SID only** — it never rewrites or replaces a path's existing security descriptor:
+
+- `filesystem.allowWrite` → an inheriting `MODIFY` ALLOW ACE (`READ|WRITE|EXECUTE|DELETE`, with `FILE_DELETE_CHILD` withheld). The sandboxed process can create, modify, and delete files inside the working tree; withholding `FILE_DELETE_CHILD` from the grant is defense-in-depth for the deny stamps below, not a guard on the tree root.
+- `filesystem.allowRead` → an inheriting `READ|EXECUTE` ALLOW ACE
+- `filesystem.denyRead` / `filesystem.denyWrite` → an inheriting DENY ACE on the target, plus an inheriting `FILE_DELETE_CHILD` DENY on its parent — together with the withheld `FILE_DELETE_CHILD` on the working-tree grant, this stops the sandboxed process from renaming or deleting a denied path via its parent directory
+
+`reset()` removes every ACE this session added (refcounted across concurrent hosts via `state.db`; a crash-recovery pass on the next `initialize()` cleans up after an unclean exit). Directory targets are supported (the ACEs inherit to the whole subtree). Glob patterns are expanded to concrete paths at `initialize()` time — a matching path that appears later is not covered.
+
+### TLS termination on Windows
+
+`network.tlsTerminate` requires the MITM CA to be present in the **sandbox user's** `CurrentUser\Root` certificate store (schannel — the TLS backend used by `System32\curl.exe`, PowerShell `Invoke-WebRequest`, .NET, and default-backend `git` — trusts only the OS store, not environment variables). This is an install-time step, separate from `windows-install`:
+
+```typescript
+import { windowsTrustCa } from '@anthropic-ai/sandbox-runtime'
+windowsTrustCa('/path/to/mitm-ca.crt') // or: srt-win user trust-ca <path>
+```
+
+`initialize()` compares the session CA's thumbprint against the installed one and fails with an actionable message on mismatch, so a stale install-time CA cannot silently break TLS inside the sandbox.
+
+OpenSSL-backed clients (msys2 `curl`, `git -c http.sslBackend=openssl`, Node, Python, cargo) are covered by the env-var trust layer: the same trust bundle used on macOS/Linux is passed into the sandbox via `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `CARGO_HTTP_CAINFO`, etc., and the bundle path is added to the session's `allowRead` grant so the sandbox account can open it.
+
+### Windows-specific configuration
+
+The cross-platform `filesystem` and `network` blocks apply as described above. Windows-only settings live under `windows`:
+
+- `windows.proxyPortRange` — `[low, high]` inclusive port range the JS proxies bind inside. **Must match** the range passed to `windows-install --proxy-port-range` (default `[60080, 60089]`) — the WFP loopback PERMIT only covers that range.
+- `windows.sublayerGuid` — WFP sublayer GUID under which the filters were installed. Omit to use the compile-time default; set only when enterprise tooling installed the filters under a custom sublayer.
+- `windows.srtWin.path` — path to the `srt-win` binary. Omit to resolve the packaged `vendor/srt-win/<arch>/srt-win.exe`. Set when embedding `srt-win`'s CLI into a multicall binary; spawns then pass `--srt-win` as `argv[1]` so the embedder's dispatcher can route to `srt_win::run_from_args`.
 
 ### Known limitations
 
-- **Not a security boundary against a deliberate child** — see [Threat model](#threat-model) above.
-- `filesystem.allowWrite` (write allow-list) and `filesystem.allowRead` (re-allow within denyRead) are **not supported** on Windows — `initialize()` rejects a config that sets either. Only `denyRead` / `denyWrite` are applied.
-- `network.tlsTerminate` is not yet supported on Windows.
-- Directory targets in `filesystem.denyRead` / `filesystem.denyWrite` are not yet supported (individual files only).
+- **Certificate revocation under schannel.** CryptoAPI's CRL/OCSP fetch goes out via WinHTTP under the caller's token, ignoring the proxy environment, so it is blocked by the WFP egress fence. Tools that use schannel with revocation checking on by default fail with `CRYPT_E_REVOCATION_OFFLINE` (`0x80092013`) unless revocation is disabled per tool: `curl --ssl-no-revoke`, `git -c http.schannelCheckRevoke=false`, `CARGO_HTTP_CHECK_REVOKE=false`. `Invoke-WebRequest`, .NET `HttpClient`, and `gh` do not check revocation by default and are unaffected. A CRL distribution point served from the loopback proxy is planned to remove this workaround.
+- **Per-user tool installs are not reachable.** The sandboxed process runs as `srt-sandbox`, not as you, so tools installed under your profile (nvm/fnm-managed Node, per-user `winget`/Scoop packages, `pip install --user`, `%LOCALAPPDATA%\Programs\…`) resolve on the inherited `PATH` but cannot be opened by the sandbox account. Prefer machine-wide installs (`Program Files`, `choco`/`winget --scope machine`), or add the specific profile paths to `filesystem.allowRead`.
+- **Per-exec `filesystem.allowRead` / `filesystem.allowWrite` overrides are not supported.** Session-level `allowRead`/`allowWrite` (in the config passed to `initialize()`) work as described above; passing them per-command in `wrapWithSandbox`'s `customConfig` throws — grants are applied session-wide via `srt-win acl grant` at `initialize()`, and `srt-win exec` only exposes per-exec denies.
+- **`proxyAuthToken` is visible in the runner's command line.** The proxy environment (including `HTTP_PROXY=http://srt:<token>@127.0.0.1:…`) is passed to the two-hop runner as `--env` arguments on `srt-win exec`'s argv, so the token is readable by any local principal that can open the runner process for `PROCESS_QUERY_LIMITED_INFORMATION`. The token exists so the sandboxed process can authenticate to the loopback proxy, so it is not a secret from the sandbox itself; on a single-user development machine this is generally acceptable, but on a shared host treat the proxy allowlist as reachable by other same-session principals.
+- **DNS resolution via the system resolver is not fenced.** `getaddrinfo()` is serviced by the `Dnscache` service running as `NETWORK SERVICE`, so name resolution succeeds even though the subsequent `connect()` from the sandboxed process is blocked. Tools that do their own UDP/53 (`nslookup`, `dig`) are fenced. This mirrors the macOS behaviour.
+
+### Uninstall
+
+```powershell
+npx @anthropic-ai/sandbox-runtime windows-uninstall
+```
+
+Removes the WFP filter set, the `srt-sandbox` account and its profile, the `sandbox-runtime-users` group, and clears the credential/setup marker from `state.db` (one UAC prompt). `%LOCALAPPDATA%\sandbox-runtime\state.db` itself is left in place (it is ACL-stamped broker-only); delete the directory manually for a full sweep.
 
 ## Development
 
@@ -548,12 +608,15 @@ The sandbox runs HTTP and SOCKS5 proxy servers on the host machine that filter a
 
 - **macOS**: The Seatbelt profile allows communication only to specific localhost ports where the proxies listen. All other network access is blocked.
 
+- **Windows**: A WFP `ALE_AUTH_CONNECT` filter blocks every outbound connect from the `srt-sandbox` account except loopback to the configured proxy port range. The proxies bind inside that range. Environment variables (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, …) point tools at the proxies, but the WFP filter is the boundary — a process that ignores or unsets them is still fenced.
+
 ### Filesystem Isolation
 
 Filesystem restrictions are enforced at the OS level:
 
 - **macOS**: Uses `sandbox-exec` with dynamically generated Seatbelt profiles that specify allowed read/write paths
 - **Linux**: Uses `bubblewrap` with bind mounts, marking directories as read-only or read-write based on configuration
+- **Windows**: Writes additive `(OI)(CI)` explicit ACEs for the `srt-sandbox` SID onto the configured paths (ALLOW on `allowRead`/`allowWrite`, DENY on `denyRead`/`denyWrite`), then removes them at `reset()`
 
 **Default filesystem permissions:**
 

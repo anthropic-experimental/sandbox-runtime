@@ -4,17 +4,16 @@
 //! touches ACL/ACE/SD types; the ACL machinery lives in
 //! [`crate::acl`].
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::mem::size_of;
 use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, GetFinalPathNameByHandleW, FILE_ATTRIBUTE_DIRECTORY,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GETFINALPATHNAMEBYHANDLE_FLAGS, OPEN_EXISTING, VOLUME_NAME_DOS,
+    CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GETFINALPATHNAMEBYHANDLE_FLAGS,
+    GetFinalPathNameByHandleW, OPEN_EXISTING, VOLUME_NAME_DOS,
 };
 
-use crate::util::{pcwstr, wstr, OwnedHandle};
+use crate::util::{OwnedHandle, pcwstr, wstr};
 
 /// True iff `decoded` round-trips back to `original` via
 /// `encode_utf16` — i.e., `from_utf16_lossy(original)` was
@@ -66,9 +65,7 @@ impl std::error::Error for CanonError {}
 /// including a canonical path that is not UTF-8-representable
 /// (unpaired surrogates) — fail closed rather than round-trip a
 /// U+FFFD-substituted string into the wrong filesystem object.
-pub fn canonicalize_path(
-    path: &str,
-) -> Result<(String, bool), CanonError> {
+pub fn canonicalize_path(path: &str) -> Result<(String, bool), CanonError> {
     // Glob check on the INPUT, ignoring the `\\?\` extended-path
     // prefix (its `?` is not a wildcard). Without the strip,
     // canonicalize_path would reject its OWN output (which always
@@ -81,13 +78,11 @@ pub fn canonicalize_path(
         // Open without requesting any data access so we don't
         // need read permission on the target.
         // `BACKUP_SEMANTICS` lets directories open too.
-        let h = open_for_metadata(path).with_context(|| {
-            format!("open '{path}' for canonicalization")
-        })?;
+        let h = open_for_metadata(path)
+            .with_context(|| format!("open '{path}' for canonicalization"))?;
 
-        let buf = final_path_from_handle(h.raw()).with_context(|| {
-            format!("GetFinalPathNameByHandleW('{path}')")
-        })?;
+        let buf = final_path_from_handle(h.raw())
+            .with_context(|| format!("GetFinalPathNameByHandleW('{path}')"))?;
         let canonical = String::from_utf16_lossy(&buf);
         if !utf16_roundtrips(&buf, &canonical) {
             bail!(
@@ -101,8 +96,7 @@ pub fn canonicalize_path(
         // `FILE_FLAG_OPEN_REPARSE_POINT`, so a symlink-to-dir was
         // already followed and `h` is the directory itself.
         use windows::Win32::Storage::FileSystem::{
-            FileBasicInfo, GetFileInformationByHandleEx,
-            FILE_BASIC_INFO,
+            FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
         };
         let mut info = FILE_BASIC_INFO::default();
         unsafe {
@@ -113,13 +107,8 @@ pub fn canonicalize_path(
                 size_of::<FILE_BASIC_INFO>() as u32,
             )
         }
-        .with_context(|| {
-            format!(
-                "GetFileInformationByHandleEx(FileBasicInfo) '{path}'"
-            )
-        })?;
-        let is_dir =
-            info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
+        .with_context(|| format!("GetFileInformationByHandleEx(FileBasicInfo) '{path}'"))?;
+        let is_dir = info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
         Ok((canonical, is_dir))
     })()
     .map_err(CanonError::Other)
@@ -151,9 +140,7 @@ fn open_for_metadata(path: &str) -> Result<OwnedHandle> {
 /// `GetFinalPathNameByHandleW` two-call sizing pattern. Returns the
 /// raw UTF-16 buffer (no NUL); caller decodes and round-trip-checks.
 fn final_path_from_handle(h: HANDLE) -> Result<Vec<u16>> {
-    let flags = GETFINALPATHNAMEBYHANDLE_FLAGS(
-        FILE_NAME_NORMALIZED.0 | VOLUME_NAME_DOS.0,
-    );
+    let flags = GETFINALPATHNAMEBYHANDLE_FLAGS(FILE_NAME_NORMALIZED.0 | VOLUME_NAME_DOS.0);
     let need = unsafe { GetFinalPathNameByHandleW(h, &mut [], flags) };
     if need == 0 {
         bail!("sizing: {}", std::io::Error::last_os_error());
@@ -172,9 +159,10 @@ fn final_path_from_handle(h: HANDLE) -> Result<Vec<u16>> {
 }
 
 /// Immediate parent of a `\\?\…` canonical path, as a string.
-/// Returns `None` when there is no stampable parent (the path
-/// is a root, or its immediate parent is a root — stamping a
-/// volume root would propagate the allow-list across the drive).
+/// Returns `None` when there is no targetable parent (the path is
+/// a root, or its immediate parent is a root — touching the
+/// volume root's DACL is out of scope for the parent
+/// `DenyFdc` ACE).
 pub fn canonical_parent_of(canonical_path: &str) -> Option<String> {
     std::path::Path::new(canonical_path)
         .parent()
@@ -211,22 +199,17 @@ impl FileId {
         vs.copy_from_slice(&b[..8]);
         let mut id = [0u8; 16];
         id.copy_from_slice(&b[8..]);
-        Ok(Self { volume_serial: u64::from_le_bytes(vs), id128: id })
-    }
-    pub fn to_hex(&self) -> String {
-        let b = self.as_bytes();
-        let mut s = String::with_capacity(48);
-        for x in b {
-            s.push_str(&format!("{x:02x}"));
-        }
-        s
+        Ok(Self {
+            volume_serial: u64::from_le_bytes(vs),
+            id128: id,
+        })
     }
 }
 
 /// `FILE_ID_INFO` of an already-open handle.
 fn file_id_from_handle(h: HANDLE) -> Result<FileId> {
     use windows::Win32::Storage::FileSystem::{
-        FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
     };
     let mut info = FILE_ID_INFO::default();
     unsafe {
@@ -244,24 +227,29 @@ fn file_id_from_handle(h: HANDLE) -> Result<FileId> {
     })
 }
 
-/// `(file_id, NumberOfLinks)` from ONE metadata open (both are
-/// `GetFileInformationByHandleEx` queries on the same handle).
-/// `links > 1` means an alternate hardlink name exists, possibly
-/// under an unstamped parent directory — so the parent allow-list
-/// alone cannot fence delete/rename via that other name; callers
-/// route such files to the per-exec handle fence.
-pub fn capture_id_and_links(
-    canonical_path: &str,
-) -> Result<(FileId, u32)> {
+/// `FILE_ID_INFO` of `canonical_path`. Opens with no data access
+/// (identity query only), so a DENY-ACE on the file does not
+/// interfere — the broker is the real user, not the deny trustee.
+pub fn capture_file_id(canonical_path: &str) -> Result<FileId> {
+    let h = open_for_metadata(canonical_path)
+        .with_context(|| format!("open '{canonical_path}' for file_id"))?;
+    file_id_from_handle(h.raw()).with_context(|| format!("file_id '{canonical_path}'"))
+}
+
+/// `(file_id, NumberOfLinks, is_dir)` from ONE metadata open.
+/// `links > 1` on a non-directory means an alternate hardlink
+/// name exists; the additive-ACE refcount in `state_db` is
+/// PATH-keyed, so releasing one alias would strip the SHARED
+/// DACL while another alias's holder still expects it denied.
+/// Directory `NumberOfLinks` counts subdirs (NTFS has no dir
+/// hardlinks), so callers gate the check on `!is_dir`.
+pub fn capture_id_and_links(canonical_path: &str) -> Result<(FileId, u32, bool)> {
     use windows::Win32::Storage::FileSystem::{
-        FileStandardInfo, GetFileInformationByHandleEx,
-        FILE_STANDARD_INFO,
+        FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandleEx,
     };
-    let h = open_for_metadata(canonical_path).with_context(|| {
-        format!("open '{canonical_path}' for file_id+links")
-    })?;
-    let id = file_id_from_handle(h.raw())
-        .with_context(|| format!("file_id '{canonical_path}'"))?;
+    let h = open_for_metadata(canonical_path)
+        .with_context(|| format!("open '{canonical_path}' for file_id+links"))?;
+    let id = file_id_from_handle(h.raw()).with_context(|| format!("file_id '{canonical_path}'"))?;
     let mut std_info = FILE_STANDARD_INFO::default();
     unsafe {
         GetFileInformationByHandleEx(
@@ -277,18 +265,7 @@ pub fn capture_id_and_links(
              '{canonical_path}'"
         )
     })?;
-    Ok((id, std_info.NumberOfLinks))
-}
-
-/// `FILE_ID_INFO` of `canonical_path`. Opens with no data access
-/// (identity query only), so a broker-only DACL on the file does
-/// not interfere.
-pub fn capture_file_id(canonical_path: &str) -> Result<FileId> {
-    let h = open_for_metadata(canonical_path).with_context(|| {
-        format!("open '{canonical_path}' for file_id")
-    })?;
-    file_id_from_handle(h.raw())
-        .with_context(|| format!("file_id '{canonical_path}'"))
+    Ok((id, std_info.NumberOfLinks, std_info.Directory))
 }
 
 /// Best-effort: locate the CURRENT path of a file by its captured
@@ -301,8 +278,7 @@ pub fn capture_file_id(canonical_path: &str) -> Result<FileId> {
 /// would re-expose a relocated secret).
 pub fn locate_by_file_id(file_id: &FileId) -> Option<String> {
     use windows::Win32::Storage::FileSystem::{
-        OpenFileById, ExtendedFileIdType, FILE_ID_128,
-        FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0,
+        ExtendedFileIdType, FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, OpenFileById,
     };
     // Open the volume root the file lived on. We need a handle ON
     // the volume to anchor OpenFileById; the captured volume
@@ -360,10 +336,7 @@ mod tests {
     #[test]
     fn canonicalize_rejects_globs() {
         for p in ["C:\\foo\\*.txt", "C:\\foo\\bar?.txt"] {
-            assert!(
-                matches!(canonicalize_path(p), Err(CanonError::Glob)),
-                "{p}"
-            );
+            assert!(matches!(canonicalize_path(p), Err(CanonError::Glob)), "{p}");
         }
         assert!(matches!(
             canonicalize_path(r"C:\srt-win-no-such-path"),
@@ -376,8 +349,7 @@ mod tests {
         // The test binary's own path is a real file we definitely
         // can open.
         let exe = std::env::current_exe().unwrap();
-        let (canon, is_dir) =
-            canonicalize_path(&exe.display().to_string()).unwrap();
+        let (canon, is_dir) = canonicalize_path(&exe.display().to_string()).unwrap();
         assert!(canon.starts_with(r"\\?\"), "got {canon}");
         assert!(!is_dir);
         // Round-trip: canonicalizing the canonical path is a no-op.
@@ -386,20 +358,15 @@ mod tests {
     }
 
     /// The parent of a file directly under a drive root IS the
-    /// volume root. Stamping a volume root with the PROTECTED
-    /// inherit-to-children allow-list DACL would re-propagate
-    /// across every file on the drive — so `canonical_parent_of`
-    /// must return `None` for a top-level child, routing it to
-    /// the handle-fence fallback instead. Rust's `Path::parent()`
-    /// returns the root (not `None`) in this case, so the helper
-    /// has to recognize and reject it.
+    /// volume root. Touching the volume root's DACL (even with an
+    /// additive `DenyFdc` ACE) is out of scope — so
+    /// `canonical_parent_of` must return `None` for a top-level
+    /// child. Rust's `Path::parent()` returns the root (not
+    /// `None`) in this case, so the helper has to recognize and
+    /// reject it.
     #[test]
     fn parent_at_volume_root_is_not_stampable() {
-        for p in [
-            r"\\?\C:\foo.txt",
-            r"\\?\C:\ProgramData",
-            r"\\?\D:\x",
-        ] {
+        for p in [r"\\?\C:\foo.txt", r"\\?\C:\ProgramData", r"\\?\D:\x"] {
             assert_eq!(
                 canonical_parent_of(p),
                 None,

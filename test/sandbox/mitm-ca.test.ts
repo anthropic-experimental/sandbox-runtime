@@ -1,4 +1,5 @@
-import { describe, test, expect, afterAll } from 'bun:test'
+import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
+import { spawnSync } from 'node:child_process'
 import {
   existsSync,
   mkdtempSync,
@@ -8,8 +9,14 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, dirname } from 'node:path'
-import { createMitmCA, disposeMitmCA } from '../../src/sandbox/mitm-ca.js'
+import forge from 'node-forge'
+import {
+  createMitmCA,
+  disposeMitmCA,
+  signCertificateNative,
+} from '../../src/sandbox/mitm-ca.js'
 import { mintLeafCert } from '../../src/sandbox/mitm-leaf.js'
+import { whichSync } from '../../src/utils/which.js'
 
 // Committed test-only CA — see test/fixtures/tls-terminate/README.md.
 const FIXTURE_DIR = join(import.meta.dir, '..', 'fixtures', 'tls-terminate')
@@ -141,6 +148,43 @@ describe('mitm-ca: ephemeral generation', () => {
     expect(existsSync(certPath)).toBe(true) // fixture untouched
   })
 
+  test('signCertificateNative is byte-identical to node-forge cert.sign()', async () => {
+    // RSASSA-PKCS1-v1_5 is deterministic, so signing the same TBSCertificate
+    // with the same key via native crypto and via node-forge's pure-JS RSA
+    // must produce the same signature bytes — and therefore the same PEM.
+    // This is the equivalence guarantee that lets generateEphemeralCA(),
+    // generateEmptyCrl(), and mintLeafCert() use native crypto for the RSA
+    // private-key operation without changing what ends up on the wire.
+    const ca = createMitmCA({})
+    try {
+      const { pki, md } = forge
+      // Rebuild an unsigned copy of the ephemeral CA's own cert (same
+      // subject/issuer/serial/validity/extensions/public key), then sign that
+      // one copy with node-forge. `ca.cert` was signed via the native path.
+      const ref = pki.createCertificate()
+      ref.publicKey = ca.cert.publicKey
+      ref.serialNumber = ca.cert.serialNumber
+      ref.validity.notBefore = ca.cert.validity.notBefore
+      ref.validity.notAfter = ca.cert.validity.notAfter
+      ref.setSubject(ca.cert.subject.attributes)
+      ref.setIssuer(ca.cert.issuer.attributes)
+      ref.setExtensions(ca.cert.extensions)
+      ref.sign(ca.key, md.sha256.create())
+
+      expect(Buffer.from(ca.cert.signature, 'binary')).toEqual(
+        Buffer.from(ref.signature, 'binary'),
+      )
+      expect(ca.certPem).toBe(pki.certificateToPem(ref))
+      // Re-signing the reference cert via the native path is also identical.
+      signCertificateNative(ref, ca.keyPem)
+      expect(ca.certPem).toBe(pki.certificateToPem(ref))
+      // And node-forge's own verifier accepts the native-signed cert.
+      expect(ref.verify(ca.cert)).toBe(true)
+    } finally {
+      await disposeMitmCA(ca)
+    }
+  })
+
   test('throws when only one of caCertPath/caKeyPath is provided', () => {
     expect(() => createMitmCA({ caCertPath: certPath })).toThrow(
       /must be provided together/,
@@ -148,5 +192,171 @@ describe('mitm-ca: ephemeral generation', () => {
     expect(() => createMitmCA({ caKeyPath: keyPath })).toThrow(
       /must be provided together/,
     )
+  })
+})
+
+describe('mitm-ca: generateEmptyCrl', () => {
+  // The CRL is what the proxy serves at /srt.crl so Schannel's revocation
+  // check on MITM-minted leaves resolves to "not revoked" instead of
+  // hard-failing CRYPT_E_NO_REVOCATION_CHECK. One ephemeral CA for the
+  // whole describe — RSA-2048 keygen is the slow part.
+  let ca: ReturnType<typeof createMitmCA>
+  beforeAll(() => {
+    ca = createMitmCA({})
+  })
+  afterAll(async () => {
+    await disposeMitmCA(ca)
+  })
+
+  test('createMitmCA populates crlDer on both load paths', async () => {
+    const user = createMitmCA({ caCertPath: certPath, caKeyPath: keyPath })
+    try {
+      for (const c of [ca, user]) {
+        expect(c.crlDer).toBeInstanceOf(Buffer)
+        expect(c.crlDer.length).toBeGreaterThan(0)
+      }
+    } finally {
+      await disposeMitmCA(user)
+    }
+  })
+
+  test('parses as a v2 CRL: issuer==CA subject, no revoked certs, AKI matches CA SKI', () => {
+    // node-forge has no CRL parser either, so validate the DER structurally
+    // via asn1.fromDer. The `openssl crl` test below is the interop check.
+    const { asn1, pki, util } = forge
+    const crl = asn1.fromDer(ca.crlDer.toString('binary'))
+    // CertificateList ::= SEQUENCE { tbsCertList, signatureAlgorithm, signature }
+    const [tbs, , sig] = crl.value as forge.asn1.Asn1[]
+    expect(sig.type).toBe(asn1.Type.BITSTRING)
+    // TBSCertList ::= SEQUENCE { version, signature, issuer, thisUpdate,
+    //   nextUpdate, [revokedCertificates absent], crlExtensions }
+    const tbsFields = tbs.value as forge.asn1.Asn1[]
+    expect(tbsFields).toHaveLength(6) // absent revokedCertificates
+    // issuer Name matches the CA subject byte-for-byte.
+    const issuerDer = asn1.toDer(tbsFields[2]).getBytes()
+    const caSubjectDer = asn1
+      .toDer(pki.distinguishedNameToAsn1(ca.cert.subject))
+      .getBytes()
+    expect(issuerDer).toBe(caSubjectDer)
+    // crlExtensions carries AKI whose keyid = the CA's SKI (raw bytes,
+    // not the hex-string node-forge stores — same trap as mitm-leaf).
+    const caSki = ca.cert.generateSubjectKeyIdentifier().toHex()
+    const extsDer = util.bytesToHex(asn1.toDer(tbsFields[5]).getBytes())
+    expect(extsDer).toContain(caSki)
+  })
+
+  // Signature verification via openssl — the strongest correctness signal.
+  const opensslTest = whichSync('openssl') !== null ? test : test.skip
+  opensslTest(
+    'openssl crl parses it and verifies the signature against the CA',
+    () => {
+      // Pipe DER on stdin (no `-in` → stdin) — the CRL is served from
+      // memory, not disk.
+      const text = spawnSync(
+        'openssl',
+        ['crl', '-inform', 'DER', '-noout', '-text'],
+        { input: ca.crlDer, encoding: 'utf8' },
+      )
+      expect(text.status).toBe(0)
+      expect(text.stdout).toMatch(/Issuer:.*sandbox-runtime ephemeral CA/)
+      expect(text.stdout).toContain('No Revoked Certificates')
+      expect(text.stdout).toMatch(/CRL Number:\s*\n?\s*1/)
+      // -CAfile makes openssl verify the CRL signature against the CA.
+      // "verify OK" goes to stderr; a bad signature exits non-zero.
+      const verify = spawnSync(
+        'openssl',
+        ['crl', '-inform', 'DER', '-noout', '-CAfile', ca.certPath],
+        { input: ca.crlDer, encoding: 'utf8' },
+      )
+      expect(verify.status).toBe(0)
+      expect(verify.stderr).toMatch(/verify OK/)
+    },
+  )
+})
+
+describe('mitm-ca: extraCaCertPaths', () => {
+  // A site-local root (e.g. an internal mTLS CA) that excluded/passthrough
+  // hosts present. Reuse the committed fixture CA as a structurally real PEM.
+  const scratch = mkdtempSync(join(tmpdir(), 'srt-extra-ca-'))
+  const extraRootPath = join(scratch, 'extra-root.pem')
+  writeFileSync(extraRootPath, certPem)
+  const notACert = join(scratch, 'not-a-cert.pem')
+  writeFileSync(
+    notACert,
+    '-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n',
+  )
+  // Combined cert+key PEM — a common layout for "the CA file". Only the
+  // CERTIFICATE block may reach the (world-readable) trust bundle.
+  const combined = join(scratch, 'combined.pem')
+  writeFileSync(combined, certPem + keyPem)
+
+  afterAll(() => {
+    rmSync(scratch, { recursive: true, force: true })
+  })
+
+  test('appends the PEM to the trust bundle (ephemeral CA path)', async () => {
+    const ca = createMitmCA({ extraCaCertPaths: [extraRootPath] })
+    try {
+      const bundle = readFileSync(ca.trustBundlePath, 'utf8')
+      // MITM CA still first; the extra root rides along at the end.
+      expect(bundle.startsWith(ca.certPem.trim())).toBe(true)
+      expect(bundle).toContain(certPem.trim())
+    } finally {
+      await disposeMitmCA(ca)
+    }
+  })
+
+  test('appends the PEM on the user-supplied CA path too (loadCA)', async () => {
+    const ca = createMitmCA({
+      caCertPath: certPath,
+      caKeyPath: keyPath,
+      extraCaCertPaths: [extraRootPath],
+    })
+    try {
+      const bundle = readFileSync(ca.trustBundlePath, 'utf8')
+      // The fixture CA is both the MITM CA and the "extra" root here, so it
+      // must appear twice: once as the bundle head, once appended.
+      const occurrences = bundle.split(certPem.trim()).length - 1
+      expect(occurrences).toBe(2)
+    } finally {
+      await disposeMitmCA(ca)
+    }
+  })
+
+  test('skips missing paths without throwing', async () => {
+    const ca = createMitmCA({
+      extraCaCertPaths: [join(scratch, 'nope.pem'), extraRootPath],
+    })
+    try {
+      const bundle = readFileSync(ca.trustBundlePath, 'utf8')
+      // The missing path is skipped; later entries are still appended.
+      expect(bundle).toContain(certPem.trim())
+    } finally {
+      await disposeMitmCA(ca)
+    }
+  })
+
+  test('skips files with no PEM CERTIFICATE block', async () => {
+    const ca = createMitmCA({ extraCaCertPaths: [notACert] })
+    try {
+      expect(readFileSync(ca.trustBundlePath, 'utf8')).not.toContain(
+        'PRIVATE KEY',
+      )
+    } finally {
+      await disposeMitmCA(ca)
+    }
+  })
+
+  test('copies only the CERTIFICATE blocks of a combined cert+key file', async () => {
+    // The trust bundle is world-readable and handed to the sandboxed child:
+    // a private key sitting next to the cert must never reach it.
+    const ca = createMitmCA({ extraCaCertPaths: [combined] })
+    try {
+      const bundle = readFileSync(ca.trustBundlePath, 'utf8')
+      expect(bundle).toContain(certPem.trim())
+      expect(bundle).not.toContain('PRIVATE KEY')
+    } finally {
+      await disposeMitmCA(ca)
+    }
   })
 })
