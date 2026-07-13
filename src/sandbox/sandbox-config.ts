@@ -186,13 +186,56 @@ const extractPatternSchema = z.string().superRefine((val, ctx) => {
  * sentinels — the rest of the file is preserved byte-for-byte. This lets a
  * tool that parses the file (`.netrc`, JSON/YAML configs) still succeed
  * inside the sandbox while the credential values are protected. If the
- * regex matches nothing, a warning is emitted to stderr and the file is
- * left readable as-is (unprotected) — fix the regex or remove the entry.
- * A future option may make this behaviour configurable.
+ * pattern matches nothing, behaviour is governed by `onExtractNoMatch`
+ * (default `"warn"` — the file is left readable as-is and a stderr
+ * warning is emitted).
+ *
+ * `mode: "mask"` with `decode: "jwt"` extends structured masking into
+ * encoded values: where `extract` opens plain text to mask a span inside
+ * it, `decode` opens the encoding so masking can target fields inside the
+ * decoded payload (`maskClaims`):
+ *
+ * - **Default pattern**: when `extract` is absent, a built-in JWT regex is
+ *   used (every JWT starts `eyJ` — base64url of `{"`), so authors don't
+ *   hand-write it. An explicit `extract` wins; its group-1 captures are the
+ *   candidates.
+ * - **Decode-verification**: each candidate must actually BE a JWT (three
+ *   segments, JSON header/payload, `alg` in the header) before it is
+ *   masked; candidates failing verification are left untouched.
+ * - **Claim-level masking** (`maskClaims`): each named top-level payload
+ *   claim present with a string value is replaced by its own sentinel and
+ *   the token is rebuilt around the modified payload (original header,
+ *   filler signature). All other claims stay real, so a client that
+ *   decodes the token and reads a non-secret claim keeps working. The
+ *   proxy substitutes both the whole rebuilt token (sent as a bearer
+ *   credential) and each claim sentinel (extracted and sent alone).
+ * - **Whole-token fallback** (no `maskClaims`): the whole decoded value is
+ *   treated as the credential — for bearer-style usage where the token
+ *   itself is the secret — and replaced with a structurally valid fake JWT
+ *   (parseable header/payload, far-future `exp`), so client-side token
+ *   parsing inside the sandbox doesn't break. Its header declares
+ *   `alg: HS256` (not `alg: none`, which misconfigured validators accept)
+ *   with a garbage signature, so any validator the unswapped fake reaches
+ *   rejects it.
+ * - **No verified candidate**: if nothing matches, no candidate verifies,
+ *   or (with `maskClaims`) no named claim matches in any verified token,
+ *   behaviour is governed by `onExtractNoMatch` — same as a non-matching
+ *   `extract` (default `"warn"`: stderr warning, file left readable
+ *   as-is).
+ *
+ * `maskDuplicates: true` (only meaningful with `extract` or `decode`)
+ * additionally replaces every verbatim occurrence of each masked value
+ * *outside* the regex-matched spans — for a secret repeated where the
+ * regex does not reach (e.g. pasted into a comment). The scan is raw
+ * substring matching, so a short or common captured value may also hit
+ * unrelated content that happens to contain it; intended for long,
+ * high-entropy secrets. Composed with `decode`, only captures that passed
+ * verification are scanned — a duplicate is the same value and reuses the
+ * verified capture's fake without re-verification.
  *
  * On macOS, SBPL cannot redirect reads, so `mode: "mask"` (with or without
- * `extract`) currently degrades to `mode: "deny"` (the file is unreadable
- * inside the sandbox).
+ * `extract`/`decode`) currently degrades to `mode: "deny"` (the file is
+ * unreadable inside the sandbox).
  */
 export const CredentialFileConfigSchema = z.object({
   path: filesystemPathSchema.describe(
@@ -205,10 +248,100 @@ export const CredentialFileConfigSchema = z.object({
     .describe(
       'Optional regex for structured masking. Applied globally; capture ' +
         'group 1 of each match is masked, the rest of the file is preserved. ' +
-        'If the pattern matches nothing in the file, a warning is emitted ' +
-        'and the file is left readable as-is (unprotected) — fix the regex ' +
-        'or remove the entry. A future option may make this configurable. ' +
-        'Only meaningful when mode is "mask"; accepted but ignored for "deny".',
+        'If the pattern matches nothing, behaviour is governed by ' +
+        'onExtractNoMatch (default "warn"). Only meaningful when mode is ' +
+        '"mask"; accepted but ignored for "deny".',
+    ),
+  /**
+   * What to do when `extract` matches nothing in the file at runtime —
+   * or, with `decode`, when no candidate survives verification.
+   *
+   * - `"warn"` (default): emit a stderr warning and leave the file
+   *   readable as-is inside the sandbox (fail-open). A non-matching
+   *   pattern is treated as a config error to surface and fix, not a
+   *   reason to break a tool that needs the file when the credential is
+   *   legitimately absent.
+   * - `"deny"`: degrade the entry to `mode: "deny"` so the file is
+   *   unreadable inside the sandbox (fail-closed). The operator declared
+   *   this file as containing a credential; if the regex cannot find it,
+   *   block access rather than expose it.
+   * - `"error"`: throw at wrap time so nothing runs until the operator
+   *   fixes the config.
+   *
+   * Only meaningful when `mode` is `"mask"` and `extract` or `decode` is
+   * set; accepted but ignored otherwise.
+   */
+  onExtractNoMatch: z
+    .enum(['warn', 'deny', 'error'])
+    .optional()
+    .describe(
+      'What to do when extract matches nothing (or, with decode, no ' +
+        'candidate verifies): "warn" (default — stderr warning, file left ' +
+        'readable), "deny" (degrade to mode "deny" — file unreadable), or ' +
+        '"error" (throw at wrap time). Only meaningful with mode "mask" ' +
+        'and extract or decode set.',
+    ),
+  decode: z
+    .enum(['jwt'])
+    .optional()
+    .describe(
+      'Optional encoded-credential format. "jwt": decodes recognized JWTs ' +
+        'so masking can target fields inside them (see maskClaims). ' +
+        'Candidates are located with a built-in JWT regex (or the explicit ' +
+        'extract pattern, if set) and verified to actually be JWTs before ' +
+        'masking. Without maskClaims, the whole decoded value is treated ' +
+        'as the credential and replaced with a structurally valid fake ' +
+        'JWT, so client-side token parsing keeps working. If no candidate ' +
+        'verifies, behaviour is governed by onExtractNoMatch (default ' +
+        '"warn"). Only meaningful when mode is "mask"; accepted but ' +
+        'ignored for "deny".',
+    ),
+  /**
+   * Names of top-level payload claims to mask inside each decoded value —
+   * the claim-level counterpart of `extract`: where `extract` opens plain
+   * text to mask a span inside it, `decode` + `maskClaims` opens the
+   * encoding to mask a field inside the decoded payload.
+   *
+   * For each verified JWT candidate, every named claim present with a
+   * string value is replaced by its own sentinel and the token is rebuilt
+   * around the modified payload (original header, filler signature). All
+   * other claims are preserved verbatim, so a tool that decodes the token
+   * and reads a non-secret claim (issuer, audience, user id) keeps
+   * working while the secret claim is protected. A named claim that is
+   * absent or non-string in a given token is skipped. If no named claim
+   * matches in any verified token, behaviour is governed by
+   * `onExtractNoMatch` — same as no candidate verifying.
+   *
+   * Requires `decode` (there is no payload to look inside otherwise); an
+   * explicitly empty list is rejected — see the superRefine below.
+   */
+  maskClaims: z
+    .array(z.string().min(1))
+    .optional()
+    .describe(
+      'Names of top-level payload claims to mask inside each decoded ' +
+        'value, instead of replacing the whole token. Each named claim ' +
+        'present with a string value gets its own sentinel; all other ' +
+        'claims are preserved so claim-reading clients keep working. ' +
+        'Requires decode. If no named claim matches in any verified ' +
+        'token, behaviour is governed by onExtractNoMatch (default ' +
+        '"warn"). Only meaningful when mode is "mask"; accepted but ' +
+        'ignored for "deny".',
+    ),
+  maskDuplicates: z
+    .boolean()
+    .optional()
+    .describe(
+      'If true, verbatim occurrences of each captured credential value ' +
+        'outside the regex-matched spans are also replaced with the ' +
+        'corresponding sentinel — for a secret repeated where the regex ' +
+        'does not reach (e.g. in a comment). Matches raw substrings: short ' +
+        'or common credential values may corrupt unrelated content, so ' +
+        'this is intended for long, high-entropy secrets. With decode, ' +
+        'only values that passed verification are scanned; duplicates ' +
+        "reuse the verified value's fake without re-verification. " +
+        'Defaults to false. Only meaningful with mode "mask" and extract ' +
+        'or decode set; accepted but ignored otherwise.',
     ),
   injectHosts: z
     .array(domainPatternSchema)
@@ -223,12 +356,135 @@ export const CredentialFileConfigSchema = z.object({
 
 /**
  * Schema for a single credential environment variable entry.
+ *
+ * `mode: "mask"` replaces the variable's value inside the sandbox with a
+ * per-session sentinel; the proxy substitutes sentinel→real on egress to
+ * the credential's injectHosts. A masked var that is unset on the host is
+ * skipped — there is nothing to protect.
+ *
+ * `mode: "mask"` without `extract` is **whole-value** masking: the entire
+ * value is replaced inside the sandbox with one sentinel string, and the
+ * proxy substitutes that sentinel back to the real value on egress. This
+ * works for variables whose value *is* the credential (a bare token).
+ *
+ * `mode: "mask"` with `extract` is **structured** masking: the regex is
+ * applied globally to the real value, capture group 1 of each match is a
+ * credential value, and only those captured spans are replaced with
+ * sentinels — the rest of the value is preserved byte-for-byte. This lets
+ * a tool that parses the value (a `DATABASE_URL` connection string, a
+ * composite `KEY:SECRET` pair) still succeed inside the sandbox while the
+ * credential spans are protected. If the pattern matches nothing,
+ * behaviour is governed by `onExtractNoMatch` (default `"warn"` — the
+ * variable passes through unmasked and a stderr warning is emitted).
+ *
+ * `mode: "mask"` with `decode: "jwt"` handles a variable whose whole value
+ * is a JWT (CI OIDC tokens, Supabase keys, ...). `decode` opens the encoded
+ * value for masking: without claim-level configuration the entire token is
+ * replaced by a structurally valid fake JWT — parseable three-segment shape
+ * with JSON header/payload and far-future `exp`, so a tool that inspects
+ * the token before sending it (segment count, exp, claims) keeps working.
+ * The fake's header declares `alg: HS256` — never `alg: none`, which
+ * misconfigured validators accept — with a filler signature, so a verifier
+ * the unswapped fake ever reaches rejects it cryptographically. The proxy
+ * swaps the whole fake token for the real one on egress.
+ *
+ * `decode: "jwt"` with `maskClaims` masks at the claim level instead: each
+ * named top-level payload claim present with a string value is replaced by
+ * its own sentinel and the token is rebuilt around the modified payload
+ * (original header segment, filler signature). All other claims stay real,
+ * so a client that decodes the token and reads a non-secret claim keeps
+ * working. The proxy substitutes both the whole rebuilt token (sent as a
+ * bearer credential) and each claim sentinel (extracted and sent alone).
+ *
+ * If the variable is set but its value does not verify as a JWT — or, with
+ * `maskClaims`, no named claim is present as a string — nothing was masked:
+ * the entry currently fails open — the real value stays in the sandbox
+ * environment and a loud stderr warning names the variable.
  */
 export const CredentialEnvVarConfigSchema = z.object({
   name: envVarNameSchema.describe('Environment variable name'),
   mode: credentialModeSchema.describe(
     'Access mode for this environment variable',
   ),
+  extract: extractPatternSchema
+    .optional()
+    .describe(
+      'Optional regex for structured masking. Applied globally; capture ' +
+        'group 1 of each match is masked, the rest of the value is ' +
+        'preserved. If the pattern matches nothing, behaviour is governed ' +
+        'by onExtractNoMatch (default "warn"). Only meaningful when mode ' +
+        'is "mask"; accepted but ignored for "deny".',
+    ),
+  /**
+   * What to do when `extract` matches nothing in the value at runtime.
+   *
+   * - `"warn"` (default): emit a stderr warning and let the variable pass
+   *   through unmasked inside the sandbox (fail-open). A non-matching
+   *   pattern is treated as a config error to surface and fix, not a
+   *   reason to break a tool that needs the variable when the credential
+   *   is legitimately absent from it.
+   * - `"deny"`: unset the variable inside the sandbox (fail-closed) — the
+   *   env analog of degrading a file to `mode: "deny"`. The operator
+   *   declared this variable as containing a credential; if the regex
+   *   cannot find it, withhold the value rather than expose it.
+   * - `"error"`: throw at wrap time so nothing runs until the operator
+   *   fixes the regex.
+   *
+   * Only meaningful when `mode` is `"mask"` and `extract` is set;
+   * accepted but ignored otherwise.
+   */
+  onExtractNoMatch: z
+    .enum(['warn', 'deny', 'error'])
+    .optional()
+    .describe(
+      'What to do when extract matches nothing: "warn" (default — stderr ' +
+        'warning, variable passes through unmasked), "deny" (variable ' +
+        'unset inside the sandbox), or "error" (throw at wrap time). Only ' +
+        'meaningful with mode "mask" and extract set.',
+    ),
+  decode: z
+    .enum(['jwt'])
+    .optional()
+    .describe(
+      'Optional encoded-credential format. "jwt": the variable\'s whole ' +
+        'value is verified to actually be a JWT and replaced with a ' +
+        'structurally valid fake JWT so client-side token parsing keeps ' +
+        'working; the proxy swaps the whole fake token on egress. If the ' +
+        'value does not verify, the variable is left unmasked with a ' +
+        'stderr warning (fail-open). Only meaningful when mode is "mask"; ' +
+        'accepted but ignored for "deny".',
+    ),
+  /**
+   * Names of top-level payload claims to mask inside the decoded value —
+   * the env-var counterpart of the `maskClaims` on a file entry: `decode`
+   * opens the variable's encoded value so masking can target a field
+   * inside the decoded payload instead of replacing the whole token.
+   *
+   * Every named claim present with a string value is replaced by its own
+   * sentinel and the token is rebuilt around the modified payload
+   * (original header segment, filler signature). All other claims are
+   * preserved verbatim, so a tool that decodes the token and reads a
+   * non-secret claim (issuer, audience, user id) keeps working while the
+   * secret claim is protected. A named claim that is absent or non-string
+   * is skipped. If no named claim matches, nothing was masked and the
+   * entry fails open with a stderr warning — same path as a value that
+   * does not verify as a JWT.
+   *
+   * Requires `decode` (there is no payload to look inside otherwise); an
+   * explicitly empty list is rejected — see the superRefine below.
+   */
+  maskClaims: z
+    .array(z.string().min(1))
+    .optional()
+    .describe(
+      'Names of top-level payload claims to mask inside the decoded ' +
+        'value, instead of replacing the whole token. Each named claim ' +
+        'present with a string value gets its own sentinel; all other ' +
+        'claims are preserved so claim-reading clients keep working. ' +
+        'Requires decode. If no named claim matches, the variable is left ' +
+        'unmasked with a stderr warning (fail-open). Only meaningful when ' +
+        'mode is "mask"; accepted but ignored for "deny".',
+    ),
   injectHosts: z
     .array(domainPatternSchema)
     .optional()
@@ -407,6 +663,19 @@ export const NetworkConfigSchema = z.object({
             'the MITM CA. Hosts still need to be reachable via ' +
             'allowedDomains; this list only changes how they are tunnelled.',
         ),
+      extraCaCertPaths: z
+        .array(z.string().min(1))
+        .optional()
+        .describe(
+          'Paths to PEM CA certificate files appended to the trust bundle ' +
+            'the sandboxed child is pointed at, after the MITM CA and the ' +
+            "host's regular roots. Use for site-local roots (e.g. an " +
+            'internal mTLS CA) presented by excluded/passthrough hosts, so ' +
+            'the child can verify them itself. Only the CERTIFICATE blocks ' +
+            'of each file are copied; files that are missing, unreadable, ' +
+            'or contain no PEM CERTIFICATE block are skipped (with a debug ' +
+            'log), so paths that exist on only some hosts are safe to list.',
+        ),
     })
     .refine(o => !o.caCertPath === !o.caKeyPath, {
       message: 'caCertPath and caKeyPath must be provided together',
@@ -490,28 +759,55 @@ export const RipgrepConfigSchema = z.object({
 })
 
 /**
+ * Configuration for locating/invoking the `srt-win` helper (Windows
+ * only). An embedder that links `srt-win`'s CLI into its own
+ * multicall binary points `path` at that binary; spawns then pass
+ * `--srt-win` as `argv[1]` (see `SRT_WIN_DISPATCH_ARG1` in
+ * `windows-sandbox-utils.ts` / `srt_win::SRT_WIN_DISPATCH_ARG1`) so
+ * the embedder's dispatcher can route to `srt_win::run_from_args`.
+ * Windows cannot reliably preserve a spoofed `argv[0]` across
+ * `CreateProcessWithLogonW` / `ShellExecuteExW(runas)`, so dispatch
+ * keys on `argv[1]`, not on `argv[0]` like
+ * {@link SeccompConfigSchema} does on Linux.
+ */
+export const SrtWinConfigSchema = z.object({
+  path: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Path to the srt-win binary. When unset, getSrtWinPath() resolves ' +
+        'the packaged vendor/srt-win/<arch>/srt-win.exe. When set, the ' +
+        'binary is spawned with the `--srt-win` argv[1] sentinel so a ' +
+        "multicall dispatcher can route to srt-win's CLI.",
+    ),
+})
+
+/**
  * Windows-specific configuration schema. See
  * `windows-sandbox-utils.ts` for the install flow these settings
  * must agree with.
+ *
+ * Canonical: `sublayerGuid`; the `wfpSublayerGuid` alias is resolved
+ * at read sites (`sublayerGuid ?? wfpSublayerGuid`) rather than via
+ * `.transform()` so this stays a plain `ZodObject` for consumers that
+ * `.extend()`/`.shape` it.
  */
 export const WindowsConfigSchema = z.object({
-  groupName: z
+  sandboxUser: z
     .string()
     .min(1)
-    .default('sandbox-runtime-net')
-    .describe(
-      'Discriminator group name. Must match the group created at install ' +
-        'time. Ignored if groupSid is set.',
-    ),
-  groupSid: z
-    .string()
-    .regex(/^S-1-/, 'must be an S-1-… SID string')
+    .max(20, 'Windows local usernames are limited to 20 characters')
     .optional()
     .describe(
-      'Discriminator group SID. Overrides groupName lookup — use for ' +
-        'domain groups or where name resolution is unreliable.',
+      'Name for the dedicated sandbox user account that `srt-win install` ' +
+        'creates and the sandboxed child runs as. Default: `srt-sandbox`. ' +
+        'Install refuses if an account by this name already exists and ' +
+        'srt-win did not create it (it will not rotate the password of an ' +
+        'account it does not own). Must match what `srt-win install ' +
+        '--sandbox-user` was run with.',
     ),
-  wfpSublayerGuid: z
+  sublayerGuid: z
     .string()
     .uuid()
     .optional()
@@ -520,16 +816,11 @@ export const WindowsConfigSchema = z.object({
         'use the srt-win compile-time default. Set this when filters were ' +
         'installed by enterprise tooling under a custom sublayer.',
     ),
-  asSandboxUser: z
-    .boolean()
-    .default(false)
-    .describe(
-      'Run sandboxed commands as the dedicated `srt-sandbox` local user ' +
-        '(two-hop launch via CreateProcessWithLogonW) instead of the ' +
-        'same-user deny-only-group token. Requires `srt-win install` to ' +
-        'have provisioned the user. Opt-in while the separate-user path ' +
-        'stabilises; the same-user path is unchanged when false.',
-    ),
+  wfpSublayerGuid: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('Deprecated alias for sublayerGuid.'),
   proxyPortRange: z
     .tuple([z.number().int().min(1), z.number().int().max(65535)])
     .refine(([lo, hi]) => lo <= hi && hi - lo <= 64, {
@@ -537,11 +828,16 @@ export const WindowsConfigSchema = z.object({
     })
     .optional()
     .describe(
-      'Inclusive [low, high] port range the JS http/socks proxies bind ' +
-        'inside. MUST match the range passed to `srt-win wfp install ' +
+      'Inclusive [low, high] port range the JS mux proxy listeners bind ' +
+        'inside. MUST match the range passed to `srt-win install ' +
         '--proxy-port-range` (default 60080–60089) — the WFP loopback ' +
         'permit only covers ports in that range.',
     ),
+  srtWin: SrtWinConfigSchema.optional().describe(
+    'How to locate/invoke the srt-win helper binary. Omit to resolve the ' +
+      'packaged vendor binary; set when embedding srt-win into a multicall ' +
+      'binary.',
+  ),
 })
 
 /**
@@ -635,7 +931,7 @@ export const SandboxRuntimeConfigSchema = z
           'When set, this path is used directly instead of resolving "socat" via PATH.',
       ),
     windows: WindowsConfigSchema.optional().describe(
-      'Windows-specific settings (group, WFP sublayer, proxy port range).',
+      'Windows-specific settings (WFP sublayer, proxy port range).',
     ),
   })
   .superRefine((cfg, ctx) => {
@@ -738,9 +1034,59 @@ export const SandboxRuntimeConfigSchema = z
     }
     for (const [idx, v] of (creds.envVars ?? []).entries()) {
       checkMaskedEntry(v, ['credentials', 'envVars', idx])
+      // maskClaims names fields inside a decoded payload; without decode
+      // there is no payload to look inside — reject the contradiction
+      // loudly rather than silently masking nothing.
+      if (v.maskClaims !== undefined && v.decode === undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['credentials', 'envVars', idx, 'maskClaims'],
+          message:
+            `maskClaims requires decode — it names claims inside the ` +
+            `decoded payload. Set decode (e.g. "jwt"), or remove ` +
+            `maskClaims to mask the whole value.`,
+        })
+      }
+      // Same posture as an explicitly empty injectHosts: "decode but mask
+      // no claims" is self-contradictory and almost certainly a mistake.
+      if (v.maskClaims !== undefined && v.maskClaims.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['credentials', 'envVars', idx, 'maskClaims'],
+          message:
+            `maskClaims is explicitly empty — no claim would ever be ` +
+            `masked. Omit maskClaims to mask the whole token, or list ` +
+            `the claims to protect.`,
+        })
+      }
     }
     for (const [idx, f] of (creds.files ?? []).entries()) {
       checkMaskedEntry(f, ['credentials', 'files', idx])
+      // maskClaims names fields inside a decoded payload; without decode
+      // there is no payload to look inside — reject the contradiction
+      // loudly rather than silently masking nothing.
+      if (f.maskClaims !== undefined && f.decode === undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['credentials', 'files', idx, 'maskClaims'],
+          message:
+            `maskClaims requires decode — it names claims inside the ` +
+            `decoded payload. Set decode (e.g. "jwt"), or remove ` +
+            `maskClaims to mask the extracted value whole.`,
+        })
+      }
+      // Same posture as an explicitly empty injectHosts: "decode but mask
+      // no claims" is self-contradictory and almost certainly a mistake.
+      if (f.maskClaims !== undefined && f.maskClaims.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['credentials', 'files', idx, 'maskClaims'],
+          message:
+            `maskClaims is explicitly empty — no claim would ever be ` +
+            `masked. Omit maskClaims to mask the whole token, or list ` +
+            `the claims to protect.`,
+        })
+      }
       // Whole-file masking replaces one file's bytes with one sentinel;
       // a directory has no single content to mask. The hard check is at
       // runtime (stat after path normalization) — this catches the obvious
@@ -792,5 +1138,6 @@ export type IgnoreViolationsConfig = z.infer<
 >
 export type RipgrepConfig = z.infer<typeof RipgrepConfigSchema>
 export type SeccompConfig = z.infer<typeof SeccompConfigSchema>
+export type SrtWinConfig = z.infer<typeof SrtWinConfigSchema>
 export type WindowsConfig = z.infer<typeof WindowsConfigSchema>
 export type SandboxRuntimeConfig = z.infer<typeof SandboxRuntimeConfigSchema>

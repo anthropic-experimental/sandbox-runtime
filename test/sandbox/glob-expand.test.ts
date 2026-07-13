@@ -15,7 +15,7 @@ import {
 } from '../../src/sandbox/sandbox-utils.js'
 import {
   containsGlobCharsWin,
-  expandWindowsFsDenyPaths,
+  expandWindowsFsPaths,
   stripExtendedPathPrefix,
 } from '../../src/sandbox/windows-sandbox-utils.js'
 import { isLinux, isWindows } from '../helpers/platform.js'
@@ -243,14 +243,14 @@ describe('containsGlobCharsWin', () => {
   })
 })
 
-describe('expandWindowsFsDenyPaths literal branch', () => {
+describe('expandWindowsFsPaths literal branch', () => {
   it('drops non-existent paths without throwing (single statSync)', () => {
     // The literal branch uses one statSync({throwIfNoEntry:false})
     // rather than existsSync→statSync, so a TOCTOU ENOENT cannot
     // abort initialize().
     const missing = join(tmpdir(), 'srt-no-such-' + Date.now() + '.txt')
-    expect(() => expandWindowsFsDenyPaths([missing])).not.toThrow()
-    expect(expandWindowsFsDenyPaths([missing])).toEqual([])
+    expect(() => expandWindowsFsPaths([missing])).not.toThrow()
+    expect(expandWindowsFsPaths([missing])).toEqual([])
   })
 })
 

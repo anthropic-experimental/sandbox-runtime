@@ -13,6 +13,7 @@ import {
   normalizePathForSandbox,
   normalizeCaseForComparison,
   isSymlinkOutsideBoundary,
+  encodeSandboxedCommand,
   DANGEROUS_FILES,
   getDangerousDirectories,
 } from './sandbox-utils.js'
@@ -73,6 +74,11 @@ export interface LinuxSandboxParams {
   bwrapPath?: string
   /** Absolute path to the socat binary (default: resolve "socat" via PATH) */
   socatPath?: string
+  /** Filesystem unix socket bound by the Linux violation monitor. When set,
+   *  the socket is bind-mounted into the sandbox and apply-seccomp is told
+   *  (via SRT_OBSERVE_SOCK) to install a USER_NOTIF observation filter and
+   *  stream observed write-intent paths over that socket as newline JSON. */
+  observeSocketPath?: string
   /** Abort signal to cancel the ripgrep scan */
   abortSignal?: AbortSignal
 }
@@ -118,6 +124,79 @@ function findSymlinkInPath(
   }
 
   return null
+}
+
+/** Bounded depth for chasing dangling symlink chains (kernel ELOOP limit). */
+const MAX_SYMLINK_RESOLUTION_DEPTH = 40
+
+/**
+ * Canonicalize a deny path through symlinks before any mask or bind is
+ * computed (resolve-before-mask). Deny paths regularly contain symlinked
+ * ancestors — the common dotfiles setup symlinks .claude (or the parent of
+ * .mcp.json) to a real directory — and masking the raw symlink with
+ * `--ro-bind /dev/null <symlink>` makes bwrap abort at startup: "Is a
+ * directory" for relative link targets, ENOENT for absolute ones.
+ *
+ * Resolution: realpath when the full path exists; otherwise canonicalize the
+ * deepest existing ancestor and re-join the missing components. A dangling
+ * symlink along the way is chain-walked (bounded) so the deny lands where a
+ * write through the link would actually create the file. Returns null when
+ * the path cannot be canonicalized (e.g. a symlink cycle); callers should
+ * skip such paths rather than emit a mask bwrap will reject.
+ *
+ * Unlike normalizePathForSandbox, this intentionally applies no
+ * isSymlinkOutsideBoundary check: that check exists so allow paths can't
+ * silently widen write access through a symlink, but a deny path only ever
+ * removes access, and the mask must land on the inode that writes through
+ * the symlink actually reach.
+ */
+function resolveSymlinkedDenyPath(targetPath: string): string | null {
+  let current = targetPath
+  for (let i = 0; i < MAX_SYMLINK_RESOLUTION_DEPTH; i++) {
+    try {
+      return fs.realpathSync(current)
+    } catch {
+      // Some component is missing or dangling — canonicalize manually below.
+    }
+
+    // Find the deepest ancestor that fully resolves, collecting the missing
+    // suffix components (leaf first, so unshift keeps them in path order).
+    let ancestor = current
+    const remainder: string[] = []
+    let resolvedAncestor: string | null = null
+    while (resolvedAncestor === null) {
+      const parent = path.dirname(ancestor)
+      if (parent === ancestor) {
+        return null // reached the root without resolving anything
+      }
+      remainder.unshift(path.basename(ancestor))
+      ancestor = parent
+      try {
+        resolvedAncestor = fs.realpathSync(ancestor)
+      } catch {
+        // Keep walking up.
+      }
+    }
+
+    // The first missing component may be a dangling symlink (lstat succeeds,
+    // realpath fails). Follow it and loop to re-canonicalize; otherwise the
+    // remainder is genuinely non-existent and the re-joined path is final.
+    const firstMissing = path.join(resolvedAncestor, remainder[0])
+    let linkTarget: string | null = null
+    try {
+      linkTarget = fs.readlinkSync(firstMissing)
+    } catch {
+      // Not a symlink — nothing left to resolve.
+    }
+    if (linkTarget === null) {
+      return path.join(resolvedAncestor, ...remainder)
+    }
+    current = path.join(
+      path.resolve(path.dirname(firstMissing), linkTarget),
+      ...remainder.slice(1),
+    )
+  }
+  return null // symlink chain too long or cyclic
 }
 
 /**
@@ -828,6 +907,12 @@ async function generateFilesystemArgs(
   // denyWrite binds are buffered and emitted after denyRead processing so that
   // a denyRead tmpfs over an ancestor directory doesn't wipe them out.
   const denyWriteArgs: string[] = []
+  // dest → the pre-resolution deny path it came from. denyWrite dests are
+  // canonicalized through symlinks but the denyRead tmpfs dirs and the write
+  // binds they are later compared against are not, so a dest reached via a
+  // symlink no longer matches them by string prefix. Both spellings name the
+  // same inode once bwrap resolves them, so the comparisons below test both.
+  const denyWriteRawDests = new Map<string, string>()
 
   // Determine initial root mount based on write restrictions
   if (writeConfig) {
@@ -896,28 +981,77 @@ async function generateFilesystemArgs(
       )),
     ]
 
-    // Dedup post-normalization: entries like ['~/.foo', '/home/user/.foo']
-    // converge to the same path here. A duplicate --ro-bind /dev/null <dest>
-    // hits a char device on the second pass and bwrap's ensure_file() falls
-    // through to creat() on a read-only mount.
+    // Duplicate deny entries must be collapsed: a duplicate
+    // --ro-bind /dev/null <dest> hits a char device on the second pass and
+    // bwrap's ensure_file() falls through to creat() on a read-only mount.
     const seenDenyWrite = new Set<string>()
     for (const pathPattern of denyPaths) {
-      const normalizedPath = normalizePathForSandbox(pathPattern)
-      if (seenDenyWrite.has(normalizedPath)) continue
-      seenDenyWrite.add(normalizedPath)
+      const rawPath = normalizePathForSandbox(pathPattern)
 
       // Skip /dev/* paths since --dev /dev already handles them
+      if (rawPath.startsWith('/dev/')) {
+        continue
+      }
+
+      // Resolve-before-mask: normalizePathForSandbox keeps the raw symlink
+      // path whenever resolution crosses isSymlinkOutsideBoundary (the
+      // common dotfiles case), so canonicalize here. Every mask/bind below
+      // must be computed against the resolved path — bwrap dest-resolves
+      // symlinks, so a mask on the raw path either aborts startup (dir
+      // symlink) or lands on the target inode anyway (file symlink). Writes
+      // through the original symlinked path resolve to the same denied
+      // target inside the mount namespace.
+      const normalizedPath = resolveSymlinkedDenyPath(rawPath)
+      if (normalizedPath === null) {
+        // Unresolvable: a symlink cycle, or a chain past the ELOOP bound.
+        // Fail closed. Dropping the deny here would sandbox the command with
+        // the path unprotected, so instead mask the symlink component and let
+        // bwrap refuse to start. When no component is a symlink inside an
+        // allowed write path there is nothing to protect: the path is already
+        // read-only from the initial --ro-bind / /.
+        const unresolvableSymlink = findSymlinkInPath(
+          rawPath,
+          allowedWritePaths,
+        )
+        if (unresolvableSymlink && !seenDenyWrite.has(unresolvableSymlink)) {
+          seenDenyWrite.add(unresolvableSymlink)
+          denyWriteArgs.push('--ro-bind', '/dev/null', unresolvableSymlink)
+          denyWriteRawDests.set(unresolvableSymlink, rawPath)
+        }
+        logForDebugging(
+          `[Sandbox Linux] Deny path could not be resolved through symlinks, failing closed: ${rawPath}`,
+        )
+        continue
+      }
+      if (normalizedPath !== rawPath) {
+        logForDebugging(
+          `[Sandbox Linux] Resolved symlinked deny path: ${rawPath} -> ${normalizedPath}`,
+        )
+      }
+
+      // Re-check after resolution: a deny path can only now land in /dev (e.g.
+      // a symlink into it), where --dev /dev has already replaced the tree and
+      // a bind would either miss or fight the new devtmpfs.
       if (normalizedPath.startsWith('/dev/')) {
         continue
       }
 
-      // Check for symlinks in the path - if any parent component is a symlink,
-      // mount /dev/null there to prevent symlink replacement attacks.
-      // Attack scenario: .claude is a symlink to ./decoy/, attacker deletes
-      // symlink and creates real .claude/settings.json with malicious hooks.
+      // Dedup post-resolution: distinct spellings (tilde vs absolute, via
+      // symlink vs direct) converge to the same real path here.
+      if (seenDenyWrite.has(normalizedPath)) continue
+      seenDenyWrite.add(normalizedPath)
+
+      // Defense-in-depth: the resolved path should be symlink-free for its
+      // existing prefix, but the tree may change between resolution and this
+      // check. A hit still fails closed — bwrap refuses to start rather than
+      // sandboxing with an unprotected deny path.
       const symlinkInPath = findSymlinkInPath(normalizedPath, allowedWritePaths)
       if (symlinkInPath) {
-        denyWriteArgs.push('--ro-bind', '/dev/null', symlinkInPath)
+        if (!seenDenyWrite.has(symlinkInPath)) {
+          seenDenyWrite.add(symlinkInPath)
+          denyWriteArgs.push('--ro-bind', '/dev/null', symlinkInPath)
+          denyWriteRawDests.set(symlinkInPath, rawPath)
+        }
         logForDebugging(
           `[Sandbox Linux] Mounted /dev/null at symlink ${symlinkInPath} to prevent symlink replacement attack`,
         )
@@ -970,6 +1104,7 @@ async function generateFilesystemArgs(
               path.join(tmpdir(), 'claude-empty-'),
             )
             denyWriteArgs.push('--ro-bind', emptyDir, firstNonExistent)
+            denyWriteRawDests.set(firstNonExistent, rawPath)
             bwrapMountPoints.add(firstNonExistent)
             registerExitCleanupHandler()
             logForDebugging(
@@ -977,6 +1112,7 @@ async function generateFilesystemArgs(
             )
           } else {
             denyWriteArgs.push('--ro-bind', '/dev/null', firstNonExistent)
+            denyWriteRawDests.set(firstNonExistent, rawPath)
             bwrapMountPoints.add(firstNonExistent)
             registerExitCleanupHandler()
             logForDebugging(
@@ -1001,6 +1137,7 @@ async function generateFilesystemArgs(
 
       if (isWithinAllowedPath) {
         denyWriteArgs.push('--ro-bind', normalizedPath, normalizedPath)
+        denyWriteRawDests.set(normalizedPath, rawPath)
       } else {
         logForDebugging(
           `[Sandbox Linux] Skipping deny path not within allowed paths: ${normalizedPath}`,
@@ -1129,11 +1266,12 @@ async function generateFilesystemArgs(
   //   if an allowed write path at-or-under that tmpfs covers the dest, the
   //   denyRead loop re-bound it (the .git/hooks case) and the write-deny bind
   //   is still required on top.
-  const emittedDenyWriteDests: string[] = []
-  for (let i = 0; i < denyWriteArgs.length; i += 3) {
-    const dest = denyWriteArgs[i + 2]!
-    if (maskedFiles.has(dest)) continue
-    const hiddenByTmpfs = tmpfsDirs.some(tmpfsDir => {
+  // tmpfsDirs and allowedWritePaths hold unresolved paths while dest has been
+  // canonicalized, so each dest is tested under both spellings: they name the
+  // same inode after bwrap resolves the mount destinations, and a hit on
+  // either means the tmpfs really does cover this bind.
+  const isHiddenByTmpfs = (dest: string): boolean =>
+    tmpfsDirs.some(tmpfsDir => {
       const underTmpfs = dest === tmpfsDir || dest.startsWith(tmpfsDir + '/')
       if (!underTmpfs) return false
       const reExposedByWriteBind = allowedWritePaths.some(
@@ -1143,7 +1281,13 @@ async function generateFilesystemArgs(
       )
       return !reExposedByWriteBind
     })
-    if (hiddenByTmpfs) {
+
+  const emittedDenyWriteDests: string[] = []
+  for (let i = 0; i < denyWriteArgs.length; i += 3) {
+    const dest = denyWriteArgs[i + 2]!
+    const rawDest = denyWriteRawDests.get(dest) ?? dest
+    if (maskedFiles.has(dest)) continue
+    if (isHiddenByTmpfs(dest) || isHiddenByTmpfs(rawDest)) {
       logForDebugging(
         `[Sandbox Linux] Skipping denyWrite bind already hidden by denyRead tmpfs: ${dest}`,
       )
@@ -1151,6 +1295,10 @@ async function generateFilesystemArgs(
     }
     args.push(denyWriteArgs[i]!, denyWriteArgs[i + 1]!, dest)
     emittedDenyWriteDests.push(dest)
+    // The tmpfs / mask re-application passes below ask "does this bind sit
+    // above a read-denied path?". A bind at the resolved dest also re-exposes
+    // anything under the symlinked spelling, so record both.
+    if (rawDest !== dest) emittedDenyWriteDests.push(rawDest)
   }
 
   // The inverse stacking problem: a denyWrite ro-bind whose dest strictly
@@ -1272,6 +1420,7 @@ export async function wrapCommandWithSandboxLinux(
     seccompConfig,
     bwrapPath,
     socatPath,
+    observeSocketPath,
     abortSignal,
   } = params
 
@@ -1332,6 +1481,28 @@ export async function wrapCommandWithSandboxLinux(
       logForDebugging(
         '[Sandbox Linux] Skipping seccomp filter - allowAllUnixSockets is enabled',
       )
+    }
+
+    // ========== VIOLATION OBSERVATION (best-effort) ==========
+    // Only meaningful when apply-seccomp will run — it is the binary that
+    // installs the USER_NOTIF filter and ships the listener fd.
+    if (observeSocketPath && applySeccompPrefix) {
+      if (fs.existsSync(observeSocketPath)) {
+        bwrapArgs.push('--bind', observeSocketPath, observeSocketPath)
+        bwrapArgs.push('--setenv', 'SRT_OBSERVE_SOCK', observeSocketPath)
+        // Tag events with the encoded command so the violation store can
+        // associate them with this invocation (parity with macOS log tag).
+        bwrapArgs.push(
+          '--setenv',
+          'SRT_ENCODED_CMD',
+          encodeSandboxedCommand(command),
+        )
+      } else {
+        logForDebugging(
+          '[Sandbox Linux] observe socket missing — supervisor not running; ' +
+            'continuing without violation monitoring',
+        )
+      }
     }
 
     // ========== ENV RESTRICTIONS ==========

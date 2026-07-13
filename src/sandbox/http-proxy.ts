@@ -7,7 +7,7 @@ import { request as httpsRequest } from 'node:https'
 import { connect } from 'node:net'
 import { URL } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
-import type { MitmCA } from './mitm-ca.js'
+import { CRL_PATH, type MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
   type FilterRequestCallback,
@@ -288,6 +288,27 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
   // Handle regular HTTP requests
   server.on('request', async (req, res) => {
     try {
+      // Serve the empty CRL for Schannel's revocation check on MITM-minted
+      // leaves (see MitmCA.crlDer). CryptoAPI fetches the leaf's
+      // cRLDistributionPoints URL over plain HTTP with no
+      // Proxy-Authorization, so this must precede both the auth check and
+      // the `new URL(req.url)` parse below (which requires absolute-form).
+      // Match on pathname so both origin-form (`GET /srt.crl`, what
+      // CryptoAPI sends) and absolute-form (`GET http://…/srt.crl`, what a
+      // proxy-aware fetcher would send) resolve; the base is ignored for
+      // the absolute case.
+      if (
+        options.mitmCA &&
+        req.method === 'GET' &&
+        new URL(req.url ?? '', 'http://x').pathname === CRL_PATH
+      ) {
+        res.writeHead(200, {
+          'Content-Type': 'application/pkix-crl',
+          'Content-Length': options.mitmCA.crlDer.length,
+        })
+        res.end(options.mitmCA.crlDer)
+        return
+      }
       if (!checkAuth(req.headers['proxy-authorization'])) {
         res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="srt"' })
         res.end()

@@ -6,10 +6,10 @@ import { once } from 'node:events'
 import { fileURLToPath } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
 import {
-  containsGlobCharsWin,
-  expandGlobPattern,
   generateProxyEnvVars,
   normalizePathForSandbox,
+  containsGlobCharsWin,
+  expandGlobPattern,
 } from './sandbox-utils.js'
 // Re-export so existing tests (glob-expand.test.ts) and any
 // out-of-tree caller keep their import path.
@@ -18,72 +18,56 @@ export {
   stripExtendedPathPrefix,
 } from './sandbox-utils.js'
 import type { SandboxDependencyCheck } from './linux-sandbox-utils.js'
+import type { SrtWinConfig } from './sandbox-config.js'
 
 /**
  * Windows sandbox backend.
  *
  * Network isolation is enforced by `srt-win.exe` — a Rust helper that
- * manages a local discriminator group, a machine-wide WFP filter set
- * keyed on that group's SID, and an `exec` subcommand that spawns the
- * target under a restricted token (group flipped deny-only) inside a
- * hardened job. The sandboxed child reaches the host only via the JS
- * http/socks proxies, which `srt-win exec` points at via env vars.
+ * provisions a dedicated `srt-sandbox` local user account, installs a
+ * machine-wide WFP filter set keyed on that account's SID, and
+ * provides an `exec` subcommand that spawns the target via a two-hop
+ * launch (broker → `CreateProcessWithLogonW(runner)` → runner →
+ * restricted-token child) under `srt-sandbox`. The sandboxed child
+ * reaches the host only via the JS mux proxy, which the caller
+ * passes in via `--env`.
+ *
+ * The separate-user account structurally closes the surrogate-spawn
+ * class (schtasks, `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`, BITS,
+ * RunAs="Interactive User" COM): the child's token carries a
+ * different user SID, so it cannot reach real-user processes, tasks
+ * register under `srt-sandbox`, and the user-SID WFP filter fences
+ * `srt-sandbox` egress regardless of how the child was spawned.
  *
  * This module is a thin wrapper around the `srt-win` CLI; all status
- * comes from live enumeration (group via `LookupAccountNameW` +
- * token-membership check; WFP via providerData-tag enumeration under
- * the configured sublayer). There is no marker file.
+ * comes from live enumeration. There is no marker file.
  *
- * Filesystem deny (`denyRead`/`denyWrite`) is enforced via
- * `srt-win acl stamp` at session start: a broker-only DACL is
- * applied to each listed file plus a `Modify`-minus-`FILE_DELETE_CHILD`
- * allow-list on its immediate parent directory, with restore state
- * sealed by an inert hash-ACE marker so the on-disk SD is
- * self-authenticating. See {@link stampWindowsAcl}.
+ * Filesystem rules (`denyRead`/`denyWrite`/`allowRead`/`allowWrite`)
+ * are enforced via additive explicit ACEs for `<sb-SID>` — see
+ * {@link grantWindowsAcl} / {@link stampWindowsAcl}.
  */
 
 // ────────────────────────────────────────────────────────────────────
 // Types
 // ────────────────────────────────────────────────────────────────────
 
-export const DEFAULT_WINDOWS_GROUP_NAME = 'sandbox-runtime-net'
 export const DEFAULT_WINDOWS_PROXY_PORT_RANGE: readonly [number, number] = [
   60080, 60089,
 ]
 
-/** Identifies the discriminator group either by name or by SID. */
-export interface WindowsGroupRef {
-  /** Local or domain group name. Default: `sandbox-runtime-net`. */
-  groupName?: string
-  /**
-   * Group SID in `S-1-…` form. Takes precedence over `groupName` —
-   * use for domain groups or where name resolution is unreliable.
-   */
-  groupSid?: string
-}
-
-export type WindowsGroupStatus = 'absent' | 'created-not-on-token' | 'ready'
-
-export interface WindowsGroupStatusResult {
-  state: WindowsGroupStatus
-  sid?: string
-  warning?: string
-  error?: string
-}
-
+/**
+ * `cannot-read` is the graceful-degrade state when BFE enumeration
+ * is access-denied (it is admin-gated). The non-elevated readiness
+ * check is {@link verifyWindowsWfpEgress}, not this enum.
+ */
 export type WindowsWfpStatus = 'absent' | 'installed' | 'cannot-read'
 
 export interface WindowsWfpStatusResult {
   state: WindowsWfpStatus
+  /** Live filter count from BFE enum; `0` on `cannot-read`. */
   filters: number
-  /** `[low, high]` from the `permit-loopback` filter's tag, when present. */
+  /** `[low, high]` for the loopback PERMIT, when known. */
   portRange?: [number, number]
-  /**
-   * Number of user-SID-keyed filters present (subset of `filters`).
-   * Zero on installs that predate the sandbox-user provisioning
-   * step, or when only `wfp install` (group set) was run.
-   */
-  userFilters: number
   /** Sandbox-user SID read from the first user-keyed filter tag. */
   userSid?: string
   /**
@@ -107,10 +91,7 @@ export interface WindowsWfpVerifyResult {
 
 /**
  * State of the `srt-sandbox` local account that `srt-win install`
- * provisions. The sandboxed child eventually runs **as** this
- * account; for now it is reported alongside the group/WFP status
- * so callers can surface a "re-run install" diagnostic when the
- * account is missing.
+ * provisions. The sandboxed child runs **as** this account.
  */
 export interface WindowsSandboxUserStatus {
   /** The `srt-sandbox` local account exists. */
@@ -135,8 +116,9 @@ export interface WindowsSandboxUserStatus {
   /** Setup marker schema version, when the marker row exists. */
   markerVersion?: number
   /**
-   * The calling (real) user's SID — the trustee for `acl stamp`
-   * under the separate-user model. Always present.
+   * The calling (real) user's SID — the broker's identity, surfaced
+   * for diagnostics. The DENY-ACE trustee is `srt-sandbox`'s SID
+   * ({@link sid}), not this. Always present.
    */
   realUserSid: string
   /**
@@ -149,118 +131,160 @@ export interface WindowsSandboxUserStatus {
 }
 
 /**
- * Inner shell to run `command` under, inside the restricted-token
- * sandbox. The discriminant picks both the executable and the flag
- * shape (`/c` vs `-Command` vs `-c`); see
- * {@link wrapCommandWithSandboxWindows}.
- *
- * For `kind: 'bash'`, `path` is the absolute Git Bash executable
- * (no fixed install location). It MUST originate from trusted host
+ * Inner shell to run `command` under, inside the sandbox: the
+ * executable to spawn and the flag argv placed between it and the
+ * user's command string. `exe` MUST originate from trusted host
  * configuration (user settings / install detection), NEVER from
  * workspace or repository content — the inner shell runs INSIDE the
- * restricted-token sandbox so an unexpected path is not a
- * sandbox-escape vector, but it would still be an arbitrary-exec
- * footgun if sourced from untrusted input.
+ * sandbox so an unexpected path is not a sandbox-escape vector, but
+ * it would still be an arbitrary-exec footgun if sourced from
+ * untrusted input.
+ *
+ * Construct via {@link parseWindowsBinShell} — it is the SOLE
+ * normalizer and the only place validation lives.
  */
-export type WindowsBinShell =
-  | { kind: 'cmd' }
-  | { kind: 'powershell' }
-  | { kind: 'pwsh' }
-  | { kind: 'bash'; path: string }
+export type WindowsBinShell = {
+  /** Shell executable to spawn (absolute path when caller-supplied). */
+  exe: string
+  /** Argv placed between `exe` and the user's command string. */
+  args: readonly string[]
+}
+
+const PWSH_FLAGS = ['-NoProfile', '-Command'] as const
 
 /**
- * Adapter from the cross-platform `binShell?: string` surface
- * ({@link SandboxManager.wrapWithSandboxArgv}) to the Windows
- * discriminated union. Throws on any value outside the recognised
- * set — there is no silent fallback to cmd.exe.
+ * Sole normalizer from the cross-platform `binShell?: string |
+ * WindowsBinShell` surface ({@link SandboxManager.wrapWithSandboxArgv})
+ * to a spawnable `{exe, args}` pair. All validation lives here —
+ * {@link wrapCommandWithSandboxWindows} consumes the result verbatim.
+ *
+ * String form: bare token (`'cmd'|'pwsh'|'powershell'`) resolves to
+ * the default install; absolute path to `bash.exe`/`sh.exe`/
+ * `pwsh.exe`/`powershell.exe`/`cmd.exe` keeps the caller's path with
+ * the matching flag shape. Object form: `exe` must be absolute; `args`
+ * pass through unchanged. Throws on anything else — no silent
+ * fallback to cmd.exe.
  *
  * Uses `path.win32` explicitly so the function (and its unit test)
  * is platform-independent.
  */
-export function parseWindowsBinShell(raw?: string): WindowsBinShell {
-  if (raw === undefined) return { kind: 'cmd' }
-  // bash/sh: path semantics — match on basename, keep the caller's
-  // absolute path verbatim.
-  const base = path.win32.basename(raw).toLowerCase()
-  if (
-    base === 'bash' ||
-    base === 'bash.exe' ||
-    base === 'sh' ||
-    base === 'sh.exe'
-  ) {
-    if (!path.win32.isAbsolute(raw)) {
+export function parseWindowsBinShell(
+  raw?: string | WindowsBinShell,
+): WindowsBinShell {
+  const systemRoot = process.env.SystemRoot ?? 'C:\\Windows'
+  const cmdDefault: WindowsBinShell = {
+    exe: path.win32.join(systemRoot, 'System32', 'cmd.exe'),
+    args: ['/d', '/s', '/c'],
+  }
+  if (raw === undefined || raw === null) return cmdDefault
+  if (typeof raw === 'object') {
+    if (!path.win32.isAbsolute(raw.exe)) {
       throw new Error(
-        `binShell bash path must be absolute (got ${JSON.stringify(raw)}); ` +
-          `pass the resolved Git Bash install path`,
+        `binShell.exe must be an absolute path ` +
+          `(got ${JSON.stringify(raw.exe)})`,
       )
     }
-    return { kind: 'bash', path: raw }
+    if (!Array.isArray(raw.args)) {
+      throw new Error(
+        `binShell.args must be an array (got ${JSON.stringify(raw.args)})`,
+      )
+    }
+    return raw
   }
-  // cmd/powershell/pwsh: token semantics — match on the FULL string,
-  // not basename, so an absolute path to pwsh.exe (whose path we'd
-  // otherwise discard) falls through to the explicit throw rather
-  // than silently degrading to a PATH lookup.
-  switch (raw.toLowerCase()) {
+  const rawBase = path.win32.basename(raw)
+  const base = rawBase.toLowerCase()
+  const isAbs = path.win32.isAbsolute(raw)
+  // A relative path with a directory component (`bin\bash.exe`) is
+  // neither a token nor a resolved install — never silently degrade.
+  if (!isAbs && raw !== rawBase) {
+    throw new Error(
+      `binShell string must be a bare token or an absolute path ` +
+        `(got ${JSON.stringify(raw)})`,
+    )
+  }
+  switch (base) {
+    case 'bash':
+    case 'bash.exe':
+    case 'sh':
+    case 'sh.exe':
+      // Bare 'bash' is ambiguous (WSL vs Git Bash) — require the
+      // resolved install path.
+      if (!isAbs) {
+        throw new Error(
+          `binShell bash path must be absolute ` +
+            `(got ${JSON.stringify(raw)}); pass the resolved Git Bash ` +
+            `install path`,
+        )
+      }
+      return { exe: raw, args: ['-c'] }
     case 'pwsh':
     case 'pwsh.exe':
-      return { kind: 'pwsh' }
+      return { exe: isAbs ? raw : 'pwsh.exe', args: PWSH_FLAGS }
     case 'powershell':
     case 'powershell.exe':
-      return { kind: 'powershell' }
+      return {
+        exe: isAbs
+          ? raw
+          : path.win32.join(
+              systemRoot,
+              'System32',
+              'WindowsPowerShell',
+              'v1.0',
+              'powershell.exe',
+            ),
+        args: PWSH_FLAGS,
+      }
     case 'cmd':
     case 'cmd.exe':
-      return { kind: 'cmd' }
+      return isAbs ? { exe: raw, args: cmdDefault.args } : cmdDefault
     default:
       throw new Error(
         `unrecognised binShell ${JSON.stringify(raw)}: expected ` +
-          `'cmd' | 'powershell' | 'pwsh' or an absolute path to bash.exe/sh.exe`,
+          `'cmd' | 'powershell' | 'pwsh' or an absolute path to ` +
+          `bash.exe/sh.exe/pwsh.exe/powershell.exe`,
       )
   }
 }
 
 export interface WindowsSandboxParams {
   command: string
-  group: WindowsGroupRef
-  /** JS HTTP proxy port — fed to `generateProxyEnvVars` for the returned env. */
+  /**
+   * JS HTTP proxy port — fed to `generateProxyEnvVars` for the env
+   * overlay. With the in-process proxy this is the mux front-end
+   * port (same as `socksProxyPort`).
+   */
   httpProxyPort?: number
-  /** JS SOCKS proxy port — fed to `generateProxyEnvVars` for the returned env. */
+  /**
+   * JS SOCKS proxy port — fed to `generateProxyEnvVars` for the env
+   * overlay. With the in-process proxy this is the mux front-end
+   * port (same as `httpProxyPort`).
+   */
   socksProxyPort?: number
   /** Per-session proxy auth token; embedded in proxy env URLs. */
   proxyAuthToken?: string
   /**
-   * Credential env vars to drop from the inherited environment
-   * (`mode: 'deny'`). Applied BEFORE the proxy assignments so the
-   * sandbox's own proxy plumbing survives even if a caller lists
-   * one of those names here — same precedence as the macOS/Linux
-   * `env -u … VAR=… sandbox-exec` order.
-   */
-  unsetEnvVars?: readonly string[]
-  /**
-   * Credential env vars to overwrite with a sentinel
-   * (`mode: 'mask'`). Applied BEFORE the proxy assignments for the
-   * same precedence reason as {@link unsetEnvVars}.
+   * `mode: 'mask'` credential env vars — sentinel values the
+   * sandboxed child should see in place of the real credentials.
+   * Threaded through the `--env` overlay so the runner forwards
+   * them into the child's fresh profile env (the broker's own
+   * environment never reaches the child, so an `env -u`-style
+   * scrub is structurally moot — there is no `unsetEnvVars`).
+   * Applied BEFORE the proxy assignments so the sandbox's own
+   * proxy plumbing survives even if a caller masks one of those
+   * names — same precedence as macOS/Linux.
    */
   setEnvVars?: Readonly<Record<string, string>>
   /**
-   * PID of the long-lived host whose `srt-win acl stamp` holds
-   * this exec should run under. When set, `srt-win exec` opens a
-   * no-`FILE_SHARE_DELETE` handle on each of that holder's stamped
-   * directories and fenced files before spawning the child — the
-   * OS then refuses delete/rename of those, which the file's DACL
-   * alone cannot prevent. Omit for an exec with no file-deny
-   * session active.
-   */
-  holderPid?: number
-  /**
-   * Per-exec read-deny paths, stamped under the `srt-win exec`
-   * process's own PID and restored after the child exits. Same
+   * Per-exec read-deny paths, applied via an additive
+   * `(D;OICI;FA;;;<sb-SID>)` ACE under the `srt-win exec`
+   * process's own PID and released after the child exits. Same
    * disk-first chokepoint as the session-level
    * {@link stampWindowsAcl}; same fail-closed semantics (exec
    * fails if any path cannot be stamped).
    *
    * Normalized concrete paths — globs expanded by the caller via
-   * {@link expandWindowsFsDenyPaths}, the same as session-level.
-   * `srt-win exec`'s `canonicalize_deny_targets` hard-fails on a
+   * {@link expandWindowsFsPaths}, the same as session-level.
+   * `srt-win exec`'s `canonicalize_ace_targets` hard-fails on a
    * glob (it never expands), so a `*`/`?` reaching this field is
    * a caller bug.
    */
@@ -268,45 +292,66 @@ export interface WindowsSandboxParams {
   /** Per-exec write-deny paths — see {@link denyRead}. */
   denyWrite?: readonly string[]
   /**
-   * Run the child as the dedicated `srt-sandbox` user via the
-   * two-hop launch (broker → `CreateProcessWithLogonW(runner)` →
-   * runner → restricted-token child). Requires `srt-win install` to
-   * have provisioned the sandbox user. Opt-in — when `false` or
-   * omitted the same-user deny-only-group path is used. The
-   * separate-user path structurally closes the surrogate-spawn
-   * class (schtasks, `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`, BITS,
-   * RunAs="Interactive User" COM): the child's token carries a
-   * different user SID, so it cannot reach real-user processes,
-   * tasks register under `srt-sandbox`, and the user-SID WFP filter
-   * fences `srt-sandbox` egress regardless of how the child was
-   * spawned.
-   */
-  asSandboxUser?: boolean
-  /**
-   * PEM-encoded CA certificate file. Same parameter macOS/Linux
-   * thread to {@link generateProxyEnvVars} for the env-var trust
-   * layer (`NODE_EXTRA_CA_CERTS` etc.). NOT passed to `srt-win
-   * exec` — schannel-level trust under the sandbox user is set
-   * separately via `srt-win user trust-ca` /
-   * {@link windowsTrustCa}; per-exec only sets the env-var layer.
+   * Working directory the child starts in. Fed to
+   * {@link buildGitConfigEnv} as a `safe.directory` entry so git
+   * inside the sandbox accepts the real-user-owned working tree.
+   * Default: `process.cwd()`.
    *
-   * **Under {@link asSandboxUser}**, this is currently NOT
-   * forwarded to the child: the bundle file lives in the broker's
-   * `%TEMP%`, which the `srt-sandbox` user cannot read, so OpenSSL
-   * clients (msys2 curl, openssl-backed git, node, python) would
-   * fail with `ACCESS_DENIED` on the bundle. The schannel-level
-   * trust set via {@link windowsTrustCa} is the only CA-trust path
-   * for the two-hop launch until working-tree/profile grants land.
+   * `srt-win exec` has no `--cwd` flag — the child's working
+   * directory is whatever the caller passes as the spawn `{cwd:}`
+   * option (broker `current_dir()` → runner `lpCurrentDirectory` →
+   * child inherits). This field must match that spawn option so
+   * `safe.directory` covers where git actually runs.
+   */
+  cwd?: string
+  /**
+   * Session-level write-granted paths (the resolved
+   * `filesystem.allowWrite` set). Each becomes a `safe.directory`
+   * entry — see {@link buildGitConfigEnv}.
+   */
+  allowWrite?: readonly string[]
+  /**
+   * Path to the TLS-termination trust bundle (the MITM CA + system
+   * roots) — fed to {@link generateProxyEnvVars} so the child's
+   * `NODE_EXTRA_CA_CERTS` / `CURL_CA_BUNDLE` / `SSL_CERT_FILE` /
+   * etc. point at it. Backslashes are normalised to forward slashes
+   * before emission so the value survives msys2 env conversion AND
+   * is accepted by native tools.
+   *
+   * The env-var layer covers OpenSSL-backed clients (msys2 curl,
+   * openssl-backed git, node, python, cargo). Schannel/.NET clients
+   * that read the Windows certificate store exclusively (System32
+   * `curl.exe`, `Invoke-WebRequest`, Go-built tools) trust via the
+   * separate `srt-win user trust-ca` / {@link windowsTrustCa}
+   * install-time write into the sandbox user's `CurrentUser\Root`.
+   *
+   * The caller is responsible for the sandbox user having read
+   * access to this path — `sandbox-manager.ts`'s `initialize()`
+   * pushes it into the session's `acl grant` read-set alongside the
+   * working-tree grants.
    */
   caCertPath?: string
   /**
-   * Inner shell. Defaults to `{ kind: 'cmd' }`. The child's post-`/c`
-   * (or `-Command` / `-c`) content is **passthrough** — `&` chains,
-   * `"…"`/`'…'` quotes exactly as written. The security boundary is at
-   * the OUTER spawn (this argv is spawned with `shell:false`); the
-   * inner shell runs INSIDE the sandbox so its metachars are the
-   * user's tool. See {@link parseWindowsBinShell} for the
-   * cross-platform string adapter.
+   * Suppress srt-win's informational stderr (progress lines,
+   * per-exec-deny summary, seclogon-job note). Actual errors still
+   * print. Default `true` — the host surfaces sandbox diagnostics
+   * via its own debug log, not the child's stderr stream.
+   */
+  quiet?: boolean
+  /**
+   * Resolved `srt-win` spawn descriptor — from
+   * {@link resolveSrtWin}. Omit to resolve the packaged vendor
+   * binary at call time.
+   */
+  srtWin?: SrtWinSpawn
+  /**
+   * Inner shell. Defaults to `parseWindowsBinShell(undefined)`
+   * (System32 cmd.exe). The child's post-`args` content is
+   * **passthrough** — `&` chains, `"…"`/`'…'` quotes exactly as
+   * written. The security boundary is at the OUTER spawn (this argv
+   * is spawned with `shell:false`); the inner shell runs INSIDE the
+   * sandbox so its metachars are the user's tool. Construct via
+   * {@link parseWindowsBinShell}.
    */
   binShell?: WindowsBinShell
 }
@@ -324,18 +369,20 @@ function repoRoot(): string {
 const nodeArchToDir: Record<string, string> = { x64: 'x64', arm64: 'arm64' }
 
 /**
- * Locate `srt-win.exe`. Resolution order:
- *   1. `SRT_WIN_PATH` env var (CI sets this to the freshly-built binary).
- *   2. `<root>/vendor/srt-win/{arch}/srt-win.exe` (prebuilt — published npm
+ * Locate the packaged `srt-win.exe`. Resolution order:
+ *   1. `<root>/vendor/srt-win/{arch}/srt-win.exe` (prebuilt — published npm
  *      package, or after `npm run build:srt-win` locally).
- *   3. `<root>/vendor/srt-win-src/target/release/srt-win.exe` (local
+ *   2. `<root>/vendor/srt-win-src/target/release/srt-win.exe` (local
  *      `cargo build --release` fallback for development).
- *   4. `<root>/vendor/srt-win/target/release/srt-win.exe` (transitional:
- *      stale local build from before the srt-win-src rename).
  *
  * `<root>` is {@link repoRoot} — `__dirname/../..`, which resolves to the
  * repo root from `src/sandbox/` and `dist/sandbox/` alike, and to the
  * package root when installed under `node_modules`.
+ *
+ * Callers that ship their own binary (or a multicall binary that
+ * routes on `argv[1] == `{@link SRT_WIN_DISPATCH_ARG1}) pass
+ * `windows.srtWin` instead of relying on this lookup — see
+ * {@link resolveSrtWin}.
  *
  * Resolution via the optional `@anthropic-ai/sandbox-runtime-win32-*`
  * platform packages is added separately.
@@ -343,10 +390,6 @@ const nodeArchToDir: Record<string, string> = { x64: 'x64', arm64: 'arm64' }
  * @throws if none exist.
  */
 export function getSrtWinPath(): string {
-  const envPath = process.env.SRT_WIN_PATH
-  if (envPath && fs.existsSync(envPath)) {
-    return envPath
-  }
   const root = repoRoot()
   const arch = nodeArchToDir[process.arch]
   const candidates: string[] = []
@@ -362,27 +405,63 @@ export function getSrtWinPath(): string {
       'release',
       'srt-win.exe',
     ),
-    // transitional: stale local build from before the srt-win-src rename
-    path.join(root, 'vendor', 'srt-win', 'target', 'release', 'srt-win.exe'),
   )
   for (const c of candidates) {
     if (fs.existsSync(c)) return c
   }
   throw new Error(
-    `srt-win.exe not found. Set SRT_WIN_PATH or build with ` +
+    `srt-win.exe not found. Set windows.srtWin.path or build with ` +
       `\`cargo build --release --manifest-path vendor/srt-win-src/Cargo.toml\`. ` +
-      `Looked in: ${[envPath, ...candidates].filter(Boolean).join(', ')}`,
+      `Looked in: ${candidates.join(', ')}`,
   )
+}
+
+/**
+ * `argv[1]` sentinel a multicall embedder's dispatcher matches
+ * against to route into `srt_win::run_from_args`. Mirrors the Rust
+ * `srt_win::SRT_WIN_DISPATCH_ARG1`; the two MUST stay in sync.
+ * `run_from_args` strips it before clap, so the standalone binary
+ * accepts it harmlessly.
+ */
+export const SRT_WIN_DISPATCH_ARG1 = '--srt-win'
+
+/**
+ * Resolved `srt-win` spawn descriptor — the executable to load plus
+ * the leading arguments that carry the dispatch sentinel. Threaded
+ * to every spawn site so {@link resolveSrtWin} runs once (at
+ * `initialize()`) instead of re-`stat`ing on every helper call.
+ */
+export type SrtWinSpawn = Readonly<{
+  exe: string
+  prependArgs: readonly string[]
+}>
+
+/**
+ * Resolve the `srt-win` spawn target from config. When `cfg.path` is
+ * set it is used verbatim (no fallback to the packaged binary — an
+ * explicit override is a directive, not a hint) and
+ * {@link SRT_WIN_DISPATCH_ARG1} is prepended so a multicall
+ * dispatcher routes on `argv[1]`. When unset, falls back to
+ * {@link getSrtWinPath} with no sentinel (the packaged binary
+ * doesn't need it; `run_from_args` would strip it anyway).
+ */
+export function resolveSrtWin(cfg?: SrtWinConfig): SrtWinSpawn {
+  if (cfg?.path !== undefined) {
+    if (!fs.existsSync(cfg.path)) {
+      throw new Error(
+        `windows.srtWin.path is set to '${cfg.path}' but the file does ` +
+          `not exist; remove srtWin.path to fall back to the packaged ` +
+          `binary`,
+      )
+    }
+    return { exe: cfg.path, prependArgs: [SRT_WIN_DISPATCH_ARG1] }
+  }
+  return { exe: getSrtWinPath(), prependArgs: [] }
 }
 
 // ────────────────────────────────────────────────────────────────────
 // Internal: spawn helpers
 // ────────────────────────────────────────────────────────────────────
-
-function groupRefArgs(ref: WindowsGroupRef): string[] {
-  if (ref.groupSid) return ['--group-sid', ref.groupSid]
-  return ['--name', ref.groupName ?? DEFAULT_WINDOWS_GROUP_NAME]
-}
 
 interface RunResult {
   status: number | null
@@ -391,16 +470,22 @@ interface RunResult {
   stderr: string
 }
 
-function runSrtWin(
-  args: string[],
-  timeoutMs = 15_000,
-  stdin?: string,
-): RunResult {
-  const exe = getSrtWinPath()
-  const r = spawnSync(exe, args, {
+interface RunOpts {
+  timeoutMs?: number
+  stdin?: string
+  srtWin?: SrtWinSpawn
+}
+
+function runSrtWin(args: string[], opts: RunOpts = {}): RunResult {
+  // Direct callers of the exported helpers may omit `srtWin`
+  // (backward-compat) — fall back to the packaged-binary lookup.
+  // `SandboxManager` resolves once at `initialize()` and threads the
+  // handle, so this per-call resolve is only hit outside a session.
+  const { exe, prependArgs } = opts.srtWin ?? resolveSrtWin()
+  const r = spawnSync(exe, [...prependArgs, ...args], {
     encoding: 'utf8',
-    timeout: timeoutMs,
-    ...(stdin !== undefined ? { input: stdin } : {}),
+    timeout: opts.timeoutMs ?? 15_000,
+    ...(opts.stdin !== undefined ? { input: opts.stdin } : {}),
   })
   if (r.error) {
     throw new Error(`srt-win ${args[0]}: spawn failed: ${r.error.message}`)
@@ -413,8 +498,8 @@ function runSrtWin(
   }
 }
 
-function runSrtWinJson<T>(args: string[], opts?: { timeoutMs?: number }): T {
-  const r = runSrtWin(args, opts?.timeoutMs)
+function runSrtWinJson<T>(args: string[], opts?: RunOpts): T {
+  const r = runSrtWin(args, opts)
   if (r.status !== 0) {
     throw new Error(
       `srt-win ${args.join(' ')} exited ${r.status}: ${r.stderr || r.stdout}`,
@@ -438,9 +523,9 @@ function runSrtWinJson<T>(args: string[], opts?: { timeoutMs?: number }): T {
  */
 function runSrtWinJsonAllowFail<T>(
   args: string[],
-  timeoutMs: number,
+  opts: RunOpts,
 ): { ok: boolean; json: T; stderr: string } {
-  const r = runSrtWin(args, timeoutMs)
+  const r = runSrtWin(args, opts)
   let json: T
   try {
     json = JSON.parse(r.stdout) as T
@@ -458,31 +543,18 @@ function runSrtWinJsonAllowFail<T>(
 // ────────────────────────────────────────────────────────────────────
 
 /**
- * Query the discriminator group's state in SAM and in the current
- * process's `TokenGroups`. `ready` means the group exists AND is
- * enabled in the caller's token (i.e. the logout/login dance has
- * happened). `created-not-on-token` means the install step ran but
- * a fresh logon is needed before {@link initialize} can succeed.
- */
-export function getWindowsGroupStatus(
-  ref: WindowsGroupRef,
-): WindowsGroupStatusResult {
-  return runSrtWinJson(['group', 'status', ...groupRefArgs(ref)])
-}
-
-/**
  * Query the WFP filter set under the given sublayer via live BFE
- * enumeration. `installed` means srt-win-tagged `permit-group` AND
- * `block` filters are both present under that sublayer. Detection is
- * **tag-based** (providerData JSON); filters installed by other
- * tooling without the tag are not counted.
+ * enumeration. `installed` means at least one srt-win-tagged
+ * `block-user` filter is present. Detection is **tag-based**
+ * (providerData JSON); filters installed by other tooling without the
+ * tag are not counted.
  *
  * BFE enumeration is admin-gated — a non-elevated caller gets
  * `state:"cannot-read"` with a `hint` (not an error). The
  * non-elevated readiness check is {@link verifyWindowsWfpEgress}.
  */
 export function getWindowsWfpStatus(
-  opts: { sublayerGuid?: string } = {},
+  opts: { sublayerGuid?: string; srtWin?: SrtWinSpawn } = {},
 ): WindowsWfpStatusResult {
   const args = ['wfp', 'status']
   if (opts.sublayerGuid) args.push('--sublayer-guid', opts.sublayerGuid)
@@ -490,15 +562,13 @@ export function getWindowsWfpStatus(
     state: WindowsWfpStatus
     filters: number
     port_range?: [number, number]
-    user_filters?: number
     user_sid?: string
     hint?: string
-  }>(args)
+  }>(args, { srtWin: opts.srtWin })
   return {
     state: raw.state,
     filters: raw.filters,
     ...(raw.port_range && { portRange: raw.port_range }),
-    userFilters: raw.user_filters ?? 0,
     ...(raw.user_sid && { userSid: raw.user_sid }),
     ...(raw.hint && { hint: raw.hint }),
   }
@@ -517,10 +587,9 @@ export function getWindowsWfpStatus(
  * the synchronous `runSrtWin` is safe). Does not require elevation
  * and does not depend on any external host.
  *
- * `initialize()` calls this once per session when
- * `windows.asSandboxUser` is set, so a stale install (sandbox user
- * provisioned but filters since removed) fails closed at session
- * start instead of running every exec with full egress.
+ * `initialize()` calls this once per session, so a stale install
+ * (sandbox user provisioned but filters since removed) fails closed
+ * at session start instead of running every exec with full egress.
  *
  * @param opts.target overrides the probe target (skips the local
  *   listener bind).
@@ -533,6 +602,7 @@ export async function verifyWindowsWfpEgress(
   opts: {
     target?: string
     proxyPortRange?: readonly [number, number]
+    srtWin?: SrtWinSpawn
   } = {},
 ): Promise<WindowsWfpVerifyResult> {
   let target = opts.target
@@ -567,7 +637,10 @@ export async function verifyWindowsWfpEgress(
     // profile (LOGON_WITH_PROFILE) via CreateProcessWithLogonW —
     // same budget as windowsTrustCa, plus the runner's own 2s
     // connect timeout.
-    const r = runSrtWin(['wfp', 'verify', '--target', target], 30_000)
+    const r = runSrtWin(['wfp', 'verify', '--target', target], {
+      timeoutMs: 30_000,
+      srtWin: opts.srtWin,
+    })
     logForDebugging(
       `[Sandbox Windows] wfp verify exit=${r.status}: ${r.stderr || r.stdout}`,
     )
@@ -575,10 +648,15 @@ export async function verifyWindowsWfpEgress(
     try {
       raw = JSON.parse(r.stdout)
     } catch {
+      // status=null → spawnSync killed the child (timeout or external
+      // signal). Include signal + stderr so the CI log self-explains
+      // instead of just `exited null with unparseable output ""`.
       throw new Error(
         `WFP egress fence could not be verified — \`srt-win wfp ` +
-          `verify\` exited ${r.status} with unparseable output ` +
-          `${JSON.stringify(r.stdout)}: ${r.stderr}`,
+          `verify\` exited ${r.status}` +
+          (r.signal ? ` (signal ${r.signal})` : '') +
+          ` with unparseable output ${JSON.stringify(r.stdout)} ` +
+          `(stderr: ${JSON.stringify(r.stderr)})`,
       )
     }
     if (r.status === 3) {
@@ -608,7 +686,9 @@ export async function verifyWindowsWfpEgress(
  * user exists but credential file missing) is distinguishable.
  * Does not require elevation.
  */
-export function getWindowsSandboxUserStatus(): WindowsSandboxUserStatus {
+export function getWindowsSandboxUserStatus(
+  opts: { srtWin?: SrtWinSpawn } = {},
+): WindowsSandboxUserStatus {
   const raw = runSrtWinJson<{
     user: {
       exists: boolean
@@ -624,7 +704,7 @@ export function getWindowsSandboxUserStatus(): WindowsSandboxUserStatus {
     real_user_sid: string
     ca_cert_thumb?: string | null
     ca_cert_pem?: string | null
-  }>(['user', 'status'])
+  }>(['user', 'status'], { srtWin: opts.srtWin })
   return {
     provisioned: raw.user.exists,
     ...(raw.user.sid && { sid: raw.user.sid }),
@@ -649,11 +729,11 @@ export function getWindowsSandboxUserStatus(): WindowsSandboxUserStatus {
  * Returns `null` when no CA was installed. The PEM is what `srt-win
  * user status` reconstructs from the DER stored in `state.db`.
  *
- * On Windows with `windows.asSandboxUser`, `tlsTerminate` requires
- * this CA to be present in the sandbox user's `CurrentUser\Root`
- * (schannel-level trust is an install-time concern, not
- * per-session); the host calls this from `initialize()` to fail
- * early with an actionable message when it isn't.
+ * On Windows, `tlsTerminate` requires this CA to be present in the
+ * sandbox user's `CurrentUser\Root` (schannel-level trust is an
+ * install-time concern, not per-session); the host calls this from
+ * `initialize()` to fail early with an actionable message when it
+ * isn't.
  *
  * @param status pass an already-fetched
  *   {@link getWindowsSandboxUserStatus} result to avoid a second
@@ -661,8 +741,9 @@ export function getWindowsSandboxUserStatus(): WindowsSandboxUserStatus {
  */
 export function getWindowsSandboxCaCert(
   status?: WindowsSandboxUserStatus,
+  opts: { srtWin?: SrtWinSpawn } = {},
 ): { pem: string; thumb: string } | null {
-  const u = status ?? getWindowsSandboxUserStatus()
+  const u = status ?? getWindowsSandboxUserStatus(opts)
   if (!u.caCertThumb || !u.caCertPem) return null
   return { pem: u.caCertPem, thumb: u.caCertThumb }
 }
@@ -677,17 +758,22 @@ export function getWindowsSandboxCaCert(
  *
  * The CA has a separate lifecycle from {@link installWindowsSandbox}
  * — install provisions the account/filters and never touches the CA;
- * call this AFTER install when `tlsTerminate` will be used with
- * `windows.asSandboxUser`.
+ * call this AFTER install when `tlsTerminate` will be used.
  *
  * @throws when the sandbox user is not provisioned, the file is not a
  *   parseable X.509 certificate, or the registry write into the
  *   sandbox user's hive fails.
  */
-export function windowsTrustCa(caCertPath: string): void {
+export function windowsTrustCa(
+  caCertPath: string,
+  opts: { srtWin?: SrtWinSpawn } = {},
+): void {
   // 60s: first call may create the sandbox user's profile
   // (LOGON_WITH_PROFILE) via the one-shot CreateProcessWithLogonW.
-  const r = runSrtWin(['user', 'trust-ca', caCertPath], 60_000)
+  const r = runSrtWin(['user', 'trust-ca', caCertPath], {
+    timeoutMs: 60_000,
+    srtWin: opts.srtWin,
+  })
   logForDebugging(
     `[Sandbox Windows] user trust-ca exit=${r.status}: ${r.stderr || r.stdout}`,
   )
@@ -699,9 +785,7 @@ export function windowsTrustCa(caCertPath: string): void {
   }
 }
 
-export interface WindowsInstallOptions extends WindowsGroupRef {
-  /** Add this user (instead of the current user) to the group. */
-  userSid?: string
+export interface WindowsInstallOptions {
   /** WFP sublayer GUID. Omit for srt-win's compile-time default. */
   sublayerGuid?: string
   /**
@@ -711,17 +795,23 @@ export interface WindowsInstallOptions extends WindowsGroupRef {
    */
   proxyPortRange?: readonly [number, number]
   /**
+   * Name for the sandbox user account (created if absent, adopted
+   * if it already exists as a local user). Default `srt-sandbox`.
+   */
+  sandboxUser?: string
+  /**
    * Replace an existing install whose configuration differs
-   * (different group SID or port range under the same sublayer).
-   * Without this, install refuses with "already installed with
-   * different config" rather than silently overwriting.
+   * (different port range or sandbox-user name under the same
+   * sublayer). Without this, install refuses with "already
+   * installed with different config" rather than silently
+   * overwriting.
    */
   force?: boolean
+  /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
+  srtWin?: SrtWinSpawn
 }
 
 export interface WindowsInstallResult {
-  /** Post-install group state. */
-  group: WindowsGroupStatusResult
   /** Post-install WFP state. */
   wfp: WindowsWfpStatusResult
   /** Post-install sandbox-user state. */
@@ -735,32 +825,29 @@ export interface WindowsInstallResult {
 }
 
 /**
- * One-shot install: creates the discriminator group, adds the
- * current user (or `userSid`), and installs the machine-wide WFP
- * filter set — all in a single self-elevating process (one UAC
- * prompt). Idempotent.
+ * One-shot install: provisions the `srt-sandbox` user account and
+ * installs the user-SID-keyed WFP filter set — all in a single
+ * self-elevating process (one UAC prompt). Idempotent; re-running
+ * rotates the sandbox user's password.
  *
- * Network for the calling user is **not disrupted** before the
- * required logout: while the group is absent from the token, WFP
- * filter-0 (PERMIT non-members) matches and traffic flows normally.
- * After log-out/log-in, the group is enabled in the token and
- * filter-1 (PERMIT group-enabled) takes over for the broker; only
- * `srt-win exec` children (group flipped deny-only) fall through to
- * the loopback/BLOCK filters.
+ * Network for the calling user is **not disrupted**: the filters key
+ * on the `srt-sandbox` user's SID, so the broker, services, and
+ * every other principal fall through to default-permit. No logout
+ * is required.
  *
- * Returns the post-call group + WFP state. If the user cancels the
- * UAC prompt this returns `{cancelled: true, …}` rather than
- * throwing — cancellation is a user choice, not an error.
+ * Returns the post-call WFP + sandbox-user state. If the user
+ * cancels the UAC prompt this returns `{cancelled: true, …}` rather
+ * than throwing — cancellation is a user choice, not an error.
  *
- * @throws on group/WFP creation failure, or if filters already
- *   exist under `sublayerGuid` with different configuration and
- *   `force` is not set.
+ * @throws on user/WFP creation failure, or if filters already exist
+ *   under `sublayerGuid` with a different port range and `force` is
+ *   not set.
  */
 export function installWindowsSandbox(
   opts: WindowsInstallOptions = {},
 ): WindowsInstallResult {
-  const args = ['install', ...groupRefArgs(opts)]
-  if (opts.userSid) args.push('--user-sid', opts.userSid)
+  const srtWin = opts.srtWin ?? resolveSrtWin()
+  const args = ['install']
   if (opts.sublayerGuid) args.push('--sublayer-guid', opts.sublayerGuid)
   if (opts.proxyPortRange) {
     args.push(
@@ -768,9 +855,10 @@ export function installWindowsSandbox(
       `${opts.proxyPortRange[0]}-${opts.proxyPortRange[1]}`,
     )
   }
+  if (opts.sandboxUser) args.push('--sandbox-user', opts.sandboxUser)
   if (opts.force) args.push('--force')
 
-  const r = runSrtWin(args, 60_000)
+  const r = runSrtWin(args, { timeoutMs: 60_000, srtWin })
   logForDebugging(
     `[Sandbox Windows] install exit=${r.status}: ${r.stderr || r.stdout}`,
   )
@@ -778,24 +866,20 @@ export function installWindowsSandbox(
   // srt-win install exit-code contract:
   //   0  ok
   //   10 user cancelled UAC elevation
-  //   11 group create failed
   //   12 WFP install failed
   //   13 already installed with different config (use --force)
   //   14 sandbox-user provisioning failed
   //   1  other error (stderr has detail)
   const out = r.stderr || r.stdout
+  const readBack = () => ({
+    wfp: getWindowsWfpStatus({ sublayerGuid: opts.sublayerGuid, srtWin }),
+    user: getWindowsSandboxUserStatus({ srtWin }),
+  })
   switch (r.status) {
     case 0:
-      break
+      return readBack()
     case 10:
-      return {
-        group: getWindowsGroupStatus(opts),
-        wfp: getWindowsWfpStatus({ sublayerGuid: opts.sublayerGuid }),
-        user: getWindowsSandboxUserStatus(),
-        cancelled: true,
-      }
-    case 11:
-      throw new Error(`srt-win install: group create failed: ${out}`)
+      return { ...readBack(), cancelled: true }
     case 12:
       throw new Error(`srt-win install: WFP filter install failed: ${out}`)
     case 14:
@@ -805,46 +889,35 @@ export function installWindowsSandbox(
     case 13:
       throw new Error(
         `srt-win install: filters already exist under this sublayer with ` +
-          `different configuration (group SID or port range). ` +
-          `Pass {force: true} to replace, or pick a different sublayerGuid. ` +
+          `a different port range or sandbox-user name. Pass ` +
+          `{force: true} to replace, or pick a different sublayerGuid. ` +
           `Output: ${out}`,
       )
     default:
       throw new Error(`srt-win install failed (exit ${r.status}): ${out}`)
   }
-
-  return {
-    group: getWindowsGroupStatus(opts),
-    wfp: getWindowsWfpStatus({ sublayerGuid: opts.sublayerGuid }),
-    user: getWindowsSandboxUserStatus(),
-  }
 }
 
 /**
- * Remove the WFP filter set under `sublayerGuid` (one UAC prompt).
- * Idempotent.
- *
- * **Does NOT delete the discriminator group** — group membership is
- * persistent user state and removing it would force every user to
- * re-do the logout dance on the next install. Call
- * {@link deleteWindowsGroup} explicitly if you want full teardown.
- *
- * **Does** remove the `srt-sandbox` account, its credential file,
- * and the setup marker, unless `keepUser` is set — the credential
- * is useless without the account and vice versa, so they're
- * treated as one unit.
+ * Remove the WFP filter set under `sublayerGuid` and the
+ * `srt-sandbox` account, its credential file, and the setup marker
+ * (one UAC prompt). Idempotent.
  *
  * @returns `{cancelled: true}` if the user dismissed UAC.
  */
 export function uninstallWindowsSandbox(
-  opts: { sublayerGuid?: string; keepUser?: boolean } = {},
+  opts: {
+    sublayerGuid?: string
+    keepUser?: boolean
+    srtWin?: SrtWinSpawn
+  } = {},
 ): {
   cancelled?: true
 } {
   const args = ['uninstall']
   if (opts.sublayerGuid) args.push('--sublayer-guid', opts.sublayerGuid)
   if (opts.keepUser) args.push('--keep-user')
-  const r = runSrtWin(args)
+  const r = runSrtWin(args, { srtWin: opts.srtWin })
   logForDebugging(
     `[Sandbox Windows] uninstall exit=${r.status}: ${r.stderr || r.stdout}`,
   )
@@ -858,154 +931,17 @@ export function uninstallWindowsSandbox(
 }
 
 /**
- * Delete the discriminator group. Separate from
- * {@link uninstallWindowsSandbox} so that uninstall→reinstall
- * doesn't force a fresh logout for every member. **Requires
- * elevation.** Idempotent (no-op if the group doesn't exist).
+ * Resolve any Windows filesystem-config path list — `allowRead`/
+ * `allowWrite` grants and `denyRead`/`denyWrite` stamps — to
+ * concrete existing paths via the single platform-aware
+ * {@link normalizePathForSandbox} chokepoint (Linux/macOS parity:
+ * point-in-time expansion at session initialize, not per-exec).
+ * Glob patterns are expanded; non-glob paths are normalized and
+ * returned 1:1. Missing paths are dropped (statSync probe).
+ * Directory targets are accepted — the additive sandbox-user ACE
+ * carries `(OI)(CI)` so it covers the subtree.
  */
-export function deleteWindowsGroup(ref: WindowsGroupRef): void {
-  const r = runSrtWin(['group', 'delete', ...groupRefArgs(ref)])
-  if (r.status !== 0) {
-    throw new Error(
-      `srt-win group delete failed (exit ${r.status}). ` +
-        `Requires elevation. Output: ${r.stderr || r.stdout}`,
-    )
-  }
-  logForDebugging(`[Sandbox Windows] group delete: ${r.stderr || r.stdout}`)
-}
-
-/**
- * Granular primitive: create the discriminator group and add the
- * current user (or `userSid`). Most callers should use
- * {@link installWindowsSandbox} instead; this exists for
- * enterprise/CI flows that manage group and WFP separately.
- * **Requires elevation.** Idempotent.
- */
-export function createWindowsGroup(
-  ref: WindowsGroupRef & { userSid?: string },
-): void {
-  const args = ['group', 'create', ...groupRefArgs(ref)]
-  if (ref.userSid) args.push('--user-sid', ref.userSid)
-  const r = runSrtWin(args)
-  if (r.status !== 0) {
-    throw new Error(
-      `srt-win group create failed (exit ${r.status}). ` +
-        `This requires elevation — run as administrator. ` +
-        `Output: ${r.stderr || r.stdout}`,
-    )
-  }
-  logForDebugging(`[Sandbox Windows] group create: ${r.stderr || r.stdout}`)
-}
-
-/**
- * Granular primitive: install the machine-wide WFP filter set
- * under `sublayerGuid` keyed on the group SID. Most callers should
- * use {@link installWindowsSandbox} instead; this exists for
- * enterprise/CI flows that manage group and WFP separately.
- * **Requires elevation.** Idempotent — re-running replaces any
- * existing srt-win-tagged filters under that sublayer.
- */
-export function createWindowsWfp(
-  ref: WindowsGroupRef & {
-    sublayerGuid?: string
-    proxyPortRange?: readonly [number, number]
-  },
-): void {
-  const args = ['wfp', 'install', ...groupRefArgs(ref)]
-  if (ref.sublayerGuid) args.push('--sublayer-guid', ref.sublayerGuid)
-  if (ref.proxyPortRange) {
-    args.push(
-      '--proxy-port-range',
-      `${ref.proxyPortRange[0]}-${ref.proxyPortRange[1]}`,
-    )
-  }
-  const r = runSrtWin(args)
-  if (r.status !== 0) {
-    throw new Error(
-      `srt-win wfp install failed (exit ${r.status}). ` +
-        `This requires elevation — run as administrator. ` +
-        `Output: ${r.stderr || r.stdout}`,
-    )
-  }
-  logForDebugging(`[Sandbox Windows] wfp install: ${r.stderr || r.stdout}`)
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Filesystem deny (ACL stamp / restore)
-// ────────────────────────────────────────────────────────────────────
-
-/**
- * Per-file outcome from `srt-win acl restore --json`. `status:
- * "restored"` covers both `Restored` and `AlreadyOriginal` on the
- * Rust side (the host doesn't need to distinguish them); every
- * other status keeps the snapshot row (fail-closed) and is
- * surfaced to the user as an anomaly to investigate. Mirrors
- * `restore_entry()` in `vendor/srt-win-src/src/main.rs`.
- */
-export interface WindowsAclPathOutcome {
-  path: string
-  status:
-    | 'restored'
-    | 'relocated'
-    | 'missing'
-    | 'leftChanged'
-    | 'leftUnreadable'
-    | 'originalSdTampered'
-    | 'originalSdLost'
-    | 'stampedUnrecognized'
-  /** Hex `FILE_ID_INFO` recorded at stamp time. Present when `status ≠ "restored"`. */
-  expectedFileId?: string
-  /** Where the protected file was found by `file_id`. Only on `relocated`. */
-  movedTo?: string
-  /** `true` whenever `status ≠ "restored"` — the snapshot row was kept (restore not confirmed). */
-  leftStamped?: boolean
-}
-
-/**
- * Per-parent-directory outcome from `srt-win acl restore --json`.
- * `stillHeld` is normal (another active session still references
- * a file under this directory). Mirrors `parent_entries_from()` +
- * `ParentRestoreOutcome::as_str()` in `vendor/srt-win-src/src/`.
- */
-export interface WindowsAclParentOutcome {
-  path: string
-  status:
-    | 'restored'
-    | 'alreadyOriginal'
-    | 'stillHeld'
-    | 'leftChanged'
-    | 'missing'
-    | 'leftStamped'
-  /** Underlying error for `leftStamped`. */
-  error?: string
-}
-
-/** Top-level shape of `srt-win acl restore --json`. */
-export interface WindowsAclRestoreResult {
-  paths: WindowsAclPathOutcome[]
-  parents: WindowsAclParentOutcome[]
-}
-
-/**
- * Expand the `denyRead`/`denyWrite` input set to a flat list of
- * existing FILE paths for `srt-win acl stamp`.
- *
- * Every input goes through {@link normalizePathForSandbox} (the
- * single Windows-aware chokepoint: `\\?\`/UNC-strip, drive-letter
- * case-fold, ~-expand, realpath). Globs (`*`/`?` only — `[`/`]`
- * are legal Win32 filename chars) expand via the shared walker
- * with case-insensitive matching (point-in-time: a file appearing
- * after this returns is NOT covered). Each candidate is checked
- * with one `statSync({throwIfNoEntry:false})`: missing → drop
- * (the protection model covers files present at session start);
- * directory → reject (the file stamp applies a per-file DACL plus
- * a per-parent-directory allow-list; stamping a directory itself
- * would touch every child); file → keep.
- */
-export function expandWindowsFsDenyPaths(
-  patterns: readonly string[],
-  opts: { allowDirs?: boolean } = {},
-): string[] {
+export function expandWindowsFsPaths(patterns: readonly string[]): string[] {
   const out = new Set<string>()
   for (const raw of patterns) {
     const norm = normalizePathForSandbox(raw)
@@ -1015,14 +951,6 @@ export function expandWindowsFsDenyPaths(
     for (const c of candidates) {
       const st = fs.statSync(c, { throwIfNoEntry: false })
       if (!st) continue
-      if (st.isDirectory() && !opts.allowDirs) {
-        throw new Error(
-          `Windows fs deny requires explicit file paths; ` +
-            `${JSON.stringify(raw)} resolved to directory ` +
-            `${JSON.stringify(c)}. Directory targets are only ` +
-            `supported under windows.asSandboxUser.`,
-        )
-      }
       out.add(c)
     }
   }
@@ -1030,41 +958,33 @@ export function expandWindowsFsDenyPaths(
 }
 
 export interface WindowsAclStampOptions {
-  group: WindowsGroupRef
   /** Paths the sandboxed child must not read. */
   denyRead: readonly string[]
   /** Paths the sandboxed child must not write (read stays allowed). */
   denyWrite: readonly string[]
+  /** SID of the dedicated sandbox user — {@link WindowsSandboxUserStatus.sid}. */
+  sandboxUserSid: string
   /** Long-lived host PID the holds are tied to. Default: this process. */
   holderPid?: number
-  /**
-   * Under the separate-user model, the sandbox user's SID
-   * ({@link WindowsSandboxUserStatus.sid}). Switches the stamp to
-   * an additive `(D;OICI;mask;;;<sb-SID>)` ACE on the target plus a
-   * `(D;OICI;FILE_DELETE_CHILD;;;<sb-SID>)` on the parent — no
-   * PROTECTED rewrite, no SD snapshot. When omitted (same-user
-   * model), the PROTECTED broker-only stamp keyed on the
-   * discriminator group is applied.
-   */
-  sandboxUserSid?: string
+  /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
+  srtWin?: SrtWinSpawn
 }
 
 /**
- * Apply the file-deny stamp set for one host session. Idempotent
- * via `srt-win`'s disk-first `ensure_stamped` chokepoint — calling
- * this again with overlapping paths re-verifies the on-disk DACL
- * against the hash-ACE marker rather than trusting state-DB rows.
+ * Apply the file-deny ACE set for one host session: an additive
+ * `(D;OICI;mask;;;<sb-SID>)` on the target plus a
+ * `(D;OICI;FILE_DELETE_CHILD;;;<sb-SID>)` on the parent — no
+ * PROTECTED rewrite, no SD snapshot. Idempotent and refcounted via
+ * srt-win's `working_aces` table.
  *
- * Inputs are passed verbatim to `srt-win` (which canonicalizes,
- * rejects directories and globs, and stamps each file plus its
- * immediate parent directory). Callers that accept globs should
- * pre-expand via {@link expandWindowsFsDenyPaths}.
+ * Inputs are passed verbatim to `srt-win` (which canonicalizes and
+ * rejects globs). Callers that accept globs should pre-expand via
+ * {@link expandWindowsFsPaths}.
  *
  * @throws on exit ≠ 0 — including exit 2 (one or more inputs
  *   skipped). srt-win stamps the resolvable inputs before exiting
  *   2, so on throw the caller should call {@link restoreWindowsAcl}
- *   to release whatever WAS stamped (fail-closed at session start
- *   means tearing down a partial setup).
+ *   to release whatever WAS stamped.
  */
 export function stampWindowsAcl(opts: WindowsAclStampOptions): void {
   const holder = opts.holderPid ?? process.pid
@@ -1072,23 +992,21 @@ export function stampWindowsAcl(opts: WindowsAclStampOptions): void {
     denyRead: opts.denyRead,
     denyWrite: opts.denyWrite,
   })
-  const args = [
-    'acl',
-    'stamp',
-    ...groupRefArgs(opts.group),
-    '--holder-pid',
-    `${holder}`,
-  ]
-  if (opts.sandboxUserSid) {
-    args.push('--sandbox-user-sid', opts.sandboxUserSid)
-  }
-  const r = runSrtWin(args, 60_000, stdin)
+  const r = runSrtWin(
+    [
+      'acl',
+      'stamp',
+      '--holder-pid',
+      `${holder}`,
+      '--sandbox-user-sid',
+      opts.sandboxUserSid,
+    ],
+    { timeoutMs: 60_000, stdin, srtWin: opts.srtWin },
+  )
   logForDebugging(
     `[Sandbox Windows] acl stamp exit=${r.status}: ${r.stderr || r.stdout}`,
   )
   if (r.status !== 0) {
-    // exit 2 = partial (some inputs skipped); exit 1 = at least
-    // one path could not be stamped. Either is a setup failure.
     throw new Error(
       `srt-win acl stamp exited ${r.status} ` +
         (r.status === 2 ? '(partial — some inputs skipped)' : '(failed)') +
@@ -1097,54 +1015,53 @@ export function stampWindowsAcl(opts: WindowsAclStampOptions): void {
   }
 }
 
-export interface WindowsAclRestoreOptions {
-  group: WindowsGroupRef
-  /** Long-lived host PID whose holds to release. Default: this process. */
-  holderPid?: number
-  /**
-   * Under the separate-user model, the sandbox user's SID — must
-   * match {@link WindowsAclStampOptions.sandboxUserSid}. Switches
-   * restore to `REVOKE_ACCESS` for the SID instead of the
-   * SD-snapshot restore.
-   */
-  sandboxUserSid?: string
+/**
+ * Per-path outcome from `srt-win acl restore --json` /
+ * `revoke --json`. The status set is intentionally loose: the
+ * pre-/post- same-user-removal `srt-win` builds emit different
+ * vocabularies for `restore` (`restored`/`leftChanged`/… vs
+ * `revoked`/`stillHeld`/…). Callers (`reset()`) only log these,
+ * so the union is whatever the binary on PATH says.
+ */
+export interface WindowsAclAceOutcome {
+  path: string
+  status: string
 }
 
 /**
- * Release this holder's file-deny stamps and return per-path /
- * per-parent outcomes. Best-effort: a non-`restored` entry means
- * the file's stamp was LEFT in place (fail-closed) — see
- * {@link WindowsAclPathOutcome} for the cases. Does not throw on
- * anomalies; the caller decides whether to surface them.
- *
- * Returns `undefined` when `srt-win acl restore` itself failed
- * (no JSON to parse) — the caller should log and move on rather
- * than block teardown.
+ * Release this holder's deny ACEs and remove the sandbox-user ACE
+ * on any path whose refcount falls to zero. Best-effort (does not
+ * throw on per-path anomalies); returns per-path outcomes for the
+ * caller to surface. Returns `undefined` only when `srt-win`
+ * itself failed (no JSON to parse).
  */
-export function restoreWindowsAcl(
-  opts: WindowsAclRestoreOptions,
-): WindowsAclRestoreResult | undefined {
+export function restoreWindowsAcl(opts: {
+  sandboxUserSid: string
+  holderPid?: number
+  srtWin?: SrtWinSpawn
+}): WindowsAclAceOutcome[] | undefined {
   const holder = opts.holderPid ?? process.pid
-  const args = [
-    'acl',
-    'restore',
-    ...groupRefArgs(opts.group),
-    '--holder-pid',
-    `${holder}`,
-    '--json',
-  ]
-  if (opts.sandboxUserSid) {
-    args.push('--sandbox-user-sid', opts.sandboxUserSid)
-  }
   // Don't let a teardown helper throw — the caller's reset() must
   // complete. runSrtWinJsonAllowFail parses stdout before checking
   // the exit code, so a non-zero exit with the per-path JSON intact
-  // (`acl restore` prints outcomes THEN errors when any path
-  // stayed stamped) still surfaces every entry to reset()'s loop
-  // instead of collapsing to `undefined`. Only spawn-fail /
-  // unparseable output throws → log and return undefined.
+  // still surfaces every entry to reset()'s loop. Only spawn-fail
+  // / unparseable output throws → log and return undefined.
   try {
-    const r = runSrtWinJsonAllowFail<WindowsAclRestoreResult>(args, 60_000)
+    const r = runSrtWinJsonAllowFail<
+      | WindowsAclAceOutcome[]
+      | { paths?: WindowsAclAceOutcome[]; parents?: WindowsAclAceOutcome[] }
+    >(
+      [
+        'acl',
+        'restore',
+        '--holder-pid',
+        `${holder}`,
+        '--sandbox-user-sid',
+        opts.sandboxUserSid,
+        '--json',
+      ],
+      { timeoutMs: 60_000, srtWin: opts.srtWin },
+    )
     if (!r.ok) {
       logForDebugging(
         `[Sandbox Windows] acl restore exited non-zero (per-path ` +
@@ -1152,7 +1069,12 @@ export function restoreWindowsAcl(
         { level: 'error' },
       )
     }
-    return r.json
+    // Pre- same-user-removal builds emit `{paths, parents}`; post-
+    // emit a flat array. Flatten either so reset()'s logging loop
+    // is shape-agnostic across the transition.
+    return Array.isArray(r.json)
+      ? r.json
+      : [...(r.json.paths ?? []), ...(r.json.parents ?? [])]
   } catch (e) {
     logForDebugging(`[Sandbox Windows] acl restore: ${(e as Error).message}`, {
       level: 'error',
@@ -1161,17 +1083,7 @@ export function restoreWindowsAcl(
   }
 }
 
-/**
- * Per-path outcomes that mean the file's DACL was returned to its
- * pre-stamp state (or was already there). Anything else left the
- * stamp in place and should be surfaced to the user.
- */
-export const WINDOWS_ACL_PATH_OK = new Set<WindowsAclPathOutcome['status']>([
-  'restored',
-])
-
 export interface WindowsAclGrantOptions {
-  group: WindowsGroupRef
   /** Paths to grant `MODIFY_NO_FDC` on (the working tree, `allowWrite`). */
   write: readonly string[]
   /** Paths to grant `FILE_GENERIC_READ|EXECUTE` on (`allowRead`). */
@@ -1180,15 +1092,17 @@ export interface WindowsAclGrantOptions {
   sandboxUserSid: string
   /** Long-lived host PID the holds are tied to. Default: this process. */
   holderPid?: number
+  /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
+  srtWin?: SrtWinSpawn
 }
 
 /**
- * Apply per-session additive `(OI)(CI)` ACEs for the sandbox user
- * on each path. Under the separate-user model the sandbox user has
- * no inherent rights on real-user-owned files; this is what makes
- * the working tree (and explicit `allowRead`/`allowWrite` paths)
- * reachable from the child. Idempotent and refcounted via srt-win's
- * `working_aces` table.
+ * Apply per-session additive `(OI)(CI)` ALLOW ACEs for the sandbox
+ * user on each path. The sandbox user has no inherent rights on
+ * real-user-owned files; this is what makes the working tree (and
+ * explicit `allowRead`/`allowWrite` paths) reachable from the
+ * child. Idempotent and refcounted via srt-win's `working_aces`
+ * table.
  *
  * @throws on exit ≠ 0. On throw the caller should call
  *   {@link revokeWindowsAcl} to release whatever WAS granted.
@@ -1200,14 +1114,12 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
     [
       'acl',
       'grant',
-      ...groupRefArgs(opts.group),
       '--holder-pid',
       `${holder}`,
       '--sandbox-user-sid',
       opts.sandboxUserSid,
     ],
-    60_000,
-    stdin,
+    { timeoutMs: 60_000, stdin, srtWin: opts.srtWin },
   )
   logForDebugging(
     `[Sandbox Windows] acl grant exit=${r.status}: ${r.stderr || r.stdout}`,
@@ -1219,43 +1131,29 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
   }
 }
 
-/** Per-path outcome from `srt-win acl revoke --json`. */
-export interface WindowsAclGrantOutcome {
-  path: string
-  status:
-    | 'revoked'
-    | 'stillHeld'
-    | 'downgraded'
-    | 'relocated'
-    | 'mismatch'
-    | 'missing'
-    | 'noRow'
-}
-
 /**
  * Release this holder's grants and remove the sandbox-user ACE on
  * any path whose refcount falls to zero. Best-effort (does not
  * throw); logs anomalies.
  */
 export function revokeWindowsAcl(opts: {
-  group: WindowsGroupRef
   sandboxUserSid: string
   holderPid?: number
-}): WindowsAclGrantOutcome[] | undefined {
+  srtWin?: SrtWinSpawn
+}): WindowsAclAceOutcome[] | undefined {
   const holder = opts.holderPid ?? process.pid
   try {
-    const r = runSrtWinJsonAllowFail<WindowsAclGrantOutcome[]>(
+    const r = runSrtWinJsonAllowFail<WindowsAclAceOutcome[]>(
       [
         'acl',
         'revoke',
-        ...groupRefArgs(opts.group),
         '--holder-pid',
         `${holder}`,
         '--sandbox-user-sid',
         opts.sandboxUserSid,
         '--json',
       ],
-      60_000,
+      { timeoutMs: 60_000, srtWin: opts.srtWin },
     )
     if (!r.ok) {
       logForDebugging(
@@ -1272,18 +1170,93 @@ export function revokeWindowsAcl(opts: {
   }
 }
 
-/**
- * Per-parent-directory outcomes that are expected during normal
- * teardown. `stillHeld` is normal when another active session
- * still references a file under this directory.
- */
-export const WINDOWS_ACL_PARENT_OK = new Set<WindowsAclParentOutcome['status']>(
-  ['restored', 'alreadyOriginal', 'stillHeld'],
-)
-
 // ────────────────────────────────────────────────────────────────────
 // Wrap
 // ────────────────────────────────────────────────────────────────────
+
+/**
+ * `safe.directory` entries above this count collapse to a single
+ * `safe.directory=*`. Keeps `GIT_CONFIG_COUNT` (and the `--env`
+ * argv it rides on) bounded when `allowWrite` is wide.
+ */
+const SAFE_DIRECTORY_WILDCARD_THRESHOLD = 8
+
+/**
+ * Build the `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` /
+ * `GIT_CONFIG_VALUE_<n>` env-var set for the sandboxed child.
+ *
+ * Emits:
+ *   - `safe.directory=<dir>` for each entry in `safeDirs` (or one
+ *     `safe.directory=*` when the list is long) — the working tree
+ *     is owned by the real user, so git running as `srt-sandbox`
+ *     refuses with "detected dubious ownership" without it.
+ *   - `http.schannelUseSSLCAInfo=true` and
+ *     `http.schannelCheckRevoke=false` when `schannelCa` — makes
+ *     git's default (schannel) backend honor `GIT_SSL_CAINFO`
+ *     without `-c http.sslBackend=openssl`. Revocation is disabled
+ *     because CryptoAPI CRL/OCSP fetches ignore proxy env and would
+ *     be WFP-fenced.
+ *
+ * Composes with an existing `GIT_CONFIG_COUNT` in `baseEnv` by
+ * continuing its numbering; the returned `GIT_CONFIG_COUNT` is the
+ * new total. Under the two-hop launch the broker's own environment
+ * never reaches the child, so `baseEnv` is the caller-supplied
+ * overlay ({@link WindowsSandboxParams.setEnvVars}), not
+ * `process.env`.
+ *
+ * Paths are emitted with forward slashes so the value survives
+ * msys2's env conversion untouched and native git accepts it.
+ */
+export function buildGitConfigEnv(opts: {
+  safeDirs: readonly string[]
+  schannelCa: boolean
+  baseEnv?: Readonly<Record<string, string | undefined>>
+}): Record<string, string> {
+  // An explicit `GIT_CONFIG_COUNT=0` in baseEnv is an opt-out ("no
+  // env-level git config") — respect it rather than overwriting.
+  if (opts.baseEnv?.GIT_CONFIG_COUNT === '0') return {}
+  const parsed = Number.parseInt(opts.baseEnv?.GIT_CONFIG_COUNT ?? '', 10)
+  const start = Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
+  let n = start
+  const out: Record<string, string> = {}
+  const emit = (key: string, value: string) => {
+    out[`GIT_CONFIG_KEY_${n}`] = key
+    out[`GIT_CONFIG_VALUE_${n}`] = value
+    n++
+  }
+  const dirs = [
+    ...new Set(
+      opts.safeDirs
+        .filter((d): d is string => !!d)
+        .map(d => {
+          const fwd = d.replace(/\\/g, '/')
+          const stripped = fwd.replace(/\/+$/, '')
+          // Don't strip the trailing slash off a drive root — `C:`
+          // is drive-relative-cwd, not the root; git wants `C:/`.
+          return /^[A-Za-z]:$/.test(stripped) ? `${stripped}/` : stripped
+        }),
+    ),
+  ]
+  if (dirs.length > SAFE_DIRECTORY_WILDCARD_THRESHOLD) {
+    emit('safe.directory', '*')
+  } else {
+    // git matches safe.directory against the REPO TOP-LEVEL exactly,
+    // so a workspace root doesn't cover a nested repo. Emit both the
+    // exact path and the `<dir>/*` glob (git ≥2.46) so any repo
+    // at-or-under a granted dir is trusted.
+    for (const d of dirs) {
+      emit('safe.directory', d)
+      emit('safe.directory', `${d}/*`)
+    }
+  }
+  if (opts.schannelCa) {
+    emit('http.schannelUseSSLCAInfo', 'true')
+    emit('http.schannelCheckRevoke', 'false')
+  }
+  if (n === start) return {}
+  out.GIT_CONFIG_COUNT = String(n)
+  return out
+}
 
 /**
  * Build the spawn descriptor for running `command` inside the Windows
@@ -1298,159 +1271,114 @@ export const WINDOWS_ACL_PARENT_OK = new Set<WindowsAclParentOutcome['status']>(
  * Proxy configuration is single-sourced by {@link generateProxyEnvVars}
  * (the same canonical builder used on macOS/Linux). `srt-win exec`
  * takes no `--http-proxy` / `--socks-proxy` flags and synthesizes no
- * proxy env; it forwards its own environment to the sandboxed child
- * verbatim. So the full proxy set is merged over the broker's
- * environment here and the child inherits it through the spawn.
+ * proxy env. The two-hop runner starts with the SANDBOX user's
+ * profile env (`USERPROFILE`/`TEMP` isolated) and overlays exactly
+ * what we pass as `--env` — built here from the broker's `PATH` plus
+ * the generated proxy set.
  */
 export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   argv: string[]
   env: NodeJS.ProcessEnv
 } {
-  const exe = getSrtWinPath()
+  const { exe, prependArgs } = p.srtWin ?? resolveSrtWin()
   // Generated proxy + CA-trust env. Single-sourced here so the
   // same object feeds (a) the spawn env merge below and (b) the
-  // explicit `--env` overlay for the two-hop launch.
+  // explicit `--env` overlay for the runner.
   //
-  // Under `asSandboxUser` the CA-bundle path is OMITTED: it points
-  // into the broker's `%TEMP%\srt-sandbox-…`, which the
-  // `srt-sandbox` user cannot read — OpenSSL-backed clients (msys2
-  // curl, `git -c http.sslBackend=openssl`, node, python) would
-  // fail to open it (curl exit 77 etc.). Schannel-level trust comes
-  // from the registry write `srt-win user trust-ca` did at install
-  // time; the env-var bundle layer for the two-hop path lands with
-  // the working-tree/profile-grant work. See WindowsSandboxParams.
-  if (p.asSandboxUser && p.caCertPath !== undefined) {
-    logForDebugging(
-      `[Sandbox Windows] caCertPath '${p.caCertPath}' not forwarded ` +
-        `under asSandboxUser (broker %TEMP% is unreadable by ` +
-        `srt-sandbox); schannel trust via 'srt-win user trust-ca' ` +
-        `is the only CA-trust path for the two-hop launch`,
-    )
-  }
+  // The CA trust-bundle path is emitted with forward slashes:
+  // msys2's POSIX-path conversion leaves `C:/…` alone and every
+  // tool we set the var for (curl, git, node, python, …) accepts
+  // forward slashes on Windows; backslashes would be mangled if
+  // the value passes through a bash command line. Schannel-level
+  // trust comes from the registry write `srt-win user trust-ca`
+  // did at install time; the env-var layer here covers the
+  // OpenSSL-backed tools.
   const generated = envListToObject(
     generateProxyEnvVars(
       p.httpProxyPort,
       p.socksProxyPort,
-      p.asSandboxUser ? undefined : p.caCertPath,
+      p.caCertPath?.replace(/\\/g, '/'),
       p.proxyAuthToken,
     ),
   )
   // TMPDIR is a POSIX path meant for the macOS/Linux FS sandbox — it
   // serves no purpose on Windows and breaks msys2 tools (mktemp etc.).
   delete generated.TMPDIR
+  // NO_PROXY=localhost,127.0.0.1,… is correct on POSIX where seatbelt/
+  // bwrap allow direct loopback: a NO_PROXY match makes the client
+  // connect directly and it works. On Windows the WFP fence blocks
+  // ALL direct connects from the sandbox user — including loopback
+  // outside the proxy-port PERMIT range — so NO_PROXY makes clients
+  // bypass the proxy and hit the fence; every localhost/127.0.0.1
+  // request fails. Consumers currently work around with
+  // `curl --noproxy ""`. Drop NO_PROXY here so localhost goes through
+  // the proxy (which connects on the child's behalf, from the broker's
+  // SID, and is not fenced).
+  delete generated.NO_PROXY
+  delete generated.no_proxy
 
-  const argv: string[] = [exe, 'exec', ...groupRefArgs(p.group)]
-  if (p.holderPid !== undefined) {
-    argv.push('--holder-pid', `${p.holderPid}`)
+  // GIT_CONFIG_* set — safe.directory (dubious-ownership) + the
+  // schannel CA knobs. Composed against setEnvVars so a caller
+  // that already emits GIT_CONFIG_COUNT keeps its entries.
+  const gitCfg = buildGitConfigEnv({
+    safeDirs: [p.cwd ?? process.cwd(), ...(p.allowWrite ?? [])],
+    schannelCa: p.caCertPath !== undefined,
+    baseEnv: p.setEnvVars,
+  })
+
+  const argv: string[] = [exe, ...prependArgs, 'exec']
+  if (p.quiet !== false) argv.push('--quiet')
+  for (const d of p.denyRead ?? []) argv.push('--deny-read', d)
+  for (const d of p.denyWrite ?? []) argv.push('--deny-write', d)
+  // The two-hop runner starts with the SANDBOX user's profile env
+  // (USERPROFILE/TEMP isolated) and overlays exactly what we pass as
+  // `--env`. The broker does NOT enumerate its own env — the overlay
+  // is built here from the broker's PATH, the mode:'mask' sentinel
+  // set, the generated proxy set, and the GIT_CONFIG_* set.
+  // Sentinels precede `generated` so a caller masking e.g.
+  // `HTTPS_PROXY` cannot break the sandbox's own proxy plumbing —
+  // same precedence as the macOS/Linux `env -u … VAR=…
+  // sandbox-exec` order. `gitCfg` is last so its GIT_CONFIG_COUNT
+  // (which composes against setEnvVars) wins.
+  const overlay: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH,
+    PATHEXT: process.env.PATHEXT,
+    ...(p.setEnvVars ?? {}),
+    ...generated,
+    ...gitCfg,
   }
-  for (const f of p.denyRead ?? []) argv.push('--deny-read', f)
-  for (const f of p.denyWrite ?? []) argv.push('--deny-write', f)
-  if (p.asSandboxUser) {
-    argv.push('--as-sandbox-user')
-    // The two-hop runner starts with the SANDBOX user's profile env
-    // (USERPROFILE/TEMP isolated) and overlays exactly what we pass
-    // as `--env`. The broker does NOT enumerate its own env — the
-    // overlay is built here from the same single source as the
-    // same-user path's spawn env.
-    const overlay: NodeJS.ProcessEnv = {
-      PATH: process.env.PATH,
-      PATHEXT: process.env.PATHEXT,
-      ...generated,
-    }
-    for (const [k, v] of Object.entries(overlay)) {
-      if (v !== undefined) argv.push('--env', `${k}=${v}`)
-    }
+  for (const [k, v] of Object.entries(overlay)) {
+    if (v !== undefined) argv.push('--env', `${k}=${v}`)
   }
   argv.push('--')
 
-  const systemRoot = process.env.SystemRoot ?? 'C:\\Windows'
-  const sh = p.binShell ?? { kind: 'cmd' }
-  switch (sh.kind) {
-    case 'bash':
-      // Git Bash: invoke the caller-supplied path directly with
-      // `-c <command>`. `command` is a fully-assembled bash command
-      // string with its own internal quoting; srt-win's `build_cmdline`
-      // takes the generic non-cmd branch and MSVCRT-quotes it as a
-      // SINGLE argv element, so bash receives it intact as argv[2].
-      // TODO: MSYS2 derives POSIX /tmp from Windows TEMP/TMP itself;
-      // revisit whether any extra TEMP/TMP normalisation is needed for
-      // the bash inner shell under the restricted token.
-      argv.push(sh.path, '-c', p.command)
-      break
-    case 'pwsh':
-      argv.push('pwsh.exe', '-NoProfile', '-Command', p.command)
-      break
-    case 'powershell':
-      argv.push(
-        path.join(
-          systemRoot,
-          'System32',
-          'WindowsPowerShell',
-          'v1.0',
-          'powershell.exe',
-        ),
-        '-NoProfile',
-        '-Command',
-        p.command,
-      )
-      break
-    case 'cmd':
-      // cmd /d (no AutoRun) /s (strip first+last quote of post-/c by
-      // position) /c (run-then-exit). The `command` string lands as a
-      // single argv element; srt-win's build_cmdline wraps it in one
-      // outer "…" pair for /s to consume. See launch.rs.
-      argv.push(
-        path.join(systemRoot, 'System32', 'cmd.exe'),
-        '/d',
-        '/s',
-        '/c',
-        p.command,
-      )
-      break
-  }
+  // Inner shell: `{exe, args}` from parseWindowsBinShell — the SOLE
+  // normalizer. `p.command` lands as a single argv element; srt-win's
+  // `build_cmdline` MSVCRT-quotes it (or wraps in one outer "…" for
+  // cmd /s) so the inner shell receives it intact. See launch.rs.
+  const sh = p.binShell ?? parseWindowsBinShell(undefined)
+  argv.push(sh.exe, ...sh.args, p.command)
 
   // CreateProcessW's lpCommandLine is capped at 32 767 WCHARs.
   // Node's `shell:false` spawn builds it by MSVCRT-quoting each
-  // argv element and joining with spaces; the worst-case quote
-  // overhead per element is +2 (wrapping `"`) plus backslash
-  // doubling before embedded quotes (rare in file paths). A
-  // path-count proxy can't see this — 60 long paths overflow
-  // while 200 short ones fit — so estimate the actual command
-  // line and refuse with the same guidance the old count check
-  // gave. ~30 000 leaves headroom for the quote overhead the
-  // estimate doesn't model.
+  // argv element and joining with spaces; ~30 000 leaves headroom
+  // for the quote overhead the estimate doesn't model.
   const cmdlineEstimate = argv.reduce((n, a) => n + a.length + 3, 0)
   if (cmdlineEstimate > 30_000) {
-    const nDeny = (p.denyRead?.length ?? 0) + (p.denyWrite?.length ?? 0)
     throw new Error(
       `Windows sandbox argv is ~${cmdlineEstimate} chars ` +
-        `(CreateProcessW limit is 32 767). ${nDeny} per-exec ` +
-        `file-deny path(s) ride on this argv — move broad globs to ` +
-        `the session-level filesystem.denyRead/denyWrite (passed to ` +
-        `SandboxManager.initialize(), stdin-passed to \`acl stamp\`) ` +
-        `instead, or shorten the command.`,
+        `(CreateProcessW limit is 32 767). Shorten the command, ` +
+        `or move broad globs to session-level filesystem.denyRead.`,
     )
   }
 
-  // Drop/overwrite denied credential env vars from the inherited
-  // environment FIRST. The proxy assignments below must come LAST
-  // so SRT's own proxy plumbing vars survive even if a caller lists
-  // one of them as a denied credential — same precedence as the
-  // macOS/Linux `env -u … VAR=… sandbox-exec` order.
-  //
-  // Windows env is case-insensitive but Node preserves the OS
-  // casing on enumeration, so a `delete baseEnv['SECRET']` would
-  // miss a `Secret` key. Match by uppercased name instead.
-  const baseEnv: NodeJS.ProcessEnv = { ...process.env }
-  const unsetUpper = new Set((p.unsetEnvVars ?? []).map(k => k.toUpperCase()))
-  for (const k of Object.keys(baseEnv)) {
-    if (unsetUpper.has(k.toUpperCase())) delete baseEnv[k]
-  }
-  Object.assign(baseEnv, p.setEnvVars ?? {})
-
-  // Generated proxy vars override any inherited (or just-masked)
-  // ones so the child always routes through this sandbox's proxies.
-  const env: NodeJS.ProcessEnv = { ...baseEnv, ...generated }
+  // The two-hop runner starts with a FRESH `srt-sandbox` profile
+  // env (`lpEnvironment = NULL` + `LOGON_WITH_PROFILE`), so the
+  // broker process's environment never reaches the child. The
+  // returned `env` is the spawn env for the broker (srt-win)
+  // process only; the child sees the `--env` overlay built into
+  // `argv` above (PATH/PATHEXT + mode:'mask' sentinels + proxy).
+  const env: NodeJS.ProcessEnv = { ...process.env, ...generated }
   return { argv, env }
 }
 
@@ -1475,35 +1403,18 @@ function envListToObject(list: string[]): NodeJS.ProcessEnv {
 
 /**
  * Install instructions, surfaced verbatim in error messages.
- * Tailored to the observed group state: if the install already
- * ran (`created-not-on-token`), only the logout is missing.
  */
 export function windowsInstallInstructions(
-  ref: WindowsGroupRef,
   sublayerGuid: string | undefined,
-  groupState: WindowsGroupStatus,
 ): string {
-  if (groupState === 'created-not-on-token') {
-    return (
-      `The discriminator group exists but is not yet in this session's ` +
-      `token. LOG OUT and back in to pick up the new group membership ` +
-      `(it enters TokenGroups at logon). Network is not disrupted ` +
-      `meanwhile — WFP filter-0 PERMITs traffic while the group is absent ` +
-      `from your token.`
-    )
-  }
-  const g = ref.groupSid
-    ? `--group-sid ${ref.groupSid}`
-    : `--name ${ref.groupName ?? DEFAULT_WINDOWS_GROUP_NAME}`
   const sl = sublayerGuid ? ` --sublayer-guid ${sublayerGuid}` : ''
   return (
     `Windows sandbox needs a one-time install (one UAC prompt):\n` +
     `  npx sandbox-runtime windows-install\n` +
     `  — or call installWindowsSandbox(), or run ` +
-    `\`srt-win.exe install ${g}${sl}\` directly —\n` +
-    `then LOG OUT and back in (the group SID enters TokenGroups at logon).\n` +
-    `Network is not disrupted before the logout: while the group is absent ` +
-    `from your token, WFP filter-0 PERMITs all traffic.`
+    `\`srt-win.exe install${sl}\` directly.\n` +
+    `No logout is needed: the WFP filter keys on the dedicated ` +
+    `\`srt-sandbox\` user's SID, so your network is unaffected.`
   )
 }
 
@@ -1512,38 +1423,38 @@ export function windowsInstallInstructions(
  * `initialize()`; warnings are informational.
  */
 export function checkWindowsDependencies(
-  ref: WindowsGroupRef,
-  sublayerGuid?: string,
+  opts: { sublayerGuid?: string; srtWin?: SrtWinSpawn } = {},
 ): SandboxDependencyCheck {
+  const { sublayerGuid } = opts
   const errors: string[] = []
   const warnings: string[] = []
 
-  // 1. Binary present.
-  let exe: string
+  // 1. Binary present (`resolveSrtWin` throws on a missing
+  // override, `getSrtWinPath` on a missing packaged binary). Resolve
+  // once and reuse for the status calls below.
+  let srtWin: SrtWinSpawn
   try {
-    exe = getSrtWinPath()
+    srtWin = opts.srtWin ?? resolveSrtWin()
   } catch (e) {
     return { errors: [(e as Error).message], warnings }
   }
-  logForDebugging(`[Sandbox Windows] using srt-win at ${exe}`)
+  logForDebugging(`[Sandbox Windows] using srt-win at ${srtWin.exe}`)
 
-  // 2. Group ready (exists AND enabled in the caller's token).
-  let gs: WindowsGroupStatusResult
+  // 2. Sandbox user provisioned + credential readable.
+  let us: WindowsSandboxUserStatus
   try {
-    gs = getWindowsGroupStatus(ref)
+    us = getWindowsSandboxUserStatus({ srtWin })
   } catch (e) {
-    errors.push(`srt-win group status failed: ${(e as Error).message}`)
+    errors.push(`srt-win user status failed: ${(e as Error).message}`)
     return { errors, warnings }
   }
-  if (gs.state !== 'ready') {
+  if (!us.provisioned || !us.credPresent) {
     errors.push(
-      `Discriminator group is ${gs.state}` +
-        (gs.sid ? ` (sid=${gs.sid})` : '') +
-        `. ` +
-        windowsInstallInstructions(ref, sublayerGuid, gs.state),
+      `Sandbox user is not provisioned (user=${us.provisioned}, ` +
+        `cred=${us.credPresent}). ` +
+        windowsInstallInstructions(sublayerGuid),
     )
   }
-  if (gs.warning) warnings.push(gs.warning)
 
   // 3. WFP filters installed under the sublayer. BFE enumeration is
   // admin-gated; `cannot-read` is informational only — the
@@ -1551,7 +1462,7 @@ export function checkWindowsDependencies(
   // `initialize()` and is what actually fails closed.
   let ws: WindowsWfpStatusResult
   try {
-    ws = getWindowsWfpStatus({ sublayerGuid })
+    ws = getWindowsWfpStatus({ sublayerGuid, srtWin })
   } catch (e) {
     errors.push(`srt-win wfp status failed: ${(e as Error).message}`)
     return { errors, warnings }
@@ -1561,15 +1472,13 @@ export function checkWindowsDependencies(
       `[Sandbox Windows] wfp status cannot-read (non-elevated): ${ws.hint}`,
     )
   } else if (ws.state !== 'installed') {
-    // If the group is also not-ready, the group-state error above
-    // already gave the right instruction; don't repeat. Only
-    // surface a separate WFP error when group IS ready (i.e.
-    // someone uninstalled filters but kept the group).
-    if (gs.state === 'ready') {
+    // 'absent'. If the user is also not-provisioned, the user-state
+    // error above already gave the right instruction; don't repeat.
+    if (us.provisioned && us.credPresent) {
       errors.push(
         `WFP filters not installed under sublayer ` +
           `${sublayerGuid ?? '(default)'}. ` +
-          windowsInstallInstructions(ref, sublayerGuid, 'absent'),
+          windowsInstallInstructions(sublayerGuid),
       )
     }
   } else if (ws.portRange) {

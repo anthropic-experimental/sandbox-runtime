@@ -1,0 +1,5 @@
+# Default rustfmt config — pins the crate to `cargo fmt` defaults so
+# editor format-on-save and CI agree. Prior to this the crate was
+# hand-wrapped at ~72 cols with no config, which meant any editor
+# that auto-formats introduced spurious reflow diffs.
+edition = "2024"

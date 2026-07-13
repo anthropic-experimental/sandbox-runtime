@@ -21,11 +21,19 @@
  * `mode: "deny"` (see macos-sandbox-utils.ts).
  */
 
+import { randomUUID } from 'node:crypto'
 import * as fs from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { logForDebugging } from '../utils/debug.js'
+import { extractAndSubstitute } from './credential-extract.js'
 import { normalizePathForSandbox } from './sandbox-utils.js'
+import {
+  JWT_DEFAULT_EXTRACT_PATTERN,
+  maskJwtClaims,
+  mintFakeJwt,
+  verifyJwt,
+} from './credential-decode.js'
 import type { CredentialFileConfig } from './sandbox-config.js'
 import type { SentinelRegistry } from './credential-sentinel.js'
 
@@ -35,85 +43,6 @@ import type { SentinelRegistry } from './credential-sentinel.js'
  * with the env var `GH_TOKEN`.
  */
 const FILE_KEY_PREFIX = 'file:'
-
-/**
- * Result of {@link extractAndSubstitute}: the file content with each
- * matched capture-group-1 span replaced by `sentinelFor(capture, i)`,
- * plus the distinct captured values in first-seen (index) order.
- */
-export interface ExtractResult {
-  fakeContent: string
-  captures: string[]
-}
-
-/**
- * `RegExpMatchArray` with the `d`-flag indices array. The project targets
- * ES2020 so `lib.es2022.regexp` is not loaded, but Node ≥18 (the engine
- * floor) supports `hasIndices` at runtime.
- */
-type MatchWithIndices = RegExpMatchArray & {
-  indices: Array<[number, number] | undefined>
-}
-
-/**
- * Apply `pattern` globally to `content` and return `content` with each
- * matched capture-group-1 span replaced by `sentinelFor(capture, i)`,
- * where `i` is the zero-based index of the distinct captured value in
- * first-seen order.
- *
- * Single pass, offset-based: the regex `d` flag exposes capture-group
- * offsets, so the output is built by slicing between matches and
- * splicing the sentinel in at the exact `[start, end)` of group 1. Only
- * the regex-matched span is replaced — a captured value that
- * coincidentally appears elsewhere in the file (outside any match) is
- * left intact. No placeholder pass, no substring-ordering concern.
- *
- * Returns `null` when the pattern matches nothing — the caller treats that
- * as fail-open (skip the entry, leave the file readable as-is) with a loud
- * stderr warning. A non-matching pattern is a config mistake for the
- * operator to fix; see {@link buildMaskedFileBinds} for the rationale.
- *
- * Throws when a match has no group-1 capture. The schema already rejects
- * patterns with zero groups, so this only fires when group 1 is optional
- * and absent for some match (e.g. `"token: (\\S+)?"`); accepting that
- * would silently mask nothing for that occurrence.
- *
- * Pure on `content`/`pattern`; the callback may close over a registry.
- */
-export function extractAndSubstitute(
-  content: string,
-  pattern: string,
-  sentinelFor: (capture: string, index: number) => string,
-): ExtractResult | null {
-  // The schema validates `pattern` compiles; `g` makes matchAll iterate
-  // every occurrence and `d` populates `m.indices` with group offsets.
-  const re = new RegExp(pattern, 'gd')
-  const indexByCapture = new Map<string, number>()
-  let out = ''
-  let pos = 0
-  for (const m of content.matchAll(re) as IterableIterator<MatchWithIndices>) {
-    const cap = m[1]
-    if (cap === undefined) {
-      throw new Error(
-        `extract pattern /${pattern}/ matched at offset ${m.index} but ` +
-          `capture group 1 is undefined — group 1 must capture the ` +
-          `credential value on every match.`,
-      )
-    }
-    // Empty captures are skipped: a zero-width span has nothing to mask.
-    if (cap.length === 0) continue
-    let i = indexByCapture.get(cap)
-    if (i === undefined) indexByCapture.set(cap, (i = indexByCapture.size))
-    const [start, end] = m.indices[1]!
-    out += content.slice(pos, start) + sentinelFor(cap, i)
-    pos = end
-  }
-  if (indexByCapture.size === 0) return null
-  return {
-    fakeContent: out + content.slice(pos),
-    captures: [...indexByCapture.keys()],
-  }
-}
 
 /** One masked file's bind mapping for the platform builder. */
 export interface MaskedFileBind {
@@ -185,23 +114,58 @@ export class MaskedFileStore {
   }
 }
 
+/** Result of {@link buildMaskedFileBinds}. */
+export interface MaskedFileBuildResult {
+  binds: MaskedFileBind[]
+  /**
+   * Resolved paths of `mode: "mask"` entries that degraded to deny at
+   * runtime — populated when `extract` matches nothing (or, with
+   * `decode`, no candidate verifies) and the entry's `onExtractNoMatch`
+   * is `"deny"`. Callers union these into the read-deny set so the
+   * credential file is unreadable rather than exposed.
+   */
+  degradeToDenyPaths: string[]
+}
+
 /**
  * For each `mode: "mask"` file entry: resolve the path, read the real
  * content, build the fake content (whole-file or structured per `extract`),
  * register sentinels in `registry`, write the fake via `store`, and return
- * the bind list.
+ * the bind list plus any entries that degraded to deny.
  *
  * Whole-file mode (no `extract`): one sentinel keyed `file:<path>` whose
  * real value is the entire file content; the fake file *is* the sentinel.
  *
- * Structured mode (`extract` set): one sentinel per distinct captured
- * value, keyed `file:<path>#<i>`; the fake file is the real content with
- * each captured span replaced by its sentinel. If the regex matches
- * nothing the entry is **skipped with a loud stderr warning** — fail-open:
- * no bind, no deny, the file stays readable via the root mount. The
- * operator's regex is treated as a config error to surface and fix, not a
- * reason to block file access; a wrong pattern should not break a tool
- * that needs the file when the credential is legitimately absent.
+ * Structured mode (`extract` and/or `decode` set): one sentinel per
+ * distinct captured value, keyed `file:<path>#<i>`; the fake file is the
+ * real content with each captured span replaced by its sentinel. With
+ * `decode: "jwt"`, candidates come from the explicit `extract` pattern or
+ * the built-in JWT pattern, each candidate must pass {@link verifyJwt}
+ * before it is masked (failed candidates are left untouched), and the
+ * sentinel is a JWT-shaped fake ({@link mintFakeJwt}) registered via
+ * `registerWithSentinel`. With `maskClaims`, masking goes one level
+ * deeper: each named top-level payload claim present with a string value
+ * gets its own sentinel and the token is rebuilt around the modified
+ * payload ({@link maskJwtClaims}); BOTH mappings are registered — the
+ * whole fake token → the whole real token (a tool sending the token as a
+ * bearer credential) and each claim sentinel → the real claim value (a
+ * tool extracting the claim and sending it alone) — under the same
+ * injectHosts. Named claims absent or non-string in a token are skipped
+ * with a debug log (portable-config posture, like a missing file). If the
+ * regex matches nothing — or, with decode, no candidate verifies, or with
+ * `maskClaims`, no named claim matches in any verified token — the
+ * entry's `onExtractNoMatch` decides:
+ * - `"warn"` (default): skip the entry with a loud stderr warning —
+ *   fail-open, the file stays readable via the root mount;
+ * - `"deny"`: push the path to `degradeToDenyPaths` — fail-closed, the
+ *   file becomes unreadable inside the sandbox;
+ * - `"error"`: throw, so nothing runs until the config is fixed.
+ * With `maskDuplicates`, verbatim occurrences of each captured value
+ * outside the matched spans are also replaced (see {@link ExtractOptions}).
+ * Composed with `decode`, the duplicate pass covers only captures that
+ * passed verification — a duplicate is the same value, so it inherits the
+ * verified capture's sentinel without re-verification; unverified
+ * candidates (left untouched by the decode gate) never mask duplicates.
  *
  * Entries whose path does not exist, is unreadable, or resolves to a
  * directory are skipped with a debug log — same posture as a masked env
@@ -216,8 +180,9 @@ export function buildMaskedFileBinds(
   allowedDomains: readonly string[],
   registry: SentinelRegistry,
   store: MaskedFileStore,
-): MaskedFileBind[] {
+): MaskedFileBuildResult {
   const binds: MaskedFileBind[] = []
+  const degradeToDenyPaths: string[] = []
   for (const f of files) {
     if (f.mode !== 'mask') continue
     const realPath = normalizePathForSandbox(f.path)
@@ -260,23 +225,119 @@ export function buildMaskedFileBinds(
     const key = FILE_KEY_PREFIX + realPath
 
     let fakeContent: string
-    if (f.extract === undefined) {
+    if (f.extract === undefined && f.decode === undefined) {
       // Whole-file: one sentinel for the entire content.
       fakeContent = registry.register(key, content, injectHosts)
     } else {
-      const extracted = extractAndSubstitute(content, f.extract, (cap, i) =>
-        registry.register(`${key}#${i}`, cap, injectHosts),
+      // An explicit extract pattern wins; decode without one falls back to
+      // the built-in JWT pattern so authors don't hand-write it.
+      const pattern = f.extract ?? JWT_DEFAULT_EXTRACT_PATTERN
+      let maskedCount = 0
+      const extracted = extractAndSubstitute(
+        content,
+        pattern,
+        (cap, i) => {
+          // Decode-verification: a regex match that is not actually a JWT
+          // (the default pattern over-matches by design) is left untouched —
+          // returning the capture replaces the span with itself.
+          if (f.decode === 'jwt' && !verifyJwt(cap)) return cap
+          const name = `${key}#${i}`
+          if (f.decode === 'jwt' && f.maskClaims?.length) {
+            // Claim-level masking: sentinels go INSIDE the payload; the
+            // rebuilt fake token is itself registered as a sentinel for
+            // the whole real token, so both the bearer path (token sent
+            // verbatim) and the extracted-claim path substitute on egress.
+            const masked = maskJwtClaims(cap, f.maskClaims, (claim, real) =>
+              registry.register(`${key}#jwt${i}.${claim}`, real, injectHosts),
+            )
+            if (masked === null) {
+              // A verified JWT none of whose named claims are present as
+              // strings: nothing to mask in THIS token — leave it as-is;
+              // if no token matches any claim, onExtractNoMatch applies.
+              logForDebugging(
+                `[credential-mask] ${f.path}: verified JWT candidate has ` +
+                  `none of maskClaims ${JSON.stringify(f.maskClaims)} as ` +
+                  `string claims — left unmasked.`,
+              )
+              return cap
+            }
+            const skipped = f.maskClaims.filter(
+              c => !masked.claimSentinels.has(c),
+            )
+            if (skipped.length > 0) {
+              logForDebugging(
+                `[credential-mask] ${f.path}: maskClaims ` +
+                  `${JSON.stringify(skipped)} absent or non-string in a ` +
+                  `verified JWT — skipped.`,
+              )
+            }
+            maskedCount++
+            return registry.registerWithSentinel(
+              name,
+              masked.fakeToken,
+              cap,
+              injectHosts,
+            )
+          }
+          maskedCount++
+          // For decode the fake must keep the token's shape: a JWT-shaped
+          // sentinel keeps client-side parsers (segment count, payload
+          // decode, exp checks) working inside the sandbox.
+          return f.decode === 'jwt'
+            ? registry.registerWithSentinel(
+                name,
+                mintFakeJwt(randomUUID()),
+                cap,
+                injectHosts,
+              )
+            : registry.register(name, cap, injectHosts)
+        },
+        { maskDuplicates: f.maskDuplicates ?? false },
       )
-      if (extracted === null) {
-        // Fail-open: a non-matching extract pattern is a config error to
-        // surface, not a reason to block file access. Skip the entry (no
-        // bind, no deny) — the file stays readable via the root mount —
-        // and warn loudly on stderr so the operator fixes the regex.
+      if (extracted === null || maskedCount === 0) {
+        // Nothing was masked — either the pattern matched nothing or, with
+        // decode, no candidate survived verification. Both are the same
+        // "masking cannot apply" condition, so both route through the
+        // entry's onExtractNoMatch policy.
+        const cause =
+          f.decode === 'jwt'
+            ? f.maskClaims?.length
+              ? `decode "jwt" with pattern "${pattern}" that matched no ` +
+                `verified JWT with maskable claims (maskClaims: ` +
+                `${JSON.stringify(f.maskClaims)})`
+              : `decode "jwt" with pattern "${pattern}" that matched no ` +
+                `verified JWT`
+            : `extract pattern "${pattern}" that matched nothing`
+        const onNoMatch = f.onExtractNoMatch ?? 'warn'
+        if (onNoMatch === 'error') {
+          throw new Error(
+            `credentials.files entry "${f.path}": ${cause} ` +
+              `(onExtractNoMatch: "error"). Fix the config, change to ` +
+              `"warn"/"deny", or remove the entry.`,
+          )
+        }
+        if (onNoMatch === 'deny') {
+          // Fail-closed: the operator declared this file as containing a
+          // credential. Masking can't apply — degrade to deny so the
+          // sandboxed process cannot read the credential at all.
+          logForDebugging(
+            `[credential-mask] ${f.path} has ${cause} — degrading to ` +
+              `mode "deny".`,
+            { level: 'warn' },
+          )
+          degradeToDenyPaths.push(realPath)
+          continue
+        }
+        // 'warn' (default): fail-open. A non-matching config is an error
+        // to surface, not a reason to block file access. Skip the entry
+        // (no bind, no deny) — the file stays readable via the root mount
+        // — and warn loudly on stderr so the operator fixes the config.
         const msg =
           `[sandbox-runtime] WARNING: credentials.files entry ` +
-          `"${f.path}" has extract pattern "${f.extract}" that matched ` +
-          `nothing in the file. The file is left UNPROTECTED (readable ` +
-          `as-is inside the sandbox). Fix the regex or remove the entry.`
+          `"${f.path}" has ${cause} in the file. The file is left ` +
+          `UNPROTECTED (readable as-is inside the sandbox). Fix the ` +
+          `config, set onExtractNoMatch to "deny" or "error", or remove ` +
+          `the entry.`
         console.warn(msg)
         logForDebugging(msg, { level: 'warn' })
         continue
@@ -287,7 +348,7 @@ export function buildMaskedFileBinds(
     const fakePath = store.write(key, fakeContent)
     binds.push({ realPath, fakePath })
   }
-  return binds
+  return { binds, degradeToDenyPaths }
 }
 
 export const MASKED_FILE_STORE_PREFIX = 'srt-credmask-'

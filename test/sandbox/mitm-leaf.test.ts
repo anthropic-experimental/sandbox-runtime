@@ -60,6 +60,39 @@ describe('mitm-leaf: mintLeafCert', () => {
     await disposeMitmCA(ephemeral)
   })
 
+  test('carries a cRLDistributionPoints URI when ca.crlUrl is set (Schannel revocation)', async () => {
+    // Schannel checks revocation on the LEAF and hard-fails when there's no
+    // CDP; the URL points at the empty CRL the proxy serves. Without crlUrl
+    // (e.g. minted before the proxy port is bound) the extension is absent —
+    // fine for OpenSSL-backed clients, which don't check by default. `ca` is
+    // the file-level fixture CA (crlUrl unset).
+    const { pki } = forge
+    expect(
+      pki
+        .certificateFromPem(
+          firstPemBlock(mintLeafCert(ca, 'cdp.example').certPem),
+        )
+        .getExtension('cRLDistributionPoints'),
+    ).toBeFalsy()
+
+    const withUrl = createMitmCA({ caCertPath: CA_CERT, caKeyPath: CA_KEY })
+    withUrl.crlUrl = 'http://127.0.0.1:60080/srt.crl'
+    try {
+      const leaf = pki.certificateFromPem(
+        firstPemBlock(mintLeafCert(withUrl, 'cdp.example').certPem),
+      )
+      const cdp = leaf.getExtension('cRLDistributionPoints') as {
+        value: string
+      }
+      expect(cdp).toBeTruthy()
+      // node-forge stores the DER value as a binary string; the URI is a
+      // GeneralName IA5String inside it.
+      expect(cdp.value).toContain('http://127.0.0.1:60080/srt.crl')
+    } finally {
+      await disposeMitmCA(withUrl)
+    }
+  })
+
   test('uses an IP SAN for IP-literal hostnames', () => {
     const leaf = mintLeafCert(ca, '127.0.0.1')
     const x = new X509Certificate(firstPemBlock(leaf.certPem))

@@ -38,6 +38,10 @@ interface SentinelEntry {
 export class SentinelRegistry {
   private readonly byName = new Map<string, SentinelEntry>()
   private readonly bySentinel = new Map<string, SentinelEntry>()
+  // True while every registered sentinel starts with SENTINEL_PREFIX, which
+  // keeps the substring fast path in substituteInString() valid. A
+  // caller-minted sentinel (e.g. a JWT-shaped fake) clears it.
+  private allSentinelsPrefixed = true
 
   /**
    * Return the sentinel for the credential named `name`, minting a fresh one
@@ -55,13 +59,41 @@ export class SentinelRegistry {
     realValue: string,
     injectHosts: readonly string[],
   ): string {
+    return this.registerWithSentinel(
+      name,
+      SENTINEL_PREFIX + randomUUID(),
+      realValue,
+      injectHosts,
+    )
+  }
+
+  /**
+   * Like {@link register}, but with a caller-minted sentinel instead of the
+   * default `fake_value_<uuid4>` — used when the fake must keep the real
+   * value's shape (e.g. a structurally valid JWT for `decode: "jwt"`), so
+   * client-side parsers inside the sandbox don't choke on it.
+   *
+   * Same idempotency contract as {@link register}: if `name` is already
+   * registered, the EXISTING sentinel is returned (and `sentinel` discarded)
+   * so a re-register never invalidates a fake the sandboxed process has
+   * already read. The caller must mint sentinels with enough entropy that
+   * collisions with real content are negligible (embed a uuid4).
+   */
+  registerWithSentinel(
+    name: string,
+    sentinel: string,
+    realValue: string,
+    injectHosts: readonly string[],
+  ): string {
     const existing = this.byName.get(name)
     if (existing !== undefined) {
       existing.realValue = realValue
       existing.injectHosts = injectHosts
       return existing.sentinel
     }
-    const sentinel = SENTINEL_PREFIX + randomUUID()
+    if (!sentinel.startsWith(SENTINEL_PREFIX)) {
+      this.allSentinelsPrefixed = false
+    }
     const entry: SentinelEntry = { name, sentinel, realValue, injectHosts }
     this.byName.set(name, entry)
     this.bySentinel.set(sentinel, entry)
@@ -101,6 +133,7 @@ export class SentinelRegistry {
   clear(): void {
     this.byName.clear()
     this.bySentinel.clear()
+    this.allSentinelsPrefixed = true
   }
 
   /**
@@ -139,9 +172,10 @@ export class SentinelRegistry {
     destHost: string,
     matches: HostMatcher,
   ): string {
-    // Fast path: the sentinel prefix is fixed, so a header value that
-    // doesn't contain it cannot contain any sentinel.
-    if (!s.includes(SENTINEL_PREFIX)) return s
+    // Fast path: while every sentinel carries the fixed prefix, a header
+    // value that doesn't contain it cannot contain any sentinel. Disabled
+    // once a caller-minted sentinel (arbitrary shape) is registered.
+    if (this.allSentinelsPrefixed && !s.includes(SENTINEL_PREFIX)) return s
     let out = s
     for (const e of this.bySentinel.values()) {
       if (!out.includes(e.sentinel)) continue

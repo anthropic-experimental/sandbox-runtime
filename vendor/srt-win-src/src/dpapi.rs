@@ -22,13 +22,13 @@
 //! loaded — machine scope is the only shape that round-trips
 //! reliably across that split.
 
-use anyhow::{anyhow, Result};
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{LocalFree, HLOCAL};
+use anyhow::{Result, anyhow};
+use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::Security::Cryptography::{
-    CryptProtectData, CryptUnprotectData, CRYPTPROTECT_LOCAL_MACHINE,
-    CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData,
+    CryptUnprotectData,
 };
+use windows::core::PCWSTR;
 
 /// `CryptProtectData` with `CRYPTPROTECT_LOCAL_MACHINE |
 /// CRYPTPROTECT_UI_FORBIDDEN`. See the module-level note: this is
@@ -87,9 +87,7 @@ fn take_blob(out: CRYPT_INTEGER_BLOB) -> Vec<u8> {
     if out.pbData.is_null() {
         return Vec::new();
     }
-    let v = unsafe {
-        std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec()
-    };
+    let v = unsafe { std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec() };
     unsafe {
         let _ = LocalFree(Some(HLOCAL(out.pbData as *mut core::ffi::c_void)));
     }

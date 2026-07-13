@@ -7,16 +7,13 @@ import {
   containsGlobCharsWin,
   stripExtendedPathPrefix,
 } from '../../src/sandbox/sandbox-utils.js'
-import {
-  expandWindowsFsDenyPaths,
-  wrapCommandWithSandboxWindows,
-} from '../../src/sandbox/windows-sandbox-utils.js'
+import { expandWindowsFsPaths } from '../../src/sandbox/windows-sandbox-utils.js'
 
 /**
- * Property tests for the Windows path-normalisation pipeline and
- * the env scrub. These pin the case-fold and glob/literal-divergence
- * invariants generically (regression coverage for past bugs in this
- * layer). Pure-JS — runs on every CI leg.
+ * Property tests for the Windows path-normalisation pipeline.
+ * Pins the case-fold and glob/literal-divergence invariants
+ * generically (regression coverage for past bugs in this layer).
+ * Pure-JS — runs on every CI leg.
  */
 
 describe('property: stripExtendedPathPrefix', () => {
@@ -61,54 +58,7 @@ describe('property: containsGlobCharsWin', () => {
   })
 })
 
-describe('property: env scrub', () => {
-  // Random casing of an ASCII identifier.
-  const recase = (s: string, seed: number): string =>
-    [...s]
-      .map((ch, i) =>
-        (seed >> i % 30) & 1 ? ch.toUpperCase() : ch.toLowerCase(),
-      )
-      .join('')
-
-  it('unsetEnvVars scrubs every casing', () => {
-    const ident = fc
-      .string({ minLength: 1, maxLength: 12 })
-      .map(s => s.replace(/[^A-Za-z0-9_]/g, '') || 'X')
-      .map(s => (/^[A-Za-z_]/.test(s) ? s : 'X' + s))
-    fc.assert(
-      fc.property(
-        fc.uniqueArray(ident, { minLength: 1, maxLength: 6 }),
-        fc.integer(),
-        (names, seed) => {
-          const prevSrt = process.env.SRT_WIN_PATH
-          process.env.SRT_WIN_PATH = process.execPath
-          // Plant each name in a random casing.
-          const planted: string[] = []
-          for (const [i, n] of names.entries()) {
-            const k = recase(n, seed + i)
-            process.env[k] = 'x'
-            planted.push(k)
-          }
-          try {
-            const { env } = wrapCommandWithSandboxWindows({
-              command: 'echo',
-              group: { groupName: 'g' },
-              unsetEnvVars: names,
-            })
-            const upper = new Set(names.map(n => n.toUpperCase()))
-            return Object.keys(env).every(k => !upper.has(k.toUpperCase()))
-          } finally {
-            for (const k of planted) delete process.env[k]
-            if (prevSrt === undefined) delete process.env.SRT_WIN_PATH
-            else process.env.SRT_WIN_PATH = prevSrt
-          }
-        },
-      ),
-    )
-  })
-})
-
-describe('property: expandWindowsFsDenyPaths', () => {
+describe('property: expandWindowsFsPaths', () => {
   let scratch: string
   const files: string[] = []
 
@@ -131,8 +81,8 @@ describe('property: expandWindowsFsDenyPaths', () => {
     // round-trip.
     fc.assert(
       fc.property(fc.subarray(files, { minLength: 1 }), subset => {
-        const once = expandWindowsFsDenyPaths(subset)
-        const twice = expandWindowsFsDenyPaths(once)
+        const once = expandWindowsFsPaths(subset)
+        const twice = expandWindowsFsPaths(once)
         return (
           once.length === twice.length &&
           new Set(once).size === once.length &&

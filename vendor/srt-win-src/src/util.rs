@@ -1,8 +1,8 @@
 //! Small Win32 helpers shared across the crate.
 
 use std::ffi::c_void;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
 use windows::core::{PCWSTR, PWSTR};
-use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
 
 /// Owns a kernel `HANDLE`; `CloseHandle` on drop. For tokens, file
 /// handles, process handles — anything whose only cleanup is
@@ -71,7 +71,7 @@ pub fn local_free(p: *mut c_void) {
     }
 }
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use windows::Win32::Foundation::WIN32_ERROR;
 
 /// `Ok(())` if `r` is `ERROR_SUCCESS`, else `bail!("{label}:
@@ -86,8 +86,8 @@ pub(crate) fn win32_ok(r: WIN32_ERROR, label: &str) -> Result<()> {
 }
 
 use windows::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, KEY_SET_VALUE,
-    REG_OPTION_NON_VOLATILE, REG_VALUE_TYPE,
+    HKEY, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_VALUE_TYPE, RegCloseKey, RegCreateKeyExW,
+    RegSetValueExW,
 };
 
 /// `RegCreateKeyExW(root, subkey, KEY_SET_VALUE)` →
@@ -121,8 +121,7 @@ pub fn reg_set_value(
     if r.is_err() {
         return Err(anyhow!("RegCreateKeyExW({subkey}): {r:?}"));
     }
-    let r =
-        unsafe { RegSetValueExW(hkey, pcwstr(&val_w), None, ty, Some(data)) };
+    let r = unsafe { RegSetValueExW(hkey, pcwstr(&val_w), None, ty, Some(data)) };
     unsafe {
         let _ = RegCloseKey(hkey);
     }
@@ -133,9 +132,7 @@ pub fn reg_set_value(
 }
 
 use windows::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
-use windows::Win32::Security::{
-    GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR,
-};
+use windows::Win32::Security::{GetSecurityDescriptorLength, PSECURITY_DESCRIPTOR};
 
 const SDDL_REVISION_1: u32 = 1;
 
@@ -162,9 +159,7 @@ impl OwnedSd {
                 Some(&mut sz),
             )
             .map_err(|e| {
-                anyhow!(
-                    "ConvertStringSecurityDescriptorToSecurityDescriptorW({sddl}): {e}"
-                )
+                anyhow!("ConvertStringSecurityDescriptorToSecurityDescriptorW({sddl}): {e}")
             })?;
             if sz == 0 {
                 sz = GetSecurityDescriptorLength(psd);

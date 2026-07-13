@@ -246,6 +246,28 @@ export function expandTilde(p: string): string {
 }
 
 /**
+ * Expand Windows-style `%USERPROFILE%` / `%HOMEDRIVE%` / `%HOMEPATH%`
+ * references to the real user's home directory. Case-insensitive;
+ * idempotent. Applied by {@link normalizePathForSandbox}'s Windows
+ * pre-processing so every filesystem-config path field
+ * (`allowRead`/`allowWrite`/`denyRead`/`denyWrite`) accepts these
+ * forms uniformly.
+ *
+ * `%HOMEPATH%` is drive-RELATIVE (`\Users\name`) and `%HOMEDRIVE%` is
+ * the drive-only (`C:`) — the split matches how cmd.exe defines them,
+ * so `%HOMEDRIVE%%HOMEPATH%` composes to the full home path.
+ */
+export function expandWindowsEnvRefs(p: string): string {
+  const home = homedir()
+  const drive = /^[A-Za-z]:/.test(home) ? home.slice(0, 2) : ''
+  const homePath = drive ? home.slice(2) : home
+  return p
+    .replace(/%USERPROFILE%/gi, home)
+    .replace(/%HOMEDRIVE%/gi, drive)
+    .replace(/%HOMEPATH%/gi, homePath)
+}
+
+/**
  * Normalize a path for use in sandbox configurations
  * Handles:
  * - Tilde (~) expansion for home directory
@@ -258,11 +280,12 @@ export function expandTilde(p: string): string {
  */
 export function normalizePathForSandbox(pathPattern: string): string {
   const cwd = process.cwd()
-  // Windows pre-processing: strip the `\\?\` / `\\?\UNC\` extended
-  // prefix (its `?` is a literal, not a glob char) and uppercase
-  // the drive letter so `c:\…` and `C:\…` normalize identically.
+  // Windows pre-processing: expand `%USERPROFILE%` / `%HOMEDRIVE%` /
+  // `%HOMEPATH%`, strip the `\\?\` / `\\?\UNC\` extended prefix (its
+  // `?` is a literal, not a glob char), and uppercase the drive
+  // letter so `c:\…` and `C:\…` normalize identically.
   if (getPlatform() === 'windows') {
-    pathPattern = stripExtendedPathPrefix(pathPattern)
+    pathPattern = stripExtendedPathPrefix(expandWindowsEnvRefs(pathPattern))
     if (/^[a-z]:/.test(pathPattern)) {
       pathPattern = pathPattern[0].toUpperCase() + pathPattern.slice(1)
     }
