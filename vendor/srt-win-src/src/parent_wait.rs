@@ -12,7 +12,7 @@ use windows::Win32::System::Threading::{
 
 use crate::util::OwnedHandle;
 
-pub const ACL_HOLDER_READY_LINE: &str = "srt-win-acl-holder-ready-v1";
+pub const ACL_HOLDER_READY_PROTOCOL: &str = "srt-win-acl-holder-ready-v2";
 
 fn open_parent_process(parent_pid: u32) -> Result<OwnedHandle> {
     let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, parent_pid) }

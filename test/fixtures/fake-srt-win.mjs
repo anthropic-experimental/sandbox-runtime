@@ -21,12 +21,19 @@ function persistState() {
   writeFileSync(statePath, JSON.stringify(state))
 }
 
+function argValue(name) {
+  const index = args.indexOf(name)
+  return index >= 0 ? args[index + 1] : undefined
+}
+
 function holderPid() {
-  const index = args.indexOf('--holder-pid')
-  if (index < 0 || !args[index + 1]) {
-    throw new Error('fake ACL command requires --holder-pid')
-  }
-  return args[index + 1]
+  const value = argValue('--holder-pid')
+  if (!value) throw new Error('fake ACL command requires --holder-pid')
+  return value
+}
+
+function holderProcessCreateTime() {
+  return argValue('--holder-process-create-time')
 }
 
 appendFileSync(
@@ -43,16 +50,36 @@ appendFileSync(
 
 let exitCode
 if (args[0] === 'acl' && args[1] === 'hold') {
-  const index = args.indexOf('--parent-pid')
-  const parentPid = Number(args[index + 1])
-  if (index < 0 || !Number.isInteger(parentPid)) {
+  const parentPid = Number(argValue('--parent-pid'))
+  const holderSid = argValue('--sandbox-user-sid')
+  if (!Number.isInteger(parentPid)) {
     throw new Error('fake acl hold requires --parent-pid')
+  }
+  if (!holderSid || holderSid !== state.sandboxUserSid) {
+    throw new Error('fake acl hold requires the configured --sandbox-user-sid')
+  }
+  const holderCreateTime = String(
+    state.holdReadyProcessCreateTime ??
+      134_123_456_789_000_000n + BigInt(process.pid),
+  )
+  const releaseHolder = () => {
+    const releaseExit = Number(state.holdReleaseExit ?? 0)
+    if (releaseExit === 0) {
+      const latest = JSON.parse(readFileSync(statePath, 'utf8'))
+      const pid = String(process.pid)
+      if (latest.holdCreateTimes?.[pid] === holderCreateTime) {
+        delete latest.holds?.[pid]
+        delete latest.holdCreateTimes[pid]
+        writeFileSync(statePath, JSON.stringify(latest))
+      }
+    }
+    process.exit(releaseExit)
   }
   const startHolder = () => {
     try {
       process.kill(parentPid, 0)
     } catch {
-      process.exit(0)
+      releaseHolder()
     }
     if (state.holdStderr !== undefined) {
       writeSync(2, String(state.holdStderr))
@@ -83,10 +110,15 @@ if (args[0] === 'acl' && args[1] === 'hold') {
       }
       process.exit(exitCode)
     }
-    writeSync(
-      1,
-      String(state.holdReadyLine ?? 'srt-win-acl-holder-ready-v1') + '\n',
-    )
+    const readyHolderPid = process.pid + Number(state.holdReadyPidOffset ?? 0)
+    const readyLine =
+      state.holdReadyLine ??
+      JSON.stringify({
+        protocol: 'srt-win-acl-holder-ready-v2',
+        holderPid: readyHolderPid,
+        holderProcessCreateTime: holderCreateTime,
+      })
+    writeSync(1, String(readyLine) + '\n')
     if (state.holdExitCode !== undefined) {
       setTimeout(
         () => process.exit(Number(state.holdExitCode)),
@@ -98,11 +130,11 @@ if (args[0] === 'acl' && args[1] === 'hold') {
         process.kill(parentPid, 0)
       } catch {
         clearInterval(timer)
-        process.exit(0)
+        releaseHolder()
       }
     }, 25)
   }
-  process.once('SIGTERM', () => process.exit(0))
+  process.once('SIGTERM', releaseHolder)
   setTimeout(startHolder, Number(state.holdReadyDelayMs ?? 0))
 } else if (args[0] === 'user' && args[1] === 'status') {
   const userExists = state.userProvisioned ?? true
@@ -128,11 +160,13 @@ if (args[0] === 'acl' && args[1] === 'hold') {
   const pid = holderPid()
   const access = JSON.parse(stdin)
   state.holds ??= {}
+  state.holdCreateTimes ??= {}
   for (const existingPid of Object.keys(state.holds)) {
     try {
       process.kill(Number(existingPid), 0)
     } catch {
       delete state.holds[existingPid]
+      delete state.holdCreateTimes[existingPid]
     }
   }
   state.holds[pid] = [
@@ -142,6 +176,8 @@ if (args[0] === 'acl' && args[1] === 'hold') {
       ...(access.write ?? []),
     ]),
   ]
+  const createTime = holderProcessCreateTime()
+  if (createTime !== undefined) state.holdCreateTimes[pid] = createTime
   persistState()
   if (state.grantDelayMs) {
     Atomics.wait(
@@ -155,7 +191,12 @@ if (args[0] === 'acl' && args[1] === 'hold') {
 } else if (args[0] === 'acl' && args[1] === 'revoke') {
   const pid = holderPid()
   const held = state.holds?.[pid] ?? []
-  const statuses = state.revokeStatuses ?? held.map(() => 'revoked')
+  const createTime = holderProcessCreateTime()
+  const identityMatches =
+    createTime === undefined || state.holdCreateTimes?.[pid] === createTime
+  const statuses = identityMatches
+    ? (state.revokeStatuses ?? held.map(() => 'revoked'))
+    : held.map(() => 'identityMismatch')
   exitCode = Number(state.revokeExit ?? 0)
   const safe = new Set([
     'revoked',
@@ -164,8 +205,13 @@ if (args[0] === 'acl' && args[1] === 'hold') {
     'restored',
     'alreadyOriginal',
   ])
-  if (exitCode === 0 && statuses.every(status => safe.has(status))) {
+  if (
+    exitCode === 0 &&
+    identityMatches &&
+    statuses.every(status => safe.has(status))
+  ) {
     delete state.holds?.[pid]
+    delete state.holdCreateTimes?.[pid]
     persistState()
   }
   writeSync(

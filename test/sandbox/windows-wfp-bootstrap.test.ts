@@ -52,13 +52,17 @@ interface FakeState {
   holdExitBeforeReady?: number
   holdExitBeforeReadyDelayMs?: number
   holdExitDelayMs?: number
+  holdReleaseExit?: number
   holdStderr?: string
   holdStderrAfterExit?: string
   holdStderrAfterExitDelayMs?: number
   holdReadyDelayMs?: number
   holdReadyLine?: string
+  holdReadyPidOffset?: number
+  holdReadyProcessCreateTime?: string
   verifyDelayMs?: number
   holds?: Record<string, string[]>
+  holdCreateTimes?: Record<string, string>
 }
 
 async function rejectedError(promise: Promise<unknown>): Promise<Error> {
@@ -183,6 +187,22 @@ describe.if(isWindows)('Windows WFP protected-runner bootstrap', () => {
   it('grants only the canonical executable and preserves caller CWD', async () => {
     const result = await bootstrap()
     expect(result.target).toBe(target)
+
+    const allCalls = invocations()
+    const holder = allCalls.find(
+      call => call.args[0] === 'acl' && call.args[1] === 'hold',
+    )
+    const grant = allCalls.find(
+      call => call.args[0] === 'acl' && call.args[1] === 'grant',
+    )
+    const revoke = allCalls.find(
+      call => call.args[0] === 'acl' && call.args[1] === 'revoke',
+    )
+    expect(argValue(holder!, '--sandbox-user-sid')).toBe(sandboxUserSid)
+    expect(argValue(grant!, '--holder-pid')).toBe(String(holder!.pid))
+    const createTime = argValue(grant!, '--holder-process-create-time')
+    expect(createTime).toMatch(/^[1-9][0-9]+$/)
+    expect(argValue(revoke!, '--holder-process-create-time')).toBe(createTime)
 
     const calls = commandInvocations()
     expect(calls.map(call => call.args.slice(0, 2).join(' '))).toEqual([
@@ -440,6 +460,24 @@ describe.if(isWindows)('Windows WFP protected-runner bootstrap', () => {
     expect(commandInvocations()).toEqual([])
   })
 
+  it('rejects a readiness identity for a different holder PID', async () => {
+    setState({ holdReadyPidOffset: 1 })
+    const error = await rejectedError(bootstrap())
+
+    expect(error).toMatchObject({ code: 'acl-holder-ready-invalid' })
+    expect(error.message).toMatch(/did not match spawned process/i)
+    expect(commandInvocations()).toEqual([])
+  })
+
+  it('rejects a readiness creation time outside signed 64-bit range', async () => {
+    setState({ holdReadyProcessCreateTime: '9223372036854775808' })
+    const error = await rejectedError(bootstrap())
+
+    expect(error).toMatchObject({ code: 'acl-holder-ready-invalid' })
+    expect(error.message).toMatch(/signed 64-bit range/i)
+    expect(commandInvocations()).toEqual([])
+  })
+
   it('rejects trailing payload in the READY frame', async () => {
     setState({
       holdReadyLine: 'srt-win-acl-holder-ready-v1\ntrailing-payload',
@@ -450,7 +488,7 @@ describe.if(isWindows)('Windows WFP protected-runner bootstrap', () => {
     )
 
     expect(error).toMatchObject({ code: 'acl-holder-ready-invalid' })
-    expect(error.message).toMatch(/invalid readiness frame/i)
+    expect(error.message).toMatch(/invalid readiness/i)
     expect(commandInvocations()).toEqual([])
   })
 
@@ -631,7 +669,7 @@ describe.if(isWindows)('Windows WFP protected-runner bootstrap', () => {
     }
   }, 10_000)
 
-  it('bounds holder lifetime after parent crash and recovers next run', async () => {
+  it('self-releases ACL state immediately after parent crash', async () => {
     setState({ grantDelayMs: 2_000 })
     const child = spawn(
       process.execPath,
@@ -660,16 +698,55 @@ describe.if(isWindows)('Windows WFP protected-runner bootstrap', () => {
         await once(child, 'exit')
       }
       await waitFor(() => !processIsAlive(holderPid))
+      await waitFor(() => fakeState().holds?.[String(holderPid)] === undefined)
       expect(Date.now() - killedAt).toBeLessThan(5_000)
+      expect(fakeState().holdCreateTimes?.[String(holderPid)]).toBeUndefined()
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill()
+      if (holderPid && processIsAlive(holderPid)) process.kill(holderPid)
+    }
+  }, 15_000)
+
+  it('recovers retryable residue after holder self-release fails', async () => {
+    setState({ grantDelayMs: 2_000, holdReleaseExit: 17 })
+    const child = spawn(
+      process.execPath,
+      [crashFixture, statePath, nodeExe, fixture, target],
+      {
+        cwd: process.cwd(),
+        stdio: 'ignore',
+        windowsHide: true,
+      },
+    )
+    let holderPid = 0
+    try {
+      await waitFor(() => {
+        const grant = invocations().find(
+          call => call.args[0] === 'acl' && call.args[1] === 'grant',
+        )
+        const value = grant && argValue(grant, '--holder-pid')
+        if (!value) return false
+        holderPid = Number(value)
+        return fakeState().holds?.[value] !== undefined
+      })
+
+      child.kill()
+      if (child.exitCode === null && child.signalCode === null) {
+        await once(child, 'exit')
+      }
+      await waitFor(() => !processIsAlive(holderPid))
       expect(fakeState().holds?.[String(holderPid)]).toBeDefined()
 
       const recovered = fakeState()
       delete recovered.grantDelayMs
+      delete recovered.holdReleaseExit
       writeFileSync(statePath, JSON.stringify(recovered))
       await bootstrap()
       expect(fakeState().holds?.[String(holderPid)]).toBeUndefined()
+      expect(fakeState().holdCreateTimes?.[String(holderPid)]).toBeUndefined()
     } finally {
       if (child.exitCode === null && child.signalCode === null) child.kill()
+      if (holderPid && processIsAlive(holderPid)) process.kill(holderPid)
     }
   }, 15_000)
 
