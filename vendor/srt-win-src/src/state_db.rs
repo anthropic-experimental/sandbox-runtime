@@ -339,6 +339,22 @@ pub fn open_db_ro() -> Result<Option<Connection>> {
     Ok(Some(conn))
 }
 
+/// Count exact-path ACL state rows for diagnostics and CI residue
+/// assertions. Missing or uninitialized DBs report zeroes.
+pub fn path_state_counts(canonical_path: &str) -> Result<(u32, u32)> {
+    let Some(conn) = open_db_ro()? else {
+        return Ok((0, 0));
+    };
+    conn.query_row(
+        "SELECT
+            (SELECT COUNT(*) FROM working_aces WHERE canonical_path = ?1),
+            (SELECT COUNT(*) FROM ace_holders WHERE canonical_path = ?1)",
+        [canonical_path],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .context("count ACL state for path")
+}
+
 /// Open at an arbitrary path. Tests use `:memory:` via
 /// `open_db_at(Path::new(":memory:"))`.
 pub(crate) fn open_db_at(path: &std::path::Path) -> Result<Connection> {

@@ -59,7 +59,7 @@ import {
   revokeWindowsAcl,
   getWindowsSandboxUserStatus,
   getWindowsSandboxCaCert,
-  verifyWindowsWfpEgress,
+  verifyWindowsWfpEgressWithAclBootstrap,
   resolveSrtWin,
   type SrtWinSpawn,
   type WindowsBinShell,
@@ -472,6 +472,14 @@ async function initialize(
           `provision it.`,
       )
     }
+    if (!u.sid) {
+      config = undefined
+      throw new Error(
+        'sandbox user SID missing from `srt-win user status` ' +
+          '(provisioned but in an inconsistent state)',
+      )
+    }
+    const sb = u.sid
     // Behavioral proof the WFP egress fence is active for the
     // sandbox user — BFE enumeration (`wfp status`) is admin-gated,
     // so this is the non-elevated readiness check. Fails closed: a
@@ -482,7 +490,8 @@ async function initialize(
     // scoped, not session-scoped.
     if (!windowsWfpVerified) {
       try {
-        await verifyWindowsWfpEgress({
+        await verifyWindowsWfpEgressWithAclBootstrap({
+          sandboxUserSid: sb,
           proxyPortRange: runtimeConfig.windows?.proxyPortRange,
           srtWin,
         })
@@ -540,16 +549,6 @@ async function initialize(
       if (mitmCA) {
         acc.grantRead.push(dirname(mitmCA.trustBundlePath))
       }
-      // `u` was fetched once above for the provisioning gate; the
-      // same status carries the SID — don't re-spawn `srt-win user
-      // status` here.
-      if (!u.sid) {
-        throw new Error(
-          'sandbox user SID missing from `srt-win user status` ' +
-            '(provisioned but in an inconsistent state)',
-        )
-      }
-      const sb = u.sid
       // Record module-level state BEFORE the first acl call so the
       // catch's best-effort revoke/restore can address whatever
       // partially landed.

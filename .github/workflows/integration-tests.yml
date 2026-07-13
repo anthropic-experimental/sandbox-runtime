@@ -28,7 +28,8 @@ jobs:
             runner: macos-14
             os: macos
           # Windows legs build srt-win, run the Rust smoke scripts,
-          # then the TS integration suite (test/sandbox/winsrt.test.ts).
+          # then the TS integration suite, including the protected-path
+          # WFP bootstrap regression.
           - arch: x86-64
             runner: windows-latest
             os: windows
@@ -111,7 +112,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           npm ci
           npm run build
-          bun test test/sandbox/winsrt.test.ts test/sandbox/mux-proxy.test.ts
+          bun test test/sandbox/winsrt.test.ts test/sandbox/mux-proxy.test.ts test/sandbox/windows-wfp-bootstrap.test.ts
 
       - name: Cleanup srt-win state (Windows)
         if: always() && matrix.os == 'windows'
