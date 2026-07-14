@@ -336,6 +336,8 @@ Uses two different patterns:
 
 - `filesystem.allowWrite` - Array of paths to allow write access. Empty array = no write access.
 - `filesystem.denyWrite` - Array of paths to deny write access within allowed paths (takes precedence over allowWrite)
+- `filesystem.allowGitConfig` - Allow writes to `.git/config` while keeping `.git/hooks` protected
+- `filesystem.allowGitCommonDir` - Allow writes to the resolved git common dir, with no effect in the main worktree
 
 **Path Syntax (macOS):**
 

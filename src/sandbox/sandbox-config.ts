@@ -719,6 +719,12 @@ export const FilesystemConfigSchema = z.object({
     .describe(
       'Allow writes to .git/config files (default: false). Enables git remote URL updates while keeping .git/hooks protected.',
     ),
+  allowGitCommonDir: z
+    .boolean()
+    .optional()
+    .describe(
+      'Allow writes to the resolved git common dir (default: false). Has no effect in the main worktree.',
+    ),
 })
 
 /**

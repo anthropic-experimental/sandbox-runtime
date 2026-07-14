@@ -39,6 +39,285 @@ export function getDangerousDirectories(): string[] {
   ]
 }
 
+function isMissingPathError(error: unknown): boolean {
+  return (
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    (error.code === 'ENOENT' || error.code === 'ENOTDIR')
+  )
+}
+
+function findNearestGitMetadata(
+  startDir: string,
+): { path: string; stats: fs.Stats } | undefined {
+  let currentDir = path.resolve(startDir)
+
+  while (true) {
+    const dotGitPath = path.join(currentDir, '.git')
+
+    try {
+      return {
+        path: dotGitPath,
+        stats: fs.lstatSync(dotGitPath),
+      }
+    } catch (error) {
+      if (!isMissingPathError(error)) {
+        throw error
+      }
+
+      const parentDir = path.dirname(currentDir)
+      if (parentDir === currentDir) {
+        return undefined
+      }
+      currentDir = parentDir
+    }
+  }
+}
+
+function readOptionalTrimmedFile(pathStr: string): string | undefined {
+  try {
+    return fs.readFileSync(pathStr, 'utf8').trim()
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      return undefined
+    }
+
+    throw error
+  }
+}
+
+function resolveExistingPath(pathStr: string): string | undefined {
+  try {
+    return fs.realpathSync(pathStr)
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      return undefined
+    }
+
+    throw error
+  }
+}
+
+function resolveExistingDirectory(pathStr: string): string | undefined {
+  const resolvedPath = resolveExistingPath(pathStr)
+  if (!resolvedPath) {
+    return undefined
+  }
+
+  try {
+    if (!fs.statSync(resolvedPath).isDirectory()) {
+      return undefined
+    }
+    return resolvedPath
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      return undefined
+    }
+
+    throw error
+  }
+}
+
+function getLinkedWorktreesDir(commonDir: string): string | undefined {
+  return resolveExistingDirectory(path.join(commonDir, 'worktrees'))
+}
+
+function hasGitDirBacklink(gitDir: string, dotGitPath: string): boolean {
+  const rawGitPath = readOptionalTrimmedFile(path.join(gitDir, 'gitdir'))
+  if (!rawGitPath) {
+    return false
+  }
+
+  const resolvedGitPath = resolveExistingPath(path.resolve(gitDir, rawGitPath))
+  const resolvedDotGitPath = resolveExistingPath(dotGitPath)
+  return resolvedGitPath !== undefined && resolvedGitPath === resolvedDotGitPath
+}
+
+function isVerifiedLinkedWorktreeGitDir(
+  gitDir: string,
+  commonDir: string,
+  dotGitPath: string,
+): boolean {
+  const worktreesDir = getLinkedWorktreesDir(commonDir)
+  if (!worktreesDir) {
+    return false
+  }
+
+  return (
+    path.dirname(gitDir) === worktreesDir &&
+    hasGitDirBacklink(gitDir, dotGitPath)
+  )
+}
+
+function getLinkedWorktreeConfigPaths(commonDir: string): string[] {
+  const worktreesDir = getLinkedWorktreesDir(commonDir)
+  if (!worktreesDir) {
+    return []
+  }
+
+  try {
+    return fs
+      .readdirSync(worktreesDir, { withFileTypes: true })
+      .filter(entry => entry.isDirectory())
+      .map(entry => path.join(worktreesDir, entry.name, 'config.worktree'))
+  } catch (error) {
+    if (isMissingPathError(error)) {
+      return []
+    }
+
+    throw error
+  }
+}
+
+export interface GitDirs {
+  gitDir: string
+  commonDir: string
+}
+
+export function getLinkedGitCommonDir(
+  gitDirs: GitDirs | undefined,
+): string | undefined {
+  if (!gitDirs || gitDirs.gitDir === gitDirs.commonDir) {
+    return undefined
+  }
+
+  return gitDirs.commonDir
+}
+
+export function getGitCommonDirDenyPaths(
+  gitDirs: GitDirs | undefined,
+  allowGitConfig = false,
+): string[] {
+  const gitCommonDir = getLinkedGitCommonDir(gitDirs)
+  if (!gitCommonDir) {
+    return []
+  }
+
+  const denyPaths = [path.join(gitCommonDir, 'hooks')]
+  if (!allowGitConfig) {
+    denyPaths.push(path.join(gitCommonDir, 'config'))
+    denyPaths.push(...getLinkedWorktreeConfigPaths(gitCommonDir))
+  }
+
+  return [...new Set(denyPaths)]
+}
+
+export function resolveGitCommonDirWriteAccess(
+  baseAllowPaths: string[] | undefined,
+  allowGitCommonDir = false,
+  allowGitConfig = false,
+  startDir: string = process.cwd(),
+): {
+  allowPaths: string[] | undefined
+  denyPaths: string[]
+} {
+  if (baseAllowPaths === undefined) {
+    return {
+      allowPaths: undefined,
+      denyPaths: [],
+    }
+  }
+
+  const gitDirs = getGitDirs(startDir)
+  const allowPaths = [...new Set(baseAllowPaths)]
+  const gitCommonDir = allowGitCommonDir
+    ? getLinkedGitCommonDir(gitDirs)
+    : undefined
+
+  if (gitCommonDir && !allowPaths.includes(gitCommonDir)) {
+    allowPaths.push(gitCommonDir)
+  }
+
+  return {
+    allowPaths,
+    denyPaths: getGitCommonDirDenyPaths(gitDirs, allowGitConfig),
+  }
+}
+
+/**
+ * Resolve the git dir and common dir for the repo containing startDir.
+ *
+ * Returns undefined when the current directory is not inside a git checkout,
+ * or when the git metadata cannot be resolved.
+ */
+export function getGitDirs(
+  startDir: string = process.cwd(),
+): GitDirs | undefined {
+  const gitMetadata = findNearestGitMetadata(startDir)
+  if (!gitMetadata) {
+    return undefined
+  }
+
+  const { path: dotGitPath, stats: dotGitStats } = gitMetadata
+
+  if (dotGitStats.isDirectory()) {
+    const gitDir = resolveExistingDirectory(dotGitPath)
+    if (!gitDir) {
+      return undefined
+    }
+
+    return {
+      gitDir,
+      commonDir: gitDir,
+    }
+  }
+
+  if (!dotGitStats.isFile()) {
+    return undefined
+  }
+
+  const dotGitContents = readOptionalTrimmedFile(dotGitPath)
+  if (!dotGitContents || !dotGitContents.startsWith('gitdir:')) {
+    return undefined
+  }
+
+  const rawGitDir = dotGitContents.slice('gitdir:'.length).trim()
+  if (!rawGitDir) {
+    return undefined
+  }
+
+  const gitDir = resolveExistingDirectory(
+    path.resolve(path.dirname(dotGitPath), rawGitDir),
+  )
+  if (!gitDir) {
+    return undefined
+  }
+
+  const rawCommonDir = readOptionalTrimmedFile(path.join(gitDir, 'commondir'))
+  if (!rawCommonDir) {
+    return {
+      gitDir,
+      commonDir: gitDir,
+    }
+  }
+
+  const commonDir = resolveExistingDirectory(path.resolve(gitDir, rawCommonDir))
+  if (!commonDir) {
+    return {
+      gitDir,
+      commonDir: gitDir,
+    }
+  }
+
+  const worktreesDir = getLinkedWorktreesDir(commonDir)
+  if (worktreesDir && path.dirname(gitDir) === worktreesDir) {
+    if (!isVerifiedLinkedWorktreeGitDir(gitDir, commonDir, dotGitPath)) {
+      return undefined
+    }
+
+    return {
+      gitDir,
+      commonDir,
+    }
+  }
+
+  return {
+    gitDir,
+    commonDir: gitDir,
+  }
+}
+
 /**
  * Normalizes a path for case-insensitive comparison.
  * This prevents bypassing security checks using mixed-case paths on case-insensitive

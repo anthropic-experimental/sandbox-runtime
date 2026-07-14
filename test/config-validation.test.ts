@@ -100,6 +100,8 @@ describe('Config Validation', () => {
         denyRead: ['/etc/shadow'],
         allowWrite: ['/tmp'],
         denyWrite: ['/etc'],
+        allowGitConfig: true,
+        allowGitCommonDir: true,
       },
       ignoreViolations: {
         '*': ['/usr/bin'],

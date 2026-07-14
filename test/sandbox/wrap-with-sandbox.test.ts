@@ -3,10 +3,15 @@ import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { isLinux, isMacOS, isSupportedPlatform } from '../helpers/platform.js'
+import {
+  createLinkedWorktreeFixture,
+  withWorktreeFixture,
+} from '../helpers/git-fixtures.js'
 
 /**
  * Create a test configuration with network access
@@ -72,6 +77,130 @@ describe.if(isSupportedPlatform)('wrapWithSandbox customConfig', () => {
       })
 
       expect(wrapped).not.toBe(command)
+    })
+
+    it('uses custom allowGitCommonDir when provided', async () => {
+      const fixtureBaseDir = join(
+        tmpdir(),
+        `srt-test-git-common-dir-${Date.now()}`,
+      )
+      const targetContent = 'UPDATED'
+
+      await withWorktreeFixture(
+        createLinkedWorktreeFixture(
+          fixtureBaseDir,
+          'linked-worktree',
+          'ORIGINAL',
+        ),
+        async ({ commonDir }) => {
+          const targetPath = join(commonDir, 'refs', 'heads', 'main')
+          const withoutOverride = await SandboxManager.wrapWithSandbox(
+            `echo '${targetContent}' > '${targetPath}'`,
+            undefined,
+            {
+              filesystem: {
+                denyRead: [],
+                allowWrite: ['.'],
+                denyWrite: [],
+              },
+            },
+          )
+
+          const blockedResult = spawnSync(withoutOverride, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 10000,
+          })
+
+          expect(blockedResult.status).not.toBe(0)
+          expect(readFileSync(targetPath, 'utf8')).toBe('ORIGINAL')
+
+          const withOverride = await SandboxManager.wrapWithSandbox(
+            `echo '${targetContent}' > '${targetPath}'`,
+            undefined,
+            {
+              filesystem: {
+                denyRead: [],
+                allowWrite: ['.'],
+                denyWrite: [],
+                allowGitCommonDir: true,
+              },
+            },
+          )
+
+          const allowedResult = spawnSync(withOverride, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 10000,
+          })
+
+          expect(allowedResult.status).toBe(0)
+          expect(readFileSync(targetPath, 'utf8').trim()).toBe(targetContent)
+        },
+      )
+    })
+
+    it('uses custom allowGitConfig when provided', async () => {
+      const fixtureBaseDir = join(
+        tmpdir(),
+        `srt-test-git-config-${Date.now()}`,
+      )
+      const targetContent = 'UPDATED'
+
+      await withWorktreeFixture(
+        createLinkedWorktreeFixture(
+          fixtureBaseDir,
+          'linked-worktree-config',
+          'ORIGINAL',
+        ),
+        async ({ commonDir }) => {
+          const targetPath = join(commonDir, 'config')
+          const withoutOverride = await SandboxManager.wrapWithSandbox(
+            `echo '${targetContent}' > '${targetPath}'`,
+            undefined,
+            {
+              filesystem: {
+                denyRead: [],
+                allowWrite: ['.'],
+                denyWrite: [],
+                allowGitCommonDir: true,
+              },
+            },
+          )
+
+          const blockedResult = spawnSync(withoutOverride, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 10000,
+          })
+
+          expect(blockedResult.status).not.toBe(0)
+          expect(readFileSync(targetPath, 'utf8')).toBe('ORIGINAL')
+
+          const withOverride = await SandboxManager.wrapWithSandbox(
+            `echo '${targetContent}' > '${targetPath}'`,
+            undefined,
+            {
+              filesystem: {
+                denyRead: [],
+                allowWrite: ['.'],
+                denyWrite: [],
+                allowGitConfig: true,
+                allowGitCommonDir: true,
+              },
+            },
+          )
+
+          const allowedResult = spawnSync(withOverride, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 10000,
+          })
+
+          expect(allowedResult.status).toBe(0)
+          expect(readFileSync(targetPath, 'utf8').trim()).toBe(targetContent)
+        },
+      )
     })
   })
 

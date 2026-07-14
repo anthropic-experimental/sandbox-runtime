@@ -70,6 +70,7 @@ import {
   containsGlobChars,
   removeTrailingGlobSuffix,
   expandGlobPattern,
+  resolveGitCommonDirWriteAccess,
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
 import type { MutateForwardedHeaders } from './request-filter.js'
@@ -938,10 +939,14 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
     })
 
   // Build allowOnly list: default paths + configured allow paths
-  const allowOnly = [...getDefaultWritePaths(), ...allowPaths]
+  const { allowPaths: allowOnly } = resolveGitCommonDirWriteAccess(
+    [...getDefaultWritePaths(), ...allowPaths],
+    config.filesystem.allowGitCommonDir ?? false,
+    config.filesystem.allowGitConfig ?? false,
+  )
 
   return {
-    allowOnly,
+    allowOnly: allowOnly || [],
     denyWithinAllow: denyPaths,
   }
 }
@@ -1108,10 +1113,6 @@ function getRipgrepConfig(): { command: string; args?: string[] } {
 
 function getMandatoryDenySearchDepth(): number {
   return config?.mandatoryDenySearchDepth ?? 3
-}
-
-function getAllowGitConfig(): boolean {
-  return config?.filesystem?.allowGitConfig ?? false
 }
 
 function getSeccompConfig(): SeccompConfig | undefined {
@@ -1287,6 +1288,14 @@ async function wrapWithSandbox(
 
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
   const allowPty = customConfig?.allowPty ?? config?.allowPty
+  const allowGitConfig =
+    customConfig?.filesystem?.allowGitConfig ??
+    config?.filesystem?.allowGitConfig ??
+    false
+  const allowGitCommonDir =
+    customConfig?.filesystem?.allowGitCommonDir ??
+    config?.filesystem?.allowGitCommonDir ??
+    false
 
   switch (platform) {
     case 'macos':
@@ -1310,7 +1319,8 @@ async function wrapWithSandbox(
         allowMachLookup: getAllowMachLookup(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
-        allowGitConfig: getAllowGitConfig(),
+        allowGitConfig,
+        allowGitCommonDir,
         enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
         allowAppleEvents: getAllowAppleEvents(),
         binShell,
@@ -1346,7 +1356,8 @@ async function wrapWithSandbox(
         binShell,
         ripgrepConfig: getRipgrepConfig(),
         mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
-        allowGitConfig: getAllowGitConfig(),
+        allowGitConfig,
+        allowGitCommonDir,
         seccompConfig: getSeccompConfig(),
         bwrapPath: config?.bwrapPath,
         socatPath: config?.socatPath,

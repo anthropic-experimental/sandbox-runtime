@@ -29,6 +29,11 @@ import {
   cleanupBwrapMountPoints,
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux, isSupportedPlatform } from '../helpers/platform.js'
+import {
+  createLinkedWorktreeFixture,
+  createMainWorktreeFixture,
+  withWorktreeFixture,
+} from '../helpers/git-fixtures.js'
 
 /**
  * Integration tests for mandatory deny paths.
@@ -139,14 +144,20 @@ describe.if(isSupportedPlatform)(
     async function runSandboxedWrite(
       filePath: string,
       content: string,
+      options: {
+        allowGitConfig?: boolean
+        allowGitCommonDir?: boolean
+        allowOnly?: string[]
+        denyWithinAllow?: string[]
+      } = {},
     ): Promise<{ success: boolean; stderr: string }> {
       const platform = getPlatform()
       const command = `echo '${content}' > '${filePath}'`
 
       // Allow writes to current directory, but mandatory denies should still block dangerous files
       const writeConfig = {
-        allowOnly: ['.'],
-        denyWithinAllow: [], // Empty - relying on mandatory denies
+        allowOnly: options.allowOnly ?? ['.'],
+        denyWithinAllow: options.denyWithinAllow ?? [],
       }
 
       let wrappedCommand: string
@@ -156,6 +167,8 @@ describe.if(isSupportedPlatform)(
           needsNetworkRestriction: false,
           readConfig: undefined,
           writeConfig,
+          allowGitConfig: options.allowGitConfig,
+          allowGitCommonDir: options.allowGitCommonDir,
         })
       } else {
         wrappedCommand = await wrapCommandWithSandboxLinux({
@@ -163,6 +176,8 @@ describe.if(isSupportedPlatform)(
           needsNetworkRestriction: false,
           readConfig: undefined,
           writeConfig,
+          allowGitConfig: options.allowGitConfig,
+          allowGitCommonDir: options.allowGitCommonDir,
         })
       }
 
@@ -375,58 +390,14 @@ describe.if(isSupportedPlatform)(
     })
 
     describe('allowGitConfig option', () => {
-      async function runSandboxedWriteWithGitConfig(
-        filePath: string,
-        content: string,
-        allowGitConfig: boolean,
-      ): Promise<{ success: boolean; stderr: string }> {
-        const platform = getPlatform()
-        const command = `echo '${content}' > '${filePath}'`
-
-        const writeConfig = {
-          allowOnly: ['.'],
-          denyWithinAllow: [],
-        }
-
-        let wrappedCommand: string
-        if (platform === 'macos') {
-          wrappedCommand = wrapCommandWithSandboxMacOS({
-            command,
-            needsNetworkRestriction: false,
-            readConfig: undefined,
-            writeConfig,
-            allowGitConfig,
-          })
-        } else {
-          wrappedCommand = await wrapCommandWithSandboxLinux({
-            command,
-            needsNetworkRestriction: false,
-            readConfig: undefined,
-            writeConfig,
-            allowGitConfig,
-          })
-        }
-
-        const result = spawnSync(wrappedCommand, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 10000,
-        })
-
-        return {
-          success: result.status === 0,
-          stderr: result.stderr || '',
-        }
-      }
-
       it('blocks writes to .git/config when allowGitConfig is false (default)', async () => {
         // Reset .git/config to original content
         writeFileSync('.git/config', ORIGINAL_CONTENT)
 
-        const result = await runSandboxedWriteWithGitConfig(
+        const result = await runSandboxedWrite(
           '.git/config',
           MODIFIED_CONTENT,
-          false,
+          { allowGitConfig: false },
         )
 
         expect(result.success).toBe(false)
@@ -437,10 +408,10 @@ describe.if(isSupportedPlatform)(
         // Reset .git/config to original content
         writeFileSync('.git/config', ORIGINAL_CONTENT)
 
-        const result = await runSandboxedWriteWithGitConfig(
+        const result = await runSandboxedWrite(
           '.git/config',
           MODIFIED_CONTENT,
-          true,
+          { allowGitConfig: true },
         )
 
         expect(result.success).toBe(true)
@@ -453,15 +424,239 @@ describe.if(isSupportedPlatform)(
         // Reset pre-commit to original content
         writeFileSync('.git/hooks/pre-commit', ORIGINAL_CONTENT)
 
-        const result = await runSandboxedWriteWithGitConfig(
+        const result = await runSandboxedWrite(
           '.git/hooks/pre-commit',
           MODIFIED_CONTENT,
-          true,
+          { allowGitConfig: true },
         )
 
         expect(result.success).toBe(false)
         expect(readFileSync('.git/hooks/pre-commit', 'utf8')).toBe(
           ORIGINAL_CONTENT,
+        )
+      })
+    })
+
+    describe('allowGitCommonDir option', () => {
+      async function withLinkedWorktreeFixture(
+        name: string,
+        testFn: (
+          fixture: ReturnType<typeof createLinkedWorktreeFixture>,
+        ) => Promise<void>,
+      ): Promise<void> {
+        await withWorktreeFixture(
+          createLinkedWorktreeFixture(TEST_DIR, name, ORIGINAL_CONTENT),
+          testFn,
+        )
+      }
+
+      async function withMainWorktreeFixture(
+        name: string,
+        testFn: (
+          fixture: ReturnType<typeof createMainWorktreeFixture>,
+        ) => Promise<void>,
+      ): Promise<void> {
+        await withWorktreeFixture(
+          createMainWorktreeFixture(TEST_DIR, name, ORIGINAL_CONTENT),
+          testFn,
+        )
+      }
+
+      it('blocks writes to git common dir when allowGitCommonDir is false', async () => {
+        await withLinkedWorktreeFixture(
+          'allow-git-common-dir-disabled',
+          async ({ commonDir }) => {
+            const targetPath = join(commonDir, 'refs', 'heads', 'main')
+            const result = await runSandboxedWrite(targetPath, MODIFIED_CONTENT)
+
+            expect(result.success).toBe(false)
+            expect(readFileSync(targetPath, 'utf8')).toBe(ORIGINAL_CONTENT)
+          },
+        )
+      })
+
+      it('allows writes to git common dir when allowGitCommonDir is true', async () => {
+        await withLinkedWorktreeFixture(
+          'allow-git-common-dir-enabled',
+          async ({ commonDir }) => {
+            const targetPath = join(commonDir, 'refs', 'heads', 'main')
+            const result = await runSandboxedWrite(targetPath, MODIFIED_CONTENT, {
+              allowGitCommonDir: true,
+            })
+
+            expect(result.success).toBe(true)
+            expect(readFileSync(targetPath, 'utf8').trim()).toBe(
+              MODIFIED_CONTENT,
+            )
+          },
+        )
+      })
+
+      it('still blocks git common dir config when broader allowWrite covers it', async () => {
+        await withLinkedWorktreeFixture(
+          'allow-git-common-dir-parent-allow',
+          async ({ commonDir }) => {
+            const targetPath = join(commonDir, 'config')
+            const result = await runSandboxedWrite(targetPath, MODIFIED_CONTENT, {
+              allowOnly: ['..'],
+            })
+
+            expect(result.success).toBe(false)
+            expect(readFileSync(targetPath, 'utf8')).toBe(ORIGINAL_CONTENT)
+          },
+        )
+      })
+
+      it('still blocks git common dir config unless allowGitConfig is true', async () => {
+        await withLinkedWorktreeFixture(
+          'allow-git-common-dir-config',
+          async ({ commonDir }) => {
+            const targetPath = join(commonDir, 'config')
+            const blockedResult = await runSandboxedWrite(
+              targetPath,
+              MODIFIED_CONTENT,
+              { allowGitCommonDir: true },
+            )
+
+            expect(blockedResult.success).toBe(false)
+            expect(readFileSync(targetPath, 'utf8')).toBe(ORIGINAL_CONTENT)
+
+            const allowedResult = await runSandboxedWrite(
+              targetPath,
+              MODIFIED_CONTENT,
+              {
+                allowGitConfig: true,
+                allowGitCommonDir: true,
+              },
+            )
+
+            expect(allowedResult.success).toBe(true)
+            expect(readFileSync(targetPath, 'utf8').trim()).toBe(
+              MODIFIED_CONTENT,
+            )
+          },
+        )
+      })
+
+      it('still blocks git common dir config.worktree unless allowGitConfig is true', async () => {
+        await withLinkedWorktreeFixture(
+          'allow-git-common-dir-worktree-config',
+          async ({ worktreeGitDir }) => {
+            const targetPath = join(worktreeGitDir, 'config.worktree')
+            const blockedResult = await runSandboxedWrite(
+              targetPath,
+              MODIFIED_CONTENT,
+              { allowGitCommonDir: true },
+            )
+
+            expect(blockedResult.success).toBe(false)
+            expect(readFileSync(targetPath, 'utf8')).toBe(ORIGINAL_CONTENT)
+
+            const allowedResult = await runSandboxedWrite(
+              targetPath,
+              MODIFIED_CONTENT,
+              {
+                allowGitConfig: true,
+                allowGitCommonDir: true,
+              },
+            )
+
+            expect(allowedResult.success).toBe(true)
+            expect(readFileSync(targetPath, 'utf8').trim()).toBe(
+              MODIFIED_CONTENT,
+            )
+          },
+        )
+      })
+
+      it('still blocks sibling git common dir config.worktree unless allowGitConfig is true', async () => {
+        await withLinkedWorktreeFixture(
+          'allow-git-common-dir-sibling-worktree-config',
+          async ({ commonDir }) => {
+            const siblingGitDir = join(commonDir, 'worktrees', 'sibling')
+            const targetPath = join(siblingGitDir, 'config.worktree')
+
+            mkdirSync(siblingGitDir, { recursive: true })
+            writeFileSync(targetPath, ORIGINAL_CONTENT)
+
+            const blockedResult = await runSandboxedWrite(
+              targetPath,
+              MODIFIED_CONTENT,
+              { allowGitCommonDir: true },
+            )
+
+            expect(blockedResult.success).toBe(false)
+            expect(readFileSync(targetPath, 'utf8')).toBe(ORIGINAL_CONTENT)
+
+            const allowedResult = await runSandboxedWrite(
+              targetPath,
+              MODIFIED_CONTENT,
+              {
+                allowGitConfig: true,
+                allowGitCommonDir: true,
+              },
+            )
+
+            expect(allowedResult.success).toBe(true)
+            expect(readFileSync(targetPath, 'utf8').trim()).toBe(
+              MODIFIED_CONTENT,
+            )
+          },
+        )
+      })
+
+      it('still blocks git common dir hooks when allowGitCommonDir is true', async () => {
+        await withLinkedWorktreeFixture(
+          'allow-git-common-dir-hooks',
+          async ({ commonDir }) => {
+            const targetPath = join(commonDir, 'hooks', 'pre-commit')
+            const result = await runSandboxedWrite(targetPath, MODIFIED_CONTENT, {
+              allowGitConfig: true,
+              allowGitCommonDir: true,
+            })
+
+            expect(result.success).toBe(false)
+            expect(readFileSync(targetPath, 'utf8')).toBe(ORIGINAL_CONTENT)
+          },
+        )
+      })
+
+      it('still respects explicit deny rules', async () => {
+        await withLinkedWorktreeFixture(
+          'allow-git-common-dir-deny',
+          async ({ commonDir }) => {
+            const targetPath = join(commonDir, 'refs', 'heads', 'main')
+            const result = await runSandboxedWrite(targetPath, MODIFIED_CONTENT, {
+              allowGitCommonDir: true,
+              denyWithinAllow: [targetPath],
+            })
+
+            expect(result.success).toBe(false)
+            expect(readFileSync(targetPath, 'utf8')).toBe(ORIGINAL_CONTENT)
+          },
+        )
+      })
+
+      it('does nothing in the main worktree', async () => {
+        await withMainWorktreeFixture(
+          'allow-git-common-dir-main-worktree',
+          async ({ rootDir, commonDir }) => {
+            const outsideCommonDir = join(rootDir, 'outside-common-dir')
+            const targetPath = join(outsideCommonDir, 'refs', 'heads', 'main')
+
+            mkdirSync(join(outsideCommonDir, 'refs', 'heads'), {
+              recursive: true,
+            })
+            writeFileSync(targetPath, ORIGINAL_CONTENT)
+            writeFileSync(join(commonDir, 'commondir'), '../../outside-common-dir')
+
+            const result = await runSandboxedWrite(targetPath, MODIFIED_CONTENT, {
+              allowGitCommonDir: true,
+            })
+
+            expect(result.success).toBe(false)
+            expect(readFileSync(targetPath, 'utf8')).toBe(ORIGINAL_CONTENT)
+          },
         )
       })
     })
