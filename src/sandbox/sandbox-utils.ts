@@ -595,6 +595,124 @@ export function generateProxyEnvVars(
 }
 
 /**
+ * `safe.directory` entries above this count collapse to a single
+ * `safe.directory=*`. Keeps `GIT_CONFIG_COUNT` (and the argv it rides
+ * on) bounded when the safe-dir set is wide.
+ */
+const SAFE_DIRECTORY_WILDCARD_THRESHOLD = 8
+
+/**
+ * Build the `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` /
+ * `GIT_CONFIG_VALUE_<n>` env-var set for the sandboxed child.
+ *
+ * Emits:
+ *   - `safe.directory=<dir>` for each entry in `safeDirs` (or one
+ *     `safe.directory=*` when the list is long) — inside the sandbox
+ *     the working tree is owned by a different user (Windows: the
+ *     real user vs `srt-sandbox`; Linux: unmapped uid under
+ *     `bwrap --unshare-user`), so git refuses with "detected dubious
+ *     ownership" without it.
+ *   - `http.schannelUseSSLCAInfo=true` and
+ *     `http.schannelCheckRevoke=false` when `schannelCa` (Windows
+ *     only) — makes git's schannel backend honor `GIT_SSL_CAINFO`
+ *     without `-c http.sslBackend=openssl`. Revocation is disabled
+ *     because CryptoAPI CRL/OCSP fetches ignore proxy env and would
+ *     be WFP-fenced.
+ *
+ * Composes with an existing `GIT_CONFIG_COUNT` in `baseEnv` by
+ * continuing its numbering; the returned `GIT_CONFIG_COUNT` is the
+ * new total. `baseEnv` should reflect what the child will actually
+ * see: on Windows the two-hop launch means the broker's own
+ * `process.env` never reaches the child, so `baseEnv` is the caller
+ * overlay (`WindowsSandboxParams.setEnvVars`); on Linux/macOS the
+ * child inherits `process.env`, so callers use
+ * {@link buildPosixGitSafeDirEnv} (which folds in `process.env`,
+ * `unsetEnvVars`, and `setEnvVars`).
+ *
+ * Paths are emitted with forward slashes so the value survives
+ * msys2's env conversion untouched and native git accepts it (a
+ * no-op on POSIX paths).
+ */
+export function buildGitConfigEnv(opts: {
+  safeDirs: readonly string[]
+  /** Windows-only schannel knobs; default false. */
+  schannelCa?: boolean
+  baseEnv?: Readonly<Record<string, string | undefined>>
+}): Record<string, string> {
+  // An explicit `GIT_CONFIG_COUNT=0` in baseEnv is an opt-out ("no
+  // env-level git config") — respect it rather than overwriting.
+  if (opts.baseEnv?.GIT_CONFIG_COUNT === '0') return {}
+  const parsed = Number.parseInt(opts.baseEnv?.GIT_CONFIG_COUNT ?? '', 10)
+  const start = Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
+  let n = start
+  const out: Record<string, string> = {}
+  const emit = (key: string, value: string) => {
+    out[`GIT_CONFIG_KEY_${n}`] = key
+    out[`GIT_CONFIG_VALUE_${n}`] = value
+    n++
+  }
+  const dirs = [
+    ...new Set(
+      opts.safeDirs
+        .filter((d): d is string => !!d)
+        .map(d => {
+          const fwd = d.replace(/\\/g, '/')
+          const stripped = fwd.replace(/\/+$/, '')
+          // Don't strip the trailing slash off a bare root: `C:`
+          // is drive-relative-cwd (git wants `C:/`), and `` is
+          // git's list-reset sentinel for safe.directory (would
+          // wipe preceding entries) — POSIX `/` must stay `/`.
+          if (stripped === '' || /^[A-Za-z]:$/.test(stripped)) {
+            return `${stripped}/`
+          }
+          return stripped
+        }),
+    ),
+  ]
+  if (dirs.length > SAFE_DIRECTORY_WILDCARD_THRESHOLD) {
+    emit('safe.directory', '*')
+  } else {
+    // git matches safe.directory against the REPO TOP-LEVEL exactly,
+    // so a workspace root doesn't cover a nested repo. Emit both the
+    // exact path and the `<dir>/*` glob (git ≥2.46) so any repo
+    // at-or-under a granted dir is trusted. Roots keep their trailing
+    // `/`; don't double it in the glob (`//*` never wildmatches).
+    for (const d of dirs) {
+      emit('safe.directory', d)
+      emit('safe.directory', d.endsWith('/') ? `${d}*` : `${d}/*`)
+    }
+  }
+  if (opts.schannelCa) {
+    emit('http.schannelUseSSLCAInfo', 'true')
+    emit('http.schannelCheckRevoke', 'false')
+  }
+  if (n === start) return {}
+  out.GIT_CONFIG_COUNT = String(n)
+  return out
+}
+
+/**
+ * POSIX-side wrapper over {@link buildGitConfigEnv} that constructs
+ * the correct `baseEnv` for a Linux/macOS sandbox: the child inherits
+ * `process.env` under bwrap/sandbox-exec, then `unsetEnvVars` are
+ * dropped and `setEnvVars` overlaid — so numbering must continue from
+ * whatever `GIT_CONFIG_COUNT` survives that. Shared by
+ * `wrapCommandWithSandbox{Linux,MacOS}`.
+ */
+export function buildPosixGitSafeDirEnv(opts: {
+  safeDirs: readonly string[]
+  unsetEnvVars?: readonly string[]
+  setEnvVars?: Readonly<Record<string, string>>
+}): Record<string, string> {
+  const baseEnv: Record<string, string | undefined> = {
+    GIT_CONFIG_COUNT: process.env.GIT_CONFIG_COUNT,
+  }
+  for (const k of opts.unsetEnvVars ?? []) delete baseEnv[k]
+  Object.assign(baseEnv, opts.setEnvVars ?? {})
+  return buildGitConfigEnv({ safeDirs: opts.safeDirs, baseEnv })
+}
+
+/**
  * Encode a command for sandbox monitoring
  * Truncates to 100 chars and base64 encodes to avoid parsing issues
  */

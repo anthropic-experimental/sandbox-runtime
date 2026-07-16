@@ -10,6 +10,7 @@ import path, { join } from 'node:path'
 import { ripGrep } from '../utils/ripgrep.js'
 import {
   generateProxyEnvVars,
+  buildPosixGitSafeDirEnv,
   normalizePathForSandbox,
   normalizeCaseForComparison,
   isSymlinkOutsideBoundary,
@@ -68,6 +69,13 @@ export interface LinuxSandboxParams {
   mandatoryDenySearchDepth?: number
   /** Allow writes to .git/config files (default: false) */
   allowGitConfig?: boolean
+  /**
+   * Directories to emit as `safe.directory` via `GIT_CONFIG_*` env
+   * vars (see {@link buildPosixGitSafeDirEnv}). Under `--unshare-user`
+   * the repo owner's uid is unmapped inside the sandbox, so git
+   * refuses with "detected dubious ownership" without this.
+   */
+  gitSafeDirectories?: readonly string[]
   /** Custom seccomp binary paths */
   seccompConfig?: SeccompConfig
   /** Absolute path to the bwrap binary (default: resolve "bwrap" via PATH) */
@@ -1417,6 +1425,7 @@ export async function wrapCommandWithSandboxLinux(
     ripgrepConfig = { command: 'rg' },
     mandatoryDenySearchDepth = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
     allowGitConfig = false,
+    gitSafeDirectories,
     seccompConfig,
     bwrapPath,
     socatPath,
@@ -1434,13 +1443,15 @@ export async function wrapCommandWithSandboxLinux(
   const hasEnvRestrictions =
     (unsetEnvVars !== undefined && unsetEnvVars.length > 0) ||
     (setEnvVars !== undefined && Object.keys(setEnvVars).length > 0)
+  const hasGitConfig = (gitSafeDirectories?.length ?? 0) > 0
 
   // Check if we need any sandboxing
   if (
     !needsNetworkRestriction &&
     !hasReadRestrictions &&
     !hasWriteRestrictions &&
-    !hasEnvRestrictions
+    !hasEnvRestrictions &&
+    !hasGitConfig
   ) {
     return command
   }
@@ -1517,6 +1528,23 @@ export async function wrapCommandWithSandboxLinux(
       // Masked credentials override the inherited real value with a
       // sentinel; bwrap --setenv replaces any inherited value of NAME.
       for (const [name, value] of Object.entries(setEnvVars ?? {})) {
+        bwrapArgs.push('--setenv', name, value)
+      }
+    }
+
+    // ========== GIT CONFIG (safe.directory) ==========
+    // Under `--unshare-user` the repo owner's uid is unmapped so git
+    // sees dubious ownership. `buildPosixGitSafeDirEnv` composes
+    // against the child's actual starting env (process.env inherited,
+    // unsetEnvVars dropped, setEnvVars overlaid) so an ambient
+    // GIT_CONFIG_COUNT is continued, not clobbered.
+    if (gitSafeDirectories && gitSafeDirectories.length > 0) {
+      const gitCfg = buildPosixGitSafeDirEnv({
+        safeDirs: gitSafeDirectories,
+        unsetEnvVars,
+        setEnvVars,
+      })
+      for (const [name, value] of Object.entries(gitCfg)) {
         bwrapArgs.push('--setenv', name, value)
       }
     }

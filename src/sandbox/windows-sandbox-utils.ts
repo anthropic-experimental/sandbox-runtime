@@ -7,15 +7,19 @@ import { fileURLToPath } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
 import {
   generateProxyEnvVars,
+  buildGitConfigEnv,
   normalizePathForSandbox,
   containsGlobCharsWin,
   expandGlobPattern,
 } from './sandbox-utils.js'
 // Re-export so existing tests (glob-expand.test.ts) and any
-// out-of-tree caller keep their import path.
+// out-of-tree caller keep their import path. `buildGitConfigEnv` is
+// hoisted to sandbox-utils (cross-platform) but re-exported here for
+// the existing `src/index.ts` surface.
 export {
   containsGlobCharsWin,
   stripExtendedPathPrefix,
+  buildGitConfigEnv,
 } from './sandbox-utils.js'
 import type { SandboxDependencyCheck } from './linux-sandbox-utils.js'
 import type { SrtWinConfig } from './sandbox-config.js'
@@ -310,6 +314,15 @@ export interface WindowsSandboxParams {
    * entry — see {@link buildGitConfigEnv}.
    */
   allowWrite?: readonly string[]
+  /**
+   * Explicit `safe.directory` entries (from
+   * `SandboxRuntimeConfig.git.safeDirectories`). Unioned with
+   * {@link cwd} and {@link allowWrite} into the `safe.directory` set
+   * — see {@link buildGitConfigEnv}. Use for the repo top-level when
+   * launching from a subdirectory: the top-level must NOT go in
+   * `allowWrite`, but git's dubious-ownership check keys on it.
+   */
+  gitSafeDirectories?: readonly string[]
   /**
    * Path to the TLS-termination trust bundle (the MITM CA + system
    * roots) — fed to {@link generateProxyEnvVars} so the child's
@@ -1175,90 +1188,6 @@ export function revokeWindowsAcl(opts: {
 // ────────────────────────────────────────────────────────────────────
 
 /**
- * `safe.directory` entries above this count collapse to a single
- * `safe.directory=*`. Keeps `GIT_CONFIG_COUNT` (and the `--env`
- * argv it rides on) bounded when `allowWrite` is wide.
- */
-const SAFE_DIRECTORY_WILDCARD_THRESHOLD = 8
-
-/**
- * Build the `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` /
- * `GIT_CONFIG_VALUE_<n>` env-var set for the sandboxed child.
- *
- * Emits:
- *   - `safe.directory=<dir>` for each entry in `safeDirs` (or one
- *     `safe.directory=*` when the list is long) — the working tree
- *     is owned by the real user, so git running as `srt-sandbox`
- *     refuses with "detected dubious ownership" without it.
- *   - `http.schannelUseSSLCAInfo=true` and
- *     `http.schannelCheckRevoke=false` when `schannelCa` — makes
- *     git's default (schannel) backend honor `GIT_SSL_CAINFO`
- *     without `-c http.sslBackend=openssl`. Revocation is disabled
- *     because CryptoAPI CRL/OCSP fetches ignore proxy env and would
- *     be WFP-fenced.
- *
- * Composes with an existing `GIT_CONFIG_COUNT` in `baseEnv` by
- * continuing its numbering; the returned `GIT_CONFIG_COUNT` is the
- * new total. Under the two-hop launch the broker's own environment
- * never reaches the child, so `baseEnv` is the caller-supplied
- * overlay ({@link WindowsSandboxParams.setEnvVars}), not
- * `process.env`.
- *
- * Paths are emitted with forward slashes so the value survives
- * msys2's env conversion untouched and native git accepts it.
- */
-export function buildGitConfigEnv(opts: {
-  safeDirs: readonly string[]
-  schannelCa: boolean
-  baseEnv?: Readonly<Record<string, string | undefined>>
-}): Record<string, string> {
-  // An explicit `GIT_CONFIG_COUNT=0` in baseEnv is an opt-out ("no
-  // env-level git config") — respect it rather than overwriting.
-  if (opts.baseEnv?.GIT_CONFIG_COUNT === '0') return {}
-  const parsed = Number.parseInt(opts.baseEnv?.GIT_CONFIG_COUNT ?? '', 10)
-  const start = Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
-  let n = start
-  const out: Record<string, string> = {}
-  const emit = (key: string, value: string) => {
-    out[`GIT_CONFIG_KEY_${n}`] = key
-    out[`GIT_CONFIG_VALUE_${n}`] = value
-    n++
-  }
-  const dirs = [
-    ...new Set(
-      opts.safeDirs
-        .filter((d): d is string => !!d)
-        .map(d => {
-          const fwd = d.replace(/\\/g, '/')
-          const stripped = fwd.replace(/\/+$/, '')
-          // Don't strip the trailing slash off a drive root — `C:`
-          // is drive-relative-cwd, not the root; git wants `C:/`.
-          return /^[A-Za-z]:$/.test(stripped) ? `${stripped}/` : stripped
-        }),
-    ),
-  ]
-  if (dirs.length > SAFE_DIRECTORY_WILDCARD_THRESHOLD) {
-    emit('safe.directory', '*')
-  } else {
-    // git matches safe.directory against the REPO TOP-LEVEL exactly,
-    // so a workspace root doesn't cover a nested repo. Emit both the
-    // exact path and the `<dir>/*` glob (git ≥2.46) so any repo
-    // at-or-under a granted dir is trusted.
-    for (const d of dirs) {
-      emit('safe.directory', d)
-      emit('safe.directory', `${d}/*`)
-    }
-  }
-  if (opts.schannelCa) {
-    emit('http.schannelUseSSLCAInfo', 'true')
-    emit('http.schannelCheckRevoke', 'false')
-  }
-  if (n === start) return {}
-  out.GIT_CONFIG_COUNT = String(n)
-  return out
-}
-
-/**
  * Build the spawn descriptor for running `command` inside the Windows
  * sandbox: an `argv` array plus the `env` to spawn it with.
  *
@@ -1321,7 +1250,11 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // schannel CA knobs. Composed against setEnvVars so a caller
   // that already emits GIT_CONFIG_COUNT keeps its entries.
   const gitCfg = buildGitConfigEnv({
-    safeDirs: [p.cwd ?? process.cwd(), ...(p.allowWrite ?? [])],
+    safeDirs: [
+      p.cwd ?? process.cwd(),
+      ...(p.allowWrite ?? []),
+      ...(p.gitSafeDirectories ?? []),
+    ],
     schannelCa: p.caCertPath !== undefined,
     baseEnv: p.setEnvVars,
   })

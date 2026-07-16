@@ -855,6 +855,23 @@ export const RipgrepConfigSchema = z.object({
 })
 
 /**
+ * Git configuration schema (cross-platform). Injected via
+ * `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`
+ * env vars — see `buildGitConfigEnv` in `sandbox-utils.ts`.
+ */
+export const GitConfigSchema = z.object({
+  safeDirectories: z
+    .array(z.string())
+    .default([])
+    .describe(
+      'Directories git should treat as safe (`safe.directory`) even though ' +
+        "they're owned by a different user inside the sandbox. Use for the " +
+        'repo top-level when launching from a subdirectory. Does NOT grant ' +
+        'write.',
+    ),
+})
+
+/**
  * Configuration for locating/invoking the `srt-win` helper (Windows
  * only). An embedder that links `srt-win`'s CLI into its own
  * multicall binary points `path` at that binary; spawns then pass
@@ -1028,6 +1045,11 @@ export const SandboxRuntimeConfigSchema = z
       ),
     windows: WindowsConfigSchema.optional().describe(
       'Windows-specific settings (WFP sublayer, proxy port range).',
+    ),
+    git: GitConfigSchema.optional().describe(
+      'Git configuration to inject via GIT_CONFIG_* env vars ' +
+        '(cross-platform). `safeDirectories` marks paths as ' +
+        '`safe.directory` without adding them to `filesystem.allowWrite`.',
     ),
   })
   .superRefine((cfg, ctx) => {
@@ -1286,6 +1308,7 @@ export type IgnoreViolationsConfig = z.infer<
   typeof IgnoreViolationsConfigSchema
 >
 export type RipgrepConfig = z.infer<typeof RipgrepConfigSchema>
+export type GitConfig = z.infer<typeof GitConfigSchema>
 export type SeccompConfig = z.infer<typeof SeccompConfigSchema>
 export type SrtWinConfig = z.infer<typeof SrtWinConfigSchema>
 export type WindowsConfig = z.infer<typeof WindowsConfigSchema>

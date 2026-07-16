@@ -79,10 +79,15 @@ export type {
   WindowsSandboxUserStatus,
   SrtWinSpawn,
 } from './sandbox/windows-sandbox-utils.js'
-export type { WindowsConfig, SrtWinConfig } from './sandbox/sandbox-config.js'
+export type {
+  WindowsConfig,
+  SrtWinConfig,
+  GitConfig,
+} from './sandbox/sandbox-config.js'
 export {
   WindowsConfigSchema,
   SrtWinConfigSchema,
+  GitConfigSchema,
 } from './sandbox/sandbox-config.js'
 
 // Utility functions

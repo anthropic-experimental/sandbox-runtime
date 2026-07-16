@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createServer, type Server } from 'node:net'
 import type { AddressInfo } from 'node:net'
-import { isWindows } from '../helpers/platform.js'
+import { isMacOS, isWindows } from '../helpers/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
@@ -471,11 +471,41 @@ describe('buildGitConfigEnv (pure, all platforms)', () => {
     expect(argv.lastIndexOf('--env')).toBeLessThan(argv.indexOf('--'))
   })
 
-  it('drive-root safeDir keeps its trailing slash; explicit COUNT=0 is an opt-out', () => {
+  it('wrapCommandWithSandboxWindows: gitSafeDirectories flows to safe.directory without allowWrite', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const { argv } = wrapCommandWithSandboxWindows({
+      command: 'git status',
+      cwd: 'C:\\repo\\sub\\dir',
+      gitSafeDirectories: ['C:\\repo'],
+      srtWin,
+    })
+    const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
+    // cwd (dir + dir/*) + gitSafeDirectories (dir + dir/*), no schannel
+    // knobs (no caCertPath). The repo top-level reaches safe.directory
+    // without appearing in allowWrite.
+    expect(envArgs).toContain('GIT_CONFIG_COUNT=4')
+    expect(envArgs).toContain('GIT_CONFIG_KEY_0=safe.directory')
+    expect(envArgs).toContain('GIT_CONFIG_VALUE_0=C:/repo/sub/dir')
+    expect(envArgs).toContain('GIT_CONFIG_VALUE_1=C:/repo/sub/dir/*')
+    expect(envArgs).toContain('GIT_CONFIG_KEY_2=safe.directory')
+    expect(envArgs).toContain('GIT_CONFIG_VALUE_2=C:/repo')
+    expect(envArgs).toContain('GIT_CONFIG_VALUE_3=C:/repo/*')
+    // No --allow-write flag exists on `srt-win exec`; the write grant
+    // is session-level. Assert gitSafeDirectories didn't leak into a
+    // per-exec deny/allow flag either.
+    expect(argv.join(' ')).not.toMatch(/--(allow|deny)-\w+ C:[/\\]repo\b/)
+  })
+
+  it('root safeDir keeps its trailing slash; explicit COUNT=0 is an opt-out', () => {
     const env = buildGitConfigEnv({ safeDirs: ['C:\\'], schannelCa: false })
     // `C:` alone is drive-relative-cwd, not the root — git wants `C:/`.
+    // Glob is `C:/*` (single slash — `//*` never wildmatches).
     expect(env.GIT_CONFIG_VALUE_0).toBe('C:/')
-    expect(env.GIT_CONFIG_VALUE_1).toBe('C://*')
+    expect(env.GIT_CONFIG_VALUE_1).toBe('C:/*')
+    // POSIX root: `/` must not strip to `` (git's list-reset sentinel).
+    const posix = buildGitConfigEnv({ safeDirs: ['/'], schannelCa: false })
+    expect(posix.GIT_CONFIG_VALUE_0).toBe('/')
+    expect(posix.GIT_CONFIG_VALUE_1).toBe('/*')
     // Explicit GIT_CONFIG_COUNT=0 in baseEnv → respect the opt-out.
     expect(
       buildGitConfigEnv({
@@ -485,6 +515,28 @@ describe('buildGitConfigEnv (pure, all platforms)', () => {
       }),
     ).toEqual({})
   })
+
+  it.if(isMacOS)(
+    'wrapCommandWithSandboxMacOS: gitSafeDirectories alone still emits GIT_CONFIG_*',
+    async () => {
+      // Repo owned by another unix user + filesystem.disabled: no
+      // net/fs/env restriction, only safe.directory. The early-return
+      // gate must NOT swallow the emit.
+      const { wrapCommandWithSandboxMacOS } = await import(
+        '../../src/sandbox/macos-sandbox-utils.js'
+      )
+      const wrapped = wrapCommandWithSandboxMacOS({
+        command: 'git status',
+        needsNetworkRestriction: false,
+        readConfig: undefined,
+        writeConfig: undefined,
+        gitSafeDirectories: ['/repo'],
+      })
+      expect(wrapped).toContain('GIT_CONFIG_KEY_0=safe.directory')
+      expect(wrapped).toContain('GIT_CONFIG_VALUE_0=/repo')
+      expect(wrapped).not.toBe('git status')
+    },
+  )
 })
 
 describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {

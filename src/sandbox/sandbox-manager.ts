@@ -1174,6 +1174,21 @@ function getAllowGitConfig(): boolean {
   return config?.filesystem?.allowGitConfig ?? false
 }
 
+/**
+ * Union of session-level and per-call `git.safeDirectories`. Marks
+ * paths as `safe.directory` (dubious-ownership bypass) WITHOUT
+ * touching the write grant — the repo top-level for a subdirectory
+ * launch must NOT go in `filesystem.allowWrite`.
+ */
+function getGitSafeDirectories(
+  customConfig?: Partial<SandboxRuntimeConfig>,
+): string[] {
+  return [
+    ...(config?.git?.safeDirectories ?? []),
+    ...(customConfig?.git?.safeDirectories ?? []),
+  ]
+}
+
 function getSeccompConfig(): SeccompConfig | undefined {
   return config?.seccomp
 }
@@ -1348,6 +1363,8 @@ async function wrapWithSandbox(
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
   const allowPty = customConfig?.allowPty ?? config?.allowPty
 
+  const gitSafeDirectories = getGitSafeDirectories(customConfig)
+
   switch (platform) {
     case 'macos':
       // macOS sandbox profile supports glob patterns directly, no ripgrep needed
@@ -1371,6 +1388,7 @@ async function wrapWithSandbox(
         ignoreViolations: getIgnoreViolations(),
         allowPty,
         allowGitConfig: getAllowGitConfig(),
+        gitSafeDirectories,
         enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
         allowAppleEvents: getAllowAppleEvents(),
         binShell,
@@ -1407,6 +1425,7 @@ async function wrapWithSandbox(
         ripgrepConfig: getRipgrepConfig(),
         mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
         allowGitConfig: getAllowGitConfig(),
+        gitSafeDirectories,
         seccompConfig: getSeccompConfig(),
         bwrapPath: config?.bwrapPath,
         socatPath: config?.socatPath,
@@ -1545,10 +1564,12 @@ async function wrapWithSandboxArgv(
       denyRead: perExecDenyRead,
       denyWrite: perExecDenyWrite,
       // safe.directory: cwd + the resolved session-level write
-      // grants — exactly the working-tree roots the sandbox user
-      // has MODIFY on and where git will see real-user-owned files.
+      // grants + explicit git.safeDirectories — the working-tree
+      // roots the sandbox user has MODIFY on plus any repo top-level
+      // the caller marks as safe without granting write.
       cwd,
       allowWrite: windowsFsStampedSet?.grantWrite,
+      gitSafeDirectories: getGitSafeDirectories(customConfig),
       caCertPath: mitmCA?.trustBundlePath,
       binShell: parseWindowsBinShell(binShell),
       srtWin: customConfig?.windows?.srtWin

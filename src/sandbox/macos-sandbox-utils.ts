@@ -6,6 +6,7 @@ import { whichSync } from '../utils/which.js'
 import {
   normalizePathForSandbox,
   generateProxyEnvVars,
+  buildPosixGitSafeDirEnv,
   encodeSandboxedCommand,
   decodeSandboxedCommand,
   containsGlobChars,
@@ -48,6 +49,11 @@ export interface MacOSSandboxParams {
   ignoreViolations?: IgnoreViolationsConfig | undefined
   allowPty?: boolean
   allowGitConfig?: boolean
+  /**
+   * Directories to emit as `safe.directory` via `GIT_CONFIG_*` env
+   * vars — see {@link buildPosixGitSafeDirEnv}.
+   */
+  gitSafeDirectories?: readonly string[]
   enableWeakerNetworkIsolation?: boolean
   allowAppleEvents?: boolean
   binShell?: string
@@ -801,6 +807,7 @@ export function wrapCommandWithSandboxMacOS(
     maskedFileBinds,
     allowPty,
     allowGitConfig = false,
+    gitSafeDirectories,
     enableWeakerNetworkIsolation = false,
     allowAppleEvents = false,
     binShell,
@@ -834,13 +841,15 @@ export function wrapCommandWithSandboxMacOS(
   const hasEnvRestrictions =
     (unsetEnvVars !== undefined && unsetEnvVars.length > 0) ||
     (setEnvVars !== undefined && Object.keys(setEnvVars).length > 0)
+  const hasGitConfig = (gitSafeDirectories?.length ?? 0) > 0
 
   // No sandboxing needed
   if (
     !needsNetworkRestriction &&
     !hasReadRestrictions &&
     !hasWriteRestrictions &&
-    !hasEnvRestrictions
+    !hasEnvRestrictions &&
+    !hasGitConfig
   ) {
     return command
   }
@@ -890,6 +899,22 @@ export function wrapCommandWithSandboxMacOS(
       ? inherited
       : [inherited, flag].filter(Boolean).join(' ')
     proxyEnvArgs.push(`JAVA_TOOL_OPTIONS=${value}`)
+  }
+
+  // safe.directory (dubious-ownership) — `buildPosixGitSafeDirEnv`
+  // composes against the child's actual starting env (process.env
+  // inherited under sandbox-exec, unsetEnvVars dropped, setEnvVars
+  // overlaid) so an ambient GIT_CONFIG_COUNT is continued, not
+  // clobbered.
+  if (gitSafeDirectories && gitSafeDirectories.length > 0) {
+    const gitCfg = buildPosixGitSafeDirEnv({
+      safeDirs: gitSafeDirectories,
+      unsetEnvVars,
+      setEnvVars,
+    })
+    for (const [name, value] of Object.entries(gitCfg)) {
+      proxyEnvArgs.push(`${name}=${value}`)
+    }
   }
 
   // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
