@@ -46,6 +46,8 @@ import {
   WindowsSandboxError,
   verifyWindowsWfpEgress,
   windowsTrustCa,
+  ensurePersistentWindowsCa,
+  windowsStateDir,
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
   resolveSrtWin,
@@ -2212,9 +2214,9 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
   afterAll(async () => {
     await SandboxManager.reset()
     // Mirror the network + H-rows describes: leave no WFP filters,
-    // sandbox user, or fixture CA behind for a subsequent local
-    // run. In CI `cleanup.ps1` sweeps regardless, but this is the
-    // last describe in the file so it owns final teardown.
+    // sandbox user, or fixture CA behind. The P-group below
+    // re-provisions if it needs to; in CI `cleanup.ps1` sweeps
+    // regardless.
     uninstallWindowsSandbox({
       sublayerGuid: TEST_SUBLAYER,
       srtWin: TEST_SRT_WIN,
@@ -2436,4 +2438,153 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
     },
     120_000,
   )
+})
+
+// ────────────────────────────────────────────────────────────────────
+// Group P — persistent CA (`ensurePersistentWindowsCa` +
+// `initialize()` auto-load with `tlsTerminate: {}`).
+//
+// Separate describe from G: G's beforeAll pins the fixture CA
+// (explicit caCertPath); this group exercises the no-explicit-path
+// branch that generates-if-absent under
+// `%LOCALAPPDATA%\sandbox-runtime\ca\`.
+// ────────────────────────────────────────────────────────────────────
+
+describe.if(isWindows)('Windows sandbox: persistent CA (P)', () => {
+  // bun evaluates describe bodies even under `.if(false)` — guard the
+  // top-level const so `windowsStateDir()` (throws without
+  // LOCALAPPDATA) doesn't run on macOS/Linux.
+  const caDir = isWindows ? join(windowsStateDir(), 'ca') : ''
+
+  beforeAll(async () => {
+    console.error('[winsrt P beforeAll] start')
+    // G's afterAll uninstalled — re-provision (own sublayer).
+    const wfp = getWindowsWfpStatus({
+      sublayerGuid: TEST_SUBLAYER,
+      srtWin: TEST_SRT_WIN,
+    })
+    if (wfp.state !== 'installed') {
+      installWindowsSandbox({
+        sublayerGuid: TEST_SUBLAYER,
+        proxyPortRange: PORT_RANGE,
+        srtWin: TEST_SRT_WIN,
+      })
+    }
+    // Start from a clean slate so P1's `generated: true` is
+    // deterministic across repeated local runs.
+    rmSync(caDir, { recursive: true, force: true })
+    console.error('[winsrt P beforeAll] done')
+  }, 120_000)
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+    rmSync(caDir, { recursive: true, force: true })
+    // Last describe in the file → owns final teardown.
+    uninstallWindowsSandbox({
+      sublayerGuid: TEST_SUBLAYER,
+      srtWin: TEST_SRT_WIN,
+    })
+  }, 60_000)
+
+  it('P1: idempotent — first call generates, second reuses (temp dir)', async () => {
+    // Scoped to a scratch dir so this row is hermetic irrespective
+    // of what P2/P3 write to the default location.
+    const dir = mkdtempSync(join(tmpdir(), 'srt-persist-ca-'))
+    const srtWin = TEST_SRT_WIN
+    try {
+      const status = getWindowsSandboxUserStatus({ srtWin })
+      const a = await ensurePersistentWindowsCa({ dir, status, srtWin })
+      expect(a.generated).toBe(true)
+      expect(a.trusted).toBe(true)
+      expect(a.thumbprint).toMatch(/^[0-9A-F]{40}$/)
+      expect(a.certPem).toContain('BEGIN CERTIFICATE')
+      expect(a.keyPem).toContain('PRIVATE KEY')
+      // ca.json is the atomic source of truth; cert.pem/key.pem are
+      // derived siblings.
+      expect(existsSync(join(dir, 'ca.json'))).toBe(true)
+      expect(existsSync(a.certPath)).toBe(true)
+      expect(existsSync(a.keyPath)).toBe(true)
+      // Second call: same PEMs, same thumb, no regenerate. `trusted`
+      // is false — the first call's trust step recorded this thumb
+      // in state.db, so the reconcile finds it already installed.
+      const b = await ensurePersistentWindowsCa({
+        dir,
+        status: getWindowsSandboxUserStatus({ srtWin }),
+        srtWin,
+      })
+      expect(b.generated).toBe(false)
+      expect(b.trusted).toBe(false)
+      expect(b.thumbprint).toBe(a.thumbprint)
+      expect(b.certPem).toBe(a.certPem)
+      // Corrupt ca.json → regenerates (no throw).
+      writeFileSync(join(dir, 'ca.json'), 'not json')
+      const c = await ensurePersistentWindowsCa({ dir, status, srtWin })
+      expect(c.generated).toBe(true)
+      expect(c.thumbprint).not.toBe(a.thumbprint)
+      // `force` regenerates even with a valid pair on disk (via
+      // tmp+rename, so ca.json is always a matched pair).
+      const d = await ensurePersistentWindowsCa({
+        dir,
+        status,
+        srtWin,
+        force: true,
+      })
+      expect(d.generated).toBe(true)
+      expect(d.thumbprint).not.toBe(c.thumbprint)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }, 120_000)
+
+  it('P2: initialize() with tlsTerminate:{} auto-loads the persistent CA', async () => {
+    // No caCertPath/caKeyPath → the Windows branch of initialize()
+    // calls ensurePersistentWindowsCa(), then createMitmCA on its
+    // paths. First run generates; the returned MitmCA's certPath
+    // must be under the state-dir `ca/` (not a mkdtemp `srt-ca-`).
+    const cfg = createTestConfig(['example.com'])
+    await SandboxManager.initialize({
+      ...cfg,
+      network: { ...cfg.network, tlsTerminate: {} },
+    })
+    const ca = SandboxManager.getMitmCA()
+    expect(ca).toBeTruthy()
+    expect(ca!.ephemeral).toBe(false)
+    // Case-insensitive prefix match — Windows path casing varies.
+    expect(ca!.certPath.toLowerCase()).toBe(
+      join(caDir, 'cert.pem').toLowerCase(),
+    )
+    // `srt-win user status` now reports the same thumb the session
+    // CA carries — proves ensurePersistentWindowsCa's trust step
+    // landed and the initialize() gate would have passed the
+    // explicit-path check too.
+    const u = getWindowsSandboxUserStatus({ srtWin: TEST_SRT_WIN })
+    expect(u.caCertThumb).toBeTruthy()
+  }, 60_000)
+
+  it('P3: schannel trusts the persistent CA end-to-end (System32 curl)', async () => {
+    // Mirrors G8 but with the persistent (not fixture) CA — the
+    // load-bearing proof that an embedder passing `tlsTerminate:{}`
+    // gets working schannel-level trust with zero orchestration.
+    const sysCurl = `${process.env.SystemRoot ?? 'C:\\Windows'}\\System32\\curl.exe`
+    const r = await runSandboxedUntil(
+      `"${sysCurl}" -sS -o NUL -w "%{http_code}" https://example.com/`,
+      x => x.status === 0,
+    )
+    expectStatus('P3', r, [0])
+    expect(r.stdout).toContain('200')
+  }, 60_000)
+
+  it('P4: ca.json (key custody) is unreadable from inside the sandbox', async () => {
+    // The `ca/` dir inherits the state-dir's `(OI)(CI)` real-user
+    // -only DACL + `sandbox-runtime-users` DENY. `type` from inside
+    // the sandbox must fail. Gate on stdout NOT containing the PEM
+    // header (cmd `type` exit codes are unreliable on access-denied).
+    const jsonPath = join(caDir, 'ca.json')
+    // Broker (real user) CAN read it.
+    expect(readFileSync(jsonPath, 'utf8')).toContain('PRIVATE KEY')
+    const r = await runSandboxed(`type "${jsonPath}"`)
+    expect(r.stdout).not.toContain('PRIVATE KEY')
+    // stderr should carry the access-denied — tolerant match.
+    expect(`${r.stdout} ${r.stderr}`).toMatch(/denied|Access is denied/i)
+  }, 30_000)
 })

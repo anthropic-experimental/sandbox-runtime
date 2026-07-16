@@ -23,6 +23,7 @@ export {
   buildGitConfigEnv,
   isUncPath,
 } from './sandbox-utils.js'
+import { certThumbprint, generateCa, validateCaPair } from './mitm-ca.js'
 import type { SandboxDependencyCheck } from './linux-sandbox-utils.js'
 import type { SrtWinConfig } from './sandbox-config.js'
 
@@ -1100,6 +1101,22 @@ export function windowsTrustCa(
     timeoutMs: 60_000,
     srtWin: opts.srtWin,
   })
+  checkTrustCaResult(caCertPath, r)
+}
+
+/** Async twin of {@link windowsTrustCa} — identical argv and errors. */
+export async function windowsTrustCaAsync(
+  caCertPath: string,
+  opts: { srtWin?: SrtWinSpawn } = {},
+): Promise<void> {
+  const r = await runSrtWinAsync(['user', 'trust-ca', caCertPath], {
+    timeoutMs: 60_000,
+    srtWin: opts.srtWin,
+  })
+  checkTrustCaResult(caCertPath, r)
+}
+
+function checkTrustCaResult(caCertPath: string, r: RunResult): void {
   logForDebugging(
     `[Sandbox Windows] user trust-ca exit=${r.status}: ${r.stderr || r.stdout}`,
   )
@@ -1110,6 +1127,274 @@ export function windowsTrustCa(
         `${r.status}): ${r.stderr || r.stdout}`,
     )
   }
+}
+
+/**
+ * `%LOCALAPPDATA%\sandbox-runtime` — the same directory `srt-win`'s
+ * `state_db::state_dir()` uses. Its DACL is stamped `(OI)(CI)`
+ * real-user-only + explicit `sandbox-runtime-users` DENY on every
+ * `state_db::open_db()` (i.e. at `srt-win install` and every `acl`
+ * op), so anything created underneath it inherits broker-only
+ * custody.
+ */
+export function windowsStateDir(): string {
+  const base = process.env.LOCALAPPDATA
+  if (!base) throw new Error('LOCALAPPDATA is not set')
+  return path.win32.join(base, 'sandbox-runtime')
+}
+
+/** Result of {@link ensurePersistentWindowsCa}. */
+export type WindowsPersistentCa = {
+  /**
+   * PEM certificate — pass to `createMitmCA({caCertPem, caKeyPem})` so
+   * the caller doesn't re-read from disk.
+   */
+  certPem: string
+  /** PEM private key — see {@link certPem}. */
+  keyPem: string
+  /**
+   * `cert.pem` on disk (derived from `ca.json`; exists so
+   * {@link windowsTrustCa} and diagnostic tooling have a path).
+   */
+  certPath: string
+  /** `key.pem` on disk (derived from `ca.json`). */
+  keyPath: string
+  /** Uppercase-hex SHA-1 (matches `srt-win user status` `caCertThumb`). */
+  thumbprint: string
+  /**
+   * `true` when this call generated a fresh CA (first run, `force`, or
+   * the on-disk pair was invalid/expiring); `false` when the existing
+   * on-disk pair was reused.
+   */
+  generated: boolean
+  /**
+   * `true` when this call wrote the CA into the sandbox user's
+   * `CurrentUser\Root` (via {@link windowsTrustCa}) — always on
+   * `generated`, and on reuse when the sandbox user's installed
+   * thumbprint didn't already match. Callers holding a
+   * {@link WindowsSandboxUserStatus} fetched before this call should
+   * treat its `caCertThumb` as stale when `trusted` is true.
+   */
+  trusted: boolean
+}
+
+/**
+ * Generate-if-absent a persistent MITM CA under
+ * `%LOCALAPPDATA%\sandbox-runtime\ca\` and ensure it is trusted in
+ * the sandbox user's `CurrentUser\Root`. Idempotent and unelevated:
+ * a second call with a valid on-disk pair returns it with
+ * `generated: false`.
+ *
+ * **Storage.** The pair lives in a single `ca.json = {certPem,
+ * keyPem}` written atomically (tmp+rename) and re-read after every
+ * write, so it is always a matched pair and concurrent brokers
+ * converge on whichever rename landed last. `cert.pem`/`key.pem` are
+ * derived copies for diagnostic tooling; `ca.json` is the source of
+ * truth.
+ *
+ * **Key custody is broker-side.** The MITM proxy runs as the real
+ * user, so the sandbox user never needs to read the key. The `ca/`
+ * subdirectory inherits the state-DB directory's `(OI)(CI)`
+ * real-user-only DACL + `sandbox-runtime-users` DENY (see
+ * {@link windowsStateDir}), so `ca.json`/`key.pem` are unreadable
+ * from inside the sandbox with no per-file ACL work here. The
+ * certificate reaches the sandboxed child via the schannel registry
+ * write ({@link windowsTrustCa}) and the trust-bundle env vars —
+ * never via these files.
+ *
+ * `SandboxManager.initialize()` calls this on Windows when
+ * `tlsTerminate` is enabled without an explicit
+ * `caCertPath`/`caKeyPath`, then feeds the returned PEMs to
+ * `createMitmCA` — so an embedder gets a stable CA across restarts
+ * without orchestrating generation, storage, or trust itself. Explicit
+ * paths in config bypass this entirely.
+ *
+ * @param opts.force regenerate even if a valid pair is on disk.
+ * @param opts.status pass an already-fetched
+ *   {@link getWindowsSandboxUserStatus} result to skip the
+ *   provisioning check and avoid re-spawning `srt-win user status`
+ *   for the trust reconcile.
+ * @param opts.dir override the CA directory (tests). Default
+ *   `windowsStateDir()/ca`.
+ * @param opts.regenerateWithinDays regenerate if `notAfter` is within
+ *   this many days. Default 30.
+ * @throws when the sandbox user is not provisioned (run
+ *   {@link installWindowsSandbox} first), or the CA directory cannot
+ *   be created.
+ */
+export async function ensurePersistentWindowsCa(
+  opts: {
+    force?: boolean
+    status?: WindowsSandboxUserStatus
+    dir?: string
+    regenerateWithinDays?: number
+    srtWin?: SrtWinSpawn
+  } = {},
+): Promise<WindowsPersistentCa> {
+  // Provisioning gate. The `ca/` subdirectory's whole custody story
+  // depends on inheriting the state-DB dir's stamped DACL — which
+  // `srt-win install` creates. Never mkdir the state dir here.
+  const status =
+    opts.status ??
+    (await getWindowsSandboxUserStatusAsync({ srtWin: opts.srtWin }))
+  if (!status.provisioned || !status.credPresent) {
+    throw new Error(
+      `ensurePersistentWindowsCa: sandbox user is not provisioned ` +
+        `(user=${status.provisioned}, cred=${status.credPresent}). ` +
+        `Run \`npx sandbox-runtime windows-install\` first.`,
+    )
+  }
+  const stateDir = opts.dir ? undefined : windowsStateDir()
+  if (stateDir && !fs.existsSync(stateDir)) {
+    throw new Error(
+      `ensurePersistentWindowsCa: state directory ${stateDir} does not ` +
+        `exist. Run \`npx sandbox-runtime windows-install\` first.`,
+    )
+  }
+  const dir = opts.dir ?? path.win32.join(stateDir!, 'ca')
+  const jsonPath = path.join(dir, 'ca.json')
+  const certPath = path.join(dir, 'cert.pem')
+  const keyPath = path.join(dir, 'key.pem')
+  const horizonMs = (opts.regenerateWithinDays ?? 30) * 24 * 60 * 60 * 1000
+
+  // tmp+rename atomic write. Node's `renameSync` on Windows is
+  // libuv's `MoveFileExW(…, MOVEFILE_REPLACE_EXISTING)` — an atomic
+  // same-volume replace — so `p` is either its previous content or
+  // the full new content, never partial.
+  const atomicWrite = (p: string, data: string): void => {
+    const tmp = `${p}.tmp.${process.pid}`
+    fs.writeFileSync(tmp, data)
+    fs.renameSync(tmp, p)
+  }
+
+  // Shared return path: write the derived cert.pem/key.pem siblings
+  // (tooling-only — trust-ca never reads them), reconcile trust, and
+  // assemble the result. Trust is idempotent and ADDITIVE: `srt-win
+  // user trust-ca` writes a per-thumbprint registry key (a rotation
+  // adds the new cert, prior ones stay trusted); the state-DB
+  // `ca_cert` column tracks the latest.
+  const finish = async (
+    certPem: string,
+    keyPem: string,
+    thumbprint: string,
+    generated: boolean,
+  ): Promise<WindowsPersistentCa> => {
+    atomicWrite(certPath, certPem)
+    atomicWrite(keyPath, keyPem)
+    const trusted = generated || status.caCertThumb !== thumbprint
+    if (trusted) {
+      // Trust from a per-call unique temp, never a shared mutable
+      // path — a concurrent broker's write to `cert.pem` could
+      // otherwise swap the bytes between our write and `srt-win user
+      // trust-ca`'s read, leaving the registry trusting a different
+      // cert than this session's proxy signs with.
+      const t = path.join(dir, `.trust.${process.pid}.${Date.now()}.pem`)
+      fs.writeFileSync(t, certPem)
+      try {
+        await windowsTrustCaAsync(t, { srtWin: opts.srtWin })
+      } finally {
+        fs.rmSync(t, { force: true })
+      }
+    }
+    logForDebugging(
+      `[Sandbox Windows] persistent CA ` +
+        `${generated ? 'generated' : 'reused'} (thumb=${thumbprint}` +
+        `${trusted && !generated ? ', trust reconciled' : ''})`,
+    )
+    return {
+      certPem,
+      keyPem,
+      certPath,
+      keyPath,
+      thumbprint,
+      generated,
+      trusted,
+    }
+  }
+
+  // Read+validate helper. Any read/parse/validate failure returns
+  // undefined (never throws) so a corrupt on-disk pair is not an
+  // error the embedder has to handle.
+  const readValid = ():
+    | { certPem: string; keyPem: string; thumbprint: string; notAfter: Date }
+    | undefined => {
+    let stored: { certPem?: unknown; keyPem?: unknown }
+    try {
+      stored = JSON.parse(fs.readFileSync(jsonPath, 'utf8'))
+    } catch (err) {
+      logForDebugging(
+        `[Sandbox Windows] persistent CA ca.json unreadable ` +
+          `(${(err as Error).message})`,
+        { level: 'warn' },
+      )
+      return undefined
+    }
+    if (typeof stored.certPem !== 'string' || typeof stored.keyPem !== 'string')
+      return undefined
+    const v = validateCaPair(stored.certPem, stored.keyPem)
+    if (!v.ok) {
+      logForDebugging(`[Sandbox Windows] persistent CA invalid (${v.reason})`, {
+        level: 'warn',
+      })
+      return undefined
+    }
+    return {
+      certPem: stored.certPem,
+      keyPem: stored.keyPem,
+      thumbprint: v.thumbprint,
+      notAfter: v.notAfter,
+    }
+  }
+
+  // Reuse when ca.json exists, validates, and isn't expiring inside
+  // the horizon.
+  if (!opts.force) {
+    const on = readValid()
+    if (on && on.notAfter.getTime() - Date.now() > horizonMs) {
+      return await finish(on.certPem, on.keyPem, on.thumbprint, false)
+    }
+    if (on) {
+      logForDebugging(
+        `[Sandbox Windows] persistent CA expiring ` +
+          `${on.notAfter.toISOString()}; regenerating`,
+        { level: 'warn' },
+      )
+    }
+  }
+
+  // Generate. `ca/` (not the state dir) is mkdir'd here so it
+  // inherits the parent's (OI)(CI) DACL. After the atomic write,
+  // RE-READ ca.json and use that content: a concurrent broker's
+  // rename may have won, and returning our own PEMs would diverge
+  // from disk — the re-read makes every racer converge.
+  fs.mkdirSync(dir, { recursive: true })
+  // Best-effort sweep of stale `*.tmp.*` / `.trust.*` files from
+  // crashed prior brokers.
+  try {
+    const cutoff = Date.now() - 5 * 60 * 1000
+    for (const f of fs.readdirSync(dir)) {
+      if (!f.includes('.tmp.') && !f.startsWith('.trust.')) continue
+      const p = path.join(dir, f)
+      if (fs.statSync(p).mtimeMs < cutoff) fs.rmSync(p, { force: true })
+    }
+  } catch {
+    // sweep is best-effort; a leftover tmp is harmless.
+  }
+  const gen = generateCa({ cn: 'sandbox-runtime persistent CA' })
+  atomicWrite(
+    jsonPath,
+    JSON.stringify({ certPem: gen.certPem, keyPem: gen.keyPem }),
+  )
+  const on = readValid()
+  // `on` can only be undefined if a concurrent broker overwrote with
+  // an invalid pair (which the tmp+rename path can't produce) — so
+  // treat as our own write having landed.
+  const { certPem, keyPem, thumbprint } = on ?? {
+    certPem: gen.certPem,
+    keyPem: gen.keyPem,
+    thumbprint: certThumbprint(gen.certPem),
+  }
+  return await finish(certPem, keyPem, thumbprint, true)
 }
 
 export interface WindowsInstallOptions {

@@ -59,6 +59,9 @@ export {
   getWindowsSandboxUserStatusAsync,
   getWindowsSandboxCaCert,
   windowsTrustCa,
+  windowsTrustCaAsync,
+  ensurePersistentWindowsCa,
+  windowsStateDir,
   installWindowsSandbox,
   installWindowsSandboxAsync,
   checkWindowsDependenciesAsync,
@@ -90,8 +93,19 @@ export type {
   WindowsWfpStatusResult,
   WindowsWfpVerifyResult,
   WindowsSandboxUserStatus,
+  WindowsPersistentCa,
   SrtWinSpawn,
 } from './sandbox/windows-sandbox-utils.js'
+
+// TLS-termination CA generation/validation (mitm-ca.ts). Embedders that
+// manage CA persistence themselves (rather than relying on the Windows
+// persistent-CA default) use these to generate and validate a pair.
+export {
+  generateCa,
+  validateCaPair,
+  certThumbprint,
+} from './sandbox/mitm-ca.js'
+export type { GeneratedCa, CaPairValidation } from './sandbox/mitm-ca.js'
 export type {
   WindowsConfig,
   SrtWinConfig,

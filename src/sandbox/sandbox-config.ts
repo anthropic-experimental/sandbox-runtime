@@ -733,8 +733,11 @@ export const NetworkConfigSchema = z.object({
         .describe(
           'Path to a PEM-encoded CA certificate. The sandboxed child is ' +
             'configured to trust this CA, and the TLS-terminating proxy uses ' +
-            'it to sign per-host certificates. If omitted, SRT generates an ' +
-            'ephemeral CA into a temp directory for the lifetime of the ' +
+            'it to sign per-host certificates. If omitted, on Windows SRT ' +
+            'generates-if-absent a persistent CA under ' +
+            '%LOCALAPPDATA%\\sandbox-runtime\\ca\\ and trusts it in the ' +
+            "sandbox user's Root store; on other platforms SRT generates " +
+            'an ephemeral CA into a temp directory for the lifetime of the ' +
             'session.',
         ),
       caKeyPath: z

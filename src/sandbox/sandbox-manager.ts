@@ -16,6 +16,7 @@ import {
   type PlanSigv4,
 } from './credential-aws-pairs.js'
 import {
+  certThumbprint,
   createMitmCA,
   CRL_PATH,
   disposeMitmCA,
@@ -25,7 +26,7 @@ import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
-import { randomBytes, X509Certificate } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import type {
   CredentialsConfig,
   SandboxRuntimeConfig,
@@ -66,6 +67,7 @@ import {
   revokeWindowsAcl,
   getWindowsSandboxUserStatusAsync,
   getWindowsSandboxCaCert,
+  ensurePersistentWindowsCa,
   verifyWindowsWfpEgress,
   resolveSrtWin,
   WindowsSandboxError,
@@ -461,9 +463,22 @@ async function initialize(
       'network.tlsTerminate and network.mitmProxy are mutually exclusive',
     )
   }
-  mitmCA = runtimeConfig.network.tlsTerminate
-    ? createMitmCA(runtimeConfig.network.tlsTerminate)
-    : undefined
+  // On Windows with tlsTerminate and no explicit caCertPath/caKeyPath,
+  // defer CA creation until the Windows block below has resolved
+  // srt-win and fetched user status — the persistent CA is
+  // generated-if-absent under %LOCALAPPDATA%\sandbox-runtime\ca\ and
+  // trusted in the sandbox user's Root store, then loaded here.
+  // Explicit paths (or non-Windows) go straight to createMitmCA.
+  const tlsTerminate = runtimeConfig.network.tlsTerminate
+  const useWindowsPersistentCa =
+    getPlatform() === 'windows' &&
+    tlsTerminate !== undefined &&
+    !tlsTerminate.caCertPath &&
+    !tlsTerminate.caKeyPath
+  mitmCA =
+    tlsTerminate && !useWindowsPersistentCa
+      ? createMitmCA(tlsTerminate)
+      : undefined
 
   // Check dependencies
   const deps = await checkDependenciesAsync()
@@ -544,18 +559,35 @@ async function initialize(
       }
       windowsWfpVerified = true
     }
-    // schannel-level trust under the sandbox user is install-time
-    // (cert lifecycle = sandbox-user lifecycle), not per-session.
-    // System32 curl / IWR / .NET / default-backend git only trust
-    // what's in the sandbox user's `CurrentUser\Root` — which
-    // `srt-win exec` does not (and must not) write. Compare
-    // thumbprints so a stale install-time CA doesn't pass the gate
-    // while schannel rejects the session's proxy-minted leaves.
-    if (runtimeConfig.network.tlsTerminate && mitmCA) {
+    // Persistent-CA branch (see the deferral comment above).
+    // `ensurePersistentWindowsCa` reconciles the registry thumb
+    // itself (so initialize() after uninstall→reinstall repairs
+    // trust) and may make `u.caCertThumb` stale — hence the
+    // explicit-path thumb check below skips this branch.
+    if (useWindowsPersistentCa && tlsTerminate) {
+      try {
+        const p = await ensurePersistentWindowsCa({ status: u, srtWin })
+        mitmCA = createMitmCA({
+          caCertPem: p.certPem,
+          caKeyPem: p.keyPem,
+          caCertPath: p.certPath,
+          caKeyPath: p.keyPath,
+          extraCaCertPaths: tlsTerminate.extraCaCertPaths,
+        })
+      } catch (e) {
+        config = undefined
+        throw e
+      }
+    }
+    // Explicit-path branch: schannel clients (System32 curl, IWR,
+    // .NET, default-backend git) only trust what's in the sandbox
+    // user's `CurrentUser\Root` — which `srt-win exec` does not (and
+    // must not) write. Compare thumbprints so a stale install-time
+    // CA doesn't pass the gate while schannel rejects the session's
+    // proxy-minted leaves.
+    if (tlsTerminate && mitmCA && !useWindowsPersistentCa) {
       const installed = getWindowsSandboxCaCert(u)
-      const sessionThumb = new X509Certificate(mitmCA.certPem).fingerprint
-        .replace(/:/g, '')
-        .toUpperCase()
+      const sessionThumb = certThumbprint(mitmCA.certPem)
       if (!installed) {
         config = undefined
         throw new WindowsSandboxError(
