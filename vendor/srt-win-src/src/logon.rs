@@ -40,7 +40,7 @@ use windows::core::{PCWSTR, PWSTR};
 
 use crate::job::Job;
 use crate::launch::{SpawnedChild, quote_arg};
-use crate::util::{OwnedHandle, wstr};
+use crate::util::{OwnedHandle, scrub_wstr, wstr};
 use crate::winsta::{IsolatedDesk, grant_sandbox_on_session_bno, grant_sandbox_on_winsta};
 
 /// One anonymous pipe pair. The end the runner gets is created
@@ -152,18 +152,15 @@ pub fn spawn_runner(
     let mut pw_w = wstr(password);
     let cwd_w = cwd.map(wstr);
 
-    // Kill-on-close job — best-effort: seclogon puts the
-    // CPWLW-spawned runner in its OWN job, which on current Windows
-    // refuses cross-session nesting (`AssignProcessToJobObject` →
-    // ERROR_NOT_SUPPORTED). The runner→child Job created inside
-    // `run_lockdown` is the load-bearing kill-chain; this broker→
-    // runner Job is a defense-in-depth extra that's kept when the
-    // assign succeeds. `breakaway_ok = true`: the runner's child
-    // must `CREATE_BREAKAWAY_FROM_JOB` past the inherited
-    // [seclogon, broker] job stack onto the runner's own Job —
-    // which requires EVERY job the runner is in to allow breakaway.
-    // The kill-chain still holds (broker dies → this Job → runner
-    // dies → runner's Job → child dies).
+    // Broker→runner kill-on-close Job: broker dies → runner dies →
+    // runner's Job → child dies. The assign succeeds on current
+    // Windows (rc=0, live-probed 2026-07-16); if a future seclogon
+    // job refused nesting (ERROR_NOT_SUPPORTED), the always-armed
+    // `SpawnedChild` guard below is the fallback.
+    // `breakaway_ok = true`: the runner's child must break away
+    // past the inherited [seclogon, broker] job stack onto the
+    // runner's own Job, which requires every containing job to
+    // allow it.
     let job = Job::new(true).context("broker→runner job")?;
 
     let mut si: STARTUPINFOW = unsafe { zeroed() };
@@ -205,10 +202,8 @@ pub fn spawn_runner(
     // Scrub the UTF-16 password buffer now that seclogon has it.
     // (The UTF-8 source is zeroed by `SandboxCred::Drop`; this is a
     // separate heap allocation.) Before any `?` so the scrub runs
-    // regardless of `r`.
-    for c in pw_w.iter_mut() {
-        *c = 0;
-    }
+    // regardless of `r`. Volatile so DSE can't remove it in release.
+    scrub_wstr(&mut pw_w);
     if let Err(e) = r {
         if e.code() == ERROR_LOGON_FAILURE.to_hresult() {
             return Err(anyhow!(
@@ -229,11 +224,18 @@ pub fn spawn_runner(
             pi.dwProcessId
         );
     }
-    // Runner exists, suspended. The guard's `Drop` terminates it on
-    // any `?` until `defuse()` — so a failed grant / assign / resume
-    // can't orphan a suspended process the (best-effort) job may not
-    // be holding.
-    let mut child = SpawnedChild::new(pi);
+    // Runner exists, suspended. The guard is never defused: its
+    // `Drop` `TerminateProcess`es the runner on every in-process
+    // exit — `?`/panic reap directly; on normal return the runner
+    // has already exited and the terminate is a no-op on the held
+    // handle. It cannot cover an external kill of the broker —
+    // that is the Job's role; if a build ever regresses the assign
+    // above, elevated `taskkill /F /FI "USERNAME eq srt-sandbox"`
+    // is the operator fallback (admins hold SeDebugPrivilege and
+    // BA is in every sandbox process's DACL — the by-user-filter
+    // denial is non-elevated-only). Declared after `job` so it
+    // drops first: terminate before job-close.
+    let child = SpawnedChild::new(pi);
 
     // Grant `srt-sandbox` on the broker's `WinSta0` (with a non-NULL
     // `lpDesktop`, seclogon skips its station auto-grant for the new
@@ -279,7 +281,7 @@ pub fn spawn_runner(
     if dbg {
         eprintln!("srt-win: spawn_runner: runner resumed; writing spec");
     }
-    child.defuse();
+    // No `child.defuse()` — the guard stays armed (see its decl).
 
     // Close the runner-side pipe ends in the broker so the pumps
     // see EOF when the runner exits.
@@ -339,7 +341,9 @@ pub fn spawn_runner(
     unsafe {
         GetExitCodeProcess(child.process(), &mut code).context("GetExitCodeProcess(runner)")?;
     }
-    drop(job);
+    // Implicit drop order: `child` (armed, no-op on the exited
+    // runner) then `job`. An explicit `drop(job)` here would close
+    // the Job before the fallback terminate.
     Ok(code)
 }
 
