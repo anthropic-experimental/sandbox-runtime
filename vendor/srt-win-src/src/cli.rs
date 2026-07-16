@@ -373,38 +373,153 @@ struct AceReleaseEntry {
     status: &'static str,
 }
 
+/// Output of [`canonicalize_ace_targets`].
+struct AceTargets {
+    /// `(canonical_path, ace)` to hand to `apply_aces`.
+    targets: Vec<(String, srt_win::acl::SbAce)>,
+    /// Inputs that could not be canonicalized (soft-skip → exit 2).
+    bad_inputs: Vec<(String, String)>,
+}
+
 /// Canonicalize `(paths, ace)` pairs for `acl grant`/`acl stamp`
 /// (additive sandbox-user ACE). Per-path canonicalize failure is
 /// soft (skipped, exit 2); a glob is a HARD error. Directory
 /// targets are accepted (the inheritable ACE covers the subtree;
 /// stamping a root is allowed because the additive ACE on `C:\` is
 /// wide but not destructive — the user can remove it).
-#[allow(clippy::type_complexity)]
+///
+/// A `Deny` target that does not exist is materialized via
+/// [`create_placeholder_chain`] (trailing `\`/`/` ⇒ directory
+/// leaf). The leaf gets the input's full deny mask; placeholder
+/// INTERMEDIATES — this call's and, via
+/// [`placeholder_ancestors_of`], any earlier holder's — get
+/// [`SbAce::DenyDelete`], so every holder holds the FULL chain and
+/// releasing any one holder cannot strip an intermediate another
+/// holder still depends on.
+///
+/// A `Deny` target the broker cannot create (`PermissionDenied` —
+/// e.g. under `Program Files` non-elevated) or that names a UNC
+/// path is soft-DROPPED, not `bad_inputs`: the sandbox user
+/// cannot create there either. Approximation — an asymmetric ACL
+/// that grants the sandbox account create where the real user is
+/// denied is possible but rare. A `Grant` on a missing path stays
+/// a soft-skip (nothing to grant on).
+///
+/// Runs under `with_init_lock` so placeholder creation, its DB
+/// record, and the ancestor-discovery query are all serialized
+/// with `apply_aces`.
+///
+/// [`create_placeholder_chain`]: srt_win::path_id::create_placeholder_chain
+/// [`placeholder_ancestors_of`]: srt_win::state_db::Locked::placeholder_ancestors_of
+/// [`SbAce::DenyDelete`]: srt_win::acl::SbAce::DenyDelete
 fn canonicalize_ace_targets(
+    db: &srt_win::state_db::Locked,
     label: &str,
     inputs: &[(&[String], srt_win::acl::SbAce)],
-) -> anyhow::Result<(Vec<(String, srt_win::acl::SbAce)>, Vec<(String, String)>)> {
+) -> anyhow::Result<AceTargets> {
     use anyhow::anyhow;
-    use srt_win::path_id::{CanonError, canonicalize_path};
+    use srt_win::acl::SbAce;
+    use srt_win::path_id::{
+        CanonError, canonicalize_path, create_placeholder_chain, is_unc_path, strip_extended_prefix,
+    };
+    use std::io::ErrorKind;
     let mut targets = Vec::new();
     let mut bad_inputs = Vec::new();
-    for (list, ace) in inputs {
-        for p in *list {
-            match canonicalize_path(p) {
-                Ok((canon, _is_dir)) => targets.push((canon, *ace)),
-                Err(CanonError::Glob) => {
-                    return Err(anyhow!(
-                        "Windows fs {label} requires explicit file \
-                         or directory paths; got glob '{p}'."
-                    ));
+    // Deepest-first so overlapping non-existent denies (`['y',
+    // 'y\secret']`) materialize as `y/` DIR + `secret` FILE, not
+    // `y` FILE (which would then fail `y\secret` with "ancestor is
+    // a FILE"). Strip any `\\?\` prefix and normalize `/`→`\`
+    // before counting so `\\?\C:\y` and `C:/y` depth-compare
+    // correctly, and trim a trailing separator so it doesn't skew
+    // the sort.
+    let mut flat: Vec<(&String, SbAce)> = inputs
+        .iter()
+        .flat_map(|(list, ace)| list.iter().map(move |p| (p, *ace)))
+        .collect();
+    flat.sort_by_cached_key(|(p, _)| {
+        std::cmp::Reverse(
+            strip_extended_prefix(p)
+                .trim_end_matches(['\\', '/'])
+                .bytes()
+                .filter(|b| *b == b'\\' || *b == b'/')
+                .count(),
+        )
+    });
+    for (p, ace) in flat {
+        let canon = match canonicalize_path(p) {
+            Ok((c, _is_dir)) => c,
+            Err(CanonError::Glob) => {
+                return Err(anyhow!(
+                    "Windows fs {label} requires explicit file \
+                     or directory paths; got glob '{p}'."
+                ));
+            }
+            Err(CanonError::NotFound(_)) if matches!(ace, SbAce::Deny(_)) => {
+                if is_unc_path(p) {
+                    eprintln!(
+                        "srt-win: deny target '{p}' is a UNC path \
+                         and does not exist; dropping — the local \
+                         ACL model does not cover SMB shares"
+                    );
+                    continue;
                 }
-                Err(CanonError::Other(e)) => {
-                    bad_inputs.push((p.clone(), format!("{e:#}")));
+                let leaf_is_dir = p.ends_with(['\\', '/']);
+                match create_placeholder_chain(p, leaf_is_dir, |c| db.record_placeholder(c)) {
+                    Ok((leaf_canon, chain)) => {
+                        if !chain.is_empty() {
+                            eprintln!(
+                                "srt-win: deny target '{p}' does \
+                                 not exist; created {} placeholder \
+                                 component(s) and stamping the chain",
+                                chain.len(),
+                            );
+                        }
+                        leaf_canon
+                    }
+                    Err(e) => {
+                        // Soft-drop per the doc above (NotFound =
+                        // unwind removed a half-built chain); any
+                        // other kind fails loudly via bad_inputs.
+                        let io_kind = e
+                            .root_cause()
+                            .downcast_ref::<std::io::Error>()
+                            .map(|io| io.kind());
+                        if matches!(
+                            io_kind,
+                            Some(ErrorKind::PermissionDenied | ErrorKind::NotFound)
+                        ) {
+                            eprintln!(
+                                "srt-win: cannot create placeholder \
+                                 for deny target '{p}' ({e:#}); \
+                                 dropping — the sandbox cannot \
+                                 create there either"
+                            );
+                        } else {
+                            bad_inputs.push((p.clone(), format!("{e:#}")));
+                        }
+                        continue;
+                    }
                 }
+            }
+            Err(CanonError::NotFound(e) | CanonError::Other(e)) => {
+                bad_inputs.push((p.clone(), format!("{e:#}")));
+                continue;
+            }
+        };
+        targets.push((canon.clone(), ace));
+        // Full-chain hold (see doc). Duplicates across inputs are
+        // harmless — `apply_aces` is idempotent per
+        // `(path, kind, holder)`.
+        if matches!(ace, SbAce::Deny(_)) {
+            for anc in db.placeholder_ancestors_of(&canon)? {
+                targets.push((anc, SbAce::DenyDelete));
             }
         }
     }
-    Ok((targets, bad_inputs))
+    Ok(AceTargets {
+        targets,
+        bad_inputs,
+    })
 }
 
 /// Read `path` and decode it as a single DER-encoded X.509
@@ -845,22 +960,29 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).context("read stdin")?;
             let input: AclStampInput = serde_json::from_str(&buf)
                 .context("parse stdin JSON {denyRead:[…], denyWrite:[…]}")?;
-            let (targets, bad_inputs) = canonicalize_ace_targets(
-                "deny",
-                &[
-                    (&input.deny_read, acl::SbAce::Deny(acl::DenyMask::ReadDeny)),
-                    (
-                        &input.deny_write,
-                        acl::SbAce::Deny(acl::DenyMask::WriteDeny),
-                    ),
-                ],
-            )?;
-            for (p, e) in &bad_inputs {
-                eprintln!("srt-win: skipped: '{p}': {e}");
-            }
-            let ((witnesses, failed), report) = state_db::with_init_lock(holder, false, |db| {
-                db.apply_aces(&sandbox_user_sid, &targets)
-            })?;
+            let ((at, witnesses, failed), report) =
+                state_db::with_init_lock(holder, false, |db| {
+                    let at = canonicalize_ace_targets(
+                        db,
+                        "deny",
+                        &[
+                            (&input.deny_read, acl::SbAce::Deny(acl::DenyMask::ReadDeny)),
+                            (
+                                &input.deny_write,
+                                acl::SbAce::Deny(acl::DenyMask::WriteDeny),
+                            ),
+                        ],
+                    )?;
+                    for (p, e) in &at.bad_inputs {
+                        eprintln!("srt-win: skipped: '{p}': {e}");
+                    }
+                    let (w, f) = db.apply_aces(&sandbox_user_sid, &at.targets)?;
+                    Ok((at, w, f))
+                })?;
+            let AceTargets {
+                targets,
+                bad_inputs,
+            } = at;
             let fresh = witnesses.iter().filter(|w| !w.already).count();
             eprintln!(
                 "srt-win: acl stamp (deny-ace) — {} target(s) → {} \
@@ -911,19 +1033,26 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf).context("read stdin")?;
             let input: AclGrantInput =
                 serde_json::from_str(&buf).context("parse stdin JSON {read:[…], write:[…]}")?;
-            let (targets, bad_inputs) = canonicalize_ace_targets(
-                "grant",
-                &[
-                    (&input.read, acl::SbAce::Grant(acl::GrantMask::ReadOnly)),
-                    (&input.write, acl::SbAce::Grant(acl::GrantMask::Modify)),
-                ],
-            )?;
-            for (p, e) in &bad_inputs {
-                eprintln!("srt-win: skipped: '{p}': {e}");
-            }
-            let ((witnesses, failed), report) = state_db::with_init_lock(holder, false, |db| {
-                db.apply_aces(&sandbox_user_sid, &targets)
-            })?;
+            let ((at, witnesses, failed), report) =
+                state_db::with_init_lock(holder, false, |db| {
+                    let at = canonicalize_ace_targets(
+                        db,
+                        "grant",
+                        &[
+                            (&input.read, acl::SbAce::Grant(acl::GrantMask::ReadOnly)),
+                            (&input.write, acl::SbAce::Grant(acl::GrantMask::Modify)),
+                        ],
+                    )?;
+                    for (p, e) in &at.bad_inputs {
+                        eprintln!("srt-win: skipped: '{p}': {e}");
+                    }
+                    let (w, f) = db.apply_aces(&sandbox_user_sid, &at.targets)?;
+                    Ok((at, w, f))
+                })?;
+            let AceTargets {
+                targets,
+                bad_inputs,
+            } = at;
             let fresh = witnesses.iter().filter(|w| !w.already).count();
             eprintln!(
                 "srt-win: acl grant — {} path(s) ({} fresh, {} \
@@ -1153,21 +1282,23 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             } else {
                 use srt_win::{acl, state_db};
                 let own = state_db::HolderPid(std::process::id());
-                let (targets, bad) = canonicalize_ace_targets(
-                    "deny",
-                    &[
-                        (&deny_read, acl::SbAce::Deny(acl::DenyMask::ReadDeny)),
-                        (&deny_write, acl::SbAce::Deny(acl::DenyMask::WriteDeny)),
-                    ],
-                )
-                .context("per-exec --deny-*")?;
-                if let Some((p, e)) = bad.first() {
-                    return Err(anyhow!("per-exec --deny-*: '{p}': {e}"));
-                }
-                let n = targets.len();
-                let ((_w, failed), _r) =
-                    state_db::with_init_lock(own, false, |db| db.apply_aces(&sb_sid, &targets))
-                        .context("per-exec deny-ace")?;
+                let ((at, _w, failed), _r) = state_db::with_init_lock(own, false, |db| {
+                    let at = canonicalize_ace_targets(
+                        db,
+                        "deny",
+                        &[
+                            (&deny_read, acl::SbAce::Deny(acl::DenyMask::ReadDeny)),
+                            (&deny_write, acl::SbAce::Deny(acl::DenyMask::WriteDeny)),
+                        ],
+                    )?;
+                    if let Some((p, e)) = at.bad_inputs.first() {
+                        return Err(anyhow!("per-exec --deny-*: '{p}': {e}"));
+                    }
+                    let (w, f) = db.apply_aces(&sb_sid, &at.targets)?;
+                    Ok((at, w, f))
+                })
+                .context("per-exec deny-ace")?;
+                let n = at.targets.len();
                 if failed > 0 {
                     return Err(anyhow!(
                         "per-exec deny: {failed} of {n} path(s) \
