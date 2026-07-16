@@ -259,6 +259,25 @@ describe('restriction pattern semantics', () => {
     )
 
     it.if(isLinux)(
+      'secure branch always passes --unshare-user and --cap-drop ALL',
+      async () => {
+        // bwrap only auto-creates a userns when EUID != 0; a root parent
+        // would otherwise leave the sandboxed command with initial-userns
+        // caps and be able to remount over --ro-bind / /. The default
+        // (secure) config must force the userns and drop caps explicitly.
+        const result = await wrapCommandWithSandboxLinux({
+          command,
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: [] },
+          writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+        })
+
+        expect(result).toContain('--unshare-user')
+        expect(result).toContain('--cap-drop ALL')
+      },
+    )
+
+    it.if(isLinux)(
       'non-empty denyOnly means has read restrictions on Linux',
       async () => {
         const result = await wrapCommandWithSandboxLinux({

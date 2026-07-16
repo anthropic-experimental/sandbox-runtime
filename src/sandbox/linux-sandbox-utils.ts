@@ -1618,8 +1618,15 @@ export async function wrapCommandWithSandboxLinux(
     // so we support running without it if explicitly requested.
     bwrapArgs.push('--unshare-pid')
     if (!enableWeakerNestedSandbox) {
-      // Mount fresh /proc if PID namespace is isolated (secure mode)
-      bwrapArgs.push('--proc', '/proc')
+      // Mount fresh /proc if PID namespace is isolated (secure mode).
+      // --unshare-user + --cap-drop ALL: bwrap only auto-creates a userns
+      // when EUID != 0, so a root parent would otherwise leave the sandboxed
+      // command with full caps in the initial userns (CAP_SYS_ADMIN → remount
+      // rw over --ro-bind / /). Force the userns and explicitly drop caps so
+      // the sandboxed process cannot remount regardless of parent EUID.
+      // apply-seccomp does not need caps here — it creates its own nested
+      // userns to obtain CAP_SYS_ADMIN for its PID+mount unshare (see below).
+      bwrapArgs.push('--unshare-user', '--cap-drop', 'ALL', '--proc', '/proc')
     } else {
       // --unshare-user: bwrap only auto-adds this when EUID != 0. In an
       // unprivileged container (Docker's default: EUID=0 without
