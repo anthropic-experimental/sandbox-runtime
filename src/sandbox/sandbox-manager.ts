@@ -978,20 +978,27 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
     return { grantRead: [], grantWrite: [], denyRead: [], denyWrite: [] }
   }
   const expand = expandWindowsFsPaths
-  const denyRead = expand([
-    ...new Set([
-      ...(fs?.denyRead ?? []),
-      ...getCredentialDenyReadPaths(c.credentials),
-    ]),
-  ])
-  const denyWrite = expand(fs?.denyWrite ?? [])
+  // `mode: 'deny'` — non-existent literals reach srt-win, which
+  // creates a placeholder chain and stamps it (deny lands on the
+  // exact target path). `mode: 'grant'` drops them (a grant on
+  // nothing is meaningless).
+  const denyRead = expand(
+    [
+      ...new Set([
+        ...(fs?.denyRead ?? []),
+        ...getCredentialDenyReadPaths(c.credentials),
+      ]),
+    ],
+    { mode: 'deny' },
+  )
+  const denyWrite = expand(fs?.denyWrite ?? [], { mode: 'deny' })
   return {
     // `allowRead` also serves as `allowWithinDeny`: a file under a
     // denied dir gets an explicit ALLOW ACE for the sandbox user,
     // and explicit DENY on the parent doesn't override it because
     // the recompose chokepoint orders deny-before-allow per-path.
-    grantRead: expand(fs?.allowRead ?? []),
-    grantWrite: expand(fs?.allowWrite ?? []),
+    grantRead: expand(fs?.allowRead ?? [], { mode: 'grant' }),
+    grantWrite: expand(fs?.allowWrite ?? [], { mode: 'grant' }),
     denyRead,
     denyWrite,
   }
@@ -1458,8 +1465,10 @@ async function wrapWithSandboxArgv(
         const sessRead = new Set(windowsFsStampedSet?.denyRead ?? [])
         const sessWrite = new Set(windowsFsStampedSet?.denyWrite ?? [])
         const expand = expandWindowsFsPaths
-        perExecDenyRead = expand(rawRead).filter(p => !sessRead.has(p))
-        perExecDenyWrite = expand(rawWrite).filter(
+        perExecDenyRead = expand(rawRead, { mode: 'deny' }).filter(
+          p => !sessRead.has(p),
+        )
+        perExecDenyWrite = expand(rawWrite, { mode: 'deny' }).filter(
           p => !sessRead.has(p) && !sessWrite.has(p),
         )
       }

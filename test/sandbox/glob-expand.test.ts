@@ -244,13 +244,46 @@ describe('containsGlobCharsWin', () => {
 })
 
 describe('expandWindowsFsPaths literal branch', () => {
-  it('drops non-existent paths without throwing (single statSync)', () => {
+  it('drops non-existent grant paths without throwing (single statSync)', () => {
     // The literal branch uses one statSync({throwIfNoEntry:false})
     // rather than existsSync→statSync, so a TOCTOU ENOENT cannot
     // abort initialize().
     const missing = join(tmpdir(), 'srt-no-such-' + Date.now() + '.txt')
     expect(() => expandWindowsFsPaths([missing])).not.toThrow()
     expect(expandWindowsFsPaths([missing])).toEqual([])
+    expect(expandWindowsFsPaths([missing], { mode: 'grant' })).toEqual([])
+  })
+
+  it('passes non-existent deny paths through for placeholder-create', () => {
+    // srt-win acl stamp materializes a placeholder chain and stamps
+    // it, so the deny lands on the exact target path.
+    const missing = join(tmpdir(), 'srt-no-such-' + Date.now(), 'secret.txt')
+    const out = expandWindowsFsPaths([missing], { mode: 'deny' })
+    expect(out).toHaveLength(1)
+    expect(out[0]).toContain('secret.txt')
+  })
+
+  it('still drops non-matching glob deny patterns (glob = match existing)', () => {
+    const noMatch = join(tmpdir(), 'srt-no-such-' + Date.now(), '*.txt')
+    expect(expandWindowsFsPaths([noMatch], { mode: 'deny' })).toEqual([])
+  })
+
+  it('preserves trailing separator on passed-through deny (leaf-is-dir signal)', () => {
+    // srt-win reads a trailing `/` or `\` as "materialize the
+    // placeholder leaf as a directory" so a later
+    // mkdirSync({recursive:true}) on the real path succeeds.
+    // normalizePathForSandbox may strip it (path.resolve on
+    // Windows, realpath elsewhere), so expandWindowsFsPaths
+    // re-applies it from the raw input.
+    const base = join(tmpdir(), 'srt-no-such-' + Date.now(), 'hooks')
+    for (const raw of [base + '/', base + '\\']) {
+      const out = expandWindowsFsPaths([raw], { mode: 'deny' })
+      expect(out).toHaveLength(1)
+      expect(/[\\/]$/.test(out[0])).toBe(true)
+    }
+    // No trailing separator ⇒ not re-applied.
+    const out = expandWindowsFsPaths([base], { mode: 'deny' })
+    expect(/[\\/]$/.test(out[0])).toBe(false)
   })
 })
 

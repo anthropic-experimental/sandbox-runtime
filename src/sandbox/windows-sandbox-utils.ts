@@ -933,24 +933,48 @@ export function uninstallWindowsSandbox(
 /**
  * Resolve any Windows filesystem-config path list — `allowRead`/
  * `allowWrite` grants and `denyRead`/`denyWrite` stamps — to
- * concrete existing paths via the single platform-aware
+ * concrete paths via the single platform-aware
  * {@link normalizePathForSandbox} chokepoint (Linux/macOS parity:
  * point-in-time expansion at session initialize, not per-exec).
  * Glob patterns are expanded; non-glob paths are normalized and
- * returned 1:1. Missing paths are dropped (statSync probe).
- * Directory targets are accepted — the additive sandbox-user ACE
- * carries `(OI)(CI)` so it covers the subtree.
+ * returned 1:1. Directory targets are accepted — the additive
+ * sandbox-user ACE carries `(OI)(CI)` so it covers the subtree.
+ *
+ * Missing literal paths are dropped for `mode: 'grant'` (a grant on
+ * nothing is meaningless) but PASSED THROUGH for `mode: 'deny'` —
+ * `srt-win acl stamp` materializes a placeholder chain (mkdirs each
+ * missing intermediate + creates an empty leaf) and stamps every
+ * created component, so the deny lands on the exact target path
+ * and the sandbox user cannot create/write/delete it. A trailing
+ * `/` or `\` on the raw input means "the target is a directory":
+ * the placeholder leaf is created as an empty directory instead of
+ * an empty file, so a later `mkdirSync({recursive: true})` on the
+ * real path succeeds. Glob results (existing-by-construction) drop
+ * on a stat miss regardless of mode: a glob is inherently "match
+ * existing".
  */
-export function expandWindowsFsPaths(patterns: readonly string[]): string[] {
+export function expandWindowsFsPaths(
+  patterns: readonly string[],
+  opts?: { mode?: 'grant' | 'deny' },
+): string[] {
   const out = new Set<string>()
   for (const raw of patterns) {
     const norm = normalizePathForSandbox(raw)
-    const candidates = containsGlobCharsWin(norm)
+    const isGlob = containsGlobCharsWin(norm)
+    const candidates = isGlob
       ? expandGlobPattern(norm, { caseInsensitive: true })
       : [norm]
     for (const c of candidates) {
       const st = fs.statSync(c, { throwIfNoEntry: false })
-      if (!st) continue
+      if (!st) {
+        // normalizePathForSandbox (path.resolve) strips the
+        // trailing separator (the dir-leaf signal — see doc);
+        // re-apply it from the raw input.
+        if (opts?.mode === 'deny' && !isGlob) {
+          out.add(/[\\/]$/.test(raw) && !/[\\/]$/.test(c) ? c + '\\' : c)
+        }
+        continue
+      }
       out.add(c)
     }
   }
