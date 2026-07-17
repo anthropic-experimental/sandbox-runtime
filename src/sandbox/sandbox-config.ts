@@ -534,6 +534,21 @@ export const CredentialsConfigSchema = z
   .strict()
 
 /**
+ * Mach/XPC service name with optional single trailing "*" wildcard
+ * (e.g., "com.example.*" or "*" for all services).
+ */
+const machServiceNameSchema = z.string().refine(
+  val => {
+    const prefix = val.endsWith('*') ? val.slice(0, -1) : val
+    return !prefix.includes('*')
+  },
+  {
+    message:
+      'Wildcards are only allowed as a single trailing "*" (e.g., "com.example.*" or "*" for all services).',
+  },
+)
+
+/**
  * Network configuration schema for validation
  */
 export const NetworkConfigSchema = z.object({
@@ -568,21 +583,16 @@ export const NetworkConfigSchema = z.object({
     .optional()
     .describe('Whether to allow binding to local ports (default: false)'),
   allowMachLookup: z
-    .array(
-      z.string().refine(
-        val => {
-          const prefix = val.endsWith('*') ? val.slice(0, -1) : val
-          return !prefix.includes('*')
-        },
-        {
-          message:
-            'Wildcards are only allowed as a single trailing "*" (e.g., "com.example.*" or "*" for all services).',
-        },
-      ),
-    )
+    .array(machServiceNameSchema)
     .optional()
     .describe(
       'macOS only: Additional XPC/Mach service names to allow looking up. Supports trailing-wildcard prefix matching (e.g., "2BUA8C4S2C.com.1password.*"). Needed for tools like 1Password CLI, Playwright, or the iOS Simulator that communicate via XPC.',
+    ),
+  allowMachRegister: z
+    .array(machServiceNameSchema)
+    .optional()
+    .describe(
+      'macOS only: Mach service names the sandboxed process may register (mach-register). Supports trailing-wildcard prefix matching (e.g., "com.example.*"). Needed for tools that host their own XPC/Mach services.',
     ),
   httpProxyPort: z
     .number()

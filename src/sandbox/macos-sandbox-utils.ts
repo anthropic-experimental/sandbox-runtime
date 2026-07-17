@@ -33,6 +33,7 @@ export interface MacOSSandboxParams {
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
   allowMachLookup?: string[]
+  allowMachRegister?: string[]
   readConfig: FsReadRestrictionConfig | undefined
   writeConfig: FsWriteRestrictionConfig | undefined
   /** Environment variable names to unset for the sandboxed child (env -u) */
@@ -453,6 +454,7 @@ function generateSandboxProfile({
   allowAllUnixSockets,
   allowLocalBinding,
   allowMachLookup,
+  allowMachRegister,
   allowPty,
   allowGitConfig = false,
   enableWeakerNetworkIsolation = false,
@@ -468,6 +470,7 @@ function generateSandboxProfile({
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
   allowMachLookup?: string[]
+  allowMachRegister?: string[]
   allowPty?: boolean
   allowGitConfig?: boolean
   enableWeakerNetworkIsolation?: boolean
@@ -535,6 +538,16 @@ function generateSandboxProfile({
             name.endsWith('*')
               ? `(allow mach-lookup (global-name-prefix ${escapePath(name.slice(0, -1))}))`
               : `(allow mach-lookup (global-name ${escapePath(name)}))`,
+          ),
+        ]
+      : []),
+    ...(allowMachRegister && allowMachRegister.length > 0
+      ? [
+          '; User-specified Mach services the sandboxed process may register',
+          ...allowMachRegister.map(name =>
+            name.endsWith('*')
+              ? `(allow mach-register (global-name-prefix ${escapePath(name.slice(0, -1))}))`
+              : `(allow mach-register (global-name ${escapePath(name)}))`,
           ),
         ]
       : []),
@@ -794,6 +807,7 @@ export function wrapCommandWithSandboxMacOS(
     allowAllUnixSockets,
     allowLocalBinding,
     allowMachLookup,
+    allowMachRegister,
     readConfig: readConfigIn,
     writeConfig,
     unsetEnvVars,
@@ -857,6 +871,7 @@ export function wrapCommandWithSandboxMacOS(
     allowAllUnixSockets,
     allowLocalBinding,
     allowMachLookup,
+    allowMachRegister,
     allowPty,
     allowGitConfig,
     enableWeakerNetworkIsolation,

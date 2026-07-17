@@ -280,6 +280,37 @@ describe('Config Validation', () => {
     },
   )
 
+  test('should accept valid allowMachRegister entries', () => {
+    const config = {
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+        allowMachRegister: ['com.example.myservice', 'com.example.*', '*'],
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(true)
+  })
+
+  test.each(['com.*.foo', 'com.example.**'])(
+    'should reject allowMachRegister entry with non-trailing wildcard: %s',
+    entry => {
+      const config = {
+        network: {
+          allowedDomains: [],
+          deniedDomains: [],
+          allowMachRegister: [entry],
+        },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      }
+
+      const result = SandboxRuntimeConfigSchema.safeParse(config)
+      expect(result.success).toBe(false)
+    },
+  )
+
   test('should use default ripgrep command when not specified', () => {
     const config = {
       network: {

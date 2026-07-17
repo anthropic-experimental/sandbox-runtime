@@ -1020,3 +1020,51 @@ describe.if(isMacOS)('macOS Seatbelt allowMachLookup', () => {
     expect(result.status).toBe(0)
   })
 })
+
+describe.if(isMacOS)('macOS Seatbelt allowMachRegister', () => {
+  it('should emit global-name and global-name-prefix rules for configured services', () => {
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: true,
+      allowMachRegister: ['com.example.myservice', 'com.example.agent.*'],
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    expect(wrappedCommand).toContain(
+      '(allow mach-register (global-name "com.example.myservice"))',
+    )
+    expect(wrappedCommand).toContain(
+      '(allow mach-register (global-name-prefix "com.example.agent."))',
+    )
+  })
+
+  it('should not emit mach-register rules when not configured', () => {
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: true,
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    expect(wrappedCommand).not.toContain('mach-register')
+  })
+
+  it('should emit a syntactically valid profile with allowMachRegister set', () => {
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: true,
+      allowMachRegister: ['com.example.service', 'com.example.prefix.*', '*'],
+      readConfig: undefined,
+      writeConfig: undefined,
+    })
+
+    const result = spawnSync(wrappedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 5000,
+    })
+
+    expect(result.status).toBe(0)
+  })
+})
