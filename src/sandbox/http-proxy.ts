@@ -21,6 +21,7 @@ import {
   prepareBodySubstitution,
   type GetBodySubstitutions,
 } from './body-substitution.js'
+import { relayPullMode } from './stream-relay.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import {
   connectViaParentProxy,
@@ -290,7 +291,9 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // plus anything the ClientHello sniff consumed when mitmCA is on.
       if (head.length) upstream.write(head)
       upstream.pipe(socket)
-      socket.pipe(upstream)
+      // Not pipe(): under Bun the 'connect'-event socket corrupts its byte
+      // stream across pipe()'s pause/resume cycles. See relayPullMode.
+      relayPullMode(socket, upstream)
 
       upstream.on('error', err => {
         logForDebugging(`CONNECT tunnel failed: ${err.message}`, {
