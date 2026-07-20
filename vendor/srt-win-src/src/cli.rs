@@ -13,6 +13,7 @@
 //!                                         `srt-sandbox` user account +
 //!                                         user-SID-keyed WFP filters
 //!                                         (one UAC prompt)
+//!   status                             — combined `{user, wfp}` JSON
 //!   user   status | read-cred | trust-ca — inspect the sandbox user
 //!   wfp    status | verify | uninstall — inspect/probe/remove WFP filters
 //!   acl    stamp | grant | restore | revoke | recover
@@ -148,6 +149,14 @@ enum Cmd {
         /// unit).
         #[arg(long)]
         keep_user: bool,
+    },
+    /// Print `{user: <user-status>, wfp: <wfp-status>}` as one line
+    /// of JSON — the same objects `user status` and `wfp status`
+    /// emit, in a single spawn. The host's readiness check calls
+    /// this instead of two separate subprocesses. Exit 0.
+    Status {
+        #[arg(long)]
+        sublayer_guid: Option<String>,
     },
     /// Inspect the sandbox user account that `srt-win install`
     /// provisions (and that the sandboxed child runs as).
@@ -405,6 +414,33 @@ fn canonicalize_ace_targets(
         }
     }
     Ok((targets, bad_inputs))
+}
+
+/// Build the `user status` JSON object (sandbox-user provisioning
+/// state + credential/marker/CA rows from `state.db`). Shared by
+/// `user status` and the top-level combined `status`.
+fn user_status_json() -> anyhow::Result<serde_json::Value> {
+    use serde_json::json;
+    use srt_win::{install, user};
+    let setup = install::read_setup().ok().flatten();
+    let name = setup
+        .as_ref()
+        .map(|s| s.sandbox_user.as_str())
+        .unwrap_or(user::SANDBOX_USER);
+    let st = user::status(name)?;
+    let ca = install::read_ca_cert()?;
+    let ca = ca.as_ref();
+    Ok(json!({
+        "user": st,
+        "cred_present": setup.is_some(),
+        "marker_version": setup.as_ref().map(|s| s.marker_version),
+        "marker_user_sid": setup.as_ref()
+            .map(|s| s.sandbox_user_sid.as_str()),
+        // The calling (real) user's SID — surfaced for diagnostics.
+        "real_user_sid": srt_win::sid::current_user_sid()?,
+        "ca_cert_thumb": ca.map(|c| c.thumb()).transpose()?,
+        "ca_cert_pem": ca.map(|c| c.to_pem()).transpose()?,
+    }))
 }
 
 /// Read `path` and decode it as a single DER-encoded X.509
@@ -697,34 +733,23 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             eprintln!("srt-win: uninstalled ({n} filter(s) removed). {user_note}");
         }
 
+        // ─── status (combined) ─────────────────────────────────────
+        Cmd::Status { sublayer_guid } => {
+            let sl = resolve_sublayer(&sublayer_guid)?;
+            println!(
+                "{}",
+                json!({
+                    "user": user_status_json()?,
+                    "wfp": wfp::filter_status(&sl)?,
+                })
+            );
+        }
+
         // ─── user ──────────────────────────────────────────────────
         Cmd::User {
             sub: UserCmd::Status,
         } => {
-            use srt_win::{install, user};
-            let setup = install::read_setup().ok().flatten();
-            let name = setup
-                .as_ref()
-                .map(|s| s.sandbox_user.as_str())
-                .unwrap_or(user::SANDBOX_USER);
-            let st = user::status(name)?;
-            let ca = install::read_ca_cert()?;
-            let ca = ca.as_ref();
-            println!(
-                "{}",
-                json!({
-                    "user": st,
-                    "cred_present": setup.is_some(),
-                    "marker_version": setup.as_ref().map(|s| s.marker_version),
-                    "marker_user_sid": setup.as_ref()
-                        .map(|s| s.sandbox_user_sid.as_str()),
-                    // The calling (real) user's SID — surfaced for
-                    // diagnostics.
-                    "real_user_sid": srt_win::sid::current_user_sid()?,
-                    "ca_cert_thumb": ca.map(|c| c.thumb()).transpose()?,
-                    "ca_cert_pem": ca.map(|c| c.to_pem()).transpose()?,
-                })
-            );
+            println!("{}", user_status_json()?);
         }
         Cmd::User {
             sub: UserCmd::ReadCred,
@@ -1456,6 +1481,31 @@ mod tests {
         assert!(
             Cli::try_parse_from(["srt-win.exe", SRT_WIN_DISPATCH_ARG1, "user", "status",]).is_err()
         );
+    }
+
+    /// Top-level `status` parses with and without `--sublayer-guid`.
+    #[test]
+    fn status_subcommand_parses() {
+        let bare = Cli::try_parse_from(["srt-win", "status"]).expect("parse");
+        assert!(matches!(
+            bare.cmd,
+            Cmd::Status {
+                sublayer_guid: None
+            }
+        ));
+        let with_sl = Cli::try_parse_from([
+            "srt-win",
+            "status",
+            "--sublayer-guid",
+            "12345678-1234-1234-1234-1234567890ab",
+        ])
+        .expect("parse");
+        assert!(matches!(
+            with_sl.cmd,
+            Cmd::Status {
+                sublayer_guid: Some(_)
+            }
+        ));
     }
 
     /// `--quiet` on `exec` parses and defaults false. Placement
