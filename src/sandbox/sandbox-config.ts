@@ -887,12 +887,13 @@ export const SrtWinConfigSchema = z.object({
   path: z
     .string()
     .min(1)
-    .optional()
     .describe(
-      'Path to the srt-win binary. When unset, getSrtWinPath() resolves ' +
-        'the packaged vendor/srt-win/<arch>/srt-win.exe. When set, the ' +
-        'binary is spawned with the `--srt-win` argv[1] sentinel so a ' +
-        "multicall dispatcher can route to srt-win's CLI.",
+      'Path to the srt-win binary. Pass the exported ' +
+        'VENDORED_SRT_WIN_EXE constant to use the packaged ' +
+        'vendor/srt-win/<arch>/srt-win.exe (see its WARNING: in a dev ' +
+        'checkout that file may sit inside your sandbox write grant). ' +
+        'The binary is spawned with the `--srt-win` argv[1] sentinel so ' +
+        "a multicall dispatcher can route to srt-win's CLI.",
     ),
 })
 
@@ -947,9 +948,9 @@ export const WindowsConfigSchema = z.object({
         'permit only covers ports in that range.',
     ),
   srtWin: SrtWinConfigSchema.optional().describe(
-    'How to locate/invoke the srt-win helper binary. Omit to resolve the ' +
-      'packaged vendor binary; set when embedding srt-win into a multicall ' +
-      'binary.',
+    'How to locate/invoke the srt-win helper binary. `srtWin.path` is ' +
+      'required to use the Windows sandbox — your own (multicall) binary, ' +
+      'or the exported VENDORED_SRT_WIN_EXE constant for the packaged exe.',
   ),
 })
 

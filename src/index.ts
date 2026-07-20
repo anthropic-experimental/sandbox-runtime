@@ -48,6 +48,7 @@ export { type SandboxDependencyCheck } from './sandbox/linux-sandbox-utils.js'
 export {
   getSrtWinPath,
   resolveSrtWin,
+  VENDORED_SRT_WIN_EXE,
   getWindowsWfpStatus,
   verifyWindowsWfpEgress,
   getWindowsSandboxUserStatus,

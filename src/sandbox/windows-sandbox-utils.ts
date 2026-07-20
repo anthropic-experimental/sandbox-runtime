@@ -353,8 +353,8 @@ export interface WindowsSandboxParams {
   quiet?: boolean
   /**
    * Resolved `srt-win` spawn descriptor — from
-   * {@link resolveSrtWin}. Omit to resolve the packaged vendor
-   * binary at call time.
+   * {@link resolveSrtWin}. Omitting it throws (there is no implicit
+   * vendor fallback); direct callers must resolve a path first.
    */
   srtWin?: SrtWinSpawn
   /**
@@ -382,25 +382,39 @@ function repoRoot(): string {
 const nodeArchToDir: Record<string, string> = { x64: 'x64', arm64: 'arm64' }
 
 /**
- * Locate the packaged `srt-win.exe`. Resolution order:
- *   1. `<root>/vendor/srt-win/{arch}/srt-win.exe` (prebuilt — published npm
- *      package, or after `npm run build:srt-win` locally).
+ * The srt-win binary packaged with this module
+ * (`vendor/srt-win/<arch>/srt-win.exe`, arch from `process.arch`).
+ * Pass explicitly as `windows.srtWin.path` if you want the vendored
+ * exe — {@link resolveSrtWin} never falls back to it implicitly.
+ *
+ * WARNING: in a dev checkout this file may live inside your sandbox
+ * write grant — a sandboxed process could overwrite it; prefer a
+ * binary outside any grant (e.g. your own signed executable).
+ */
+export const VENDORED_SRT_WIN_EXE: string = path.join(
+  repoRoot(),
+  'vendor',
+  'srt-win',
+  nodeArchToDir[process.arch] ?? process.arch,
+  'srt-win.exe',
+)
+
+/**
+ * Locate a built `srt-win.exe` for development/CI. Checks, in order:
+ *   1. `<root>/vendor/srt-win/{arch}/srt-win.exe` (prebuilt —
+ *      {@link VENDORED_SRT_WIN_EXE}).
  *   2. `<root>/vendor/srt-win-src/target/release/srt-win.exe` (local
- *      `cargo build --release` fallback for development).
+ *      `cargo build --release`).
  *
  * `<root>` is {@link repoRoot} — `__dirname/../..`, which resolves to the
  * repo root from `src/sandbox/` and `dist/sandbox/` alike, and to the
  * package root when installed under `node_modules`.
  *
- * Callers that ship their own binary (or a multicall binary that
- * routes on `argv[1] == `{@link SRT_WIN_DISPATCH_ARG1}) pass
- * `windows.srtWin` instead of relying on this lookup — see
- * {@link resolveSrtWin}.
+ * This is an explicit helper — nothing calls it as an ambient
+ * default. Production callers set `windows.srtWin.path` (their own
+ * binary, or {@link VENDORED_SRT_WIN_EXE}); see {@link resolveSrtWin}.
  *
- * Resolution via the optional `@anthropic-ai/sandbox-runtime-win32-*`
- * platform packages is added separately.
- *
- * @throws if none exist.
+ * @throws if neither candidate exists.
  */
 export function getSrtWinPath(): string {
   const root = repoRoot()
@@ -450,26 +464,33 @@ export type SrtWinSpawn = Readonly<{
 }>
 
 /**
- * Resolve the `srt-win` spawn target from config. When `cfg.path` is
- * set it is used verbatim (no fallback to the packaged binary — an
- * explicit override is a directive, not a hint) and
- * {@link SRT_WIN_DISPATCH_ARG1} is prepended so a multicall
- * dispatcher routes on `argv[1]`. When unset, falls back to
- * {@link getSrtWinPath} with no sentinel (the packaged binary
- * doesn't need it; `run_from_args` would strip it anyway).
+ * Resolve the `srt-win` spawn target from config. `cfg.path` is
+ * required and used verbatim; {@link SRT_WIN_DISPATCH_ARG1} is
+ * prepended so a multicall dispatcher routes on `argv[1]` (the
+ * standalone binary strips it harmlessly).
+ *
+ * The path must be explicit because the packaged exe lives under
+ * the package root, which in a dev checkout sits inside the
+ * working-tree write grant (a planted `srt-win.exe` there would be
+ * spawned as the broker). Callers that want the packaged binary
+ * pass {@link VENDORED_SRT_WIN_EXE}.
+ *
+ * @throws if `cfg.path` is unset or names a missing file.
  */
 export function resolveSrtWin(cfg?: SrtWinConfig): SrtWinSpawn {
-  if (cfg?.path !== undefined) {
-    if (!fs.existsSync(cfg.path)) {
-      throw new Error(
-        `windows.srtWin.path is set to '${cfg.path}' but the file does ` +
-          `not exist; remove srtWin.path to fall back to the packaged ` +
-          `binary`,
-      )
-    }
-    return { exe: cfg.path, prependArgs: [SRT_WIN_DISPATCH_ARG1] }
+  if (cfg?.path === undefined) {
+    throw new Error(
+      `no srt-win path configured; set windows.srtWin.path (e.g. to the ` +
+        `exported VENDORED_SRT_WIN_EXE constant for the packaged binary)`,
+    )
   }
-  return { exe: getSrtWinPath(), prependArgs: [] }
+  if (!fs.existsSync(cfg.path)) {
+    throw new Error(
+      `windows.srtWin.path is set to '${cfg.path}' but the file does ` +
+        `not exist`,
+    )
+  }
+  return { exe: cfg.path, prependArgs: [SRT_WIN_DISPATCH_ARG1] }
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -490,10 +511,9 @@ interface RunOpts {
 }
 
 function runSrtWin(args: string[], opts: RunOpts = {}): RunResult {
-  // Direct callers of the exported helpers may omit `srtWin`
-  // (backward-compat) — fall back to the packaged-binary lookup.
-  // `SandboxManager` resolves once at `initialize()` and threads the
-  // handle, so this per-call resolve is only hit outside a session.
+  // Callers must thread `srtWin` (SandboxManager resolves once at
+  // `initialize()`); the argless `resolveSrtWin()` throws, telling a
+  // direct helper caller to pass an explicit path.
   const { exe, prependArgs } = opts.srtWin ?? resolveSrtWin()
   const r = spawnSync(exe, [...prependArgs, ...args], {
     encoding: 'utf8',
@@ -1300,8 +1320,7 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   if (cmdlineEstimate > 30_000) {
     throw new Error(
       `Windows sandbox argv is ~${cmdlineEstimate} chars ` +
-        `(CreateProcessW limit is 32 767). Shorten the command, ` +
-        `or move broad globs to session-level filesystem.denyRead.`,
+        `(CreateProcessW limit is 32 767).`,
     )
   }
 
@@ -1362,9 +1381,9 @@ export function checkWindowsDependencies(
   const errors: string[] = []
   const warnings: string[] = []
 
-  // 1. Binary present (`resolveSrtWin` throws on a missing
-  // override, `getSrtWinPath` on a missing packaged binary). Resolve
-  // once and reuse for the status calls below.
+  // 1. Binary present. The argless `resolveSrtWin()` throws (no
+  // implicit vendor fallback) — surfaced as a dependency error
+  // telling the caller to thread an explicit path.
   let srtWin: SrtWinSpawn
   try {
     srtWin = opts.srtWin ?? resolveSrtWin()

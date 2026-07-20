@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { createServer, type Server } from 'node:net'
 import type { AddressInfo } from 'node:net'
 import { isMacOS, isWindows } from '../helpers/platform.js'
@@ -31,6 +31,7 @@ import {
   buildGitConfigEnv,
   SRT_WIN_DISPATCH_ARG1,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
+  VENDORED_SRT_WIN_EXE,
 } from '../../src/sandbox/windows-sandbox-utils.js'
 
 /**
@@ -77,6 +78,14 @@ function hasTool(name: string): boolean {
   return whereAll(name).length > 0
 }
 
+// Direct helper calls (and SandboxManager configs) must thread an
+// explicit srt-win path — there is no ambient vendor fallback.
+// getSrtWinPath() picks the built exe (vendored or cargo
+// target/release) on the CI runner.
+const TEST_SRT_WIN = isWindows
+  ? resolveSrtWin({ path: getSrtWinPath() })
+  : undefined
+
 function createTestConfig(
   allowedDomains: string[] = ['example.com'],
 ): SandboxRuntimeConfig {
@@ -94,6 +103,7 @@ function createTestConfig(
     windows: {
       sublayerGuid: TEST_SUBLAYER,
       proxyPortRange: [PORT_RANGE[0], PORT_RANGE[1]],
+      srtWin: isWindows ? { path: getSrtWinPath() } : undefined,
     },
   }
 }
@@ -298,7 +308,7 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     expect(off.argv).not.toContain('--quiet')
   })
 
-  it('resolveSrtWin: explicit path → sentinel prepend; unset → packaged binary, no sentinel', () => {
+  it('resolveSrtWin: explicit path → used verbatim, sentinel prepend', () => {
     const set = resolveSrtWin({ path: process.execPath })
     expect(set.exe).toBe(process.execPath)
     expect(set.prependArgs).toEqual([SRT_WIN_DISPATCH_ARG1])
@@ -310,6 +320,25 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
     expect(() => resolveSrtWin({ path: '/nonexistent/srt-win.exe' })).toThrow(
       /windows\.srtWin\.path is set to '.+' but the file does not exist/,
     )
+  })
+
+  it('resolveSrtWin: no path → throws naming VENDORED_SRT_WIN_EXE', () => {
+    // No implicit vendor fallback — the message tells the embedder
+    // how to opt in explicitly.
+    expect(() => resolveSrtWin()).toThrow(
+      /set windows\.srtWin\.path[\s\S]*VENDORED_SRT_WIN_EXE/,
+    )
+    expect(() => resolveSrtWin({})).toThrow(/VENDORED_SRT_WIN_EXE/)
+  })
+
+  it('VENDORED_SRT_WIN_EXE: absolute path to the arch-specific vendored exe', () => {
+    expect(isAbsolute(VENDORED_SRT_WIN_EXE)).toBe(true)
+    expect(VENDORED_SRT_WIN_EXE.split(/[\\/]/).slice(-4)).toEqual([
+      'vendor',
+      'srt-win',
+      process.arch,
+      'srt-win.exe',
+    ])
   })
 
   it('drops NO_PROXY/no_proxy from the --env overlay (WFP fences direct loopback)', () => {
@@ -552,6 +581,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     const { argv } = wrapCommandWithSandboxWindows({
       command: cmd,
       binShell: parseWindowsBinShell(bashPath),
+      srtWin: TEST_SRT_WIN,
     })
     expect(argv.slice(-3)).toEqual([bashPath, '-c', cmd])
     expect(argv).not.toContain('/c')
@@ -561,6 +591,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
   it('getWindowsWfpStatus reports absent for a never-installed sublayer', () => {
     const ws = getWindowsWfpStatus({
       sublayerGuid: '11111111-2222-3333-4444-555555555555',
+      srtWin: TEST_SRT_WIN,
     })
     expect(ws.state).toBe('absent')
     expect(ws.filters).toBe(0)
@@ -574,13 +605,17 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     installWindowsSandbox({
       sublayerGuid: sl,
       proxyPortRange: PORT_RANGE,
+      srtWin: TEST_SRT_WIN,
     })
     try {
       // Fence active: WFP block-user filter fires at
       // ALE_AUTH_CONNECT before any packet leaves → WSAEACCES. The
       // probe binds a local out-of-range loopback listener; no
       // external host involved.
-      const v = await verifyWindowsWfpEgress({ proxyPortRange: PORT_RANGE })
+      const v = await verifyWindowsWfpEgress({
+        proxyPortRange: PORT_RANGE,
+        srtWin: TEST_SRT_WIN,
+      })
       expect(v.target).toMatch(/^127\.0\.0\.1:\d+$/)
       // Filters removed, sandbox user kept → fence inactive →
       // throws. This is the throw initialize() relays when a stale
@@ -589,13 +624,20 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       // matches both the exit-3 (`is not active`) and exit-2
       // (`could not be verified`) messages — either is correct
       // fail-closed behaviour.
-      uninstallWindowsSandbox({ sublayerGuid: sl, keepUser: true })
+      uninstallWindowsSandbox({
+        sublayerGuid: sl,
+        keepUser: true,
+        srtWin: TEST_SRT_WIN,
+      })
       // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
       await expect(
-        verifyWindowsWfpEgress({ proxyPortRange: PORT_RANGE }),
+        verifyWindowsWfpEgress({
+          proxyPortRange: PORT_RANGE,
+          srtWin: TEST_SRT_WIN,
+        }),
       ).rejects.toThrow(/WFP egress fence/i)
     } finally {
-      uninstallWindowsSandbox({ sublayerGuid: sl })
+      uninstallWindowsSandbox({ sublayerGuid: sl, srtWin: TEST_SRT_WIN })
     }
   }, 60_000)
 
@@ -608,6 +650,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       const r = installWindowsSandbox({
         sublayerGuid: sl,
         proxyPortRange: PORT_RANGE,
+        srtWin: TEST_SRT_WIN,
       })
       expect(r.cancelled).toBeUndefined()
       expect(r.wfp.state).toBe('installed')
@@ -626,14 +669,17 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       const r2 = installWindowsSandbox({
         sublayerGuid: sl,
         proxyPortRange: PORT_RANGE,
+        srtWin: TEST_SRT_WIN,
       })
       expect(r2.cancelled).toBeUndefined()
       expect(r2.wfp.state).toBe('installed')
     } finally {
-      uninstallWindowsSandbox({ sublayerGuid: sl })
+      uninstallWindowsSandbox({ sublayerGuid: sl, srtWin: TEST_SRT_WIN })
     }
-    expect(getWindowsWfpStatus({ sublayerGuid: sl }).state).toBe('absent')
-    const u = getWindowsSandboxUserStatus()
+    expect(
+      getWindowsWfpStatus({ sublayerGuid: sl, srtWin: TEST_SRT_WIN }).state,
+    ).toBe('absent')
+    const u = getWindowsSandboxUserStatus({ srtWin: TEST_SRT_WIN })
     expect(u.provisioned).toBe(false)
     expect(u.credPresent).toBe(false)
     expect(u.markerVersion).toBeUndefined()
@@ -642,13 +688,18 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
   it('installWindowsSandbox refuses different-config without force (exit 13)', () => {
     const sl = '9e3a2fa2-5c4d-6b7f-ba0e-3f4a5b6c7d8e'
     try {
-      installWindowsSandbox({ sublayerGuid: sl, proxyPortRange: PORT_RANGE })
+      installWindowsSandbox({
+        sublayerGuid: sl,
+        proxyPortRange: PORT_RANGE,
+        srtWin: TEST_SRT_WIN,
+      })
       // Re-install with a DIFFERENT port range under the same
       // sublayer without force → exit 13 → throw.
       expect(() =>
         installWindowsSandbox({
           sublayerGuid: sl,
           proxyPortRange: [PORT_RANGE[0], PORT_RANGE[0] + 1],
+          srtWin: TEST_SRT_WIN,
         }),
       ).toThrow(/already exist.*different/i)
       // With force → succeeds and replaces.
@@ -656,10 +707,11 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
         sublayerGuid: sl,
         proxyPortRange: [PORT_RANGE[0], PORT_RANGE[0] + 1],
         force: true,
+        srtWin: TEST_SRT_WIN,
       })
       expect(r.wfp.portRange).toEqual([PORT_RANGE[0], PORT_RANGE[0] + 1])
     } finally {
-      uninstallWindowsSandbox({ sublayerGuid: sl })
+      uninstallWindowsSandbox({ sublayerGuid: sl, srtWin: TEST_SRT_WIN })
     }
   })
 
@@ -677,6 +729,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     installWindowsSandbox({
       sublayerGuid: TEST_SUBLAYER,
       proxyPortRange: PORT_RANGE,
+      srtWin: TEST_SRT_WIN,
     })
     const scratch = mkdtempSync(join(tmpdir(), 'srt-fsdeny-'))
     const f = join(scratch, 'secret.txt')
@@ -714,6 +767,7 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     const r = installWindowsSandbox({
       sublayerGuid: TEST_SUBLAYER,
       proxyPortRange: PORT_RANGE,
+      srtWin: TEST_SRT_WIN,
     })
     if (!r.user.provisioned || !r.user.sid || !r.user.credPresent) {
       throw new Error(
@@ -732,7 +786,10 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
 
   afterAll(async () => {
     await SandboxManager.reset()
-    uninstallWindowsSandbox({ sublayerGuid: TEST_SUBLAYER })
+    uninstallWindowsSandbox({
+      sublayerGuid: TEST_SUBLAYER,
+      srtWin: TEST_SRT_WIN,
+    })
   })
 
   it('wrapWithSandbox() throws on Windows (use wrapWithSandboxArgv)', async () => {
@@ -1128,7 +1185,7 @@ describe.if(isWindows)(
       if (inst.status !== 0) {
         throw new Error(`srt-win install failed: ${inst.stderr || inst.stdout}`)
       }
-      const us = getWindowsSandboxUserStatus()
+      const us = getWindowsSandboxUserStatus({ srtWin: TEST_SRT_WIN })
       if (!us.provisioned || !us.sid || !us.credPresent) {
         throw new Error(
           `srt-sandbox not provisioned after install: ${JSON.stringify(us)}`,
@@ -1150,6 +1207,7 @@ describe.if(isWindows)(
     async function rexec(tail: string) {
       const { argv, env } = wrapCommandWithSandboxWindows({
         command: tail,
+        srtWin: TEST_SRT_WIN,
       })
       return spawnAsync(argv[0], argv.slice(1), {
         env,
@@ -1197,6 +1255,7 @@ describe.if(isWindows)(
       const { argv, env } = wrapCommandWithSandboxWindows({
         command: `waitfor /t 30 ${nonce}`,
         quiet: false,
+        srtWin: TEST_SRT_WIN,
       })
       const broker = spawn(argv[0], argv.slice(1), { env })
       let stderr = ''
@@ -1637,18 +1696,22 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
     // Reuse the network/file describes' WFP install (already
     // present in CI from the earlier suites; install when running
     // this describe in isolation).
-    const wfp = getWindowsWfpStatus({ sublayerGuid: TEST_SUBLAYER })
+    const wfp = getWindowsWfpStatus({
+      sublayerGuid: TEST_SUBLAYER,
+      srtWin: TEST_SRT_WIN,
+    })
     if (wfp.state !== 'installed') {
       installWindowsSandbox({
         sublayerGuid: TEST_SUBLAYER,
         proxyPortRange: PORT_RANGE,
+        srtWin: TEST_SRT_WIN,
       })
     }
     // tlsTerminate on Windows requires the fixture CA to be
     // installed in the sandbox user's CurrentUser\Root
     // (initialize() gates on the thumbprint match). Idempotent —
     // replaces any prior install.
-    windowsTrustCa(CA_CERT)
+    windowsTrustCa(CA_CERT, { srtWin: TEST_SRT_WIN })
     await SandboxManager.initialize(createTlsTestConfig(TLS_ALLOWED))
     // Sanity: tlsTerminate config produced a CA + trust bundle.
     const ca = SandboxManager.getMitmCA()
@@ -1666,7 +1729,10 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
     // sandbox user, or fixture CA behind for a subsequent local
     // run. In CI `cleanup.ps1` sweeps regardless, but this is the
     // last describe in the file so it owns final teardown.
-    uninstallWindowsSandbox({ sublayerGuid: TEST_SUBLAYER })
+    uninstallWindowsSandbox({
+      sublayerGuid: TEST_SUBLAYER,
+      srtWin: TEST_SRT_WIN,
+    })
   }, 60_000)
 
   it('G2: child sees SSL_CERT_FILE and can read the trust bundle', async () => {
