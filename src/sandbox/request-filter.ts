@@ -54,7 +54,7 @@ export type MutateForwardedHeaders = (
   destHost: string,
 ) => void
 
-const BODYLESS_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
+export const BODYLESS_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
 
 /**
  * Build a `Request`, run the callback, and if denied write the 403 response

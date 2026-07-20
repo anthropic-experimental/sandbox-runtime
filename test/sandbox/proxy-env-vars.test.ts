@@ -30,6 +30,49 @@ describe('generateProxyEnvVars', () => {
     expect(env.some(v => v.startsWith('CLOUDSDK_PROXY_'))).toBe(false)
   })
 
+  describe('GRPC_PROXY', () => {
+    const grpcNames = ['GRPC_PROXY', 'grpc_proxy']
+
+    it('advertises the HTTP CONNECT proxy, and never SOCKS alongside it', () => {
+      // gRPC C-core rejects socks5h:// ("scheme not supported in proxy URI"),
+      // ignores the var, and resolves directly via c-ares — which the sandbox
+      // blocks. It must get an http:// URL, and must not also get a socks one:
+      // two values for the same var in the child env is a coin flip.
+      const env = generateProxyEnvVars(3128, 1080)
+
+      for (const name of grpcNames) {
+        expect(env).toContain(`${name}=http://localhost:3128`)
+        expect(env.filter(v => v.startsWith(`${name}=`))).toHaveLength(1)
+      }
+    })
+
+    it('carries proxy credentials in the URL', () => {
+      const env = generateProxyEnvVars(3128, 1080, undefined, 'tok')
+
+      for (const name of grpcNames) {
+        expect(env).toContain(`${name}=http://srt:tok@localhost:3128`)
+      }
+    })
+
+    it('is emitted when only an HTTP proxy port is configured', () => {
+      // The value does not depend on the SOCKS port, and a gRPC client in an
+      // HTTP-only sandbox needs it just as much.
+      const env = generateProxyEnvVars(3128, undefined)
+
+      for (const name of grpcNames) {
+        expect(env).toContain(`${name}=http://localhost:3128`)
+      }
+    })
+
+    it('falls back to SOCKS when no HTTP proxy port is configured', () => {
+      const env = generateProxyEnvVars(undefined, 1080)
+
+      for (const name of grpcNames) {
+        expect(env).toContain(`${name}=socks5h://localhost:1080`)
+      }
+    })
+  })
+
   describe('caCertPath', () => {
     it('sets all trust env vars to the CA path when provided', () => {
       const env = generateProxyEnvVars(3128, 1080, '/etc/srt/ca.crt')

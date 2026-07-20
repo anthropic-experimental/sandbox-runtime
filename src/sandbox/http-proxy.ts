@@ -17,6 +17,10 @@ import {
   peekForClientHello,
   terminateAndForward,
 } from './tls-terminate-proxy.js'
+import {
+  prepareBodySubstitution,
+  type GetBodySubstitutions,
+} from './body-substitution.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import {
   connectViaParentProxy,
@@ -90,6 +94,22 @@ export interface HttpProxyServerOptions {
    * injection over plaintext is opt-in.
    */
   mutateHeadersPlaintext?: MutateForwardedHeaders
+
+  /**
+   * Per-destination sentinel→real byte pairs for masked-credential
+   * substitution in request BODIES on the TLS-terminated path — the body
+   * counterpart of `mutateHeaders`. Consulted once per body-carrying
+   * request; an empty/undefined result keeps the existing bare body pipe,
+   * byte-identical. See body-substitution.ts for gating and framing rules.
+   */
+  getBodySubstitutions?: GetBodySubstitutions
+
+  /**
+   * Body substitution on the plain-HTTP path. Separate from
+   * `getBodySubstitutions` for the same reason `mutateHeadersPlaintext` is
+   * separate: credential injection over plaintext is opt-in.
+   */
+  getBodySubstitutionsPlaintext?: GetBodySubstitutions
 
   /**
    * Additional trusted CA(s) for the terminating proxy's outbound TLS leg.
@@ -200,6 +220,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             options.mitmCA,
             options.filterRequest,
             options.mutateHeaders,
+            options.getBodySubstitutions,
             socket,
             peeked.head,
             { hostname, port, upstreamCA: options.tlsTerminateUpstreamCA },
@@ -341,6 +362,14 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
 
       const fwdHeaders = { ...stripHopByHop(req.headers), host: url.host }
       options.mutateHeadersPlaintext?.(fwdHeaders, hostname)
+      // Body-substitution counterpart of mutateHeadersPlaintext (opt-in via
+      // the same config gate). May delete content-length from fwdHeaders.
+      const bodyTransform = prepareBodySubstitution(
+        options.getBodySubstitutionsPlaintext,
+        req,
+        fwdHeaders,
+        hostname,
+      )
 
       // Decide upstream route: MITM unix socket > parent HTTP proxy > direct.
       const mitmSocketPath = options.getMitmSocketPath?.(hostname)
@@ -451,7 +480,17 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // Tear down the upstream request if the client goes away mid-flight.
       res.on('close', () => proxyReq.destroy())
 
-      body.pipe(proxyReq)
+      if (bodyTransform) {
+        // Errors on either side of the extra pipe stage tear the chain
+        // down — a stalled half-open upstream would otherwise wait for the
+        // client.
+        bodyTransform.on('error', err => proxyReq.destroy(err))
+        body.on('error', err => bodyTransform.destroy(err))
+        res.on('close', () => bodyTransform.destroy())
+        body.pipe(bodyTransform).pipe(proxyReq)
+      } else {
+        body.pipe(proxyReq)
+      }
     } catch (err) {
       logForDebugging(`Error handling HTTP request: ${err}`, { level: 'error' })
       if (!res.headersSent) {

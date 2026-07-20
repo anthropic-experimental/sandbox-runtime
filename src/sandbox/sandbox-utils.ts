@@ -473,20 +473,34 @@ export function generateProxyEnvVars(
     }
   }
 
+  // The URL to advertise to clients that need a general-purpose,
+  // CONNECT-capable proxy. The mux serves HTTP CONNECT and SOCKS on the same
+  // advertised port, so http:// works for everyone: clients that only speak
+  // CONNECT get a URL they understand, and anything that actually speaks
+  // SOCKS to it still reaches the SOCKS handler. Falls back to socks5h://
+  // only when no HTTP proxy port exists, which no current caller configures.
+  const connectProxyUrl = httpProxyPort
+    ? `http://${auth}localhost:${httpProxyPort}`
+    : `socks5h://${auth}localhost:${socksProxyPort}`
+
   // ALL_PROXY: prefer the HTTP proxy URL over SOCKS. httpx (and similar
   // Python clients) eagerly import `socksio` at client construction when
   // ALL_PROXY is a socks5h:// URL and crash with ImportError in envs that
   // lack the package — before any bytes hit the wire, so the mux's
-  // protocol sniffing can't help. With the mux serving both protocols on
-  // one port, anything that actually speaks SOCKS to this URL still
-  // reaches the SOCKS handler, so nothing is lost by advertising http://.
-  // Falls back to socks5h:// only when no HTTP proxy port exists, which no
-  // current caller configures.
-  const allProxy = httpProxyPort
-    ? `http://${auth}localhost:${httpProxyPort}`
-    : `socks5h://${auth}localhost:${socksProxyPort}`
-  envVars.push(`ALL_PROXY=${allProxy}`)
-  envVars.push(`all_proxy=${allProxy}`)
+  // protocol sniffing can't help.
+  envVars.push(`ALL_PROXY=${connectProxyUrl}`)
+  envVars.push(`all_proxy=${connectProxyUrl}`)
+
+  // gRPC-based tools. gRPC C-core (every google-cloud-* Python client, and
+  // grpc-js) only understands HTTP CONNECT proxies. Given a socks5h:// URL it
+  // logs "'socks5h' scheme not supported in proxy URI", ignores the var, and
+  // resolves the target directly via c-ares — which the sandbox blocks, so
+  // the client dies with "address lookup failed / Could not contact DNS
+  // servers" instead of falling back to https_proxy. Not gated on
+  // socksProxyPort: the value no longer depends on it, and a gRPC client in
+  // an HTTP-only sandbox needs this var just as much.
+  envVars.push(`GRPC_PROXY=${connectProxyUrl}`)
+  envVars.push(`grpc_proxy=${connectProxyUrl}`)
 
   if (socksProxyPort) {
     // Configure Git to use SSH through the proxy so DNS resolution happens outside the sandbox.
@@ -517,7 +531,12 @@ export function generateProxyEnvVars(
       )
     }
 
-    // FTP proxy support (use socks5h for DNS resolution through proxy)
+    // FTP proxy support (use socks5h for DNS resolution through proxy).
+    // Deliberately not connectProxyUrl: given an http:// ftp_proxy, curl does
+    // not CONNECT-tunnel by default, it gateways the transfer as
+    // `GET ftp://host/path HTTP/1.1` to the proxy — which the mux does not
+    // implement, and an env var can't ask curl for --proxytunnel. socks5h is
+    // transparent at the TCP layer, so it is the value that works here.
     envVars.push(`FTP_PROXY=socks5h://${auth}localhost:${socksProxyPort}`)
     envVars.push(`ftp_proxy=socks5h://${auth}localhost:${socksProxyPort}`)
 
@@ -565,9 +584,7 @@ export function generateProxyEnvVars(
     // Terraform - uses standard HTTP/HTTPS proxy vars
     // Terraform respects HTTP_PROXY/HTTPS_PROXY which we already set above
 
-    // gRPC-based tools - use standard proxy vars
-    envVars.push(`GRPC_PROXY=socks5h://${auth}localhost:${socksProxyPort}`)
-    envVars.push(`grpc_proxy=socks5h://${auth}localhost:${socksProxyPort}`)
+    // gRPC: see GRPC_PROXY above, emitted outside this guard.
   }
 
   // Do not set HTTP_PROXY/HTTPS_PROXY to SOCKS URLs in the SOCKS-only path:
