@@ -98,6 +98,39 @@ export function stripExtendedPathPrefix(p: string): string {
 }
 
 /**
+ * True for a Windows UNC path in any spelling — `\\server\share\…`,
+ * extended-length `\\?\UNC\server\share\…`, device-namespace
+ * `\\.\UNC\server\share\…` (all any casing, either separator).
+ * Delegates path-form normalization to
+ * `path.win32.toNamespacedPath` — every UNC spelling canonicalizes
+ * to `\\?\UNC\…` — so the check is "namespaced form starts with
+ * `\\?\UNC\` (or `\\.\UNC\`)". Drive-local forms (`C:\…`,
+ * `\\?\C:\…`), other device paths (`\\.\pipe\…`), relative paths
+ * (resolved against a local cwd), and server-only `\\srv` (no
+ * share) are all false.
+ *
+ * The broker uses this to skip `stat`/`realpath` on UNC **literals**
+ * (see {@link normalizePathForSandbox}): any such call is an SMB
+ * request carrying the **real user's** NTLM credentials to whatever
+ * host the path names — a forced-auth / path-encoded-exfil channel
+ * if the path is model-influenced. Literals pass through raw
+ * (resolution failures surface at `srt-win` stamp/grant time); a
+ * UNC **glob** still walks the share with real-user credentials —
+ * the user consented by naming their own share in the config.
+ * Defense-in-depth: the primary embedder already gates
+ * model-provided cwd/paths upstream.
+ */
+export function isUncPath(p: string): boolean {
+  const ns = path.win32.toNamespacedPath(p)
+  // Already-namespaced input passes through `toNamespacedPath`
+  // verbatim (casing and separators preserved), so match the UNC
+  // marker case-insensitively with either separator. `[?.]` also
+  // catches the device-namespace `\\.\UNC\…` form — that is a real
+  // network access, not a local device.
+  return /^[\\/]{2}[?.][\\/]unc[\\/]/i.test(ns)
+}
+
+/**
  * Remove trailing /** glob suffix from a path pattern
  * Used to normalize path patterns since /** just means "directory and everything under it"
  */
@@ -288,6 +321,12 @@ export function normalizePathForSandbox(pathPattern: string): string {
     pathPattern = stripExtendedPathPrefix(expandWindowsEnvRefs(pathPattern))
     if (/^[a-z]:/.test(pathPattern)) {
       pathPattern = pathPattern[0].toUpperCase() + pathPattern.slice(1)
+    }
+    // UNC literal: return as-is (separators normalised only) — no
+    // stat/realpath. A UNC *glob* falls through to the glob walk
+    // below (user-trusted share). See {@link isUncPath}.
+    if (isUncPath(pathPattern) && !containsGlobCharsWin(pathPattern)) {
+      return path.win32.normalize(pathPattern)
     }
   }
   let normalizedPath = expandTilde(pathPattern)

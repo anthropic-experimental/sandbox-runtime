@@ -11,6 +11,7 @@ import {
   normalizePathForSandbox,
   containsGlobCharsWin,
   expandGlobPattern,
+  isUncPath,
 } from './sandbox-utils.js'
 // Re-export so existing tests (glob-expand.test.ts) and any
 // out-of-tree caller keep their import path. `buildGitConfigEnv` is
@@ -20,6 +21,7 @@ export {
   containsGlobCharsWin,
   stripExtendedPathPrefix,
   buildGitConfigEnv,
+  isUncPath,
 } from './sandbox-utils.js'
 import type { SandboxDependencyCheck } from './linux-sandbox-utils.js'
 import type { SrtWinConfig } from './sandbox-config.js'
@@ -108,7 +110,13 @@ export type WindowsSandboxErrorCode =
   | 'argv_too_long'
   /** Sandbox user account / credential not present — run install. */
   | 'not_provisioned'
-  /** Working directory is on a mapped network drive; sandbox cannot start. */
+  /**
+   * Working directory is on a mapped network drive; the sandbox
+   * cannot start (per-user drive mappings don't exist under the
+   * sandbox logon). `srt-win exec` exit **16**; parsed from its
+   * stderr JSON by {@link parseWindowsSandboxError}, which carries
+   * the failing root on `.drive` ({@link MappedDriveCwdError}).
+   */
   | 'mapped_drive_cwd'
 
 /**
@@ -1171,6 +1179,12 @@ export function uninstallWindowsSandbox(
  * real path succeeds. Glob results (existing-by-construction) drop
  * on a stat miss regardless of mode: a glob is inherently "match
  * existing".
+ *
+ * **UNC exception:** a `\\server\share\…` **literal** passes through
+ * raw in BOTH modes (no existence probe — see {@link isUncPath});
+ * `srt-win` soft-drops a missing UNC deny target rather than
+ * materializing a placeholder chain on an SMB share. A UNC **glob**
+ * still walks the share (user-trusted).
  */
 export function expandWindowsFsPaths(
   patterns: readonly string[],
@@ -1180,6 +1194,12 @@ export function expandWindowsFsPaths(
   for (const raw of patterns) {
     const norm = normalizePathForSandbox(raw)
     const isGlob = containsGlobCharsWin(norm)
+    // UNC literal: pass raw (no stat) — see {@link isUncPath}. A
+    // UNC glob falls through to expandGlobPattern below.
+    if (isUncPath(norm) && !isGlob) {
+      out.add(norm)
+      continue
+    }
     const candidates = isGlob
       ? expandGlobPattern(norm, { caseInsensitive: true })
       : [norm]
@@ -1198,6 +1218,63 @@ export function expandWindowsFsPaths(
     }
   }
   return [...out]
+}
+
+/**
+ * {@link WindowsSandboxError} narrowed to `mapped_drive_cwd`,
+ * carrying the `DRIVE_REMOTE` root that made the launch fail
+ * (`Z:\` for a mapped letter, `\\server\share\` for a raw UNC cwd).
+ */
+export interface MappedDriveCwdError extends WindowsSandboxError {
+  readonly code: 'mapped_drive_cwd'
+  readonly drive?: string
+}
+
+/**
+ * Parse a structured `srt-win exec` error from its stderr. `exec`
+ * emits typed launch failures as a single JSON line
+ * `{"code":…,"message":…}` alongside a distinct exit code —
+ * `mapped_drive_cwd` is exit **16**. Embedders that spawn the
+ * `{argv, env}` from {@link wrapCommandWithSandboxWindows} call
+ * this on non-zero exit to surface an actionable
+ * {@link WindowsSandboxError} instead of a bare status.
+ *
+ * Returns `undefined` when no typed-error line is present (the
+ * common case: exit status is the child's own). Gate on the
+ * `srt-win` exit code before calling — the sandboxed child's own
+ * stderr is pumped through unchanged, so a child that happened to
+ * print a matching JSON line would parse here too.
+ */
+export function parseWindowsSandboxError(
+  stderr: string,
+): MappedDriveCwdError | undefined {
+  for (const line of stderr.split(/\r?\n/)) {
+    const t = line.trim()
+    if (!t.startsWith('{') || !t.includes('"code"')) continue
+    try {
+      const j = JSON.parse(t) as {
+        code?: string
+        message?: string
+        drive?: string
+      }
+      if (j.code === 'mapped_drive_cwd') {
+        // The canonical class carries `code`/`subcommand`; `drive`
+        // is this one code's extra payload, attached as a plain
+        // property rather than forking the class.
+        return Object.assign(
+          new WindowsSandboxError(
+            'mapped_drive_cwd',
+            j.message ?? 'mapped/network-drive working directory',
+            'exec',
+          ),
+          { drive: j.drive },
+        ) as MappedDriveCwdError
+      }
+    } catch {
+      // not our line
+    }
+  }
+  return undefined
 }
 
 export interface WindowsAclStampOptions {

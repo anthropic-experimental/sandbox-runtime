@@ -17,6 +17,9 @@ import {
   containsGlobCharsWin,
   expandWindowsFsPaths,
   stripExtendedPathPrefix,
+  isUncPath,
+  parseWindowsSandboxError,
+  WindowsSandboxError,
 } from '../../src/sandbox/windows-sandbox-utils.js'
 import { isLinux, isWindows } from '../helpers/platform.js'
 import { spawnSync } from 'node:child_process'
@@ -284,6 +287,104 @@ describe('expandWindowsFsPaths literal branch', () => {
     // No trailing separator ⇒ not re-applied.
     const out = expandWindowsFsPaths([base], { mode: 'deny' })
     expect(/[\\/]$/.test(out[0])).toBe(false)
+  })
+})
+
+// ============================================================================
+// isUncPath — broker never stats `\\server\…` with real-user creds
+// ============================================================================
+
+describe('isUncPath', () => {
+  it('recognises \\\\server\\share and //server/share', () => {
+    expect(isUncPath('\\\\srv\\share\\dir')).toBe(true)
+    expect(isUncPath('//srv/share')).toBe(true)
+  })
+
+  it('recognises the extended-length \\\\?\\UNC\\… form (any casing)', () => {
+    expect(isUncPath('\\\\?\\UNC\\srv\\share\\dir')).toBe(true)
+    expect(isUncPath('\\\\?\\unc\\srv\\share')).toBe(true)
+    expect(isUncPath('//?/UNC/srv/share')).toBe(true)
+    expect(isUncPath('//?/unc/srv/share')).toBe(true)
+  })
+
+  it('recognises the device-namespace \\\\.\\UNC\\… form', () => {
+    // `\\.\UNC\server\share\…` is a real network access — same SMB
+    // round-trip as `\\server\share\…`, different spelling.
+    expect(isUncPath('\\\\.\\UNC\\srv\\share\\x')).toBe(true)
+    expect(isUncPath('//./UNC/srv/share')).toBe(true)
+    expect(isUncPath('\\\\.\\unc\\srv\\share')).toBe(true)
+  })
+
+  it('does NOT treat drive-local extended or device paths as UNC', () => {
+    // `\\?\C:\…` is a drive-local extended path; `\\.\pipe\…` /
+    // `\\.\C:` are local device names — none name a remote host.
+    expect(isUncPath('\\\\?\\C:\\dir')).toBe(false)
+    expect(isUncPath('\\\\.\\pipe\\x')).toBe(false)
+    expect(isUncPath('\\\\.\\C:\\x')).toBe(false)
+  })
+
+  it('rejects local drive-letter, relative, and server-only paths', () => {
+    expect(isUncPath('C:\\dir')).toBe(false)
+    // Relative input: toNamespacedPath resolves against the local
+    // cwd → drive-local (or rooted) form → false.
+    expect(isUncPath('dir\\file')).toBe(false)
+    expect(isUncPath('\\single')).toBe(false)
+    // Server without a share is not a valid UNC root.
+    expect(isUncPath('\\\\srv')).toBe(false)
+  })
+})
+
+describe.if(isWindows)('expandWindowsFsPaths UNC pass-raw', () => {
+  it('passes UNC literals through without stat (broker never touches SMB)', () => {
+    // A non-existent UNC host — if the broker stat'd this it would
+    // hang on an SMB timeout. Pass-raw returns the literal verbatim
+    // (path.win32.normalize applied); resolution failure surfaces
+    // at srt-win stamp/grant time.
+    const unc = '\\\\srt-no-such-host\\share\\dir'
+    expect(expandWindowsFsPaths([unc])).toEqual([unc])
+  })
+
+  it('passes \\\\?\\UNC\\… literal through as \\\\server\\share (post-strip)', () => {
+    const ext = '\\\\?\\UNC\\srt-no-such-host\\share\\dir'
+    expect(expandWindowsFsPaths([ext])).toEqual([
+      '\\\\srt-no-such-host\\share\\dir',
+    ])
+  })
+
+  it('passes a UNC deny literal raw (srt-win soft-drops, no placeholder)', () => {
+    // Composition with the deny placeholder chain: a missing UNC
+    // deny target must reach srt-win raw — srt-win's is_unc_path
+    // soft-drops it rather than mkdir-ing placeholders on an SMB
+    // share. The broker side must not stat or placeholder-mark it.
+    const unc = '\\\\srt-no-such-host\\share\\secret'
+    expect(expandWindowsFsPaths([unc], { mode: 'deny' })).toEqual([unc])
+  })
+})
+
+// ============================================================================
+// parseWindowsSandboxError — typed error from srt-win exec stderr
+// ============================================================================
+
+describe('parseWindowsSandboxError', () => {
+  it('parses mapped_drive_cwd JSON line among noise', () => {
+    const stderr = [
+      'srt-win: launching runner as srt-sandbox (overlay=12 var(s))',
+      '{"code":"mapped_drive_cwd","drive":"Z:\\\\","message":"the sandbox cannot start with a mapped/network-drive working directory (Z:\\\\ is DRIVE_REMOTE)"}',
+      '',
+    ].join('\n')
+    const err = parseWindowsSandboxError(stderr)
+    expect(err).toBeInstanceOf(WindowsSandboxError)
+    expect(err?.code).toBe('mapped_drive_cwd')
+    expect(err?.subcommand).toBe('exec')
+    expect(err?.drive).toBe('Z:\\')
+    expect(err?.message).toContain('DRIVE_REMOTE')
+  })
+
+  it('returns undefined when no typed-error line present', () => {
+    expect(parseWindowsSandboxError('srt-win: error: something\n')).toBe(
+      undefined,
+    )
+    expect(parseWindowsSandboxError('')).toBe(undefined)
   })
 })
 
