@@ -8,10 +8,35 @@
  * never written to disk and never logged.
  */
 
-import { randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 import type { IncomingHttpHeaders } from 'node:http'
+import type { SentinelBufferPair } from './body-substitution.js'
 
 export const SENTINEL_PREFIX = 'fake_value_'
+
+// Padding alphabet: the same character class as the base sentinel, so a
+// padded sentinel still survives shells, JSON, URLs, and multipart unquoted.
+const SENTINEL_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789_-'
+
+/**
+ * Mint `fake_value_<uuid4>`, padded with random alphabet chars up to the
+ * real value's byte length when the real value is longer. A length-matched
+ * sentinel keeps Content-Length invariant under body substitution, so the
+ * proxy forwards the header verbatim; a shorter real value keeps the
+ * 47-byte base sentinel (entropy is never reduced below the uuid4) and the
+ * proxy falls back to chunked framing instead. The padding carries no
+ * entropy contract — the uuid4 does — so modulo bias is irrelevant.
+ */
+function mintSentinel(realValue: string): string {
+  const base = SENTINEL_PREFIX + randomUUID()
+  const pad = Buffer.byteLength(realValue) - base.length
+  if (pad <= 0) return base
+  let out = base
+  for (const b of randomBytes(pad)) {
+    out += SENTINEL_ALPHABET[b % SENTINEL_ALPHABET.length]
+  }
+  return out
+}
 
 /** Predicate matching a destination host against one injectHosts pattern. */
 export type HostMatcher = (host: string, pattern: string) => boolean
@@ -53,6 +78,9 @@ export class SentinelRegistry {
    * Idempotent on `name`: a repeat call returns the same sentinel and updates
    * `realValue`/`injectHosts` in place so `updateConfig()` can change either
    * without invalidating sentinels the sandboxed process has already read.
+   * (A re-register whose new value has a different byte length leaves the
+   * sentinel un-length-matched; body substitution then re-frames as chunked
+   * rather than trusting a stale Content-Length.)
    */
   register(
     name: string,
@@ -61,7 +89,7 @@ export class SentinelRegistry {
   ): string {
     return this.registerWithSentinel(
       name,
-      SENTINEL_PREFIX + randomUUID(),
+      mintSentinel(realValue),
       realValue,
       injectHosts,
     )
@@ -77,7 +105,17 @@ export class SentinelRegistry {
    * registered, the EXISTING sentinel is returned (and `sentinel` discarded)
    * so a re-register never invalidates a fake the sandboxed process has
    * already read. The caller must mint sentinels with enough entropy that
-   * collisions with real content are negligible (embed a uuid4).
+   * collisions with real content are negligible (embed a uuid4). No
+   * registered sentinel may be a substring of any other registered sentinel:
+   * the body-substitution scan matches earliest-position-then-registration-
+   * order, not longest-match, so nested sentinels would make replacement
+   * chunk-boundary-dependent (still fail-safe — worst case a wrong fake
+   * reaches upstream, never a secret).
+   *
+   * Caller-minted sentinels are used verbatim — never length-padded: a
+   * shaped fake (e.g. a JWT) must keep its structure. They are therefore
+   * generally not length-matched, and body substitution at hosts where they
+   * inject falls back to chunked framing.
    */
   registerWithSentinel(
     name: string,
@@ -117,6 +155,28 @@ export class SentinelRegistry {
       if (e.injectHosts.some(p => matches(destHost, p))) names.push(e.name)
     }
     return names
+  }
+
+  /**
+   * Sentinel→real byte pairs for every credential whose `injectHosts`
+   * cover `destHost` — the substitution set the body transform scans for.
+   * Same per-credential gating as {@link substituteInHeaders}. Buffers are
+   * built per call so a re-registered credential's updated real value is
+   * always current.
+   */
+  sentinelsForHost(
+    destHost: string,
+    matches: HostMatcher,
+  ): SentinelBufferPair[] {
+    const pairs: SentinelBufferPair[] = []
+    for (const e of this.bySentinel.values()) {
+      if (!e.injectHosts.some(p => matches(destHost, p))) continue
+      pairs.push({
+        sentinel: Buffer.from(e.sentinel),
+        realValue: Buffer.from(e.realValue),
+      })
+    }
+    return pairs
   }
 
   /** Iterate registered `[sentinel, realValue]` pairs. */

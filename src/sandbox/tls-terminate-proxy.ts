@@ -26,6 +26,10 @@ import {
   type FilterRequestCallback,
   type MutateForwardedHeaders,
 } from './request-filter.js'
+import {
+  prepareBodySubstitution,
+  type GetBodySubstitutions,
+} from './body-substitution.js'
 import { mintLeafCert, secureContextFor } from './mitm-leaf.js'
 import { stripHopByHop } from './parent-proxy.js'
 
@@ -117,6 +121,7 @@ export function terminateAndForward(
   ca: MitmCA,
   filterRequest: FilterRequestCallback | undefined,
   mutateHeaders: MutateForwardedHeaders | undefined,
+  getBodySubstitutions: GetBodySubstitutions | undefined,
   socket: Duplex,
   head: Buffer,
   target: TerminateTarget,
@@ -139,7 +144,14 @@ export function terminateAndForward(
   })
 
   inner.on('request', (req, res) => {
-    void forwardUpstream(filterRequest, mutateHeaders, req, res, target)
+    void forwardUpstream(
+      filterRequest,
+      mutateHeaders,
+      getBodySubstitutions,
+      req,
+      res,
+      target,
+    )
   })
   inner.on('tlsClientError', (err, sock) => {
     logForDebugging(
@@ -198,6 +210,7 @@ export function terminateAndForward(
 async function forwardUpstream(
   filterRequest: FilterRequestCallback | undefined,
   mutateHeaders: MutateForwardedHeaders | undefined,
+  getBodySubstitutions: GetBodySubstitutions | undefined,
   req: IncomingMessage,
   res: ServerResponse,
   target: TerminateTarget,
@@ -255,6 +268,15 @@ async function forwardUpstream(
   // completes before any HTTP bytes are written, so mutated headers never
   // reach an unverified server.
   mutateHeaders?.(fwdHeaders, target.hostname)
+  // Masked-credential substitution in the request body, mirroring the
+  // header substitution above. undefined → the bare pipe below, exactly as
+  // before. May delete content-length from fwdHeaders (chunked fallback).
+  const bodyTransform = prepareBodySubstitution(
+    getBodySubstitutions,
+    req,
+    fwdHeaders,
+    target.hostname,
+  )
 
   // TODO(terminating-tls): honour parentProxy for the upstream leg.
   const upstream = httpsRequest(
@@ -298,7 +320,16 @@ async function forwardUpstream(
   })
 
   res.on('close', () => upstream.destroy())
-  body.pipe(upstream)
+  if (bodyTransform) {
+    // Errors on either side of the extra pipe stage tear the chain down —
+    // a stalled half-open upstream would otherwise wait for the client.
+    bodyTransform.on('error', err => upstream.destroy(err))
+    body.on('error', err => bodyTransform.destroy(err))
+    res.on('close', () => bodyTransform.destroy())
+    body.pipe(bodyTransform).pipe(upstream)
+  } else {
+    body.pipe(upstream)
+  }
 }
 
 function originFormPath(reqUrl: string | undefined): string {

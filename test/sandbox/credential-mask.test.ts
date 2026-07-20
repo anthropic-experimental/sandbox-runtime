@@ -44,6 +44,44 @@ describe('SentinelRegistry', () => {
     expect(reg.lookupReal(s)).toBe('hunter2')
   })
 
+  test('register pads the sentinel to the real value byte length (length-matched)', () => {
+    const reg = new SentinelRegistry()
+    const real = 'x'.repeat(100)
+    const s = reg.register('LONG', real, ['api.github.com'])
+    expect(s.startsWith(SENTINEL_PREFIX)).toBe(true)
+    expect(Buffer.byteLength(s)).toBe(Buffer.byteLength(real))
+    // Padding stays in the sentinel alphabet so the fake still survives
+    // shells, JSON, and URLs unquoted.
+    expect(s).toMatch(/^[a-z0-9_-]+$/)
+    expect(reg.lookupReal(s)).toBe(real)
+  })
+
+  test('register never shrinks the sentinel below the base (short real value)', () => {
+    const reg = new SentinelRegistry()
+    const s = reg.register('SHORT', 'tiny', ['api.github.com'])
+    expect(s.length).toBe(SENTINEL_PREFIX.length + 36)
+  })
+
+  test('sentinelsForHost returns byte pairs gated per credential', () => {
+    const reg = new SentinelRegistry()
+    const a = reg.register('A', 'real-a', ['a.example.com'])
+    reg.register('B', 'real-b', ['b.example.com'])
+    const pairs = reg.sentinelsForHost('a.example.com', eq)
+    expect(pairs).toHaveLength(1)
+    expect(pairs[0]!.sentinel.toString()).toBe(a)
+    expect(pairs[0]!.realValue.toString()).toBe('real-a')
+    expect(reg.sentinelsForHost('c.example.com', eq)).toHaveLength(0)
+  })
+
+  test('sentinelsForHost reflects a re-registered real value', () => {
+    const reg = new SentinelRegistry()
+    reg.register('T', 'old-value', ['h.example.com'])
+    reg.register('T', 'new-value', ['h.example.com'])
+    const pairs = reg.sentinelsForHost('h.example.com', eq)
+    expect(pairs).toHaveLength(1)
+    expect(pairs[0]!.realValue.toString()).toBe('new-value')
+  })
+
   test('register is idempotent on credential name', () => {
     const reg = new SentinelRegistry()
     const a = reg.register('GH_TOKEN', 'hunter2', ['api.github.com'])
