@@ -25,11 +25,11 @@ use anyhow::{Context, Result, anyhow};
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_LOGON_FAILURE, ERROR_NOT_SUPPORTED, HANDLE, HANDLE_FLAG_INHERIT,
-    HANDLE_FLAGS, SetHandleInformation, WAIT_OBJECT_0,
+    CloseHandle, ERROR_DIRECTORY, ERROR_LOGON_FAILURE, ERROR_NOT_SUPPORTED, HANDLE,
+    HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::SECURITY_ATTRIBUTES;
-use windows::Win32::Storage::FileSystem::{ReadFile, WriteFile};
+use windows::Win32::Storage::FileSystem::{GetDriveTypeW, ReadFile, WriteFile};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessWithLogonW,
@@ -42,6 +42,72 @@ use crate::job::Job;
 use crate::launch::{SpawnedChild, quote_arg};
 use crate::util::{OwnedHandle, scrub_wstr, wstr};
 use crate::winsta::{IsolatedDesk, grant_sandbox_on_session_bno, grant_sandbox_on_winsta};
+
+/// Typed error for [`spawn_runner`] with a mapped/network-drive
+/// working directory. Per-user drive mappings and SMB share
+/// authentication belong to the **real** user's logon session; the
+/// `srt-sandbox` logon that seclogon creates for
+/// `CreateProcessWithLogonW` has neither, so `lpCurrentDirectory`
+/// pointing at a mapped drive fails inside seclogon with
+/// `ERROR_DIRECTORY` (`0x8007010B`). A mechanism failure, not a
+/// security block — typed so callers can present an actionable
+/// message instead of a bare HRESULT.
+#[derive(Debug)]
+pub struct MappedDriveCwd {
+    /// The drive root that resolved as `DRIVE_REMOTE` (`Z:\` for a
+    /// mapped drive letter, `\\server\share\` for a raw UNC cwd).
+    pub drive: String,
+}
+
+impl std::fmt::Display for MappedDriveCwd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the sandbox cannot start with a mapped/network-drive \
+             working directory ({} is DRIVE_REMOTE — per-user drive \
+             mappings do not exist under the sandbox logon). Use a \
+             local-drive workspace.",
+            self.drive,
+        )
+    }
+}
+
+impl std::error::Error for MappedDriveCwd {}
+
+/// `GetDriveTypeW` return value for a network drive. The `windows`
+/// crate parks this constant under `Win32_System_WindowsProgramming`
+/// (a grab-bag feature we don't otherwise need); the value is a
+/// stable Win32 ABI constant.
+const DRIVE_REMOTE: u32 = 4;
+
+/// Extract the drive root of `cwd` in the form `GetDriveTypeW`
+/// wants: `X:\` for a drive-letter path, `\\server\share\` for a
+/// UNC path. `None` for anything else (relative, device path
+/// `\\.\…` / `\\?\…`, or malformed) — the caller falls through to
+/// the `CreateProcessWithLogonW` attempt and the post-check catches
+/// the `ERROR_DIRECTORY` case.
+fn cwd_drive_root(cwd: &str) -> Option<String> {
+    let b = cwd.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
+    {
+        return Some(format!("{}:\\", (b[0] as char).to_ascii_uppercase()));
+    }
+    if let Some(rest) = cwd.strip_prefix(r"\\") {
+        // `\\?\…` / `\\.\…` are extended/device prefixes, not a
+        // server name — leave to the post-check.
+        if rest.starts_with(['?', '.']) {
+            return None;
+        }
+        let mut it = rest.splitn(3, ['\\', '/']);
+        if let (Some(srv), Some(share)) = (it.next(), it.next())
+            && !srv.is_empty()
+            && !share.is_empty()
+        {
+            return Some(format!(r"\\{srv}\{share}\"));
+        }
+    }
+    None
+}
 
 /// One anonymous pipe pair. The end the runner gets is created
 /// inheritable; the broker's end is flipped non-inheritable so the
@@ -116,6 +182,17 @@ pub fn spawn_runner(
     cmd: &crate::runner::RunnerCmd,
     quiet: bool,
 ) -> Result<u32> {
+    // Mapped/network-drive cwd pre-check: `DRIVE_REMOTE` on the
+    // cwd's root means CPWLW would fail inside seclogon with
+    // `ERROR_DIRECTORY` — fail fast with the typed error. The
+    // post-CPWLW arm below maps `ERROR_DIRECTORY` to the same
+    // error for shapes this pre-check doesn't recognise.
+    if let Some(root) = cwd.and_then(cwd_drive_root)
+        && unsafe { GetDriveTypeW(PCWSTR(wstr(&root).as_ptr())) } == DRIVE_REMOTE
+    {
+        return Err(MappedDriveCwd { drive: root }.into());
+    }
+
     let cmd_bytes = crate::runner::encode_cmd(cmd)?;
     let stdin = make_pipe(false)?;
     let stdout = make_pipe(true)?;
@@ -212,6 +289,17 @@ pub fn spawn_runner(
                  account is disabled. Re-run `srt-win install` (one \
                  UAC prompt) to rotate the credential."
             ));
+        }
+        // `ERROR_DIRECTORY` = seclogon couldn't set the requested
+        // cwd under the sandbox logon (mapped drive / unreachable
+        // UNC share) — same typed error as the pre-check above,
+        // catching shapes it didn't classify.
+        if e.code() == ERROR_DIRECTORY.to_hresult() {
+            let drive = cwd
+                .and_then(cwd_drive_root)
+                .or_else(|| cwd.map(str::to_owned))
+                .unwrap_or_else(|| "<unknown>".into());
+            return Err(MappedDriveCwd { drive }.into());
         }
         return Err(anyhow!(
             "CreateProcessWithLogonW({username}): {e} — ensure the \
@@ -359,5 +447,36 @@ impl AsRawHandle for std::io::Stdout {
 impl AsRawHandle for std::io::Stderr {
     fn as_raw(&self) -> HANDLE {
         HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(self))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cwd_drive_root;
+
+    #[test]
+    fn drive_letter_root() {
+        assert_eq!(cwd_drive_root(r"Z:\work\repo"), Some(r"Z:\".into()));
+        assert_eq!(cwd_drive_root("c:/work"), Some(r"C:\".into()));
+        assert_eq!(cwd_drive_root("relative"), None);
+    }
+
+    #[test]
+    fn unc_root() {
+        assert_eq!(
+            cwd_drive_root(r"\\srv\share\dir\f"),
+            Some(r"\\srv\share\".into()),
+        );
+        assert_eq!(cwd_drive_root(r"\\srv\share"), Some(r"\\srv\share\".into()));
+        // server-only (no share) is not a valid UNC root
+        assert_eq!(cwd_drive_root(r"\\srv"), None);
+    }
+
+    #[test]
+    fn device_and_extended_prefix_skipped() {
+        // `\\?\` / `\\.\` are extended/device prefixes, not UNC —
+        // left to the CPWLW post-check.
+        assert_eq!(cwd_drive_root(r"\\?\C:\x"), None);
+        assert_eq!(cwd_drive_root(r"\\.\pipe\x"), None);
     }
 }

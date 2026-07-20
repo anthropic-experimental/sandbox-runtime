@@ -1384,7 +1384,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             let cwd = std::env::current_dir()
                 .ok()
                 .and_then(|p| p.to_str().map(String::from));
-            let code = logon::spawn_runner(
+            let code = match logon::spawn_runner(
                 &cred.user,
                 &cred.pw,
                 &sb_sid,
@@ -1394,7 +1394,28 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     env_overlay,
                 }),
                 quiet,
-            )?;
+            ) {
+                Ok(c) => c,
+                Err(e) => {
+                    // Mapped/network-drive cwd (see
+                    // `logon::MappedDriveCwd`): emit a one-line
+                    // JSON error the TS caller can parse and exit
+                    // 16 — distinct from the child's own exit
+                    // status. `?` propagates any other
+                    // spawn_runner error unchanged.
+                    let m = e.downcast::<logon::MappedDriveCwd>()?;
+                    eprintln!(
+                        "{}",
+                        json!({
+                            "code": "mapped_drive_cwd",
+                            "drive": m.drive,
+                            "message": m.to_string(),
+                        })
+                    );
+                    drop(per_exec_guard);
+                    std::process::exit(16);
+                }
+            };
             // `cred` drops here → `SandboxCred::Drop` zeroes the
             // password. process::exit skips destructors, so the
             // per-exec restore guard's Drop must be explicit
