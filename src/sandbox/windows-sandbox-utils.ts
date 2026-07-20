@@ -52,6 +52,93 @@ import type { SrtWinConfig } from './sandbox-config.js'
  */
 
 // ────────────────────────────────────────────────────────────────────
+// Errors
+// ────────────────────────────────────────────────────────────────────
+
+/**
+ * Stable machine-readable code carried on every
+ * {@link WindowsSandboxError}. Consumers branch on `.code` instead of
+ * prose-matching `.message` (message text is diagnostic and may change
+ * between releases).
+ */
+export type WindowsSandboxErrorCode =
+  /** `windows.srtWin.path` unset, or the configured/packaged exe is missing. */
+  | 'srt_win_not_found'
+  /** `spawnSync(srt-win)` itself failed (ENOENT, EACCES). */
+  | 'spawn_failed'
+  /** `srt-win` was killed by the spawn timeout (generic; see `install_timeout`). */
+  | 'srt_win_timeout'
+  /** A JSON-emitting `srt-win` subcommand exited non-zero. */
+  | 'srt_win_nonzero'
+  /** `srt-win` stdout was not valid JSON. */
+  | 'srt_win_bad_json'
+  /** {@link parseWindowsBinShell} rejected the `binShell` value. */
+  | 'bin_shell_invalid'
+  /** {@link verifyWindowsWfpEgress} could not bind a probe listener. */
+  | 'wfp_verify_bind_failed'
+  /** `srt-win wfp verify` produced no parseable result (timeout/kill). */
+  | 'wfp_verify_unparseable'
+  /** `srt-win wfp verify` proved direct egress SUCCEEDED (fence absent). */
+  | 'wfp_fence_inactive'
+  /** `srt-win wfp verify` was neither `blocked` nor `connected`. */
+  | 'wfp_verify_inconclusive'
+  /** `srt-win user trust-ca` exited non-zero. */
+  | 'trust_ca_failed'
+  /** `tlsTerminate` requested but no CA is installed for the sandbox user. */
+  | 'trust_ca_not_installed'
+  /** Installed CA thumbprint ≠ session CA thumbprint. */
+  | 'trust_ca_thumbprint_mismatch'
+  /** `srt-win install` exit 12 — WFP filter install failed. */
+  | 'install_wfp_failed'
+  /** `srt-win install` exit 14 — sandbox-user provisioning failed. */
+  | 'install_user_failed'
+  /** `srt-win install` exit 13 — different config under this sublayer. */
+  | 'install_config_conflict'
+  /** `srt-win install` was killed by the spawn timeout (UAC left open). */
+  | 'install_timeout'
+  /** `srt-win install` failed with an unmapped exit code. */
+  | 'install_failed'
+  /** `srt-win uninstall` exited non-zero (not UAC-cancel). */
+  | 'uninstall_failed'
+  /** `srt-win acl stamp` exited non-zero. */
+  | 'acl_stamp_failed'
+  /** `srt-win acl grant` exited non-zero. */
+  | 'acl_grant_failed'
+  /** `srt-win exec` argv would exceed CreateProcessW's 32 767-char limit. */
+  | 'argv_too_long'
+  /** Sandbox user account / credential not present — run install. */
+  | 'not_provisioned'
+  /** Working directory is on a mapped network drive; sandbox cannot start. */
+  | 'mapped_drive_cwd'
+
+/**
+ * Error thrown by the Windows sandbox backend. Carries a stable
+ * {@link WindowsSandboxErrorCode} on `.code` so callers can branch
+ * without prose-matching `.message`. `instanceof WindowsSandboxError`
+ * narrows `.code` to the union.
+ *
+ * `.subcommand` is set on errors thrown from the `srt-win` spawn
+ * chokepoint (`spawn_failed`, `srt_win_timeout`, `srt_win_nonzero`,
+ * `srt_win_bad_json`) to the first CLI arg (e.g. `'install'`,
+ * `'wfp'`) so a consumer can distinguish install-spawn-failed from
+ * probe-spawn-failed without prose-matching. Unset elsewhere.
+ */
+export class WindowsSandboxError extends Error {
+  readonly code: WindowsSandboxErrorCode
+  readonly subcommand?: string
+  constructor(
+    code: WindowsSandboxErrorCode,
+    message: string,
+    subcommand?: string,
+  ) {
+    super(message)
+    this.name = 'WindowsSandboxError'
+    this.code = code
+    this.subcommand = subcommand
+  }
+}
+
+// ────────────────────────────────────────────────────────────────────
 // Types
 // ────────────────────────────────────────────────────────────────────
 
@@ -183,13 +270,15 @@ export function parseWindowsBinShell(
   if (raw === undefined || raw === null) return cmdDefault
   if (typeof raw === 'object') {
     if (!path.win32.isAbsolute(raw.exe)) {
-      throw new Error(
+      throw new WindowsSandboxError(
+        'bin_shell_invalid',
         `binShell.exe must be an absolute path ` +
           `(got ${JSON.stringify(raw.exe)})`,
       )
     }
     if (!Array.isArray(raw.args)) {
-      throw new Error(
+      throw new WindowsSandboxError(
+        'bin_shell_invalid',
         `binShell.args must be an array (got ${JSON.stringify(raw.args)})`,
       )
     }
@@ -201,7 +290,8 @@ export function parseWindowsBinShell(
   // A relative path with a directory component (`bin\bash.exe`) is
   // neither a token nor a resolved install — never silently degrade.
   if (!isAbs && raw !== rawBase) {
-    throw new Error(
+    throw new WindowsSandboxError(
+      'bin_shell_invalid',
       `binShell string must be a bare token or an absolute path ` +
         `(got ${JSON.stringify(raw)})`,
     )
@@ -214,7 +304,8 @@ export function parseWindowsBinShell(
       // Bare 'bash' is ambiguous (WSL vs Git Bash) — require the
       // resolved install path.
       if (!isAbs) {
-        throw new Error(
+        throw new WindowsSandboxError(
+          'bin_shell_invalid',
           `binShell bash path must be absolute ` +
             `(got ${JSON.stringify(raw)}); pass the resolved Git Bash ` +
             `install path`,
@@ -242,7 +333,8 @@ export function parseWindowsBinShell(
     case 'cmd.exe':
       return isAbs ? { exe: raw, args: cmdDefault.args } : cmdDefault
     default:
-      throw new Error(
+      throw new WindowsSandboxError(
+        'bin_shell_invalid',
         `unrecognised binShell ${JSON.stringify(raw)}: expected ` +
           `'cmd' | 'powershell' | 'pwsh' or an absolute path to ` +
           `bash.exe/sh.exe/pwsh.exe/powershell.exe`,
@@ -436,7 +528,8 @@ export function getSrtWinPath(): string {
   for (const c of candidates) {
     if (fs.existsSync(c)) return c
   }
-  throw new Error(
+  throw new WindowsSandboxError(
+    'srt_win_not_found',
     `srt-win.exe not found. Set windows.srtWin.path or build with ` +
       `\`cargo build --release --manifest-path vendor/srt-win-src/Cargo.toml\`. ` +
       `Looked in: ${candidates.join(', ')}`,
@@ -479,13 +572,15 @@ export type SrtWinSpawn = Readonly<{
  */
 export function resolveSrtWin(cfg?: SrtWinConfig): SrtWinSpawn {
   if (cfg?.path === undefined) {
-    throw new Error(
+    throw new WindowsSandboxError(
+      'srt_win_not_found',
       `no srt-win path configured; set windows.srtWin.path (e.g. to the ` +
         `exported VENDORED_SRT_WIN_EXE constant for the packaged binary)`,
     )
   }
   if (!fs.existsSync(cfg.path)) {
-    throw new Error(
+    throw new WindowsSandboxError(
+      'srt_win_not_found',
       `windows.srtWin.path is set to '${cfg.path}' but the file does ` +
         `not exist`,
     )
@@ -521,7 +616,26 @@ function runSrtWin(args: string[], opts: RunOpts = {}): RunResult {
     ...(opts.stdin !== undefined ? { input: opts.stdin } : {}),
   })
   if (r.error) {
-    throw new Error(`srt-win ${args[0]}: spawn failed: ${r.error.message}`)
+    // ETIMEDOUT means the process ran and spawnSync killed it after
+    // `timeout` — throw a distinct code so every caller surfaces
+    // "timed out" instead of an opaque `exited null`. Callers with a
+    // more specific mapping (e.g. `install_timeout`) catch by code.
+    // Any other `r.error` (ENOENT, EACCES, EINVAL) means the process
+    // never started.
+    if ((r.error as NodeJS.ErrnoException).code === 'ETIMEDOUT') {
+      throw new WindowsSandboxError(
+        'srt_win_timeout',
+        `srt-win ${args.join(' ')} timed out after ` +
+          `${opts.timeoutMs ?? 15_000}ms` +
+          (r.signal ? ` (killed by ${r.signal})` : ''),
+        args[0],
+      )
+    }
+    throw new WindowsSandboxError(
+      'spawn_failed',
+      `srt-win ${args[0]}: spawn failed: ${r.error.message}`,
+      args[0],
+    )
   }
   return {
     status: r.status,
@@ -534,16 +648,20 @@ function runSrtWin(args: string[], opts: RunOpts = {}): RunResult {
 function runSrtWinJson<T>(args: string[], opts?: RunOpts): T {
   const r = runSrtWin(args, opts)
   if (r.status !== 0) {
-    throw new Error(
+    throw new WindowsSandboxError(
+      'srt_win_nonzero',
       `srt-win ${args.join(' ')} exited ${r.status}: ${r.stderr || r.stdout}`,
+      args[0],
     )
   }
   try {
     return JSON.parse(r.stdout) as T
   } catch (e) {
-    throw new Error(
+    throw new WindowsSandboxError(
+      'srt_win_bad_json',
       `srt-win ${args.join(' ')}: unparseable JSON output ` +
         `${JSON.stringify(r.stdout)}: ${(e as Error).message}`,
+      args[0],
     )
   }
 }
@@ -563,9 +681,11 @@ function runSrtWinJsonAllowFail<T>(
   try {
     json = JSON.parse(r.stdout) as T
   } catch (e) {
-    throw new Error(
+    throw new WindowsSandboxError(
+      'srt_win_bad_json',
       `srt-win ${args.join(' ')}: unparseable JSON output ` +
         `${JSON.stringify(r.stdout)}: ${(e as Error).message}`,
+      args[0],
     )
   }
   return { ok: r.status === 0, json, stderr: r.stderr }
@@ -574,6 +694,87 @@ function runSrtWinJsonAllowFail<T>(
 // ────────────────────────────────────────────────────────────────────
 // Status / install API
 // ────────────────────────────────────────────────────────────────────
+
+/** Shape of `srt-win wfp status` (and `srt-win status .wfp`) stdout. */
+type RawWfpStatus = {
+  state: WindowsWfpStatus
+  filters: number
+  port_range?: [number, number]
+  user_sid?: string
+  hint?: string
+}
+
+function mapWfpStatus(raw: RawWfpStatus): WindowsWfpStatusResult {
+  return {
+    state: raw.state,
+    filters: raw.filters,
+    ...(raw.port_range && { portRange: raw.port_range }),
+    ...(raw.user_sid && { userSid: raw.user_sid }),
+    ...(raw.hint && { hint: raw.hint }),
+  }
+}
+
+/** Shape of `srt-win user status` (and `srt-win status .user`) stdout. */
+type RawUserStatus = {
+  user: {
+    exists: boolean
+    sid?: string
+    group_exists: boolean
+    group_sid?: string
+    in_builtin_users: boolean
+    in_sandbox_group: boolean
+    hidden_from_logon: boolean
+  }
+  cred_present: boolean
+  marker_version?: number | null
+  real_user_sid: string
+  ca_cert_thumb?: string | null
+  ca_cert_pem?: string | null
+}
+
+function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
+  return {
+    provisioned: raw.user.exists,
+    ...(raw.user.sid && { sid: raw.user.sid }),
+    groupExists: raw.user.group_exists,
+    ...(raw.user.group_sid && { groupSid: raw.user.group_sid }),
+    inBuiltinUsers: raw.user.in_builtin_users,
+    inSandboxGroup: raw.user.in_sandbox_group,
+    hiddenFromLogon: raw.user.hidden_from_logon,
+    credPresent: raw.cred_present,
+    ...(typeof raw.marker_version === 'number' && {
+      markerVersion: raw.marker_version,
+    }),
+    realUserSid: raw.real_user_sid,
+    ...(raw.ca_cert_thumb && { caCertThumb: raw.ca_cert_thumb }),
+    ...(raw.ca_cert_pem && { caCertPem: raw.ca_cert_pem }),
+  }
+}
+
+/** Combined result of `srt-win status` — see {@link checkWindowsSandboxStatus}. */
+export interface WindowsSandboxStatus {
+  user: WindowsSandboxUserStatus
+  wfp: WindowsWfpStatusResult
+}
+
+/**
+ * Query sandbox-user provisioning state AND the WFP filter set in a
+ * single `srt-win status` spawn — the same objects
+ * {@link getWindowsSandboxUserStatus} and {@link getWindowsWfpStatus}
+ * return, without paying two subprocess round-trips. Does not require
+ * elevation (WFP degrades to `cannot-read` for a non-elevated caller;
+ * see {@link WindowsWfpStatusResult.hint}).
+ */
+export function checkWindowsSandboxStatus(
+  opts: { sublayerGuid?: string; srtWin?: SrtWinSpawn } = {},
+): WindowsSandboxStatus {
+  const args = ['status']
+  if (opts.sublayerGuid) args.push('--sublayer-guid', opts.sublayerGuid)
+  const raw = runSrtWinJson<{ user: RawUserStatus; wfp: RawWfpStatus }>(args, {
+    srtWin: opts.srtWin,
+  })
+  return { user: mapUserStatus(raw.user), wfp: mapWfpStatus(raw.wfp) }
+}
 
 /**
  * Query the WFP filter set under the given sublayer via live BFE
@@ -591,20 +792,9 @@ export function getWindowsWfpStatus(
 ): WindowsWfpStatusResult {
   const args = ['wfp', 'status']
   if (opts.sublayerGuid) args.push('--sublayer-guid', opts.sublayerGuid)
-  const raw = runSrtWinJson<{
-    state: WindowsWfpStatus
-    filters: number
-    port_range?: [number, number]
-    user_sid?: string
-    hint?: string
-  }>(args, { srtWin: opts.srtWin })
-  return {
-    state: raw.state,
-    filters: raw.filters,
-    ...(raw.port_range && { portRange: raw.port_range }),
-    ...(raw.user_sid && { userSid: raw.user_sid }),
-    ...(raw.hint && { hint: raw.hint }),
-  }
+  return mapWfpStatus(
+    runSrtWinJson<RawWfpStatus>(args, { srtWin: opts.srtWin }),
+  )
 }
 
 /**
@@ -658,7 +848,8 @@ export async function verifyWindowsWfpEgress(
       s.close()
     }
     if (!target) {
-      throw new Error(
+      throw new WindowsSandboxError(
+        'wfp_verify_bind_failed',
         `verifyWindowsWfpEgress: could not bind a loopback ` +
           `listener outside the WFP permit range [${lo},${hi}] in ` +
           `5 attempts`,
@@ -681,10 +872,12 @@ export async function verifyWindowsWfpEgress(
     try {
       raw = JSON.parse(r.stdout)
     } catch {
-      // status=null → spawnSync killed the child (timeout or external
-      // signal). Include signal + stderr so the CI log self-explains
-      // instead of just `exited null with unparseable output ""`.
-      throw new Error(
+      // Timeout is thrown as `srt_win_timeout` by `runSrtWin` before
+      // this parse; status=null here means an external signal.
+      // Include signal + stderr so the CI log self-explains instead
+      // of just `exited null with unparseable output ""`.
+      throw new WindowsSandboxError(
+        'wfp_verify_unparseable',
         `WFP egress fence could not be verified — \`srt-win wfp ` +
           `verify\` exited ${r.status}` +
           (r.signal ? ` (signal ${r.signal})` : '') +
@@ -693,14 +886,16 @@ export async function verifyWindowsWfpEgress(
       )
     }
     if (r.status === 3) {
-      throw new Error(
+      throw new WindowsSandboxError(
+        'wfp_fence_inactive',
         `WFP egress fence is not active — direct outbound from the ` +
           `sandbox user to ${raw.target} succeeded. Re-run ` +
           `\`srt-win install\` (one UAC prompt). (${r.stderr})`,
       )
     }
     if (r.status !== 0) {
-      throw new Error(
+      throw new WindowsSandboxError(
+        'wfp_verify_inconclusive',
         `WFP egress fence could not be verified — probe to ` +
           `${raw.target} was '${raw.egress_probe}' (exit ` +
           `${r.status}). The fence may be absent. Re-run \`srt-win ` +
@@ -722,38 +917,9 @@ export async function verifyWindowsWfpEgress(
 export function getWindowsSandboxUserStatus(
   opts: { srtWin?: SrtWinSpawn } = {},
 ): WindowsSandboxUserStatus {
-  const raw = runSrtWinJson<{
-    user: {
-      exists: boolean
-      sid?: string
-      group_exists: boolean
-      group_sid?: string
-      in_builtin_users: boolean
-      in_sandbox_group: boolean
-      hidden_from_logon: boolean
-    }
-    cred_present: boolean
-    marker_version?: number | null
-    real_user_sid: string
-    ca_cert_thumb?: string | null
-    ca_cert_pem?: string | null
-  }>(['user', 'status'], { srtWin: opts.srtWin })
-  return {
-    provisioned: raw.user.exists,
-    ...(raw.user.sid && { sid: raw.user.sid }),
-    groupExists: raw.user.group_exists,
-    ...(raw.user.group_sid && { groupSid: raw.user.group_sid }),
-    inBuiltinUsers: raw.user.in_builtin_users,
-    inSandboxGroup: raw.user.in_sandbox_group,
-    hiddenFromLogon: raw.user.hidden_from_logon,
-    credPresent: raw.cred_present,
-    ...(typeof raw.marker_version === 'number' && {
-      markerVersion: raw.marker_version,
-    }),
-    realUserSid: raw.real_user_sid,
-    ...(raw.ca_cert_thumb && { caCertThumb: raw.ca_cert_thumb }),
-    ...(raw.ca_cert_pem && { caCertPem: raw.ca_cert_pem }),
-  }
+  return mapUserStatus(
+    runSrtWinJson<RawUserStatus>(['user', 'status'], { srtWin: opts.srtWin }),
+  )
 }
 
 /**
@@ -811,7 +977,8 @@ export function windowsTrustCa(
     `[Sandbox Windows] user trust-ca exit=${r.status}: ${r.stderr || r.stdout}`,
   )
   if (r.status !== 0) {
-    throw new Error(
+    throw new WindowsSandboxError(
+      'trust_ca_failed',
       `srt-win user trust-ca '${caCertPath}' failed (exit ` +
         `${r.status}): ${r.stderr || r.stdout}`,
     )
@@ -891,7 +1058,19 @@ export function installWindowsSandbox(
   if (opts.sandboxUser) args.push('--sandbox-user', opts.sandboxUser)
   if (opts.force) args.push('--force')
 
-  const r = runSrtWin(args, { timeoutMs: 60_000, srtWin })
+  let r: RunResult
+  try {
+    r = runSrtWin(args, { timeoutMs: 60_000, srtWin })
+  } catch (e) {
+    if (e instanceof WindowsSandboxError && e.code === 'srt_win_timeout') {
+      throw new WindowsSandboxError(
+        'install_timeout',
+        `srt-win install timed out — the UAC prompt may still be open. ` +
+          `Re-run when ready to grant elevation. (${e.message})`,
+      )
+    }
+    throw e
+  }
   logForDebugging(
     `[Sandbox Windows] install exit=${r.status}: ${r.stderr || r.stdout}`,
   )
@@ -904,30 +1083,36 @@ export function installWindowsSandbox(
   //   14 sandbox-user provisioning failed
   //   1  other error (stderr has detail)
   const out = r.stderr || r.stdout
-  const readBack = () => ({
-    wfp: getWindowsWfpStatus({ sublayerGuid: opts.sublayerGuid, srtWin }),
-    user: getWindowsSandboxUserStatus({ srtWin }),
-  })
+  const readBack = () =>
+    checkWindowsSandboxStatus({ sublayerGuid: opts.sublayerGuid, srtWin })
   switch (r.status) {
     case 0:
       return readBack()
     case 10:
       return { ...readBack(), cancelled: true }
     case 12:
-      throw new Error(`srt-win install: WFP filter install failed: ${out}`)
+      throw new WindowsSandboxError(
+        'install_wfp_failed',
+        `srt-win install: WFP filter install failed: ${out}`,
+      )
     case 14:
-      throw new Error(
+      throw new WindowsSandboxError(
+        'install_user_failed',
         `srt-win install: sandbox user provisioning failed: ${out}`,
       )
     case 13:
-      throw new Error(
+      throw new WindowsSandboxError(
+        'install_config_conflict',
         `srt-win install: filters already exist under this sublayer with ` +
           `a different port range or sandbox-user name. Pass ` +
           `{force: true} to replace, or pick a different sublayerGuid. ` +
           `Output: ${out}`,
       )
     default:
-      throw new Error(`srt-win install failed (exit ${r.status}): ${out}`)
+      throw new WindowsSandboxError(
+        'install_failed',
+        `srt-win install failed (exit ${r.status}): ${out}`,
+      )
   }
 }
 
@@ -956,7 +1141,8 @@ export function uninstallWindowsSandbox(
   )
   if (r.status === 10) return { cancelled: true }
   if (r.status !== 0) {
-    throw new Error(
+    throw new WindowsSandboxError(
+      'uninstall_failed',
       `srt-win uninstall failed (exit ${r.status}): ${r.stderr || r.stdout}`,
     )
   }
@@ -1040,7 +1226,8 @@ export function stampWindowsAcl(opts: WindowsAclStampOptions): void {
     `[Sandbox Windows] acl stamp exit=${r.status}: ${r.stderr || r.stdout}`,
   )
   if (r.status !== 0) {
-    throw new Error(
+    throw new WindowsSandboxError(
+      'acl_stamp_failed',
       `srt-win acl stamp exited ${r.status} ` +
         (r.status === 2 ? '(partial — some inputs skipped)' : '(failed)') +
         `: ${r.stderr || r.stdout}`,
@@ -1158,7 +1345,8 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
     `[Sandbox Windows] acl grant exit=${r.status}: ${r.stderr || r.stdout}`,
   )
   if (r.status !== 0) {
-    throw new Error(
+    throw new WindowsSandboxError(
+      'acl_grant_failed',
       `srt-win acl grant exited ${r.status}: ${r.stderr || r.stdout}`,
     )
   }
@@ -1318,7 +1506,8 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // for the quote overhead the estimate doesn't model.
   const cmdlineEstimate = argv.reduce((n, a) => n + a.length + 3, 0)
   if (cmdlineEstimate > 30_000) {
-    throw new Error(
+    throw new WindowsSandboxError(
+      'argv_too_long',
       `Windows sandbox argv is ~${cmdlineEstimate} chars ` +
         `(CreateProcessW limit is 32 767).`,
     )

@@ -21,8 +21,10 @@ import {
   getSrtWinPath,
   getWindowsWfpStatus,
   getWindowsSandboxUserStatus,
+  checkWindowsSandboxStatus,
   installWindowsSandbox,
   uninstallWindowsSandbox,
+  WindowsSandboxError,
   verifyWindowsWfpEgress,
   windowsTrustCa,
   wrapCommandWithSandboxWindows,
@@ -414,6 +416,33 @@ describe('parseWindowsBinShell (pure, all platforms)', () => {
   })
 })
 
+describe('WindowsSandboxError (pure, all platforms)', () => {
+  it('carries a stable .code and is instanceof Error', () => {
+    const e = new WindowsSandboxError('install_config_conflict', 'x')
+    expect(e).toBeInstanceOf(Error)
+    expect(e).toBeInstanceOf(WindowsSandboxError)
+    expect(e.code).toBe('install_config_conflict')
+    expect(e.name).toBe('WindowsSandboxError')
+    expect(e.message).toBe('x')
+    expect(e.subcommand).toBeUndefined()
+    // Spawn-helper throws set .subcommand to args[0].
+    const s = new WindowsSandboxError('srt_win_timeout', 'y', 'install')
+    expect(s.subcommand).toBe('install')
+  })
+
+  it('parseWindowsBinShell throws with .code = bin_shell_invalid', () => {
+    // Consumers branch on `.code` instead of prose-matching `.message`.
+    let err: unknown
+    try {
+      parseWindowsBinShell('zsh')
+    } catch (e) {
+      err = e
+    }
+    expect(err).toBeInstanceOf(WindowsSandboxError)
+    expect((err as WindowsSandboxError).code).toBe('bin_shell_invalid')
+  })
+})
+
 describe('WindowsConfigSchema.sandboxUser (pure, all platforms)', () => {
   it('accepts a valid name and rejects empty / >20 chars', () => {
     expect(
@@ -665,6 +694,18 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect(r.user.credPresent).toBe(true)
       expect(r.user.markerVersion).toBe(1)
       expect(r.wfp.userSid).toBe(r.user.sid)
+      // Combined `srt-win status` returns the same objects the two
+      // per-noun calls do (one spawn instead of two).
+      const c = checkWindowsSandboxStatus({
+        sublayerGuid: sl,
+        srtWin: TEST_SRT_WIN,
+      })
+      expect(c.wfp).toEqual(
+        getWindowsWfpStatus({ sublayerGuid: sl, srtWin: TEST_SRT_WIN }),
+      )
+      expect(c.user).toEqual(
+        getWindowsSandboxUserStatus({ srtWin: TEST_SRT_WIN }),
+      )
       // Idempotent re-run with the SAME config also succeeds.
       const r2 = installWindowsSandbox({
         sublayerGuid: sl,
@@ -694,14 +735,20 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
         srtWin: TEST_SRT_WIN,
       })
       // Re-install with a DIFFERENT port range under the same
-      // sublayer without force → exit 13 → throw.
-      expect(() =>
+      // sublayer without force → exit 13 → throw with a stable
+      // .code (message text is diagnostic and may change).
+      let err: unknown
+      try {
         installWindowsSandbox({
           sublayerGuid: sl,
           proxyPortRange: [PORT_RANGE[0], PORT_RANGE[0] + 1],
           srtWin: TEST_SRT_WIN,
-        }),
-      ).toThrow(/already exist.*different/i)
+        })
+      } catch (e) {
+        err = e
+      }
+      expect(err).toBeInstanceOf(WindowsSandboxError)
+      expect((err as WindowsSandboxError).code).toBe('install_config_conflict')
       // With force → succeeds and replaces.
       const r = installWindowsSandbox({
         sublayerGuid: sl,

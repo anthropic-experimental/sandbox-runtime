@@ -67,6 +67,7 @@ import {
   getWindowsSandboxCaCert,
   verifyWindowsWfpEgress,
   resolveSrtWin,
+  WindowsSandboxError,
   type SrtWinSpawn,
   type WindowsBinShell,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
@@ -514,7 +515,8 @@ async function initialize(
     const u = getWindowsSandboxUserStatus({ srtWin })
     if (!u.provisioned || !u.credPresent) {
       config = undefined
-      throw new Error(
+      throw new WindowsSandboxError(
+        'not_provisioned',
         `Windows sandbox user is not provisioned (user=` +
           `${u.provisioned}, cred=${u.credPresent}). Run \`npx ` +
           `sandbox-runtime windows-install\` (one UAC prompt) to ` +
@@ -555,7 +557,8 @@ async function initialize(
         .toUpperCase()
       if (!installed) {
         config = undefined
-        throw new Error(
+        throw new WindowsSandboxError(
+          'trust_ca_not_installed',
           `tlsTerminate on Windows requires the sandbox to be ` +
             `installed with this CA (thumb=${sessionThumb}): run ` +
             `\`srt-win user trust-ca ${mitmCA.certPath}\`. Per-exec ` +
@@ -565,7 +568,8 @@ async function initialize(
       }
       if (installed.thumb !== sessionThumb) {
         config = undefined
-        throw new Error(
+        throw new WindowsSandboxError(
+          'trust_ca_thumbprint_mismatch',
           `tlsTerminate on Windows: the sandbox's installed CA ` +
             `(thumb=${installed.thumb}) doesn't match this ` +
             `session's CA (thumb=${sessionThumb}). Run \`srt-win ` +

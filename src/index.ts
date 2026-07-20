@@ -46,9 +46,11 @@ export { type SandboxDependencyCheck } from './sandbox/linux-sandbox-utils.js'
 
 // Windows install/status API
 export {
+  WindowsSandboxError,
   getSrtWinPath,
   resolveSrtWin,
   VENDORED_SRT_WIN_EXE,
+  checkWindowsSandboxStatus,
   getWindowsWfpStatus,
   verifyWindowsWfpEgress,
   getWindowsSandboxUserStatus,
@@ -68,6 +70,8 @@ export {
   SRT_WIN_DISPATCH_ARG1,
 } from './sandbox/windows-sandbox-utils.js'
 export type {
+  WindowsSandboxErrorCode,
+  WindowsSandboxStatus,
   WindowsBinShell,
   WindowsInstallOptions,
   WindowsInstallResult,
