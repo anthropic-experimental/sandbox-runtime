@@ -1048,9 +1048,7 @@ describe.if(isMacOS)('macOS Seatbelt move-blocking rule deduplication', () => {
 
     // All three siblings share `parent` as an ancestor. It must be pinned
     // exactly once per op (unlink + create), not once per protected path.
-    // Strip shell-quote escaping before matching the literal filter.
-    const profileText = wrappedCommand.replace(/\\/g, '')
-    const occurrences = profileText.split(`(literal "${parent}")`).length - 1
+    const occurrences = wrappedCommand.split(`(literal "${parent}")`).length - 1
     expect(occurrences).toBe(2)
   })
 })
