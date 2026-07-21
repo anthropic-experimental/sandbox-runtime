@@ -1174,6 +1174,10 @@ function getAllowGitConfig(): boolean {
   return config?.filesystem?.allowGitConfig ?? false
 }
 
+function getAllowGitHooks(): boolean {
+  return config?.filesystem?.allowGitHooks ?? false
+}
+
 function getSeccompConfig(): SeccompConfig | undefined {
   return config?.seccomp
 }
@@ -1348,6 +1352,11 @@ async function wrapWithSandbox(
   // Check custom config to allow pseudo-terminal (can be applied dynamically)
   const allowPty = customConfig?.allowPty ?? config?.allowPty
 
+  const allowGitConfig =
+    customConfig?.filesystem?.allowGitConfig ?? getAllowGitConfig()
+  const allowGitHooks =
+    customConfig?.filesystem?.allowGitHooks ?? getAllowGitHooks()
+
   switch (platform) {
     case 'macos':
       // macOS sandbox profile supports glob patterns directly, no ripgrep needed
@@ -1370,7 +1379,8 @@ async function wrapWithSandbox(
         allowMachLookup: getAllowMachLookup(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
-        allowGitConfig: getAllowGitConfig(),
+        allowGitConfig,
+        allowGitHooks,
         enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
         allowAppleEvents: getAllowAppleEvents(),
         binShell,
@@ -1406,7 +1416,8 @@ async function wrapWithSandbox(
         binShell,
         ripgrepConfig: getRipgrepConfig(),
         mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
-        allowGitConfig: getAllowGitConfig(),
+        allowGitConfig,
+        allowGitHooks,
         seccompConfig: getSeccompConfig(),
         bwrapPath: config?.bwrapPath,
         socatPath: config?.socatPath,

@@ -268,7 +268,9 @@ srt --settings /path/to/srt-settings.json <command>
     "denyRead": ["~/.ssh"],
     "allowRead": [],
     "allowWrite": [".", "src/", "test/", "/tmp"],
-    "denyWrite": [".env", "config/production.json"]
+    "denyWrite": [".env", "config/production.json"],
+    "allowGitConfig": false,
+    "allowGitHooks": false
   },
   "ignoreViolations": {
     "*": ["/usr/bin", "/System"],
@@ -336,6 +338,8 @@ Uses two different patterns:
 
 - `filesystem.allowWrite` - Array of paths to allow write access. Empty array = no write access.
 - `filesystem.denyWrite` - Array of paths to deny write access within allowed paths (takes precedence over allowWrite)
+- `filesystem.allowGitConfig` - Allow writes to `.git/config` files (default: false)
+- `filesystem.allowGitHooks` - Allow writes to `.git/hooks/` directories (default: false). This enables operations like `git init` to install sample hooks, but also allows creating executable hooks.
 
 **Path Syntax (macOS):**
 
@@ -647,7 +651,7 @@ Certain sensitive files and directories are **always blocked from writes**, even
 
 - IDE directories: `.vscode/`, `.idea/`
 - Claude config directories: `.claude/commands/`, `.claude/agents/`
-- Git hooks and config: `.git/hooks/`, `.git/config`
+- Git hooks and config: `.git/hooks/`, `.git/config` (unless `allowGitHooks` or `allowGitConfig` is enabled, respectively)
 
 These paths are blocked automatically - you don't need to add them to `denyWrite`. For example, even with `allowWrite: ["."]`, writing to `.bashrc` or `.git/hooks/pre-commit` will fail:
 

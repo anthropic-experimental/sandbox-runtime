@@ -48,6 +48,7 @@ export interface MacOSSandboxParams {
   ignoreViolations?: IgnoreViolationsConfig | undefined
   allowPty?: boolean
   allowGitConfig?: boolean
+  allowGitHooks?: boolean
   enableWeakerNetworkIsolation?: boolean
   allowAppleEvents?: boolean
   binShell?: string
@@ -57,7 +58,10 @@ export interface MacOSSandboxParams {
  * Get mandatory deny patterns as glob patterns (no filesystem scanning).
  * macOS sandbox profile supports regex/glob matching directly via globToRegex().
  */
-export function macGetMandatoryDenyPatterns(allowGitConfig = false): string[] {
+export function macGetMandatoryDenyPatterns(
+  allowGitConfig = false,
+  allowGitHooks = false,
+): string[] {
   const cwd = process.cwd()
   const denyPaths: string[] = []
 
@@ -73,9 +77,11 @@ export function macGetMandatoryDenyPatterns(allowGitConfig = false): string[] {
     denyPaths.push(`**/${dirName}/**`)
   }
 
-  // Git hooks are always blocked for security
-  denyPaths.push(path.resolve(cwd, '.git/hooks'))
-  denyPaths.push('**/.git/hooks/**')
+  // Git hooks - conditionally blocked based on allowGitHooks setting
+  if (!allowGitHooks) {
+    denyPaths.push(path.resolve(cwd, '.git/hooks'))
+    denyPaths.push('**/.git/hooks/**')
+  }
 
   // Git config - conditionally blocked based on allowGitConfig setting
   if (!allowGitConfig) {
@@ -378,6 +384,7 @@ function generateWriteRules(
   config: FsWriteRestrictionConfig | undefined,
   logTag: string,
   allowGitConfig = false,
+  allowGitHooks = false,
 ): string[] {
   if (!config) {
     return [`(allow file-write*)`]
@@ -410,7 +417,7 @@ function generateWriteRules(
   // Combine user-specified and mandatory deny patterns (no ripgrep needed on macOS)
   const denyPaths = [
     ...(config.denyWithinAllow || []),
-    ...macGetMandatoryDenyPatterns(allowGitConfig),
+    ...macGetMandatoryDenyPatterns(allowGitConfig, allowGitHooks),
   ]
 
   for (const pathPattern of denyPaths) {
@@ -455,6 +462,7 @@ function generateSandboxProfile({
   allowMachLookup,
   allowPty,
   allowGitConfig = false,
+  allowGitHooks = false,
   enableWeakerNetworkIsolation = false,
   allowAppleEvents = false,
   logTag,
@@ -470,6 +478,7 @@ function generateSandboxProfile({
   allowMachLookup?: string[]
   allowPty?: boolean
   allowGitConfig?: boolean
+  allowGitHooks?: boolean
   enableWeakerNetworkIsolation?: boolean
   allowAppleEvents?: boolean
   logTag: string
@@ -750,7 +759,9 @@ function generateSandboxProfile({
 
   // Write rules
   profile.push('; File write')
-  profile.push(...generateWriteRules(writeConfig, logTag, allowGitConfig))
+  profile.push(
+    ...generateWriteRules(writeConfig, logTag, allowGitConfig, allowGitHooks),
+  )
 
   // Pseudo-terminal (pty) support
   if (allowPty) {
@@ -801,6 +812,7 @@ export function wrapCommandWithSandboxMacOS(
     maskedFileBinds,
     allowPty,
     allowGitConfig = false,
+    allowGitHooks = false,
     enableWeakerNetworkIsolation = false,
     allowAppleEvents = false,
     binShell,
@@ -859,6 +871,7 @@ export function wrapCommandWithSandboxMacOS(
     allowMachLookup,
     allowPty,
     allowGitConfig,
+    allowGitHooks,
     enableWeakerNetworkIsolation,
     allowAppleEvents,
     logTag,

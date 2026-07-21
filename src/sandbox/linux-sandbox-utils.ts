@@ -68,6 +68,8 @@ export interface LinuxSandboxParams {
   mandatoryDenySearchDepth?: number
   /** Allow writes to .git/config files (default: false) */
   allowGitConfig?: boolean
+  /** Allow writes to .git/hooks directories (default: false) */
+  allowGitHooks?: boolean
   /** Custom seccomp binary paths */
   seccompConfig?: SeccompConfig
   /** Absolute path to the bwrap binary (default: resolve "bwrap" via PATH) */
@@ -262,6 +264,7 @@ async function linuxGetMandatoryDenyPaths(
   ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
   maxDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
+  allowGitHooks = false,
   abortSignal?: AbortSignal,
 ): Promise<string[]> {
   const cwd = process.cwd()
@@ -292,8 +295,10 @@ async function linuxGetMandatoryDenyPaths(
   }
 
   if (dotGitIsDirectory) {
-    // Git hooks always blocked for security
-    denyPaths.push(path.resolve(cwd, '.git/hooks'))
+    // Git hooks conditionally blocked based on allowGitHooks setting
+    if (!allowGitHooks) {
+      denyPaths.push(path.resolve(cwd, '.git/hooks'))
+    }
 
     // Git config conditionally blocked based on allowGitConfig setting
     if (!allowGitConfig) {
@@ -309,8 +314,10 @@ async function linuxGetMandatoryDenyPaths(
   for (const dirName of dangerousDirectories) {
     iglobArgs.push('--iglob', `**/${dirName}/**`)
   }
-  // Git hooks always blocked in nested repos
-  iglobArgs.push('--iglob', '**/.git/hooks/**')
+  // Git hooks conditionally blocked in nested repos
+  if (!allowGitHooks) {
+    iglobArgs.push('--iglob', '**/.git/hooks/**')
+  }
 
   // Git config conditionally blocked in nested repos
   if (!allowGitConfig) {
@@ -896,6 +903,7 @@ async function generateFilesystemArgs(
   ripgrepConfig: { command: string; args?: string[] } = { command: 'rg' },
   mandatoryDenySearchDepth: number = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
   allowGitConfig = false,
+  allowGitHooks = false,
   abortSignal?: AbortSignal,
 ): Promise<string[]> {
   const args: string[] = []
@@ -977,6 +985,7 @@ async function generateFilesystemArgs(
         ripgrepConfig,
         mandatoryDenySearchDepth,
         allowGitConfig,
+        allowGitHooks,
         abortSignal,
       )),
     ]
@@ -1417,6 +1426,7 @@ export async function wrapCommandWithSandboxLinux(
     ripgrepConfig = { command: 'rg' },
     mandatoryDenySearchDepth = DEFAULT_MANDATORY_DENY_SEARCH_DEPTH,
     allowGitConfig = false,
+    allowGitHooks = false,
     seccompConfig,
     bwrapPath,
     socatPath,
@@ -1602,6 +1612,7 @@ export async function wrapCommandWithSandboxLinux(
       ripgrepConfig,
       mandatoryDenySearchDepth,
       allowGitConfig,
+      allowGitHooks,
       abortSignal,
     )
     bwrapArgs.push(...fsArgs)
