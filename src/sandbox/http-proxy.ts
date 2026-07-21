@@ -21,6 +21,7 @@ import {
   prepareBodySubstitution,
   type GetBodySubstitutions,
 } from './body-substitution.js'
+import type { PlanSigv4 } from './credential-aws-pairs.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import {
   connectViaParentProxy,
@@ -110,6 +111,23 @@ export interface HttpProxyServerOptions {
    * separate: credential injection over plaintext is opt-in.
    */
   getBodySubstitutionsPlaintext?: GetBodySubstitutions
+
+  /**
+   * Per-request AWS SigV4 hook on the TLS-terminated path. Runs in
+   * forwardUpstream around `mutateHeaders`: requests whose signature
+   * references a masked credential pair are re-signed with the real
+   * credentials (or denied per policy for shapes that cannot be
+   * re-signed); everything else is untouched. See credential-aws-pairs.ts.
+   */
+  planSigv4?: PlanSigv4
+
+  /**
+   * Override for the SigV4 literal-hash body buffering cap
+   * (MAX_SIGV4_RESIGN_BODY_BYTES). Primarily a test seam — exercising the
+   * over-cap denial with the production 64 MiB value would need a 64 MiB
+   * fixture upload per test.
+   */
+  maxSigv4ResignBodyBytes?: number
 
   /**
    * Additional trusted CA(s) for the terminating proxy's outbound TLS leg.
@@ -224,6 +242,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             socket,
             peeked.head,
             { hostname, port, upstreamCA: options.tlsTerminateUpstreamCA },
+            options.planSigv4,
+            options.maxSigv4ResignBodyBytes,
           )
           return
         }

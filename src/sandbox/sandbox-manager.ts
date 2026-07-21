@@ -10,6 +10,12 @@ import {
 } from './credential-mask-files.js'
 import { buildMaskedEnvVars } from './credential-mask-env.js'
 import {
+  AwsPairRegistry,
+  createSigv4Planner,
+  registerAwsPairs,
+  type PlanSigv4,
+} from './credential-aws-pairs.js'
+import {
   createMitmCA,
   CRL_PATH,
   disposeMitmCA,
@@ -140,6 +146,10 @@ const sandboxViolationStore = new SandboxViolationStore()
 // Per-session sentinel↔real-value map for masked credentials. Lives only in
 // process memory; never written to disk or logged. Cleared on reset().
 const sentinelRegistry = new SentinelRegistry()
+// Per-session linked AWS credential pairs for SigV4 re-signing, keyed by
+// the fake access key id. Same lifecycle and secrecy posture as the
+// sentinel registry.
+const awsPairRegistry = new AwsPairRegistry()
 // Temp dir holding the sentinel-content fake files for masked credential
 // files. Created lazily on first masked file; removed on reset().
 const maskedFileStore = new MaskedFileStore()
@@ -271,6 +281,25 @@ function buildBodyCredentialInjector(): GetBodySubstitutions | undefined {
     sentinelRegistry.sentinelsForHost(destHost, matchesDomainPattern)
 }
 
+/**
+ * Build the per-request SigV4 hook for the TLS-terminating proxy.
+ * Returns undefined when no `credentials` block is configured. The hook
+ * consults {@link awsPairRegistry} at request time, so pairs registered
+ * later (wrapWithSandbox runs after the proxy starts) are picked up.
+ */
+function buildSigv4Planner(): PlanSigv4 | undefined {
+  if (!config?.credentials) return undefined
+  // Re-read the policies per request (not captured at proxy start) so an
+  // updateConfig() that changes credentials.sigv4 takes effect without a
+  // proxy restart, matching how the injector sees live registry state.
+  return (method, requestTarget, headers, destHost) =>
+    createSigv4Planner(
+      awsPairRegistry,
+      config?.credentials?.sigv4,
+      matchesDomainPattern,
+    )(method, requestTarget, headers, destHost)
+}
+
 function getMitmSocketPath(host: string): string | undefined {
   if (!config?.network.mitmProxy) {
     return undefined
@@ -355,6 +384,9 @@ async function startMuxProxyServer(
     getBodySubstitutionsPlaintext: config?.credentials?.allowPlaintextInject
       ? injectBodyCredentials
       : undefined,
+    // SigV4 re-signing is TLS-terminated-path only, like credential
+    // injection: the real signature must not travel over plaintext.
+    planSigv4: buildSigv4Planner(),
     parentProxy,
     proxyAuthToken,
   })
@@ -820,6 +852,17 @@ function getCredentialRestrictions(
     sentinelRegistry,
   )
   unsetEnvVars.push(...degradeToUnsetNames)
+
+  // Link masked AWS credentials into pairs so the proxy can re-sign
+  // SigV4 requests (the signature is derived from the secret; header
+  // substitution alone cannot fix it).
+  registerAwsPairs(
+    credentials.envVars ?? [],
+    credentials.awsPairs,
+    allowedDomains ?? [],
+    setEnvVars,
+    awsPairRegistry,
+  )
 
   // Masked files: read the real bytes on the host, register a sentinel,
   // write it to a fake file in the manager-owned temp dir. Missing/unreadable
@@ -1845,6 +1888,7 @@ async function reset(): Promise<void> {
   parentProxy = undefined
   mitmCA = undefined
   sentinelRegistry.clear()
+  awsPairRegistry.clear()
   maskedFileStore.dispose()
 }
 
@@ -1963,6 +2007,7 @@ export interface ISandboxManager {
   getConfig(): SandboxRuntimeConfig | undefined
   getMitmCA(): MitmCA | undefined
   getSentinelRegistry(): SentinelRegistry
+  getAwsPairRegistry(): AwsPairRegistry
   getMaskedFileStore(): MaskedFileStore
   updateConfig(newConfig: SandboxRuntimeConfig): void
   cleanupAfterCommand(): void
@@ -2002,6 +2047,7 @@ export const SandboxManager: ISandboxManager = {
   reset,
   getMitmCA: () => mitmCA,
   getSentinelRegistry: () => sentinelRegistry,
+  getAwsPairRegistry: () => awsPairRegistry,
   getMaskedFileStore: () => maskedFileStore,
   getSandboxViolationStore,
   annotateStderrWithSandboxFailures,

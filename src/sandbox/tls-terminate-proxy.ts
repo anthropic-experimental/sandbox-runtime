@@ -23,6 +23,7 @@ import { logForDebugging } from '../utils/debug.js'
 import type { MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
+  respondDenied,
   type FilterRequestCallback,
   type MutateForwardedHeaders,
 } from './request-filter.js'
@@ -32,6 +33,22 @@ import {
 } from './body-substitution.js'
 import { mintLeafCert, secureContextFor } from './mitm-leaf.js'
 import { stripHopByHop } from './parent-proxy.js'
+import { sha256Hex } from './aws-sigv4.js'
+import type { PlanSigv4 } from './credential-aws-pairs.js'
+
+/**
+ * Upper bound on the request body the proxy will buffer to recompute a
+ * literal SigV4 body hash. The signature must cover the exact bytes sent
+ * upstream, so buffering is unavoidable for that shape — but without a
+ * cap a sandboxed client could pin arbitrary host memory with one large
+ * signed upload (awslabs/aws-sigv4-proxy buffers with no limit; we fail
+ * closed instead). Bodies over the cap are denied with a 403; clients
+ * with larger payloads should sign UNSIGNED-PAYLOAD, which streams.
+ */
+export const MAX_SIGV4_RESIGN_BODY_BYTES = 64 * 1024 * 1024
+
+/** Rejection cause when a body exceeds {@link MAX_SIGV4_RESIGN_BODY_BYTES}. */
+class BodyTooLargeError extends Error {}
 
 /**
  * True if `buf` starts with a TLS Handshake record header.
@@ -90,6 +107,36 @@ export function peekForClientHello(
   })
 }
 
+/**
+ * Relay `src` into `dst` with paused-mode reads (`'readable'` + `read()`)
+ * instead of `src.pipe(dst)`.
+ *
+ * `pipe()` throttles a flowing source with `pause()`/`resume()`, and under
+ * Bun a socket delivered by an http server's `'connect'` event corrupts its
+ * byte stream across those pause/resume cycles once writes queue (reliably
+ * reproducible with multi-megabyte uploads; the TLS server behind the relay
+ * then fails record MAC verification and the client sees `bad_record_mac` /
+ * a mid-upload reset). Pull-mode reads never call `pause()` and provide the
+ * same flow control: `read()` is only called while `dst` has buffer space,
+ * so the kernel backpressures the peer identically. Do not replace this
+ * with `pipe()` — under Node both are equivalent, but under Bun only this
+ * form is safe for CONNECT-upgraded sockets.
+ */
+function relayPullMode(src: Duplex, dst: Duplex): void {
+  const pump = (): void => {
+    let chunk: Buffer | string | null
+    while ((chunk = src.read() as Buffer | string | null) !== null) {
+      if (!dst.write(chunk)) {
+        dst.once('drain', pump)
+        return
+      }
+    }
+    src.once('readable', pump)
+  }
+  pump()
+  src.once('end', () => dst.end())
+}
+
 export type TerminateTarget = {
   hostname: string
   port: number
@@ -125,6 +172,8 @@ export function terminateAndForward(
   socket: Duplex,
   head: Buffer,
   target: TerminateTarget,
+  planSigv4?: PlanSigv4,
+  maxSigv4BodyBytes: number = MAX_SIGV4_RESIGN_BODY_BYTES,
 ): void {
   // ALPN advertises HTTP/1.1 only — terminating HTTP/2 would require a frame
   // parser; clients negotiate down. The base secureContext covers clients
@@ -151,6 +200,8 @@ export function terminateAndForward(
       req,
       res,
       target,
+      planSigv4,
+      maxSigv4BodyBytes,
     )
   })
   inner.on('tlsClientError', (err, sock) => {
@@ -194,7 +245,7 @@ export function terminateAndForward(
       // The caller wrote `200 Connection Established` before sniffing for the
       // ClientHello; `head` holds whatever the sniff consumed.
       if (head.length) loop.write(head)
-      socket.pipe(loop)
+      relayPullMode(socket, loop)
       loop.pipe(socket)
     })
     socket.on('error', () => loop.destroy())
@@ -214,6 +265,8 @@ async function forwardUpstream(
   req: IncomingMessage,
   res: ServerResponse,
   target: TerminateTarget,
+  planSigv4?: PlanSigv4,
+  maxSigv4BodyBytes: number = MAX_SIGV4_RESIGN_BODY_BYTES,
 ): Promise<void> {
   // req.url is the request-target verbatim. Inside a CONNECT tunnel almost
   // every client sends origin-form (`/path?q`), but RFC 7230 §5.3.2 also
@@ -263,6 +316,18 @@ async function forwardUpstream(
   // correct verification under both Node and Bun.
   const fwdHeaders = stripHopByHop(req.headers)
   delete fwdHeaders.host
+  // SigV4 planning runs on the PRE-substitution headers (the trigger is
+  // the fake access key id in the credential scope, which the header
+  // substitution below replaces) but on the POST-strip view: the plan's
+  // signed-header presence check must see exactly the set that will be
+  // signed and forwarded, or a signed hop-by-hop header would pass the
+  // check and then blow up inside the signer.
+  const sigv4Plan = planSigv4?.(
+    req.method ?? 'GET',
+    path,
+    fwdHeaders,
+    target.hostname,
+  )
   // Header mutation runs after the allow decision and before httpsRequest.
   // The upstream TLS handshake (rejectUnauthorized defaults to true)
   // completes before any HTTP bytes are written, so mutated headers never
@@ -277,6 +342,81 @@ async function forwardUpstream(
     fwdHeaders,
     target.hostname,
   )
+
+  // SigV4 re-signing runs after substitution so the new signature covers
+  // the headers as they actually go upstream (real access key id, real
+  // session token). Same denial surface as filterRequest.
+  let bufferedBody: Buffer | undefined
+  if (sigv4Plan?.action === 'deny') {
+    respondDenied(res, sigv4Plan.reason)
+    body.destroy()
+    return
+  }
+  if (sigv4Plan?.action === 'resign') {
+    let payloadHash = sigv4Plan.payloadHash
+    if (payloadHash === undefined) {
+      // The client signed a literal body hash: buffer the body and
+      // recompute so the signature covers the bytes actually sent. Body
+      // substitution runs FIRST — the buffered bytes (and therefore the
+      // hash and signature) must be the substituted body, not the
+      // sentinel-bearing one the client wrote.
+      const bodySource = bodyTransform ? body.pipe(bodyTransform) : body
+      if (bodyTransform) {
+        body.on('error', err => bodyTransform.destroy(err))
+      }
+      try {
+        bufferedBody = await collectBody(bodySource, maxSigv4BodyBytes)
+      } catch (err) {
+        if (err instanceof BodyTooLargeError) {
+          respondDenied(
+            res,
+            `AWS SigV4 request uses a masked credential and signs a ` +
+              `literal body hash, so the proxy must buffer the body to ` +
+              `re-sign it, but the body exceeds the ` +
+              `${maxSigv4BodyBytes}-byte buffering limit; denied. Sign ` +
+              `the payload as UNSIGNED-PAYLOAD to stream it without ` +
+              `buffering, or use an unmasked credential to have the ` +
+              `request forwarded untouched.`,
+          )
+          // Drain (discarding) whatever the client is still sending so it
+          // can read the 403 instead of seeing a reset mid-upload.
+          bodySource.resume()
+          return
+        }
+        logForDebugging(
+          `[tls-terminate] failed to buffer body for SigV4 re-sign: ${(err as Error).message}`,
+          { level: 'error' },
+        )
+        res.destroy()
+        return
+      }
+      payloadHash = sha256Hex(bufferedBody)
+      // Substitution may have re-framed the request (Content-Length is
+      // deleted when a sentinel is not length-matched); the body is now
+      // fully buffered so its exact length is known — restore the header
+      // so the upstream leg and any signed content-length stay consistent.
+      if (bodyTransform) {
+        fwdHeaders['content-length'] = String(bufferedBody.length)
+      }
+    }
+    // Mirror the Host value the runtime derives from {host, port} below.
+    const bracketedHost =
+      isIP(target.hostname) === 6 ? `[${target.hostname}]` : target.hostname
+    const hostHeader =
+      target.port === 443 ? bracketedHost : `${bracketedHost}:${target.port}`
+    try {
+      sigv4Plan.apply(fwdHeaders, hostHeader, payloadHash)
+    } catch (err) {
+      // Fail closed on any signer error — a request the proxy claimed to
+      // handle must not go upstream half-rewritten, and a client-crafted
+      // header set must not become an unhandled rejection.
+      respondDenied(
+        res,
+        `AWS SigV4 re-signing failed: ${(err as Error).message}`,
+      )
+      return
+    }
+  }
 
   // TODO(terminating-tls): honour parentProxy for the upstream leg.
   const upstream = httpsRequest(
@@ -320,7 +460,11 @@ async function forwardUpstream(
   })
 
   res.on('close', () => upstream.destroy())
-  if (bodyTransform) {
+  if (bufferedBody !== undefined) {
+    // SigV4 literal-hash path: the buffered body already went through
+    // bodyTransform above (when one applied), so send it verbatim.
+    upstream.end(bufferedBody)
+  } else if (bodyTransform) {
     // Errors on either side of the extra pipe stage tear the chain down —
     // a stalled half-open upstream would otherwise wait for the client.
     bodyTransform.on('error', err => upstream.destroy(err))
@@ -330,6 +474,32 @@ async function forwardUpstream(
   } else {
     body.pipe(upstream)
   }
+}
+
+/**
+ * Read a request body fully into memory (for SigV4 body-hash re-signing).
+ * Rejects with {@link BodyTooLargeError} once more than `maxBytes` have
+ * arrived, discarding everything buffered so far — the caller denies the
+ * request, so holding the partial body would defeat the cap.
+ */
+function collectBody(body: Readable, maxBytes: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = []
+    let total = 0
+    const onData = (c: Buffer) => {
+      total += c.length
+      if (total > maxBytes) {
+        chunks.length = 0
+        body.removeListener('data', onData)
+        reject(new BodyTooLargeError(`request body exceeds ${maxBytes} bytes`))
+        return
+      }
+      chunks.push(c)
+    }
+    body.on('data', onData)
+    body.once('end', () => resolve(Buffer.concat(chunks)))
+    body.once('error', reject)
+  })
 }
 
 function originFormPath(reqUrl: string | undefined): string {

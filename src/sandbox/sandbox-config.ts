@@ -497,6 +497,98 @@ export const CredentialEnvVarConfigSchema = z.object({
 })
 
 /**
+ * Explicit grouping of masked env vars into an AWS credential pair for
+ * SigV4 re-signing.
+ *
+ * A SigV4 signature is an HMAC derived from the secret access key, so a
+ * client signing with a masked (fake) secret produces a signature no
+ * substitution can repair — the proxy must re-sign with the real secret.
+ * Re-signing needs the access key id, secret, and optional session token
+ * *linked* as one credential: this entry names the `credentials.envVars`
+ * entries (all `mode: "mask"`, whole-value — no `extract`/`decode`) that
+ * hold each part.
+ *
+ * The conventional trio AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY /
+ * AWS_SESSION_TOKEN is paired automatically when those vars are masked
+ * whole-value and no explicit awsPairs entry references them — this
+ * config exists for non-standard variable names.
+ *
+ * Re-signing triggers only on requests whose signature scope references
+ * the pair's fake access key id (exact match); everything else — including
+ * requests signed with real, unmasked AWS credentials — is untouched. The
+ * substitution gate is the access-key-id entry's `injectHosts` (defaulting
+ * to network.allowedDomains); the secret/session-token entries' own
+ * injectHosts are not consulted for re-signing.
+ */
+export const AwsPairConfigSchema = z
+  .object({
+    accessKeyIdVar: envVarNameSchema.describe(
+      'Name of the masked env var holding the AWS access key id.',
+    ),
+    secretAccessKeyVar: envVarNameSchema.describe(
+      'Name of the masked env var holding the AWS secret access key.',
+    ),
+    sessionTokenVar: envVarNameSchema
+      .optional()
+      .describe(
+        'Optional name of the masked env var holding the AWS session ' +
+          'token (temporary credentials). When set, the proxy sends the ' +
+          'real token as x-amz-security-token on re-signed requests and ' +
+          'adds it to the signed header set if the client did not.',
+      ),
+  })
+  .strict()
+
+const sigv4PolicySchema = z.enum(['deny', 'passthrough'])
+
+/**
+ * Per-shape policy for AWS SigV4 request forms the proxy cannot re-sign.
+ * Applies only to requests whose signature references a masked pair's
+ * fake access key id; requests signed with unmasked credentials are never
+ * affected.
+ *
+ * - `"deny"` (default): fail closed with a 403 naming the case, so the
+ *   sandboxed client sees a policy block instead of a confusing upstream
+ *   signature error.
+ * - `"passthrough"`: forward the request without re-signing. Ordinary
+ *   header substitution still applies, but the signature was computed
+ *   from the masked placeholder secret, so the upstream will reject it —
+ *   set this only when that failure mode is preferable to a proxy denial.
+ *
+ * Re-signable header-SigV4 requests that sign a literal body hash are
+ * buffered (up to 64 MiB — MAX_SIGV4_RESIGN_BODY_BYTES in
+ * tls-terminate-proxy.ts) so the hash can be recomputed over the bytes
+ * actually forwarded; larger bodies are denied with a 403. Payloads
+ * signed as UNSIGNED-PAYLOAD stream through without buffering.
+ */
+export const Sigv4ConfigSchema = z
+  .object({
+    streaming: sigv4PolicySchema
+      .optional()
+      .describe(
+        'Policy for aws-chunked streaming uploads (x-amz-content-sha256: ' +
+          'STREAMING-*): per-chunk signatures chain off the seed ' +
+          'signature, so re-signing would require rewriting the body. ' +
+          'Default "deny".',
+      ),
+    presigned: sigv4PolicySchema
+      .optional()
+      .describe(
+        'Policy for presigned URLs (X-Amz-Algorithm/X-Amz-Signature in ' +
+          'the query, no Authorization header): the signature lives in ' +
+          'the URL itself. Default "deny".',
+      ),
+    sigv4a: sigv4PolicySchema
+      .optional()
+      .describe(
+        'Policy for SigV4A (AWS4-ECDSA-P256-SHA256) asymmetric ' +
+          'signatures: there is no shared-key HMAC to recompute. ' +
+          'Default "deny".',
+      ),
+  })
+  .strict()
+
+/**
  * Credentials configuration schema for validation.
  *
  * Declares credential sources (files and environment variables) with a
@@ -528,6 +620,20 @@ export const CredentialsConfigSchema = z
           'is unverified and the credential travels in cleartext. Set only ' +
           'for trusted-network test fixtures.',
       ),
+    awsPairs: z
+      .array(AwsPairConfigSchema)
+      .optional()
+      .describe(
+        'Explicit groupings of masked env vars into AWS credential pairs ' +
+          'for SigV4 re-signing, for non-standard variable names. The ' +
+          'conventional AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / ' +
+          'AWS_SESSION_TOKEN trio is paired automatically when masked.',
+      ),
+    sigv4: Sigv4ConfigSchema.optional().describe(
+      'Policies for AWS SigV4 request shapes the proxy cannot re-sign ' +
+        '(streaming, presigned, sigv4a) when they reference a masked ' +
+        'credential pair: "deny" (default) or "passthrough".',
+    ),
   })
   // Reject unknown keys so a stale `credentials.injectHosts` (the removed
   // block-level default) fails loudly instead of being silently stripped.
@@ -1093,6 +1199,57 @@ export const SandboxRuntimeConfigSchema = z
       }
     }
 
+    // awsPairs entries must reference whole-value masked env vars: the
+    // re-signer needs the fake value to BE the sentinel (exact-match
+    // trigger on the access key id in the credential scope) and the real
+    // value to be the entire secret. extract/decode entries violate both.
+    const seenPairVars = new Set<string>()
+    for (const [idx, pair] of (creds.awsPairs ?? []).entries()) {
+      const vars: Array<[string, string]> = [
+        ['accessKeyIdVar', pair.accessKeyIdVar],
+        ['secretAccessKeyVar', pair.secretAccessKeyVar],
+      ]
+      if (pair.sessionTokenVar !== undefined) {
+        vars.push(['sessionTokenVar', pair.sessionTokenVar])
+      }
+      for (const [field, name] of vars) {
+        const path = ['credentials', 'awsPairs', idx, field]
+        if (seenPairVars.has(name)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path,
+            message:
+              `"${name}" appears in more than one awsPairs slot (within ` +
+              `or across pairs) — each variable can fill exactly one slot.`,
+          })
+          continue
+        }
+        seenPairVars.add(name)
+        const entry = (creds.envVars ?? []).find(v => v.name === name)
+        if (entry === undefined || entry.mode !== 'mask') {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path,
+            message:
+              `"${name}" does not reference a credentials.envVars entry ` +
+              `with mode "mask" — an AWS pair links already-masked ` +
+              `variables; add the entry (masking is the opt-in for ` +
+              `SigV4 re-signing).`,
+          })
+        } else if (entry.extract !== undefined || entry.decode !== undefined) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path,
+            message:
+              `"${name}" uses extract/decode, but an AWS pair member ` +
+              `must be masked whole-value: the SigV4 trigger is an ` +
+              `exact match of the fake access key id, and the signer ` +
+              `needs the entire real value.`,
+          })
+        }
+      }
+    }
+
     // Masked credentials require the TLS-terminated proxy path so the real
     // value is only sent to a cert-verified upstream. allowPlaintextInject
     // is the explicit escape hatch.
@@ -1123,6 +1280,8 @@ export type CredentialEnvVarConfig = z.infer<
   typeof CredentialEnvVarConfigSchema
 >
 export type CredentialsConfig = z.infer<typeof CredentialsConfigSchema>
+export type AwsPairConfig = z.infer<typeof AwsPairConfigSchema>
+export type Sigv4Config = z.infer<typeof Sigv4ConfigSchema>
 export type IgnoreViolationsConfig = z.infer<
   typeof IgnoreViolationsConfigSchema
 >

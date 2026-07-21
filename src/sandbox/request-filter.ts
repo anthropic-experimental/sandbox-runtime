@@ -132,7 +132,16 @@ export async function decideAndRespond(
 }
 
 function deny(res: ServerResponse, decision: RequestDecision): void {
-  const reason = decision.reason ?? 'denied by filterRequest'
+  respondDenied(res, decision.reason ?? 'denied by filterRequest')
+}
+
+/**
+ * Write the proxy's standard policy-denial response: 403 with the reason
+ * in the body, so the sandboxed client can tell a policy block from a
+ * network failure. Shared by filterRequest denials and other in-proxy
+ * policy decisions (e.g. SigV4 shapes that cannot be re-signed).
+ */
+export function respondDenied(res: ServerResponse, reason: string): void {
   logForDebugging(`[request-filter] deny: ${reason}`)
   if (res.headersSent) {
     res.destroy()
