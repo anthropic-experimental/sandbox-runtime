@@ -268,31 +268,26 @@ pub fn capture_id_and_links(canonical_path: &str) -> Result<(FileId, u32, bool)>
     Ok((id, std_info.NumberOfLinks, std_info.Directory))
 }
 
-/// Best-effort: locate the CURRENT path of a file by its captured
-/// `(volume_serial, file_id)`. Opens the volume root (`\\?\X:\`),
-/// `OpenFileById` with an `ExtendedFileId` descriptor, then
-/// `GetFinalPathNameByHandleW`. Returns `None` if the file was
-/// deleted or the open fails for any reason. Used ONLY for
-/// reporting `movedTo` — restore is path-anchored and never
-/// relocates by inode (chasing the file by ID to remove its stamp
-/// would re-expose a relocated secret).
-pub fn locate_by_file_id(file_id: &FileId) -> Option<String> {
+/// Locate the CURRENT path of a file by its captured
+/// `(volume_serial, file_id)`. `Ok(None)` means the mounted volume
+/// confirmed that the file no longer exists. Lookup, volume, and path
+/// decoding failures are errors so ACL release can retain its DB rows
+/// and retry instead of losing track of a relocated ALLOW ACE.
+pub fn locate_by_file_id(file_id: &FileId) -> Result<Option<String>> {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
     use windows::Win32::Storage::FileSystem::{
         ExtendedFileIdType, FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, OpenFileById,
     };
     // Open the volume root the file lived on. We need a handle ON
     // the volume to anchor OpenFileById; the captured volume
     // serial doesn't directly map to a drive letter, so try each
-    // mounted local drive and match the serial — keeping the
-    // locate volume-keyed (a moved file may not be on the drive
-    // its canonical_path was recorded under).
+    // mounted local drive and match the serial.
     for drive in b'A'..=b'Z' {
         let root = format!(r"\\?\{}:\", drive as char);
         let vh = match open_for_metadata(&root) {
             Ok(h) => h,
             Err(_) => continue,
         };
-        // Match the volume by reading FILE_ID_INFO of the root.
         match file_id_from_handle(vh.raw()) {
             Ok(id) if id.volume_serial == file_id.volume_serial => {}
             _ => continue,
@@ -306,9 +301,6 @@ pub fn locate_by_file_id(file_id: &FileId) -> Option<String> {
                 },
             },
         };
-        // dwDesiredAccess = 0: GetFinalPathNameByHandleW needs only
-        // a valid handle, not read-data, so a relocated file whose
-        // DACL no longer grants the broker read still resolves.
         let fh = match unsafe {
             OpenFileById(
                 vh.raw(),
@@ -319,16 +311,29 @@ pub fn locate_by_file_id(file_id: &FileId) -> Option<String> {
                 FILE_FLAG_BACKUP_SEMANTICS,
             )
         } {
-            Ok(h) => OwnedHandle(h),
-            Err(_) => return None,
+            Ok(h) if !h.is_invalid() => OwnedHandle(h),
+            Ok(_) => bail!("OpenFileById returned an invalid handle"),
+            Err(e)
+                if e.code() == ERROR_FILE_NOT_FOUND.into()
+                    || e.code() == ERROR_PATH_NOT_FOUND.into() =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e).context("OpenFileById for ACL relocation cleanup"),
         };
-        let buf = final_path_from_handle(fh.raw()).ok()?;
+        let buf = final_path_from_handle(fh.raw())
+            .context("GetFinalPathNameByHandleW for ACL relocation cleanup")?;
         let s = String::from_utf16_lossy(&buf);
-        return utf16_roundtrips(&buf, &s).then_some(s);
+        if !utf16_roundtrips(&buf, &s) {
+            bail!("relocated ACL path is not representable as UTF-8");
+        }
+        return Ok(Some(s));
     }
-    None
+    bail!(
+        "volume serial {} for ACL relocation cleanup is not mounted",
+        file_id.volume_serial
+    )
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

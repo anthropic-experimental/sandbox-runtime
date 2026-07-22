@@ -267,6 +267,22 @@ enum UserCmd {
 
 #[derive(Subcommand)]
 enum AclCmd {
+    /// Stay alive until the original parent process object exits.
+    /// Internal holder used to isolate temporary ACL grants.
+    #[command(hide = true)]
+    Hold {
+        #[arg(long)]
+        parent_pid: u32,
+        /// Sandbox SID whose temporary grant this holder owns.
+        #[arg(long)]
+        sandbox_user_sid: String,
+    },
+    /// Report exact-path DB residue counts. Internal CI diagnostic.
+    #[command(hide = true)]
+    State {
+        #[arg(long)]
+        path: String,
+    },
     /// Read `{denyRead:[…], denyWrite:[…]}` from stdin and add an
     /// additive `(D;OICI;mask;;;<sid>)` ACE for the sandbox user on
     /// each target plus a `(D;OICI;FILE_DELETE_CHILD;;;<sid>)` on
@@ -301,6 +317,10 @@ enum AclCmd {
         /// Holder PID (see `acl stamp`).
         #[arg(long)]
         holder_pid: u32,
+        /// Optional creation FILETIME binding for PID-reuse-safe
+        /// internal holders. Existing PID-only callers remain valid.
+        #[arg(long)]
+        holder_process_create_time: Option<i64>,
         /// SID to grant — the dedicated sandbox user
         /// (`srt-win user status` → `marker_user_sid`).
         #[arg(long)]
@@ -311,6 +331,9 @@ enum AclCmd {
     Revoke {
         #[arg(long)]
         holder_pid: u32,
+        /// Optional creation FILETIME binding supplied by `acl hold`.
+        #[arg(long)]
+        holder_process_create_time: Option<i64>,
         #[arg(long)]
         sandbox_user_sid: String,
         #[arg(long)]
@@ -338,11 +361,14 @@ enum AclCmd {
     /// Run crash-recovery only: prune dead holders, drop any
     /// orphaned sandbox-user ACEs.
     Recover {
+        /// Recompose every tracked ACE after file-identity validation.
+        /// This is also the targeted migration for legacy inheritable
+        /// parent-FDC rows; it does not sweep untracked trustees.
         #[arg(long)]
         force: bool,
-        /// Emit `{"deadBrokers": N, "acesRevoked": N}` on stdout.
-        /// (Not the per-path array — recover sweeps by trustee SID
-        /// and does not enumerate paths.)
+        /// Emit recovery counts, including retryable cleanup failures, on stdout.
+        /// (Not the per-path array — recover reconciles only
+        /// state-DB-tracked paths.)
         #[arg(long)]
         json: bool,
     },
@@ -363,6 +389,15 @@ struct AclGrantInput {
     read: Vec<String>,
     #[serde(default)]
     write: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AclHolderReady {
+    protocol: &'static str,
+    holder_pid: u32,
+    // Decimal string: FILETIME exceeds JavaScript's safe integer range.
+    holder_process_create_time: String,
 }
 
 /// One per-path entry of `acl revoke --json` / `acl restore
@@ -407,8 +442,39 @@ fn canonicalize_ace_targets(
     Ok((targets, bad_inputs))
 }
 
+/// Resolve the authoritative Windows system directory for the
+/// sandbox-user WFP probe working directory.
+fn canonical_system32_cwd() -> anyhow::Result<String> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+    let mut buffer = vec![0_u16; 260];
+    let system32 = loop {
+        let length = unsafe { GetSystemDirectoryW(Some(&mut buffer)) } as usize;
+        if length == 0 {
+            return Err(std::io::Error::last_os_error())
+                .map_err(|error| anyhow::anyhow!("GetSystemDirectoryW: {error}"));
+        }
+        if length < buffer.len() {
+            buffer.truncate(length);
+            break std::path::PathBuf::from(std::ffi::OsString::from_wide(&buffer));
+        }
+        buffer.resize(length + 1, 0);
+    };
+    let system32 = std::fs::canonicalize(&system32).map_err(|error| {
+        anyhow::anyhow!(
+            "canonicalize System32 from GetSystemDirectoryW '{}': {error}",
+            system32.display()
+        )
+    })?;
+    system32
+        .to_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("canonical System32 path is not UTF-8"))
+}
+
 /// Read `path` and decode it as a single DER-encoded X.509
-/// certificate (PEM, base64, or raw DER input — see
+/// certificate (PEM, base64, or raw DER input; see
 /// [`srt_win::cert_store::CertDer::from_pem_or_der`]). Used by
 /// `user trust-ca`.
 fn read_ca_der(path: &str) -> anyhow::Result<srt_win::cert_store::CertDer> {
@@ -782,11 +848,15 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(15);
                 }
             };
+            // The WFP probe is independent of the broker's caller
+            // CWD. Pin only the CPWLW runner to canonical System32 so
+            // protected package/workspace directories need no broad RX.
+            let probe_cwd = canonical_system32_cwd()?;
             let code = logon::spawn_runner(
                 &cred.user,
                 &cred.pw,
                 &sb_sid,
-                None,
+                Some(&probe_cwd),
                 &runner::RunnerCmd::ProbeEgress {
                     target: target.clone(),
                 },
@@ -829,6 +899,60 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
         }
 
         // ─── acl ───────────────────────────────────────────────────
+        Cmd::Acl {
+            sub:
+                AclCmd::Hold {
+                    parent_pid,
+                    sandbox_user_sid,
+                },
+        } => {
+            use srt_win::state_db;
+            use std::io::Write;
+
+            let holder = state_db::HolderIdentity::current()
+                .context("capture acl holder process identity")?;
+            let ready = AclHolderReady {
+                protocol: srt_win::parent_wait::ACL_HOLDER_READY_PROTOCOL,
+                holder_pid: holder.pid.0,
+                holder_process_create_time: holder.process_create_time.to_string(),
+            };
+            srt_win::parent_wait::wait_for_parent_exit_after_ready(parent_pid, || {
+                let mut stdout = std::io::stdout().lock();
+                serde_json::to_writer(&mut stdout, &ready)
+                    .context("write acl holder readiness JSON")?;
+                writeln!(stdout).context("terminate acl holder readiness frame")?;
+                stdout.flush().context("flush acl holder readiness")?;
+                Ok(())
+            })
+            .context("acl hold parent wait")?;
+
+            let ((entries, failed), _) = state_db::with_init_lock_bound(holder, false, |db| {
+                db.release_aces(&sandbox_user_sid, state_db::KIND_GRANT)
+            })
+            .context("acl hold self-release")?;
+            if failed > 0 {
+                return Err(anyhow!(
+                    "acl hold self-release: {failed} of {} grant(s) remain retryable",
+                    entries.len() + failed
+                ));
+            }
+        }
+        Cmd::Acl {
+            sub: AclCmd::State { path },
+        } => {
+            use srt_win::{path_id, state_db};
+            let (canonical, _) = path_id::canonicalize_path(&path)
+                .map_err(|e| anyhow!("canonicalize acl state path '{path}': {e}"))?;
+            let (working_aces, ace_holders) = state_db::path_state_counts(&canonical)?;
+            println!(
+                "{}",
+                json!({
+                    "path": canonical,
+                    "workingAces": working_aces,
+                    "aceHolders": ace_holders,
+                })
+            );
+        }
         Cmd::Acl {
             sub:
                 AclCmd::Stamp {
@@ -902,6 +1026,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             sub:
                 AclCmd::Grant {
                     holder_pid,
+                    holder_process_create_time,
                     sandbox_user_sid,
                 },
         } => {
@@ -921,9 +1046,18 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             for (p, e) in &bad_inputs {
                 eprintln!("srt-win: skipped: '{p}': {e}");
             }
-            let ((witnesses, failed), report) = state_db::with_init_lock(holder, false, |db| {
-                db.apply_aces(&sandbox_user_sid, &targets)
-            })?;
+            let apply = |db: &mut state_db::Locked| db.apply_aces(&sandbox_user_sid, &targets);
+            let ((witnesses, failed), report) = match holder_process_create_time {
+                Some(process_create_time) => state_db::with_init_lock_bound(
+                    state_db::HolderIdentity {
+                        pid: holder,
+                        process_create_time,
+                    },
+                    false,
+                    apply,
+                ),
+                None => state_db::with_init_lock(holder, false, apply),
+            }?;
             let fresh = witnesses.iter().filter(|w| !w.already).count();
             eprintln!(
                 "srt-win: acl grant — {} path(s) ({} fresh, {} \
@@ -965,15 +1099,27 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             sub:
                 AclCmd::Revoke {
                     holder_pid,
+                    holder_process_create_time,
                     sandbox_user_sid,
                     json,
                 },
         } => {
             use srt_win::state_db;
             let holder = state_db::HolderPid(holder_pid);
-            let ((entries, failed), report) = state_db::with_init_lock(holder, false, |db| {
+            let release = |db: &mut state_db::Locked| {
                 db.release_aces(&sandbox_user_sid, state_db::KIND_GRANT)
-            })?;
+            };
+            let ((entries, failed), report) = match holder_process_create_time {
+                Some(process_create_time) => state_db::with_init_lock_bound(
+                    state_db::HolderIdentity {
+                        pid: holder,
+                        process_create_time,
+                    },
+                    false,
+                    release,
+                ),
+                None => state_db::with_init_lock(holder, false, release),
+            }?;
             eprintln!(
                 "srt-win: acl revoke — {} path(s){}; recovery \
                  revoked {} orphan grant(s)",
@@ -1057,9 +1203,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     Ok(())
                 })?;
             eprintln!(
-                "srt-win: acl recover — pruned {} dead broker(s), \
-                 revoked {} orphan ACE(s)",
-                report.dead_brokers, report.aces_revoked,
+                "srt-win: acl recover — pruned {} dead broker(s), reconciled {} ACE row(s), {} cleanup failure(s) retained",
+                report.dead_brokers, report.aces_revoked, report.cleanup_failures,
             );
             if json {
                 println!(
@@ -1067,6 +1212,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     json!({
                         "deadBrokers": report.dead_brokers,
                         "acesRevoked": report.aces_revoked,
+                        "cleanupFailures": report.cleanup_failures,
                     })
                 );
             }
@@ -1467,5 +1613,48 @@ mod tests {
         assert!(matches!(with.cmd, Cmd::Exec { quiet: true, .. }));
         let without = Cli::try_parse_from(["srt-win", "exec", "--", "cmd.exe"]).expect("parse");
         assert!(matches!(without.cmd, Cmd::Exec { quiet: false, .. }));
+    }
+
+    #[test]
+    fn internal_acl_commands_parse_but_stay_hidden() {
+        let hold = Cli::try_parse_from([
+            "srt-win.exe",
+            "acl",
+            "hold",
+            "--parent-pid",
+            "123",
+            "--sandbox-user-sid",
+            "S-1-test",
+        ])
+        .expect("acl hold parses");
+        assert!(matches!(
+            hold.cmd,
+            Cmd::Acl {
+                sub: AclCmd::Hold {
+                    parent_pid: 123,
+                    sandbox_user_sid,
+                }
+            } if sandbox_user_sid == "S-1-test"
+        ));
+
+        let state = Cli::try_parse_from(["srt-win.exe", "acl", "state", "--path", r"C:\probe.exe"])
+            .expect("acl state parses");
+        match state.cmd {
+            Cmd::Acl {
+                sub: AclCmd::State { path },
+            } => assert_eq!(path, r"C:\probe.exe"),
+            _ => panic!("expected acl state"),
+        }
+
+        let help = Cli::try_parse_from(["srt-win.exe", "acl", "--help"])
+            .err()
+            .expect("help exits through clap");
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = help.to_string();
+        assert!(
+            !help
+                .lines()
+                .any(|line| { matches!(line.split_whitespace().next(), Some("hold" | "state")) })
+        );
     }
 }

@@ -27,6 +27,7 @@ pub mod token;
 pub mod winsta;
 
 pub mod acl;
+pub mod parent_wait;
 pub mod path_id;
 pub mod state_db;
 

@@ -9,11 +9,13 @@
 //!   sandbox user (which has no inherent rights on real-user-owned
 //!   files) can reach the working tree;
 //! - `stamp` ⇒ `(D;OICI;mask;;;<sb-SID>)` on the target plus
-//!   `(D;OICI;FILE_DELETE_CHILD;;;<sb-SID>)` on the parent.
+//!   an object-local `(D;;FILE_DELETE_CHILD;;;<sb-SID>)` on only
+//!   its immediate parent.
 //!
-//! Restore = walk the path's explicit ACEs, drop any whose trustee
-//! is `<sb-SID>`, write back `UNPROTECTED` so inherited ACEs are
-//! re-derived. The single chokepoint is [`apply_sandbox_aces`]
+//! Restore = walk the path's ACEs, drop any whose trustee
+//! is `<sb-SID>`, preserve every other explicit/inherited ACE, and
+//! write back `UNPROTECTED` so inheritance remains enabled. The
+//! single chokepoint is [`apply_sandbox_aces`]
 //! ([`SbAceSet`]): converge the path to exactly the wanted ALLOW +
 //! DENY for `<sb-SID>`, idempotently.
 //!
@@ -333,8 +335,9 @@ pub(crate) fn read_file_dacl(canonical_path: &str) -> Result<(OwnedSd, *mut ACL)
 
 /// Whether [`write_file_dacl`] sets `PROTECTED_` (block inheritance
 /// from the parent — used for the state-DB dir's allow-list) or
-/// `UNPROTECTED_DACL_SECURITY_INFORMATION` (re-derive inherited
-/// ACEs from the parent — used by [`apply_sandbox_aces`]).
+/// `UNPROTECTED_DACL_SECURITY_INFORMATION` (keep inheritance enabled;
+/// the caller must preserve unmanaged inherited ACEs in the supplied
+/// DACL — used by [`apply_sandbox_aces`]).
 pub(crate) enum Protection {
     Protected,
     Unprotected,
@@ -422,6 +425,14 @@ pub(crate) fn ace_sid_is(body: &[u8], sid_bytes: &[u8]) -> bool {
     body.get(ACE_FIXED..ACE_FIXED + sid_bytes.len()) == Some(sid_bytes)
 }
 
+/// Preserve every ACE this feature does not own, regardless of
+/// whether it is explicit or inherited. The managed identity is the
+/// dedicated sandbox-user SID only; group/Users inherited access is
+/// outside this state machine and must survive grant/revoke.
+fn keep_unmanaged_ace(body: &[u8], managed_sid: &[u8]) -> bool {
+    !ace_sid_is(body, managed_sid)
+}
+
 /// Apply the broker-only DACL to a directory with `(OI)(CI)`
 /// inheritance, optionally **prefixed** by a `(D;OICI;FA;;;
 /// <deny_sid>)` ACE. Used by `state_db.rs` and `install.rs` to
@@ -487,9 +498,9 @@ pub fn set_path_dacl_from_sddl(path: &str, sddl: &str, label: &str) -> Result<()
 // rights on real-user-owned files. `acl grant` adds an inheritable
 // ALLOW ACE for the sandbox user's SID on a path (typically the
 // working-tree root) so the child can read/write there; `acl stamp
-// --sandbox-user-sid` adds an explicit DENY ACE on a path (and a
-// `(OI)(CI)` `FILE_DELETE_CHILD` DENY on its parent) so the child
-// can NOT read/write/delete it even when an inherited
+// --sandbox-user-sid` adds an inheritable DENY ACE on a path (and an
+// object-local `FILE_DELETE_CHILD` DENY on its immediate parent) so
+// the child can NOT read/write/delete it even when an inherited
 // `BUILTIN\Users` ACE would otherwise allow. Both are ADDITIVE
 // (the path keeps its own explicit ACEs and inheritance);
 // revoke/restore drops the SID's ACEs by walk-and-filter, not a
@@ -517,16 +528,18 @@ pub enum DenyMask {
 
 /// One explicit ACE the sandbox user holds on a path. The
 /// separate-user FS model is entirely additive: `acl grant` adds
-/// ALLOW ACEs, `acl stamp --sandbox-user-sid` adds DENY ACEs (plus
-/// a `(OI)(CI)` `FILE_DELETE_CHILD` DENY on the parent). Restore
+/// ALLOW ACEs, `acl stamp --sandbox-user-sid` adds inheritable DENY
+/// ACEs plus an object-local `FILE_DELETE_CHILD` DENY on the immediate
+/// parent. Restore
 /// drops the SID's ACEs via walk-and-filter — no PROTECTED rewrite,
 /// no SD snapshot, no calibration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SbAce {
     Grant(GrantMask),
     Deny(DenyMask),
-    /// `(D;OICI;FILE_DELETE_CHILD;;;<sb>)` — applied to the parent
-    /// of every denied target so the sandbox user cannot `del`/`ren`
+    /// `(D;;FILE_DELETE_CHILD;;;<sb>)` — applied without inheritance
+    /// to the immediate parent of every denied target so the sandbox
+    /// user cannot `del`/`ren`
     /// it via parent-FDC even when the parent carries an inherited
     /// `BUILTIN\Users:(F)` (which the sandbox user, a Users member,
     /// would otherwise pick up).
@@ -623,14 +636,19 @@ pub struct SbAceSet {
 
 impl SbAceSet {
     /// The set's entries as [`NewAce`]s for `sid`, in canonical
-    /// deny → deny-fdc → allow order. All carry [`OICI`].
+    /// deny → deny-fdc → allow order. Target deny/allow carry
+    /// [`OICI`]; parent-FDC is object-local [`NO_INHERIT`].
     fn head_aces(&self, sid: PSID) -> Vec<NewAce> {
         let mut v = Vec::with_capacity(3);
         if let Some(m) = self.deny {
             v.push(NewAce::Deny(sid, m.bits(), OICI));
         }
         if self.deny_fdc {
-            v.push(NewAce::Deny(sid, Mask::FILE_DELETE_CHILD.bits(), OICI));
+            v.push(NewAce::Deny(
+                sid,
+                Mask::FILE_DELETE_CHILD.bits(),
+                NO_INHERIT,
+            ));
         }
         if let Some(m) = self.grant {
             v.push(NewAce::Allow(sid, m.bits(), OICI));
@@ -640,11 +658,12 @@ impl SbAceSet {
 }
 
 /// Converge `canonical_path`'s explicit ACEs for `sandbox_sid` to
-/// exactly `set`. Idempotent — every existing explicit ACE for the
-/// SID (allow AND deny) is dropped, then `set`'s entries are
-/// prepended in canonical (deny-before-allow) order. Inherited ACEs
-/// are dropped too; `SetNamedSecurityInfoW` without `PROTECTED_`
-/// re-derives them from the parent.
+/// exactly `set`. Idempotent — every existing ACE for the managed
+/// SID (allow AND deny, explicit or inherited) is dropped, then `set`'s
+/// entries are prepended in canonical (deny-before-allow) order. ACEs
+/// for every other trustee are copied byte-for-byte, including inherited
+/// entries; a complete DACL write must not assume Windows will recreate
+/// them from the parent.
 ///
 /// `SetEntriesInAclW(REVOKE_ACCESS)` is NOT used: per MSDN it
 /// removes `ACCESS_ALLOWED_ACE`/`SYSTEM_AUDIT_ACE` for the trustee,
@@ -653,8 +672,10 @@ impl SbAceSet {
 /// which is wrong when `set` is empty. So we walk + filter
 /// manually.
 ///
-/// Both grant and deny carry `(OI)(CI)` so directory targets cover
-/// the subtree; on a file the inheritance flags are inert.
+/// Target grant and deny carry `(OI)(CI)` so directory targets cover
+/// the subtree; on a file the inheritance flags are inert. Parent-FDC
+/// is deliberately non-inheriting: FILE_DELETE_CHILD is evaluated on
+/// the immediate parent, and propagation would deny unrelated descendants.
 pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet) -> Result<()> {
     let sid = LocalPsid::from_string(sandbox_sid)
         .with_context(|| format!("parse sandbox SID '{sandbox_sid}'"))?;
@@ -663,16 +684,16 @@ pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet
     //    point into; it's freed after step 4's write.
     let (_sd, old) =
         read_file_dacl(canonical_path).with_context(|| format!("recompose '{canonical_path}'"))?;
-    // 2. Collect surviving explicit ACEs (drop inherited and any
-    //    explicit ACE whose SID == sandbox_sid — allow AND deny).
-    let kept = filter_aces(old, |hdr, body| {
-        hdr.AceFlags & INHERITED_ACE == 0 && !ace_sid_is(body, sid_bytes)
-    })?;
+    // 2. Drop only ACEs owned by this state machine. In particular,
+    //    preserve inherited access for every other trustee: the WFP
+    //    bootstrap grants this executable temporarily, and losing its
+    //    inherited runtime-group RX makes the next CPWLW spawn fail.
+    let kept = filter_aces(old, |_hdr, body| keep_unmanaged_ace(body, sid_bytes))?;
     // 3. Build fresh ACL: set's entries (deny-first canonical order)
     //    then surviving explicit ACEs.
     let new = rebuild_acl(kept.2, &set.head_aces(sid.as_psid()), &kept, &[])?;
-    // 4. Write back. UNPROTECTED so the kernel re-derives inherited
-    //    ACEs from the parent.
+    // 4. Write back UNPROTECTED so inheritance remains enabled.
+    //    Unmanaged inherited ACEs are already present in `new`.
     write_file_dacl(canonical_path, new.as_ptr(), Protection::Unprotected)
         .with_context(|| format!("recompose '{canonical_path}'"))
 }
@@ -694,6 +715,7 @@ pub fn build_init_mutex_sa() -> Result<OwnedSa> {
     .into_security_attributes()
 }
 
+#[cfg(test)]
 const INHERITED_ACE: u8 = 0x10;
 #[cfg(test)]
 mod tests {
@@ -738,6 +760,76 @@ mod tests {
         // current_user / SY / BA / OWNER_RIGHTS = 4 ACEs (the
         // current user is never SY/BA, so no dedup).
         assert_eq!(ace_count(&sa._acl), 4);
+    }
+
+    #[test]
+    fn sandbox_ace_filter_preserves_unrelated_inherited_access() {
+        let sandbox = LocalPsid::from_string("S-1-5-21-1-2-3-1004").unwrap();
+        let runtime_group = LocalPsid::from_string("S-1-5-21-1-2-3-1010").unwrap();
+        let empty: KeptAces = (Vec::new(), 0, ACL_REVISION);
+        let source = rebuild_acl(
+            ACL_REVISION,
+            &[
+                NewAce::Allow(
+                    runtime_group.as_psid(),
+                    Mask::FILE_READ_EXEC.bits(),
+                    ACE_FLAGS(INHERITED_ACE.into()),
+                ),
+                NewAce::Allow(sandbox.as_psid(), Mask::FILE_READ_EXEC.bits(), NO_INHERIT),
+            ],
+            &empty,
+            &[],
+        )
+        .unwrap();
+
+        let kept = filter_aces(source.as_ptr(), |_hdr, body| {
+            keep_unmanaged_ace(body, sandbox.as_bytes())
+        })
+        .unwrap();
+
+        assert_eq!(kept.0.len(), 1, "only the managed SID ACE is removed");
+        let (ace, size) = kept.0[0];
+        let header = unsafe { &*(ace as *const ACE_HEADER) };
+        let body = unsafe { std::slice::from_raw_parts(ace as *const u8, size as usize) };
+        assert_eq!(header.AceFlags & INHERITED_ACE, INHERITED_ACE);
+        assert!(ace_sid_is(body, runtime_group.as_bytes()));
+    }
+
+    #[test]
+    fn sandbox_ace_set_uses_minimal_inheritance_flags() {
+        let sid = LocalPsid::from_string("S-1-5-21-1-2-3-1004").unwrap();
+        let aces = SbAceSet {
+            grant: Some(GrantMask::Modify),
+            deny: Some(DenyMask::WriteDeny),
+            deny_fdc: true,
+        }
+        .head_aces(sid.as_psid());
+
+        assert_eq!(aces.len(), 3);
+        match &aces[0] {
+            NewAce::Deny(_, mask, flags) => {
+                assert_eq!(*mask, DenyMask::WriteDeny.bits());
+                assert_eq!(flags.0, OICI.0, "target deny must remain inheritable");
+            }
+            NewAce::Allow(..) => panic!("target deny must be first"),
+        }
+        match &aces[1] {
+            NewAce::Deny(_, mask, flags) => {
+                assert_eq!(*mask, Mask::FILE_DELETE_CHILD.bits());
+                assert_eq!(
+                    flags.0, NO_INHERIT.0,
+                    "parent FDC deny must not propagate to descendants"
+                );
+            }
+            NewAce::Allow(..) => panic!("parent FDC entry must be a deny"),
+        }
+        match &aces[2] {
+            NewAce::Allow(_, mask, flags) => {
+                assert_eq!(*mask, GrantMask::Modify.bits());
+                assert_eq!(flags.0, OICI.0, "target grant must remain inheritable");
+            }
+            NewAce::Deny(..) => panic!("target grant must be last"),
+        }
     }
 
     #[test]

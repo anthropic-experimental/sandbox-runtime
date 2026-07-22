@@ -65,7 +65,7 @@ import {
   revokeWindowsAcl,
   getWindowsSandboxUserStatus,
   getWindowsSandboxCaCert,
-  verifyWindowsWfpEgress,
+  verifyWindowsWfpEgressWithAclBootstrap,
   resolveSrtWin,
   type SrtWinSpawn,
   type WindowsBinShell,
@@ -521,6 +521,14 @@ async function initialize(
           `provision it.`,
       )
     }
+    if (!u.sid) {
+      config = undefined
+      throw new Error(
+        'sandbox user SID missing from `srt-win user status` ' +
+          '(provisioned but in an inconsistent state)',
+      )
+    }
+    const sb = u.sid
     // Behavioral proof the WFP egress fence is active for the
     // sandbox user — BFE enumeration (`wfp status`) is admin-gated,
     // so this is the non-elevated readiness check. Fails closed: a
@@ -531,7 +539,8 @@ async function initialize(
     // scoped, not session-scoped.
     if (!windowsWfpVerified) {
       try {
-        await verifyWindowsWfpEgress({
+        await verifyWindowsWfpEgressWithAclBootstrap({
+          sandboxUserSid: sb,
           proxyPortRange: runtimeConfig.windows?.proxyPortRange,
           srtWin,
         })
@@ -589,16 +598,6 @@ async function initialize(
       if (mitmCA) {
         acc.grantRead.push(dirname(mitmCA.trustBundlePath))
       }
-      // `u` was fetched once above for the provisioning gate; the
-      // same status carries the SID — don't re-spawn `srt-win user
-      // status` here.
-      if (!u.sid) {
-        throw new Error(
-          'sandbox user SID missing from `srt-win user status` ' +
-            '(provisioned but in an inconsistent state)',
-        )
-      }
-      const sb = u.sid
       // Record module-level state BEFORE the first acl call so the
       // catch's best-effort revoke/restore can address whatever
       // partially landed.
@@ -1017,8 +1016,8 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
  * so `allowWrite` (the working-tree roots) becomes a per-session
  * `MODIFY_NO_FDC` ALLOW ACE for `<sb-SID>`, `allowRead` a
  * `READ|EXECUTE` ALLOW ACE, and `denyRead`/`denyWrite` become an
- * explicit DENY ACE for `<sb-SID>` on the target plus a
- * `(OI)(CI) FILE_DELETE_CHILD` DENY on its parent.
+ * inheriting explicit DENY ACE for `<sb-SID>` on the target plus a
+ * non-inheriting `FILE_DELETE_CHILD` DENY on its direct parent.
  */
 function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
   grantRead: string[]

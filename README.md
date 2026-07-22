@@ -521,11 +521,11 @@ Running under a distinct user SID structurally closes the surrogate-spawn class 
 
 **Network isolation** is a two-filter WFP set at `FWPM_LAYER_ALE_AUTH_CONNECT_V4/V6`: a PERMIT for loopback destinations inside the configured proxy port range (default `60080–60089`), and a BLOCK for any connect whose token carries the `srt-sandbox` SID. The sandboxed process reaches the internet only via the JS HTTP/SOCKS5 proxies listening in that range; a process that strips its proxy environment and connects directly is blocked at the kernel.
 
-**Filesystem isolation** is enforced by NTFS discretionary ACLs. The `srt-sandbox` account has no inherent rights on the calling user's files, so at `initialize()` the sandbox writes **additive, inheriting explicit ACEs for the `srt-sandbox` SID only** — it never rewrites or replaces a path's existing security descriptor:
+**Filesystem isolation** is enforced by NTFS discretionary ACLs. The `srt-sandbox` account has no inherent rights on the calling user's files, so at `initialize()` the sandbox writes **additive explicit ACEs for the `srt-sandbox` SID only** — it never rewrites or replaces a path's existing security descriptor. Target ACEs inherit where noted; the parent deletion guard applies only to the direct parent:
 
 - `filesystem.allowWrite` → an inheriting `MODIFY` ALLOW ACE (`READ|WRITE|EXECUTE|DELETE`, with `FILE_DELETE_CHILD` withheld). The sandboxed process can create, modify, and delete files inside the working tree; withholding `FILE_DELETE_CHILD` from the grant is defense-in-depth for the deny stamps below, not a guard on the tree root.
 - `filesystem.allowRead` → an inheriting `READ|EXECUTE` ALLOW ACE
-- `filesystem.denyRead` / `filesystem.denyWrite` → an inheriting DENY ACE on the target, plus an inheriting `FILE_DELETE_CHILD` DENY on its parent — together with the withheld `FILE_DELETE_CHILD` on the working-tree grant, this stops the sandboxed process from renaming or deleting a denied path via its parent directory
+- `filesystem.denyRead` / `filesystem.denyWrite` → an inheriting DENY ACE on the target, plus a non-inheriting `FILE_DELETE_CHILD` DENY on its direct parent — together with the withheld `FILE_DELETE_CHILD` on the working-tree grant, this stops the sandboxed process from renaming or deleting a denied path via its parent directory without propagating the parent guard through unrelated descendants
 
 `reset()` removes every ACE this session added (refcounted across concurrent hosts via `state.db`; a crash-recovery pass on the next `initialize()` cleans up after an unclean exit). Directory targets are supported (the ACEs inherit to the whole subtree). Glob patterns are expanded to concrete paths at `initialize()` time — a matching path that appears later is not covered.
 

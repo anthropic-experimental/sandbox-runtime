@@ -1,7 +1,8 @@
 import * as fs from 'node:fs'
 import * as net from 'node:net'
 import * as path from 'node:path'
-import { spawnSync } from 'node:child_process'
+import { Buffer } from 'node:buffer'
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { once } from 'node:events'
 import { fileURLToPath } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
@@ -486,6 +487,7 @@ interface RunResult {
 interface RunOpts {
   timeoutMs?: number
   stdin?: string
+  cwd?: string
   srtWin?: SrtWinSpawn
 }
 
@@ -498,6 +500,7 @@ function runSrtWin(args: string[], opts: RunOpts = {}): RunResult {
   const r = spawnSync(exe, [...prependArgs, ...args], {
     encoding: 'utf8',
     timeout: opts.timeoutMs ?? 15_000,
+    ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
     ...(opts.stdin !== undefined ? { input: opts.stdin } : {}),
   })
   if (r.error) {
@@ -545,7 +548,8 @@ function runSrtWinJsonAllowFail<T>(
   } catch (e) {
     throw new Error(
       `srt-win ${args.join(' ')}: unparseable JSON output ` +
-        `${JSON.stringify(r.stdout)}: ${(e as Error).message}`,
+        `${JSON.stringify(r.stdout)}: ${(e as Error).message} ` +
+        `(stderr: ${JSON.stringify(r.stderr)})`,
     )
   }
   return { ok: r.status === 0, json, stderr: r.stderr }
@@ -611,11 +615,13 @@ export function getWindowsWfpStatus(
  *   {@link DEFAULT_WINDOWS_PROXY_PORT_RANGE}.
  * @throws on any outcome other than `blocked` (exit 0).
  */
-export async function verifyWindowsWfpEgress(
+async function verifyWindowsWfpEgressRaw(
   opts: {
     target?: string
     proxyPortRange?: readonly [number, number]
     srtWin?: SrtWinSpawn
+    /** Explicit broker working directory for the srt-win process. */
+    cwd?: string
   } = {},
 ): Promise<WindowsWfpVerifyResult> {
   let target = opts.target
@@ -653,6 +659,7 @@ export async function verifyWindowsWfpEgress(
     const r = runSrtWin(['wfp', 'verify', '--target', target], {
       timeoutMs: 30_000,
       srtWin: opts.srtWin,
+      cwd: opts.cwd,
     })
     logForDebugging(
       `[Sandbox Windows] wfp verify exit=${r.status}: ${r.stderr || r.stdout}`,
@@ -693,6 +700,733 @@ export async function verifyWindowsWfpEgress(
   }
 }
 
+/**
+ * Verify the WFP fence using the installed sandbox account. Direct
+ * callers retain the existing API shape while the implementation
+ * temporarily grants the sandbox SID access to the exact resolved
+ * srt-win executable needed by CreateProcessWithLogonW.
+ */
+export async function verifyWindowsWfpEgress(
+  opts: {
+    target?: string
+    proxyPortRange?: readonly [number, number]
+    srtWin?: SrtWinSpawn
+  } = {},
+): Promise<WindowsWfpVerifyResult> {
+  const srtWin = opts.srtWin ?? resolveSrtWin()
+  const user = getWindowsSandboxUserStatus({ srtWin })
+  if (!user.provisioned || !user.credPresent) {
+    throw new Error(
+      `Windows sandbox user is not provisioned (user=${user.provisioned}, ` +
+        `cred=${user.credPresent}). Run \`npx sandbox-runtime ` +
+        'windows-install` before verifying WFP egress.',
+    )
+  }
+  if (!user.sid) {
+    throw new Error(
+      'Windows sandbox user SID is missing from `srt-win user status`; ' +
+        'repair the sandbox installation before verifying WFP egress',
+    )
+  }
+  return verifyWindowsWfpEgressWithAclBootstrap({
+    sandboxUserSid: user.sid,
+    target: opts.target,
+    proxyPortRange: opts.proxyPortRange,
+    srtWin,
+  })
+}
+
+const windowsWfpBootstrapPromises = new Map<
+  string,
+  Promise<WindowsWfpVerifyResult>
+>()
+const WINDOWS_ACL_HOLDER_READY_PROTOCOL = 'srt-win-acl-holder-ready-v2'
+const WINDOWS_ACL_HOLDER_READY_TIMEOUT_MS = 5_000
+const WINDOWS_ACL_HOLDER_READY_MAX_BYTES = 256
+const WINDOWS_ACL_HOLDER_STDERR_MAX_BYTES = 4_096
+const WINDOWS_ACL_HOLDER_STDERR_CLOSE_TIMEOUT_MS = 1_000
+const WINDOWS_ACL_HOLDER_EXIT_TIMEOUT_MS = 5_000
+const WINDOWS_PROCESS_CREATE_TIME_PATTERN = /^[1-9][0-9]{0,18}$/
+const WINDOWS_PROCESS_CREATE_TIME_MAX = 9_223_372_036_854_775_807n
+
+type WindowsWfpBootstrapErrorCode =
+  | 'acl-holder-spawn-error'
+  | 'acl-holder-exited-early'
+  | 'acl-holder-ready-timeout'
+  | 'acl-holder-ready-invalid'
+  | 'acl-holder-kill-failed'
+  | 'acl-holder-exit-timeout'
+
+class WindowsWfpBootstrapError extends Error {
+  readonly code: WindowsWfpBootstrapErrorCode
+  readonly cause: unknown
+
+  constructor(
+    code: WindowsWfpBootstrapErrorCode,
+    message: string,
+    cause?: unknown,
+  ) {
+    super(message)
+    this.name = 'WindowsWfpBootstrapError'
+    this.code = code
+    this.cause = cause
+  }
+}
+
+interface WindowsAclHolder {
+  child: ChildProcess
+  ready: Promise<WindowsAclHolderIdentity>
+  stopping: boolean
+  stderrTail: Buffer
+  stderrClosed: Promise<void>
+  stderrOpen: boolean
+  stderrDiagnosticBaseMessage?: string
+  failure?: WindowsWfpBootstrapError
+}
+
+interface WindowsAclHolderIdentity {
+  holderPid: number
+  holderProcessCreateTime: string
+}
+
+function invalidWindowsAclHolderReady(
+  message: string,
+  cause?: unknown,
+): WindowsWfpBootstrapError {
+  return new WindowsWfpBootstrapError(
+    'acl-holder-ready-invalid',
+    'Native ACL holder returned invalid readiness: ' + message,
+    cause,
+  )
+}
+
+function parseWindowsAclHolderReadyFrame(
+  frame: Buffer,
+  spawnedPid: number | undefined,
+): WindowsAclHolderIdentity {
+  if (
+    frame.byteLength < 2 ||
+    frame[frame.byteLength - 1] !== 0x0a ||
+    frame.subarray(0, frame.byteLength - 1).includes(0x0a)
+  ) {
+    throw invalidWindowsAclHolderReady('expected one JSON line')
+  }
+
+  let payload: unknown
+  try {
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(
+      frame.subarray(0, frame.byteLength - 1),
+    )
+    payload = JSON.parse(text)
+  } catch (cause) {
+    throw invalidWindowsAclHolderReady('malformed UTF-8 JSON', cause)
+  }
+  if (
+    payload === null ||
+    typeof payload !== 'object' ||
+    Array.isArray(payload)
+  ) {
+    throw invalidWindowsAclHolderReady('expected a JSON object')
+  }
+  const record = payload as Record<string, unknown>
+  const keys = Object.keys(record).sort()
+  if (
+    keys.length !== 3 ||
+    keys[0] !== 'holderPid' ||
+    keys[1] !== 'holderProcessCreateTime' ||
+    keys[2] !== 'protocol'
+  ) {
+    throw invalidWindowsAclHolderReady('unexpected JSON fields')
+  }
+  if (record.protocol !== WINDOWS_ACL_HOLDER_READY_PROTOCOL) {
+    throw invalidWindowsAclHolderReady('unsupported protocol')
+  }
+  if (
+    !Number.isSafeInteger(record.holderPid) ||
+    (record.holderPid as number) < 1 ||
+    (record.holderPid as number) > 0xffff_ffff
+  ) {
+    throw invalidWindowsAclHolderReady('holderPid must be a positive u32')
+  }
+  if (record.holderPid !== spawnedPid) {
+    throw invalidWindowsAclHolderReady(
+      'holderPid ' +
+        String(record.holderPid) +
+        ' did not match spawned process ' +
+        String(spawnedPid ?? 'unknown'),
+    )
+  }
+  if (
+    typeof record.holderProcessCreateTime !== 'string' ||
+    !WINDOWS_PROCESS_CREATE_TIME_PATTERN.test(record.holderProcessCreateTime)
+  ) {
+    throw invalidWindowsAclHolderReady(
+      'holderProcessCreateTime must be a canonical positive decimal string',
+    )
+  }
+  if (
+    BigInt(record.holderProcessCreateTime) > WINDOWS_PROCESS_CREATE_TIME_MAX
+  ) {
+    throw invalidWindowsAclHolderReady(
+      'holderProcessCreateTime exceeded signed 64-bit range',
+    )
+  }
+  return {
+    holderPid: record.holderPid as number,
+    holderProcessCreateTime: record.holderProcessCreateTime,
+  }
+}
+
+function resolveWindowsSpawnExecutable(
+  executable: string,
+  callerCwd: string,
+): string {
+  if (path.isAbsolute(executable) || /[\\/]/.test(executable)) {
+    return fs.realpathSync.native(path.resolve(callerCwd, executable))
+  }
+
+  const systemRoot = process.env.SystemRoot
+  const whereCandidate = systemRoot
+    ? path.join(systemRoot, 'System32', 'where.exe')
+    : 'where.exe'
+  const whereExe = fs.existsSync(whereCandidate)
+    ? fs.realpathSync.native(whereCandidate)
+    : whereCandidate
+  const found = spawnSync(whereExe, [executable], {
+    cwd: callerCwd,
+    encoding: 'utf8',
+    windowsHide: true,
+  })
+  const candidate = (found.stdout ?? '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .find(Boolean)
+  if (found.error || found.status !== 0 || !candidate) {
+    throw new Error(
+      `Could not resolve srt-win executable '${executable}' through PATH: ` +
+        (found.error?.message ||
+          found.stderr ||
+          `where.exe exited ${found.status}`),
+    )
+  }
+  return fs.realpathSync.native(candidate)
+}
+
+function appendWindowsAclHolderStderr(
+  holder: WindowsAclHolder,
+  failure: WindowsWfpBootstrapError,
+): WindowsWfpBootstrapError {
+  holder.stderrDiagnosticBaseMessage ??= failure.message
+  failure.message = holder.stderrDiagnosticBaseMessage
+  const stderr = holder.stderrTail.toString('utf8').trim()
+  if (stderr) failure.message += `; holder stderr=${JSON.stringify(stderr)}`
+  return failure
+}
+
+async function finalizeWindowsAclHolderFailure(
+  holder: WindowsAclHolder,
+  failure: WindowsWfpBootstrapError,
+): Promise<WindowsWfpBootstrapError> {
+  if (
+    holder.stderrOpen &&
+    (failure.code === 'acl-holder-exited-early' ||
+      failure.code === 'acl-holder-spawn-error')
+  ) {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        holder.stderrClosed,
+        new Promise<void>(resolve => {
+          timer = setTimeout(
+            resolve,
+            WINDOWS_ACL_HOLDER_STDERR_CLOSE_TIMEOUT_MS,
+          )
+          timer.unref()
+        }),
+      ])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+  return appendWindowsAclHolderStderr(holder, failure)
+}
+
+function currentHolderFailure(
+  holder: WindowsAclHolder,
+): WindowsWfpBootstrapError | undefined {
+  if (holder.failure) {
+    return holder.failure
+  }
+  if (
+    !holder.stopping &&
+    (holder.child.exitCode !== null || holder.child.signalCode !== null)
+  ) {
+    holder.failure = new WindowsWfpBootstrapError(
+      'acl-holder-exited-early',
+      `Native ACL holder ${holder.child.pid ?? 'unknown'} exited early ` +
+        `(code=${holder.child.exitCode}, signal=${holder.child.signalCode})`,
+    )
+    return holder.failure
+  }
+  return undefined
+}
+
+async function observeWindowsAclHolder(
+  holder: WindowsAclHolder,
+): Promise<WindowsWfpBootstrapError | undefined> {
+  // grant/verify use spawnSync and can block delivery of the child's
+  // exit event. Yield once at each boundary before deciding that the
+  // holder remained alive.
+  await new Promise<void>(resolve => setImmediate(resolve))
+  const failure = currentHolderFailure(holder)
+  return failure
+    ? await finalizeWindowsAclHolderFailure(holder, failure)
+    : undefined
+}
+
+function spawnWindowsAclHolder(
+  srtWin: SrtWinSpawn,
+  callerCwd: string,
+  sandboxUserSid: string,
+): WindowsAclHolder {
+  let child: ChildProcess
+  try {
+    child = spawn(
+      srtWin.exe,
+      [
+        ...srtWin.prependArgs,
+        'acl',
+        'hold',
+        '--parent-pid',
+        String(process.pid),
+        '--sandbox-user-sid',
+        sandboxUserSid,
+      ],
+      {
+        cwd: callerCwd,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        // The holder must outlive an abruptly terminated broker long enough
+        // to release its own ACL claims after the parent HANDLE is signaled.
+        detached: true,
+        windowsHide: true,
+      },
+    )
+  } catch (cause) {
+    throw new WindowsWfpBootstrapError(
+      'acl-holder-spawn-error',
+      `Native ACL holder failed to start: ${(cause as Error).message}`,
+      cause,
+    )
+  }
+
+  let resolveReady!: (identity: WindowsAclHolderIdentity) => void
+  let rejectReady!: (reason: unknown) => void
+  const ready = new Promise<WindowsAclHolderIdentity>((resolve, reject) => {
+    resolveReady = resolve
+    rejectReady = reject
+  })
+  const stderr = child.stderr
+  let resolveStderrClosed!: () => void
+  const stderrClosed = stderr
+    ? new Promise<void>(resolve => {
+        resolveStderrClosed = resolve
+      })
+    : Promise.resolve()
+  const holder: WindowsAclHolder = {
+    child,
+    ready,
+    stopping: false,
+    stderrTail: Buffer.alloc(0),
+    stderrClosed,
+    stderrOpen: stderr !== null,
+  }
+  if (stderr) {
+    stderr.on('data', (chunk: Buffer) => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      const combined = Buffer.concat([holder.stderrTail, bytes])
+      holder.stderrTail =
+        combined.byteLength <= WINDOWS_ACL_HOLDER_STDERR_MAX_BYTES
+          ? combined
+          : combined.subarray(
+              combined.byteLength - WINDOWS_ACL_HOLDER_STDERR_MAX_BYTES,
+            )
+    })
+    stderr.once('close', () => {
+      holder.stderrOpen = false
+      resolveStderrClosed()
+    })
+  }
+
+  let readySettled = false
+  const failReady = (failure: WindowsWfpBootstrapError) => {
+    holder.failure ??= failure
+    if (!readySettled) {
+      readySettled = true
+      rejectReady(holder.failure)
+    }
+  }
+
+  child.once('error', cause => {
+    failReady(
+      new WindowsWfpBootstrapError(
+        'acl-holder-spawn-error',
+        `Native ACL holder failed to start: ${(cause as Error).message}`,
+        cause,
+      ),
+    )
+  })
+  child.once('exit', (code, signal) => {
+    if (!holder.stopping) {
+      failReady(
+        new WindowsWfpBootstrapError(
+          'acl-holder-exited-early',
+          `Native ACL holder ${child.pid ?? 'unknown'} exited early ` +
+            `(code=${code}, signal=${signal})`,
+        ),
+      )
+    }
+  })
+
+  const stdout = child.stdout
+  if (!stdout) {
+    failReady(
+      new WindowsWfpBootstrapError(
+        'acl-holder-ready-invalid',
+        'Native ACL holder started without a readiness pipe',
+      ),
+    )
+  } else {
+    let frame = Buffer.alloc(0)
+    let frameBytes = 0
+    let frameComplete = false
+    const onData = (chunk: Buffer) => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      if (frameComplete) {
+        failReady(
+          new WindowsWfpBootstrapError(
+            'acl-holder-ready-invalid',
+            'Native ACL holder wrote trailing readiness payload',
+          ),
+        )
+        return
+      }
+
+      frameBytes += bytes.byteLength
+      if (frameBytes > WINDOWS_ACL_HOLDER_READY_MAX_BYTES) {
+        stdout.off('data', onData)
+        failReady(
+          new WindowsWfpBootstrapError(
+            'acl-holder-ready-invalid',
+            'Native ACL holder readiness frame exceeded its byte bound',
+          ),
+        )
+        return
+      }
+      frame = Buffer.concat([frame, bytes], frameBytes)
+      if (!frame.includes(0x0a)) return
+
+      let identity: WindowsAclHolderIdentity
+      try {
+        identity = parseWindowsAclHolderReadyFrame(frame, child.pid)
+      } catch (cause) {
+        stdout.off('data', onData)
+        failReady(
+          cause instanceof WindowsWfpBootstrapError
+            ? cause
+            : invalidWindowsAclHolderReady('unparseable identity', cause),
+        )
+        return
+      }
+      frameComplete = true
+      if (!readySettled) {
+        readySettled = true
+        resolveReady(identity)
+      }
+    }
+    stdout.on('data', onData)
+  }
+  return holder
+}
+
+async function waitForWindowsAclHolder(
+  holder: WindowsAclHolder,
+  readyTimeoutMs: number,
+): Promise<WindowsAclHolderIdentity> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let identity: WindowsAclHolderIdentity | undefined
+  try {
+    identity = await Promise.race([
+      holder.ready,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(
+              new WindowsWfpBootstrapError(
+                'acl-holder-ready-timeout',
+                `Native ACL holder ${holder.child.pid ?? 'unknown'} did not confirm parent HANDLE readiness`,
+              ),
+            ),
+          readyTimeoutMs,
+        )
+        timer.unref()
+      }),
+    ])
+  } catch (error) {
+    if (error instanceof WindowsWfpBootstrapError && error === holder.failure) {
+      throw await finalizeWindowsAclHolderFailure(holder, error)
+    }
+    throw error
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+
+  // Let any trailing bytes already queued on the readiness pipe run
+  // before the caller is allowed to grant the executable ACL.
+  await new Promise<void>(resolve => setImmediate(resolve))
+  const failure = currentHolderFailure(holder)
+  if (failure) throw await finalizeWindowsAclHolderFailure(holder, failure)
+  if (holder.child.pid === undefined || identity === undefined) {
+    throw new WindowsWfpBootstrapError(
+      'acl-holder-spawn-error',
+      'Native ACL holder started without a process identity',
+    )
+  }
+  return identity
+}
+
+async function terminateWindowsAclHolder(
+  holder: WindowsAclHolder,
+): Promise<void> {
+  holder.stopping = true
+  const child = holder.child
+  if (
+    holder.failure?.code === 'acl-holder-spawn-error' &&
+    child.pid === undefined
+  ) {
+    return
+  }
+  if (child.exitCode !== null || child.signalCode !== null) return
+
+  const exited = new Promise<void>((resolve, reject) => {
+    child.once('exit', () => resolve())
+    child.once('error', cause =>
+      reject(
+        new WindowsWfpBootstrapError(
+          'acl-holder-spawn-error',
+          `Native ACL holder emitted an error during cleanup: ${(cause as Error).message}`,
+          cause,
+        ),
+      ),
+    )
+  })
+
+  let killed: boolean
+  try {
+    killed = child.kill()
+  } catch (cause) {
+    throw new WindowsWfpBootstrapError(
+      'acl-holder-kill-failed',
+      `Native ACL holder ${child.pid ?? 'unknown'} could not be terminated`,
+      cause,
+    )
+  }
+  if (!killed && child.exitCode === null && child.signalCode === null) {
+    throw new WindowsWfpBootstrapError(
+      'acl-holder-kill-failed',
+      `Native ACL holder ${child.pid ?? 'unknown'} refused termination`,
+    )
+  }
+
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([
+      exited,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(
+              new WindowsWfpBootstrapError(
+                'acl-holder-exit-timeout',
+                `Native ACL holder ${child.pid ?? 'unknown'} did not exit after cleanup`,
+              ),
+            ),
+          WINDOWS_ACL_HOLDER_EXIT_TIMEOUT_MS,
+        )
+        timer.unref()
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+/**
+ * Run a WFP readiness probe with a temporary exact-file ACL grant.
+ *
+ * A dedicated native `acl hold` process owns the grant. It waits on
+ * an open HANDLE to the original host process, making parent death
+ * detection PID-reuse safe while keeping holder-wide revoke isolated
+ * from the host process's session grants.
+ */
+export function verifyWindowsWfpEgressWithAclBootstrap(opts: {
+  sandboxUserSid: string
+  target?: string
+  proxyPortRange?: readonly [number, number]
+  srtWin: SrtWinSpawn
+  /** Internal test seam; production callers use the bounded default. */
+  holderReadyTimeoutMs?: number
+}): Promise<WindowsWfpVerifyResult> {
+  const callerCwd = process.cwd()
+  const sandboxUserSid = opts.sandboxUserSid
+  const target = opts.target
+  const proxyPortRange: readonly [number, number] | undefined =
+    opts.proxyPortRange === undefined
+      ? undefined
+      : [opts.proxyPortRange[0], opts.proxyPortRange[1]]
+  const prependArgs = [...opts.srtWin.prependArgs]
+  const holderReadyTimeoutMs =
+    opts.holderReadyTimeoutMs ?? WINDOWS_ACL_HOLDER_READY_TIMEOUT_MS
+  if (!Number.isInteger(holderReadyTimeoutMs) || holderReadyTimeoutMs < 1) {
+    return Promise.reject(
+      new Error('holderReadyTimeoutMs must be a positive integer'),
+    )
+  }
+
+  let canonicalExe: string
+  try {
+    canonicalExe = resolveWindowsSpawnExecutable(opts.srtWin.exe, callerCwd)
+    if (!fs.statSync(canonicalExe).isFile()) {
+      throw new Error('Resolved srt-win path is not a file: ' + canonicalExe)
+    }
+  } catch (error) {
+    return Promise.reject(error)
+  }
+
+  const key = JSON.stringify({
+    sandboxUserSid,
+    executable: canonicalExe.toLowerCase(),
+    prependArgs,
+    target: target ?? null,
+    proxyPortRange: proxyPortRange ?? null,
+    callerCwd: callerCwd.toLowerCase(),
+    holderReadyTimeoutMs,
+  })
+  const pending = windowsWfpBootstrapPromises.get(key)
+  if (pending) return pending
+
+  const canonicalSrtWin: SrtWinSpawn = {
+    exe: canonicalExe,
+    prependArgs,
+  }
+  const promise = (async () => {
+    const holder = spawnWindowsAclHolder(
+      canonicalSrtWin,
+      callerCwd,
+      sandboxUserSid,
+    )
+    let holderIdentity: WindowsAclHolderIdentity | undefined
+    let grantAttempted = false
+    let result: WindowsWfpVerifyResult | undefined
+    let primaryError: unknown
+    try {
+      holderIdentity = await waitForWindowsAclHolder(
+        holder,
+        holderReadyTimeoutMs,
+      )
+      const beforeGrant = await observeWindowsAclHolder(holder)
+      if (beforeGrant) throw beforeGrant
+
+      grantAttempted = true
+      grantWindowsAclForHolder({
+        sandboxUserSid,
+        holderPid: holderIdentity.holderPid,
+        holderProcessCreateTime: holderIdentity.holderProcessCreateTime,
+        read: [canonicalExe],
+        write: [],
+        cwd: callerCwd,
+        srtWin: canonicalSrtWin,
+      })
+      const afterGrant = await observeWindowsAclHolder(holder)
+      if (afterGrant) throw afterGrant
+
+      result = await verifyWindowsWfpEgressRaw({
+        target,
+        proxyPortRange,
+        srtWin: canonicalSrtWin,
+        cwd: callerCwd,
+      })
+      const afterProbe = await observeWindowsAclHolder(holder)
+      if (afterProbe) throw afterProbe
+    } catch (error) {
+      primaryError = error
+    }
+
+    let cleanupError: unknown
+    if (grantAttempted && holderIdentity !== undefined) {
+      try {
+        revokeWindowsAclOrThrow({
+          sandboxUserSid,
+          holderPid: holderIdentity.holderPid,
+          holderProcessCreateTime: holderIdentity.holderProcessCreateTime,
+          cwd: callerCwd,
+          srtWin: canonicalSrtWin,
+        })
+      } catch (error) {
+        cleanupError = error
+      }
+    }
+
+    let holderLifecycleError: unknown
+    const observedHolderError = await observeWindowsAclHolder(holder)
+    if (
+      observedHolderError &&
+      !(primaryError instanceof WindowsWfpBootstrapError)
+    ) {
+      holderLifecycleError = observedHolderError
+    }
+
+    let holderStopError: unknown
+    try {
+      await terminateWindowsAclHolder(holder)
+    } catch (error) {
+      holderStopError = error
+    }
+
+    const errors: unknown[] = []
+    if (primaryError !== undefined) errors.push(primaryError)
+    if (cleanupError !== undefined) errors.push(cleanupError)
+    if (holderLifecycleError !== undefined) errors.push(holderLifecycleError)
+    if (holderStopError !== undefined) errors.push(holderStopError)
+    if (errors.length > 1) {
+      const AggregateErrorCtor = (
+        globalThis as unknown as {
+          AggregateError: new (
+            errors: unknown[],
+            message: string,
+          ) => Error & { errors: unknown[] }
+        }
+      ).AggregateError
+      throw new AggregateErrorCtor(
+        errors,
+        'WFP verification or temporary ACL cleanup failed',
+      )
+    }
+    if (errors.length === 1) throw errors[0]
+    if (result === undefined) {
+      throw new Error('WFP verification completed without a result')
+    }
+    return result
+  })()
+
+  windowsWfpBootstrapPromises.set(key, promise)
+  const clear = () => {
+    if (windowsWfpBootstrapPromises.get(key) === promise) {
+      windowsWfpBootstrapPromises.delete(key)
+    }
+  }
+  void promise.then(clear, clear)
+  return promise
+}
 /**
  * Query the sandbox user account's provisioning state. Each field
  * is independently observed so a half-provisioned install (e.g.
@@ -1107,6 +1841,27 @@ export interface WindowsAclGrantOptions {
   holderPid?: number
   /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
   srtWin?: SrtWinSpawn
+  /** Broker CWD; bootstrap callers snapshot the caller CWD. */
+  cwd?: string
+}
+
+interface WindowsAclGrantCommandOptions extends WindowsAclGrantOptions {
+  holderProcessCreateTime?: string
+}
+
+function windowsAclHolderIdentityArgs(
+  holderProcessCreateTime: string | undefined,
+): string[] {
+  if (holderProcessCreateTime === undefined) return []
+  if (
+    !WINDOWS_PROCESS_CREATE_TIME_PATTERN.test(holderProcessCreateTime) ||
+    BigInt(holderProcessCreateTime) > WINDOWS_PROCESS_CREATE_TIME_MAX
+  ) {
+    throw new Error(
+      'holderProcessCreateTime must be a canonical positive signed 64-bit decimal string',
+    )
+  }
+  return ['--holder-process-create-time', holderProcessCreateTime]
 }
 
 /**
@@ -1120,7 +1875,7 @@ export interface WindowsAclGrantOptions {
  * @throws on exit ≠ 0. On throw the caller should call
  *   {@link revokeWindowsAcl} to release whatever WAS granted.
  */
-export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
+function grantWindowsAclForHolder(opts: WindowsAclGrantCommandOptions): void {
   const holder = opts.holderPid ?? process.pid
   const stdin = JSON.stringify({ read: opts.read, write: opts.write })
   const r = runSrtWin(
@@ -1129,10 +1884,11 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
       'grant',
       '--holder-pid',
       `${holder}`,
+      ...windowsAclHolderIdentityArgs(opts.holderProcessCreateTime),
       '--sandbox-user-sid',
       opts.sandboxUserSid,
     ],
-    { timeoutMs: 60_000, stdin, srtWin: opts.srtWin },
+    { timeoutMs: 60_000, stdin, cwd: opts.cwd, srtWin: opts.srtWin },
   )
   logForDebugging(
     `[Sandbox Windows] acl grant exit=${r.status}: ${r.stderr || r.stdout}`,
@@ -1144,30 +1900,72 @@ export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
   }
 }
 
+export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
+  grantWindowsAclForHolder(opts)
+}
+
 /**
  * Release this holder's grants and remove the sandbox-user ACE on
  * any path whose refcount falls to zero. Best-effort (does not
  * throw); logs anomalies.
  */
-export function revokeWindowsAcl(opts: {
+interface WindowsAclRevokeOptions {
   sandboxUserSid: string
   holderPid?: number
+  holderProcessCreateTime?: string
+  cwd?: string
   srtWin?: SrtWinSpawn
-}): WindowsAclAceOutcome[] | undefined {
+}
+
+function runWindowsAclRevoke(opts: WindowsAclRevokeOptions) {
   const holder = opts.holderPid ?? process.pid
-  try {
-    const r = runSrtWinJsonAllowFail<WindowsAclAceOutcome[]>(
-      [
-        'acl',
-        'revoke',
-        '--holder-pid',
-        `${holder}`,
-        '--sandbox-user-sid',
-        opts.sandboxUserSid,
-        '--json',
-      ],
-      { timeoutMs: 60_000, srtWin: opts.srtWin },
+  return runSrtWinJsonAllowFail<WindowsAclAceOutcome[]>(
+    [
+      'acl',
+      'revoke',
+      '--holder-pid',
+      `${holder}`,
+      ...windowsAclHolderIdentityArgs(opts.holderProcessCreateTime),
+      '--sandbox-user-sid',
+      opts.sandboxUserSid,
+      '--json',
+    ],
+    { timeoutMs: 60_000, cwd: opts.cwd, srtWin: opts.srtWin },
+  )
+}
+
+function revokeWindowsAclOrThrow(
+  opts: WindowsAclRevokeOptions,
+): WindowsAclAceOutcome[] {
+  const r = runWindowsAclRevoke(opts)
+  if (!r.ok) {
+    throw new Error(
+      'srt-win acl revoke exited non-zero: ' +
+        (r.stderr || JSON.stringify(r.json)),
     )
+  }
+  const ok = new Set([
+    'revoked',
+    'stillHeld',
+    'downgraded',
+    'restored',
+    'alreadyOriginal',
+  ])
+  const anomaly = r.json.find(entry => !ok.has(entry.status))
+  if (anomaly) {
+    throw new Error(
+      `srt-win acl revoke returned unsafe status '${anomaly.status}' ` +
+        `for '${anomaly.path}'; ACL cleanup may be incomplete`,
+    )
+  }
+  return r.json
+}
+
+export function revokeWindowsAcl(
+  opts: WindowsAclRevokeOptions,
+): WindowsAclAceOutcome[] | undefined {
+  try {
+    const r = runWindowsAclRevoke(opts)
     if (!r.ok) {
       logForDebugging(
         `[Sandbox Windows] acl revoke exited non-zero: ${r.stderr}`,

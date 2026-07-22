@@ -376,9 +376,10 @@ fn open_session_bno() -> Result<OwnedHandle> {
 ///
 /// Walk-and-rebuild (not `SetEntriesInAclW`) so the round-trip is
 /// byte-faithful for ACEs we don't touch. The walk is
-/// [`crate::acl::filter_aces`] with a SID-match predicate; unlike
-/// `apply_sandbox_aces` this **keeps** inherited ACEs (kernel
-/// objects don't get the `UNPROTECTED`-re-derive treatment).
+/// [`crate::acl::filter_aces`] with a SID-match predicate. Like
+/// `apply_sandbox_aces`, this keeps inherited ACEs belonging to
+/// trustees other than `target_sid`; kernel objects have no
+/// filesystem inheritance re-evaluation step.
 fn recompose_dacl(
     what: &str,
     target_sid: &[u8],

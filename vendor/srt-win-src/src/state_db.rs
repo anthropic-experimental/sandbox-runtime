@@ -26,18 +26,22 @@
 //! tells us the previous holder died mid-op (crash-recovery
 //! already runs unconditionally).
 //!
-//! There is deliberately NO single enclosing transaction. Each
-//! path's (FS mutation + row change) commits independently so a
-//! failure on path Y can't revert path X. The one ordering rule is
-//! record-first: upsert, THEN `SetNamedSecurityInfoW`. A crash
-//! between leaves a row whose ACE hasn't been written; the next
-//! call re-derives and reapplies.
+//! There is deliberately NO transaction spanning a caller's whole
+//! apply batch. GRANT removal is record-first so a failed filesystem
+//! convergence cannot leave an untracked ALLOW. DENY removal first
+//! commits the holder transition, then converges the filesystem; a
+//! crash therefore leaves the stronger DENY in place, and recovery
+//! derives the desired state from the remaining holder edges. Crash
+//! recovery uses per-broker and per-path retry units so one poisoned
+//! path cannot block unrelated cleanup or the current operation.
 
 use anyhow::{Context, Result, anyhow, bail};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{
+    CloseHandle, FILETIME, HANDLE, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0,
+};
 use windows::Win32::System::Threading::{
     CreateMutexExW, GetCurrentProcess, GetProcessTimes, INFINITE, MUTEX_ALL_ACCESS, OpenProcess,
     PROCESS_QUERY_LIMITED_INFORMATION, ReleaseMutex, WaitForSingleObject,
@@ -59,6 +63,38 @@ impl std::str::FromStr for HolderPid {
     type Err = std::num::ParseIntError;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         s.parse::<u32>().map(HolderPid)
+    }
+}
+
+/// PID plus the process object's immutable creation FILETIME. The
+/// pair binds a caller-observed holder to the same process object at
+/// registration/release time and closes the PID-reuse window.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct HolderIdentity {
+    pub pid: HolderPid,
+    pub process_create_time: i64,
+}
+
+impl HolderIdentity {
+    /// Capture the current process identity. Used by the dedicated
+    /// `acl hold` process before it emits readiness.
+    pub fn current() -> Result<Self> {
+        Ok(Self {
+            pid: HolderPid(std::process::id()),
+            process_create_time: process_create_time(unsafe { GetCurrentProcess() })?,
+        })
+    }
+
+    /// Observe a live process and bind its PID to its creation time.
+    pub fn observe(pid: HolderPid) -> Result<Self> {
+        if pid.0 == std::process::id() {
+            return Self::current();
+        }
+        let h = open_live_process(pid.0)?;
+        Ok(Self {
+            pid,
+            process_create_time: process_create_time(h.raw())?,
+        })
     }
 }
 
@@ -129,8 +165,21 @@ CREATE TABLE IF NOT EXISTS sandbox_user (
 #[derive(Debug, Default)]
 pub struct RecoveryReport {
     pub dead_brokers: u32,
-    /// Orphaned `working_aces` rows whose ACE was revoked.
+    /// `working_aces` rows whose on-disk state was reconciled.
     pub aces_revoked: u32,
+    /// Per-broker or per-path cleanup attempts retained for retry.
+    pub cleanup_failures: u32,
+}
+
+/// Begin a write transaction before reading derived holder state.
+/// This closes cross-Terminal-Services-session stale-snapshot races
+/// that the session-local named mutex cannot serialize.
+fn immediate_transaction<'conn>(
+    conn: &'conn Connection,
+    operation: &str,
+) -> Result<Transaction<'conn>> {
+    Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .with_context(|| format!("begin {operation} IMMEDIATE tx"))
 }
 
 /// RAII guard for the init mutex. Releases on drop. The mutex
@@ -339,14 +388,32 @@ pub fn open_db_ro() -> Result<Option<Connection>> {
     Ok(Some(conn))
 }
 
+/// Count exact-path ACL state rows for diagnostics and CI residue
+/// assertions. Missing or uninitialized DBs report zeroes.
+pub fn path_state_counts(canonical_path: &str) -> Result<(u32, u32)> {
+    let Some(conn) = open_db_ro()? else {
+        return Ok((0, 0));
+    };
+    conn.query_row(
+        "SELECT
+            (SELECT COUNT(*) FROM working_aces WHERE canonical_path = ?1),
+            (SELECT COUNT(*) FROM ace_holders WHERE canonical_path = ?1)",
+        [canonical_path],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .context("count ACL state for path")
+}
+
 /// Open at an arbitrary path. Tests use `:memory:` via
 /// `open_db_at(Path::new(":memory:"))`.
 pub(crate) fn open_db_at(path: &std::path::Path) -> Result<Connection> {
     // Schema mismatch → rename + recreate. No ALTER/DROP migration:
     // the old DB is preserved (debugging/recovery) at
     // state.db.v<old>.<ts>.bak alongside `path`, and a fresh DB is
-    // created at the expected schema. `acl recover` sweeps orphaned
-    // ACEs by trustee SID without the old rows. The `sandbox_user`
+    // created at the expected schema. The backup is the only durable
+    // map of paths owned by the old schema; the targeted recovery
+    // command deliberately does not sweep untracked trustee ACEs.
+    // The `sandbox_user`
     // row (cred + ca_cert) is in the renamed-away DB → the hint
     // says re-run install + trust-ca. The .bak inherits the
     // PROTECTED broker-only DACL from the state dir (stamped by
@@ -404,10 +471,11 @@ pub(crate) fn open_db_at(path: &std::path::Path) -> Result<Connection> {
                      v{SCHEMA_VERSION}; renamed to {} and created fresh. \
                      Re-run `srt-win install` (and `srt-win user \
                      trust-ca <pem>` if you use TLS termination) to \
-                     re-provision. `srt-win acl recover` will sweep \
-                     any sandbox-user DENY ACEs from a prior install; \
-                     PROTECTED-stamp DACLs from the removed same-user \
-                     mode require manual `icacls <path> /reset`.",
+                     re-provision. Review the backup before manually \
+                     removing sandbox-user ACEs from its tracked paths; \
+                     `srt-win acl recover` only reconciles paths in the \
+                     current DB. PROTECTED-stamp DACLs from the removed \
+                     same-user mode require manual `icacls <path> /reset`.",
                     bak.display(),
                 );
             }
@@ -601,10 +669,39 @@ pub fn with_init_lock<R>(
     force_recover: bool,
     f: impl FnOnce(&mut Locked) -> Result<R>,
 ) -> Result<(R, RecoveryReport)> {
+    with_init_lock_inner(holder_pid, None, force_recover, f)
+}
+
+/// [`with_init_lock`] with an immutable holder process identity. New
+/// protocols that can observe creation time should use this form;
+/// PID-only callers remain supported for compatibility.
+pub fn with_init_lock_bound<R>(
+    holder: HolderIdentity,
+    force_recover: bool,
+    f: impl FnOnce(&mut Locked) -> Result<R>,
+) -> Result<(R, RecoveryReport)> {
+    with_init_lock_inner(
+        holder.pid,
+        Some(holder.process_create_time),
+        force_recover,
+        f,
+    )
+}
+
+fn with_init_lock_inner<R>(
+    holder_pid: HolderPid,
+    expected_create_time: Option<i64>,
+    force_recover: bool,
+    f: impl FnOnce(&mut Locked) -> Result<R>,
+) -> Result<(R, RecoveryReport)> {
     let _mutex = InitMutex::acquire()?;
     let conn = open_db()?;
     let report = crash_recovery(&conn, force_recover)?;
-    let mut locked = Locked { conn, holder_pid };
+    let mut locked = Locked {
+        conn,
+        holder_pid,
+        expected_create_time,
+    };
     let out = f(&mut locked)?;
     Ok((out, report))
 }
@@ -622,6 +719,7 @@ pub fn with_init_lock<R>(
 pub struct Locked {
     conn: Connection,
     holder_pid: HolderPid,
+    expected_create_time: Option<i64>,
 }
 
 impl Locked {
@@ -639,8 +737,38 @@ impl Locked {
     /// while the holder's child is still running. `ON CONFLICT DO
     /// UPDATE` updates in place and leaves child rows intact.
     pub fn register_broker(&self) -> Result<()> {
-        let ct = pid_create_time(self.holder_pid.0)
-            .with_context(|| format!("read create-time of holder pid {}", self.holder_pid.0))?;
+        let observed = HolderIdentity::observe(self.holder_pid)
+            .with_context(|| format!("observe holder pid {}", self.holder_pid.0))?;
+        if let Some(expected) = self.expected_create_time
+            && observed.process_create_time != expected
+        {
+            bail!(
+                "holder pid {} creation-time mismatch: expected {}, observed {}",
+                self.holder_pid.0,
+                expected,
+                observed.process_create_time
+            );
+        }
+        let ct = observed.process_create_time;
+        let registered: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT process_create_time FROM brokers WHERE pid = ?1",
+                params![self.holder_pid.0 as i64],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("SELECT existing broker identity")?;
+        if let Some(registered) = registered
+            && registered != ct
+        {
+            bail!(
+                "holder pid {} collides with stale broker identity: observed {}, registered {}",
+                self.holder_pid.0,
+                ct,
+                registered
+            );
+        }
         let now = unix_now();
         self.conn
             .execute(
@@ -658,12 +786,61 @@ impl Locked {
     /// Remove the holder's `brokers` row. CASCADE drops its
     /// `holders` rows.
     pub fn unregister_broker(&self) -> Result<()> {
-        self.conn
-            .execute(
-                "DELETE FROM brokers WHERE pid = ?1",
+        match self.expected_create_time {
+            Some(ct) => self
+                .conn
+                .execute(
+                    "DELETE FROM brokers WHERE pid = ?1 AND process_create_time = ?2",
+                    params![self.holder_pid.0 as i64, ct],
+                )
+                .context("DELETE bound broker")?,
+            None => self
+                .conn
+                .execute(
+                    "DELETE FROM brokers WHERE pid = ?1",
+                    params![self.holder_pid.0 as i64],
+                )
+                .context("DELETE brokers")?,
+        };
+        Ok(())
+    }
+
+    fn validate_bound_broker(&self) -> Result<()> {
+        let Some(expected) = self.expected_create_time else {
+            return Ok(());
+        };
+        let stored: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT process_create_time FROM brokers WHERE pid = ?1",
                 params![self.holder_pid.0 as i64],
+                |row| row.get(0),
             )
-            .context("DELETE brokers")?;
+            .optional()
+            .context("SELECT bound broker identity")?;
+        if let Some(stored) = stored
+            && stored != expected
+        {
+            bail!(
+                "holder pid {} no longer identifies the registered process: expected {}, stored {}",
+                self.holder_pid.0,
+                expected,
+                stored
+            );
+        }
+        Ok(())
+    }
+
+    /// ACL tracking is not SID-keyed, so accepting a caller-supplied
+    /// SID different from the installed sandbox identity could remove
+    /// tracking while filtering a different principal on disk.
+    fn validate_sandbox_sid(&self, supplied: &str) -> Result<()> {
+        let installed = read_setup_info(&self.conn)?
+            .ok_or_else(|| anyhow!("sandbox setup missing; refusing ACL mutation"))?
+            .sandbox_user_sid;
+        if !installed.eq_ignore_ascii_case(supplied) {
+            bail!("sandbox user SID mismatch: supplied {supplied}, installed {installed}");
+        }
         Ok(())
     }
 
@@ -675,6 +852,7 @@ impl Locked {
         sandbox_sid: &str,
         f: impl FnOnce(&Self) -> Result<(Vec<AceWitness>, usize)>,
     ) -> Result<(Vec<AceWitness>, usize)> {
+        self.validate_sandbox_sid(sandbox_sid)?;
         self.register_broker()?;
         let (witnesses, failed) = f(self)?;
         if failed > 0 {
@@ -753,10 +931,10 @@ impl Locked {
         })
     }
 
-    /// Disk-first single-ACE converge. Record-first upsert (holder
-    /// row plus `working_aces` row) then [`recompose_at`] so a
-    /// crash between leaves a row whose ACE hasn't been written —
-    /// the next call re-derives and reapplies.
+    /// Converge one ACE with kind-specific crash ordering. GRANT
+    /// commits tracking before adding access; DENY applies the
+    /// restriction while its IMMEDIATE transaction is open, then
+    /// commits tracking. Either crash direction is fail-closed.
     fn ensure_ace(&self, canon: &str, want: SbAce, sandbox_sid: &str) -> Result<AceWitness> {
         let (cur_id, links, is_dir) = path_id::capture_id_and_links(canon)
             .with_context(|| format!("capture file_id+links '{canon}'"))?;
@@ -776,8 +954,11 @@ impl Locked {
                  alias would prematurely strip the shared deny ACE"
             );
         }
-        let prior: Option<Vec<u8>> = self
-            .conn
+        // Serialize holder/effective-row derivation across TS sessions.
+        // The tracking transaction commits before filesystem mutation,
+        // so a GRANT can never exist without a durable working row.
+        let tx = immediate_transaction(&self.conn, "ensure ACE tracking")?;
+        let prior: Option<Vec<u8>> = tx
             .prepare_cached(
                 "SELECT file_id FROM working_aces \
                  WHERE canonical_path = ?1 AND kind = ?2",
@@ -795,18 +976,10 @@ impl Locked {
             );
         }
         // Holder row first (`want_mask` is THIS holder's request,
-        // independent of what other holders want — `effective_ace`
-        // computes the MAX). UPSERT so a re-apply at a different
-        // mask updates this holder's want. `holder_added` must
-        // reflect whether THIS call inserted a NEW (canon, kind,
-        // pid) row — NOT whether `working_aces` was empty
-        // (`prior.is_none()`): the latter would give a second
-        // holder of an already-held path `holder_added=false`,
-        // and partial-failure rollback (`with_broker_registration`)
-        // would leak its row. SQLite's UPSERT `changes()` returns
-        // 1 for both branches, so probe first.
-        let already_held: bool = self
-            .conn
+        // independent of what other holders want — `effective_ace_at`
+        // computes the MAX). Probe first because SQLite UPSERT reports
+        // one changed row for both insert and update.
+        let already_held: bool = tx
             .prepare_cached(
                 "SELECT 1 FROM ace_holders WHERE \
                  canonical_path = ?1 AND kind = ?2 AND pid = ?3 \
@@ -814,40 +987,56 @@ impl Locked {
             )?
             .exists(params![canon, want.kind(), self.holder_pid.0 as i64])
             .context("SELECT ace_holders (held?)")?;
-        self.conn
-            .prepare_cached(
-                "INSERT INTO ace_holders \
-                 (canonical_path, kind, pid, want_mask) \
-                 VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(canonical_path, kind, pid) \
-                 DO UPDATE SET want_mask = excluded.want_mask",
-            )?
-            .execute(params![
-                canon,
-                want.kind(),
-                self.holder_pid.0 as i64,
-                want.as_str()
-            ])
-            .context("UPSERT ace_holders")?;
+        tx.prepare_cached(
+            "INSERT INTO ace_holders \
+             (canonical_path, kind, pid, want_mask) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(canonical_path, kind, pid) \
+             DO UPDATE SET want_mask = excluded.want_mask",
+        )?
+        .execute(params![
+            canon,
+            want.kind(),
+            self.holder_pid.0 as i64,
+            want.as_str()
+        ])
+        .context("UPSERT ace_holders")?;
         let holder_added = !already_held;
-        let eff = self.effective_ace(canon, want.kind())?.unwrap_or(want);
-        self.conn
-            .prepare_cached(
-                "INSERT INTO working_aces \
-                 (canonical_path, kind, file_id, mask) \
-                 VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(canonical_path, kind) DO UPDATE SET \
-                   file_id = excluded.file_id, \
-                   mask    = excluded.mask",
-            )?
-            .execute(params![
-                canon,
-                want.kind(),
-                cur_id.as_bytes().as_slice(),
-                eff.as_str()
-            ])
-            .context("UPSERT working_aces")?;
-        recompose_at(&self.conn, canon, sandbox_sid)?;
+        let eff = effective_ace_at(&tx, canon, want.kind())?.unwrap_or(want);
+        tx.prepare_cached(
+            "INSERT INTO working_aces \
+             (canonical_path, kind, file_id, mask) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(canonical_path, kind) DO UPDATE SET \
+               file_id = excluded.file_id, \
+               mask    = excluded.mask",
+        )?
+        .execute(params![
+            canon,
+            want.kind(),
+            cur_id.as_bytes().as_slice(),
+            eff.as_str()
+        ])
+        .context("UPSERT working_aces")?;
+        match want {
+            SbAce::Grant(_) => {
+                tx.commit().context("commit ensure GRANT tracking")?;
+                // Access may only be added after tracking is durable.
+                // Re-acquire an IMMEDIATE writer lock so a concurrent
+                // grant cannot widen the DB state and then have this
+                // caller overwrite disk with a stale narrower mask.
+                let tx = immediate_transaction(&self.conn, "ensure GRANT filesystem")?;
+                recompose_at(&tx, canon, sandbox_sid)?;
+                tx.commit().context("commit ensure GRANT filesystem")?;
+            }
+            SbAce::Deny(_) | SbAce::DenyFdc => {
+                // Keep the write lock through the filesystem DENY. A
+                // crash or commit failure can leave an extra DENY, but
+                // can never leave a committed holder without its deny.
+                recompose_object_at(&tx, canon, canon, sandbox_sid)?;
+                tx.commit().context("commit ensure DENY tracking")?;
+            }
+        }
         Ok(AceWitness {
             canon: canon.to_string(),
             ace: eff,
@@ -857,122 +1046,222 @@ impl Locked {
         })
     }
 
-    /// `MAX(want_mask)` across live holders of `(canon, kind)`.
-    fn effective_ace(&self, canon: &str, kind: &str) -> Result<Option<SbAce>> {
-        let masks: Vec<String> = query_vec(
-            &self.conn,
-            "SELECT want_mask FROM ace_holders \
-             WHERE canonical_path = ?1 AND kind = ?2",
-            params![canon, kind],
-            |r| r.get(0),
-        )?;
-        masks
-            .iter()
-            .map(|m| SbAce::parse(kind, m))
-            .reduce(|a, b| Ok(a?.max(b?)))
-            .transpose()
-    }
-
     /// Release one `(canon, kind)` hold; recompute the effective ACE
     /// from the remaining holders (downgrade if this holder was the
     /// one that escalated it; revoke when zero remain).
-    /// Identity-validated: if the path now resolves to a different
-    /// `file_id`, the row is dropped and the ACE on the foreign
-    /// object is NOT touched — except for `Grant`, where we
-    /// best-effort `locate_by_file_id` and revoke at the moved path
-    /// so the sandbox user does not keep stale access.
+    ///
+    /// GRANT and DENY have opposite crash-safety ordering:
+    ///
+    /// - GRANT changes tracking and disk in one transaction so a
+    ///   failure cannot leave an untracked ALLOW.
+    /// - DENY first commits the holder removal while the stronger
+    ///   on-disk DENY remains, then converges disk in a second
+    ///   retryable phase. A crash before convergence is fail-closed.
     fn release_one_ace(&self, canon: &str, kind: &str, sandbox_sid: &str) -> Result<AceRelease> {
-        self.conn
-            .prepare_cached(
-                "DELETE FROM ace_holders WHERE canonical_path = ?1 \
-                 AND kind = ?2 AND pid = ?3",
-            )?
-            .execute(params![canon, kind, self.holder_pid.0 as i64])
-            .context("DELETE ace_holders (self)")?;
-        let row: Option<(Vec<u8>, String)> = self
+        self.release_one_ace_with(
+            canon,
+            kind,
+            sandbox_sid,
+            identity_gate,
+            path_id::locate_by_file_id,
+            recompose_object_at,
+        )
+    }
+
+    fn release_one_ace_with<I, L, R>(
+        &self,
+        canon: &str,
+        kind: &str,
+        sandbox_sid: &str,
+        identity: I,
+        locate: L,
+        recompose: R,
+    ) -> Result<AceRelease>
+    where
+        I: Fn(&str, FileId) -> IdGate,
+        L: Fn(&FileId) -> Result<Option<String>>,
+        R: Fn(&Connection, &str, &str, &str) -> Result<()>,
+    {
+        match kind {
+            "grant" => self.release_one_grant_with(canon, sandbox_sid, identity, locate, recompose),
+            "deny" | "deny_fdc" => self.release_one_deny_with(
+                canon,
+                kind,
+                sandbox_sid,
+                identity,
+                recompose,
+                || Ok(()),
+                |_| Ok(()),
+                || Ok(()),
+            ),
+            _ => bail!("unknown ACE kind {kind:?}"),
+        }
+    }
+
+    /// Remove a GRANT edge record-first. The transaction remains open
+    /// through filesystem convergence, so rollback always retains a
+    /// tracking row for any ALLOW that might still exist.
+    fn release_one_grant_with<I, L, R>(
+        &self,
+        canon: &str,
+        sandbox_sid: &str,
+        identity: I,
+        locate: L,
+        recompose: R,
+    ) -> Result<AceRelease>
+    where
+        I: Fn(&str, FileId) -> IdGate,
+        L: Fn(&FileId) -> Result<Option<String>>,
+        R: Fn(&Connection, &str, &str, &str) -> Result<()>,
+    {
+        let kind = "grant";
+        let tx = self
             .conn
+            .unchecked_transaction()
+            .context("begin release grant tx")?;
+        tx.prepare_cached(
+            "DELETE FROM ace_holders WHERE canonical_path = ?1 AND kind = ?2 AND pid = ?3",
+        )?
+        .execute(params![canon, kind, self.holder_pid.0 as i64])
+        .context("DELETE ace_holders (self)")?;
+        let row: Option<(Vec<u8>, String)> = tx
             .prepare_cached(
-                "SELECT file_id, mask FROM working_aces \
-                 WHERE canonical_path = ?1 AND kind = ?2",
+                "SELECT file_id, mask FROM working_aces WHERE canonical_path = ?1 AND kind = ?2",
             )?
             .query_row(params![canon, kind], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional()?;
         let Some((fid, stored)) = row else {
+            tx.commit()
+                .context("commit release grant with no working row")?;
             return Ok(AceRelease::NoRow);
         };
-        let new_eff = self.effective_ace(canon, kind)?;
-        // Row update first (record-first), then converge disk.
-        match new_eff {
-            Some(e) => self
-                .conn
-                .execute(
-                    "UPDATE working_aces SET mask = ?3 \
-                     WHERE canonical_path = ?1 AND kind = ?2",
-                    params![canon, kind, e.as_str()],
-                )
-                .context("UPDATE working_aces (downgrade)")?,
-            None => self
-                .conn
-                .execute(
-                    "DELETE FROM working_aces \
-                     WHERE canonical_path = ?1 AND kind = ?2",
-                    params![canon, kind],
-                )
-                .context("DELETE working_aces")?,
-        };
+        let new_eff = effective_ace_at(&tx, canon, kind)?;
+        update_working_ace(&tx, canon, kind, new_eff)?;
         let want_id = FileId::from_bytes(&fid)?;
-        match identity_gate(canon, want_id) {
+        let outcome = match identity(canon, want_id) {
             IdGate::Match => {
-                recompose_at(&self.conn, canon, sandbox_sid)?;
-                Ok(match new_eff {
+                recompose(&tx, canon, canon, sandbox_sid)?;
+                match new_eff {
                     Some(e) if e.as_str() == stored => AceRelease::StillHeld,
                     Some(_) => AceRelease::Downgraded,
                     None => AceRelease::Revoked,
-                })
+                }
             }
-            IdGate::Mismatch if kind == "grant" => {
-                // The granted object moved. The ALLOW ACE travels
-                // with the inode → the sandbox user still has
-                // access at the new path. Chase by file_id and
-                // revoke there (then re-converge if the new path
-                // happens to be tracked too). DENY/FDC are left in
-                // place on the moved inode (fail-closed).
-                Ok(match path_id::locate_by_file_id(&want_id) {
+            IdGate::Mismatch => {
+                // The ALLOW travels with the inode. A confirmed delete
+                // needs no cleanup; every lookup/recompose failure is
+                // propagated so the original rows remain retryable.
+                match locate(&want_id)? {
                     Some(at) => {
                         eprintln!(
-                            "srt-win: grant '{canon}': file_id moved \
-                             to '{at}'; revoking there"
+                            "srt-win: grant '{canon}': file_id moved to '{at}'; revoking there"
                         );
-                        recompose_at(&self.conn, &at, sandbox_sid)?;
+                        recompose(&tx, canon, &at, sandbox_sid)?;
                         AceRelease::Relocated { moved_to: at }
                     }
                     None => {
                         eprintln!(
-                            "srt-win: grant '{canon}': file_id not \
-                             found on volume; dropping row"
+                            "srt-win: grant '{canon}': file_id no longer exists on its mounted volume; dropping row"
                         );
                         AceRelease::Missing
                     }
-                })
+                }
+            }
+            IdGate::Unreadable => {
+                bail!(
+                    "grant '{canon}': file identity is unreadable; retaining holder and working rows for retry"
+                )
+            }
+        };
+        tx.commit().context("commit release grant tx")?;
+        Ok(outcome)
+    }
+
+    /// Remove a DENY edge in two durable phases. Phase 1 commits only
+    /// the holder transition while the existing (same-or-stronger)
+    /// DENY remains on disk. Phase 2 derives the narrower desired state
+    /// from the remaining holders and converges disk before committing
+    /// the updated `working_aces`. Failed phase-2 commits leave the stale
+    /// stronger row as a recovery marker.
+    #[allow(clippy::too_many_arguments)]
+    fn release_one_deny_with<I, R, B, C, A>(
+        &self,
+        canon: &str,
+        kind: &str,
+        sandbox_sid: &str,
+        identity: I,
+        recompose: R,
+        before_holder_commit: B,
+        between_phases: C,
+        before_state_commit: A,
+    ) -> Result<AceRelease>
+    where
+        I: Fn(&str, FileId) -> IdGate,
+        R: Fn(&Connection, &str, &str, &str) -> Result<()>,
+        B: FnOnce() -> Result<()>,
+        C: FnOnce(&Connection) -> Result<()>,
+        A: FnOnce() -> Result<()>,
+    {
+        let tx = immediate_transaction(&self.conn, "release DENY holder")?;
+        tx.prepare_cached(
+            "DELETE FROM ace_holders WHERE canonical_path = ?1 AND kind = ?2 AND pid = ?3",
+        )?
+        .execute(params![canon, kind, self.holder_pid.0 as i64])
+        .context("DELETE deny ace_holders (self)")?;
+
+        // This is the security boundary: no filesystem DENY is
+        // weakened until the holder transition is durable.
+        before_holder_commit().context("before commit deny holder transition")?;
+        tx.commit().context("commit release deny holder tx")?;
+        between_phases(&self.conn).context("between deny release phases")?;
+
+        // Acquire the cross-session write lock before deriving the
+        // remaining effective mask. Never carry a phase-1 snapshot
+        // across the durable boundary.
+        let tx = immediate_transaction(&self.conn, "release DENY state")?;
+        let row: Option<(Vec<u8>, String)> = tx
+            .prepare_cached(
+                "SELECT file_id, mask FROM working_aces WHERE canonical_path = ?1 AND kind = ?2",
+            )?
+            .query_row(params![canon, kind], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let new_eff = effective_ace_at(&tx, canon, kind)?;
+        let Some((fid, stored)) = row else {
+            if new_eff.is_some() {
+                bail!(
+                    "{kind} '{canon}': holder remains but working row is missing; holder transition committed, recovery required"
+                );
+            }
+            return Ok(AceRelease::NoRow);
+        };
+
+        update_working_ace(&tx, canon, kind, new_eff)?;
+        let want_id = FileId::from_bytes(&fid)?;
+        let outcome = match identity(canon, want_id) {
+            IdGate::Match => {
+                recompose(&tx, canon, canon, sandbox_sid)?;
+                match new_eff {
+                    Some(e) if e.as_str() == stored => AceRelease::StillHeld,
+                    Some(_) => AceRelease::Downgraded,
+                    None => AceRelease::Revoked,
+                }
             }
             IdGate::Mismatch => {
                 eprintln!(
-                    "srt-win: {kind} '{canon}': file_id mismatch — \
-                     path substituted; not touching ACE on the \
-                     foreign object (fail-closed)"
+                    "srt-win: {kind} '{canon}': file_id mismatch — path substituted; not touching DENY on the foreign object (fail-closed)"
                 );
-                Ok(AceRelease::Mismatch)
+                AceRelease::Mismatch
             }
             IdGate::Unreadable => {
-                eprintln!(
-                    "srt-win: {kind} '{canon}': open failed; \
-                     dropping row"
-                );
-                Ok(AceRelease::Missing)
+                bail!(
+                    "{kind} '{canon}': file identity is unreadable; holder transition committed, stronger DENY and working row retained for retry"
+                )
             }
-        }
+        };
+        before_state_commit().context("before commit deny state convergence")?;
+        tx.commit().context("commit release deny state tx")?;
+        Ok(outcome)
     }
-
     /// `(canon, kind)` rows held by this holder, optionally filtered
     /// to one set of kinds.
     fn my_ace_holds(&self, kinds: Option<&[&str]>) -> Result<Vec<(String, String)>> {
@@ -999,6 +1288,8 @@ impl Locked {
         sandbox_sid: &str,
         kinds: &[&str],
     ) -> Result<(Vec<(String, AceRelease)>, usize)> {
+        self.validate_bound_broker()?;
+        self.validate_sandbox_sid(sandbox_sid)?;
         let holds = self.my_ace_holds(Some(kinds))?;
         let mut out = Vec::with_capacity(holds.len());
         let mut failed = 0usize;
@@ -1025,31 +1316,103 @@ impl Locked {
     }
 }
 
+/// `MAX(want_mask)` across holder edges for one path/kind.
+fn effective_ace_at(conn: &Connection, canon: &str, kind: &str) -> Result<Option<SbAce>> {
+    let masks: Vec<String> = query_vec(
+        conn,
+        "SELECT want_mask FROM ace_holders WHERE canonical_path = ?1 AND kind = ?2",
+        params![canon, kind],
+        |r| r.get(0),
+    )?;
+    masks
+        .iter()
+        .map(|m| SbAce::parse(kind, m))
+        .reduce(|a, b| Ok(a?.max(b?)))
+        .transpose()
+}
+
+/// Update the tracked effective mask, or remove the row when no
+/// holders remain. Callers own the surrounding crash-safety order.
+fn update_working_ace(
+    conn: &Connection,
+    canon: &str,
+    kind: &str,
+    effective: Option<SbAce>,
+) -> Result<()> {
+    match effective {
+        Some(ace) => conn
+            .execute(
+                "UPDATE working_aces SET mask = ?3 WHERE canonical_path = ?1 AND kind = ?2",
+                params![canon, kind, ace.as_str()],
+            )
+            .context("UPDATE working_aces (effective mask)")?,
+        None => conn
+            .execute(
+                "DELETE FROM working_aces WHERE canonical_path = ?1 AND kind = ?2",
+                params![canon, kind],
+            )
+            .context("DELETE working_aces")?,
+    };
+    Ok(())
+}
+
 /// Read all `working_aces` rows for `canon` and converge the on-disk
 /// ACEs for `sandbox_sid` to exactly that set. The single chokepoint
 /// for sandbox-user ACE state — every add/drop/crash-recover routes
 /// here so a path with both a grant AND a deny (or a parent that is
 /// both granted and `deny_fdc`'d) is handled consistently.
 fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()> {
-    let rows: Vec<(String, String)> = query_vec(
-        conn,
-        "SELECT kind, mask FROM working_aces \
-         WHERE canonical_path = ?1",
-        params![canon],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-    let mut set = acl::SbAceSet::default();
-    for (k, m) in &rows {
-        match SbAce::parse(k, m)? {
-            SbAce::Grant(g) => set.grant = Some(g),
-            SbAce::Deny(d) => set.deny = Some(d),
-            SbAce::DenyFdc => set.deny_fdc = true,
-        }
-    }
-    acl::apply_sandbox_aces(canon, sandbox_sid, set)
-        .with_context(|| format!("recompose '{canon}' ({set:?})"))
+    recompose_object_at(conn, canon, canon, sandbox_sid)
 }
 
+/// Converge the object currently at `target` from tracking attached
+/// both to its original canonical path and to the current path. The
+/// union preserves DENY/DENY_FDC when a relocated GRANT is removed.
+fn recompose_object_at(
+    conn: &Connection,
+    source_canon: &str,
+    target: &str,
+    sandbox_sid: &str,
+) -> Result<()> {
+    let set = sandbox_ace_set_for_object(conn, source_canon, target)?;
+    acl::apply_sandbox_aces(target, sandbox_sid, set)
+        .with_context(|| format!("recompose '{target}' from '{source_canon}' ({set:?})"))
+}
+
+fn sandbox_ace_set_for_object(
+    conn: &Connection,
+    source_canon: &str,
+    target: &str,
+) -> Result<acl::SbAceSet> {
+    let rows: Vec<(String, String)> = query_vec(
+        conn,
+        "SELECT kind, mask FROM working_aces WHERE canonical_path = ?1 OR canonical_path = ?2",
+        params![source_canon, target],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let mut grant: Option<SbAce> = None;
+    let mut deny: Option<SbAce> = None;
+    let mut deny_fdc = false;
+    for (kind, mask) in &rows {
+        let ace = SbAce::parse(kind, mask)?;
+        match ace {
+            SbAce::Grant(_) => grant = Some(grant.map_or(ace, |current| current.max(ace))),
+            SbAce::Deny(_) => deny = Some(deny.map_or(ace, |current| current.max(ace))),
+            SbAce::DenyFdc => deny_fdc = true,
+        }
+    }
+    let mut set = acl::SbAceSet {
+        deny_fdc,
+        ..Default::default()
+    };
+    if let Some(SbAce::Grant(mask)) = grant {
+        set.grant = Some(mask);
+    }
+    if let Some(SbAce::Deny(mask)) = deny {
+        set.deny = Some(mask);
+    }
+    Ok(set)
+}
 /// Sealed proof that [`Locked::apply_aces`] converged `canon` to
 /// carry `ace` for the sandbox user.
 #[must_use]
@@ -1101,94 +1464,315 @@ impl AceRelease {
     }
 }
 
-/// Prune dead brokers and revoke any sandbox-user ACEs they orphaned.
+/// Prune dead brokers and reconcile sandbox-user ACE tracking.
 ///
-/// Per-path commit: the dead-broker prune is one short tx (pure DB,
-/// CASCADE); then each orphan's (recompose FS mutation + row
-/// delete) is committed independently, so a failure on path Y
-/// leaves path X's recompose+delete durable. `force` is reserved
-/// for a future "force-recompose ignoring file-id mismatch" mode.
+/// Broker deletion and each path convergence use independent retry
+/// units. A poisoned row remains tracked and is reported, but cannot
+/// block unrelated recovery or the operation that acquired the init
+/// lock. `force` revalidates and recomposes every tracked row; it
+/// never bypasses file-identity checks or deletes unreadable state.
 fn crash_recovery(conn: &Connection, force: bool) -> Result<RecoveryReport> {
-    let mut report = RecoveryReport::default();
+    crash_recovery_with(
+        conn,
+        force,
+        is_process_alive,
+        path_id::capture_file_id,
+        identity_gate,
+        path_id::locate_by_file_id,
+        recompose_object_at,
+    )
+}
 
-    // 1. Find dead brokers.
-    let dead: Vec<i64> = query_vec(
+fn recovery_key_cmp(left: &(String, String), right: &(String, String)) -> std::cmp::Ordering {
+    let left_fdc_rank = u8::from(left.1 != "deny_fdc");
+    let right_fdc_rank = u8::from(right.1 != "deny_fdc");
+    left_fdc_rank
+        .cmp(&right_fdc_rank)
+        .then_with(|| {
+            std::path::Path::new(&left.0)
+                .components()
+                .count()
+                .cmp(&std::path::Path::new(&right.0).components().count())
+        })
+        .then_with(|| left.0.cmp(&right.0))
+        .then_with(|| left.1.cmp(&right.1))
+}
+
+fn crash_recovery_with<A, C, I, L, R>(
+    conn: &Connection,
+    force: bool,
+    alive: A,
+    capture: C,
+    identity: I,
+    locate: L,
+    recompose: R,
+) -> Result<RecoveryReport>
+where
+    A: Fn(u32, i64) -> bool,
+    C: Fn(&str) -> Result<FileId>,
+    I: Fn(&str, FileId) -> IdGate,
+    L: Fn(&FileId) -> Result<Option<String>>,
+    R: Fn(&Connection, &str, &str, &str) -> Result<()>,
+{
+    let mut report = RecoveryReport::default();
+    let sandbox_sid = read_setup_info(conn)?.map(|setup| setup.sandbox_user_sid);
+
+    // Older builds could commit a holder without its working row.
+    // Rebuild only restrictive holder-only state before dead-broker
+    // pruning; a GRANT has no durable file identity and must never
+    // TOFU the object currently occupying the path.
+    if let Some(sandbox_sid) = sandbox_sid.as_deref() {
+        let holder_only_denies: Vec<(String, String)> = query_vec(
+            conn,
+            concat!(
+                "SELECT DISTINCT h.canonical_path, h.kind ",
+                "FROM ace_holders h ",
+                "LEFT JOIN working_aces w ",
+                "ON w.canonical_path = h.canonical_path AND w.kind = h.kind ",
+                "WHERE w.canonical_path IS NULL ",
+                "AND h.kind IN ('deny', 'deny_fdc')"
+            ),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        for (canon, kind) in holder_only_denies {
+            match reconcile_working_ace_with(
+                conn,
+                &canon,
+                &kind,
+                false,
+                sandbox_sid,
+                &capture,
+                &identity,
+                &locate,
+                &recompose,
+            ) {
+                Ok(ReconcileOutcome::Reconciled) => {
+                    report.aces_revoked = report.aces_revoked.saturating_add(1);
+                }
+                Ok(ReconcileOutcome::Skipped) => {}
+                Err(error) => {
+                    report.cleanup_failures = report.cleanup_failures.saturating_add(1);
+                    eprintln!(
+                        "srt-win: WARNING: recovery could not rebuild holder-only {kind} '{canon}': {error:#}; tracking retained for retry"
+                    );
+                }
+            }
+        }
+    }
+
+    let brokers: Vec<(i64, i64)> = query_vec(
         conn,
         "SELECT pid, process_create_time FROM brokers",
         [],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-    )?
-    .into_iter()
-    .filter(|&(pid, ct)| !is_process_alive(pid as u32, ct))
-    .map(|(pid, _)| pid)
-    .collect();
-    // 2. Delete dead brokers in one short tx; CASCADE drops their
-    //    holder rows. (No-op if none — but still cheap.)
-    if !dead.is_empty() {
-        report.dead_brokers = dead.len() as u32;
-        let tx = conn
-            .unchecked_transaction()
-            .context("begin prune-dead tx")?;
-        for pid_i in &dead {
-            tx.execute("DELETE FROM brokers WHERE pid = ?1", params![pid_i])
-                .context("DELETE dead broker")?;
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    for (pid, create_time) in brokers {
+        if alive(pid as u32, create_time) {
+            continue;
         }
-        tx.commit().context("commit prune-dead")?;
-    }
-    // Even with no dead brokers there can be orphaned ACE rows
-    // (a broker that unregistered but crashed before releasing), so
-    // always run step 3.
-
-    // 3. Orphaned sandbox-user ACEs: any working_aces row with
-    //     zero ace_holders is one whose holder died (CASCADE
-    //     dropped the holder row above). Re-converge the path —
-    //     `recompose_at` reads the (possibly remaining) rows and
-    //     applies exactly that, so a path with one orphaned kind
-    //     and one still-held kind keeps the held one. Sandbox SID
-    //     comes from `read_setup_info` — when no sandbox user is
-    //     provisioned, there are no `working_aces` rows to orphan.
-    if let Some(sb) = read_setup_info(conn)?.map(|s| s.sandbox_user_sid) {
-        let orphan_aces: Vec<(String, String, Vec<u8>)> = query_vec(
-            conn,
-            "SELECT g.canonical_path, g.kind, g.file_id \
-             FROM working_aces g \
-             LEFT JOIN ace_holders h \
-               ON h.canonical_path = g.canonical_path \
-              AND h.kind = g.kind \
-             WHERE h.canonical_path IS NULL",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )?;
-        for (canon, kind, fid) in orphan_aces {
-            conn.execute(
-                "DELETE FROM working_aces \
-                 WHERE canonical_path = ?1 AND kind = ?2",
-                params![&canon, &kind],
-            )
-            .context("DELETE working_aces (orphan)")?;
-            let want = FileId::from_bytes(&fid)?;
-            match identity_gate(&canon, want) {
-                IdGate::Match => {
-                    if let Err(e) = recompose_at(conn, &canon, &sb) {
-                        eprintln!(
-                            "srt-win: orphaned {kind} '{canon}': \
-                             recompose failed ({e:#})"
-                        );
-                        continue;
-                    }
-                }
-                IdGate::Mismatch if kind == "grant" => {
-                    if let Some(at) = path_id::locate_by_file_id(&want) {
-                        let _ = recompose_at(conn, &at, &sb);
-                    }
-                }
-                _ => {} // gone/substituted — nothing on disk to do
+        let prune: Result<bool> = (|| {
+            let tx = immediate_transaction(conn, "dead-broker prune")?;
+            let holder_only: bool = tx
+                .prepare_cached(concat!(
+                    "SELECT 1 ",
+                    "FROM ace_holders h ",
+                    "LEFT JOIN working_aces w ",
+                    "ON w.canonical_path = h.canonical_path AND w.kind = h.kind ",
+                    "WHERE h.pid = ?1 AND w.canonical_path IS NULL ",
+                    "LIMIT 1"
+                ))?
+                .exists(params![pid])
+                .context("SELECT dead broker holder-only ACE")?;
+            if holder_only {
+                bail!("dead broker {pid} owns holder-only ACE state without file identity");
             }
-            report.aces_revoked += 1;
+            // Compare-and-delete the identity observed above. Another
+            // recovery may have removed the stale row and allowed a
+            // PID-reused live broker to register in the meantime.
+            let deleted = tx
+                .execute(
+                    concat!(
+                        "DELETE FROM brokers ",
+                        "WHERE pid = ?1 AND process_create_time = ?2"
+                    ),
+                    params![pid, create_time],
+                )
+                .with_context(|| format!("DELETE dead broker {pid}"))?;
+            tx.commit()
+                .with_context(|| format!("commit dead-broker prune {pid}"))?;
+            Ok(deleted > 0)
+        })();
+        match prune {
+            Ok(true) => {
+                report.dead_brokers = report.dead_brokers.saturating_add(1);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                report.cleanup_failures = report.cleanup_failures.saturating_add(1);
+                eprintln!(
+                    "srt-win: WARNING: recovery could not prune dead broker {pid}: {error:#}; broker row retained for retry"
+                );
+            }
         }
     }
-    let _ = force; // reserved for a future "force-recompose" mode
+
+    let Some(sandbox_sid) = sandbox_sid else {
+        return Ok(report);
+    };
+    let mut keys: Vec<(String, String)> = query_vec(
+        conn,
+        concat!(
+            "SELECT canonical_path, kind FROM working_aces ",
+            "UNION ",
+            "SELECT canonical_path, kind FROM ace_holders"
+        ),
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    // Force recovery is the explicit migration path for legacy
+    // inheritable parent-FDC ACEs. Recompose tracked parent rows
+    // shallowest-first, then targets, and retain identity failures
+    // per path instead of broad trustee sweeping.
+    keys.sort_by(recovery_key_cmp);
+    if force && keys.iter().any(|(_, kind)| kind == "deny_fdc") {
+        eprintln!(concat!(
+            "srt-win: WARNING: force recovery is migrating tracked parent-FDC ACEs; ",
+            "stop older srt-win binaries first. Protected descendants and ",
+            "out-of-band orphan ACEs require explicit targeted recovery"
+        ));
+    }
+    for (canon, kind) in keys {
+        match reconcile_working_ace_with(
+            conn,
+            &canon,
+            &kind,
+            force,
+            &sandbox_sid,
+            &capture,
+            &identity,
+            &locate,
+            &recompose,
+        ) {
+            Ok(ReconcileOutcome::Reconciled) => {
+                report.aces_revoked = report.aces_revoked.saturating_add(1);
+            }
+            Ok(ReconcileOutcome::Skipped) => {}
+            Err(error) => {
+                report.cleanup_failures = report.cleanup_failures.saturating_add(1);
+                eprintln!(
+                    "srt-win: WARNING: recovery could not reconcile {kind} '{canon}': {error:#}; tracking retained for retry"
+                );
+            }
+        }
+    }
     Ok(report)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileOutcome {
+    Skipped,
+    Reconciled,
+}
+
+/// Reconcile one tracking key while holding an IMMEDIATE writer
+/// transaction. The desired mask is derived only after the lock is
+/// acquired, so another TS session cannot widen a DENY between the
+/// holder read and filesystem convergence.
+#[allow(clippy::too_many_arguments)]
+fn reconcile_working_ace_with<C, I, L, R>(
+    conn: &Connection,
+    canon: &str,
+    kind: &str,
+    force: bool,
+    sandbox_sid: &str,
+    capture: &C,
+    identity: &I,
+    locate: &L,
+    recompose: &R,
+) -> Result<ReconcileOutcome>
+where
+    C: Fn(&str) -> Result<FileId>,
+    I: Fn(&str, FileId) -> IdGate,
+    L: Fn(&FileId) -> Result<Option<String>>,
+    R: Fn(&Connection, &str, &str, &str) -> Result<()>,
+{
+    let tx = immediate_transaction(conn, "working-ACE reconcile")?;
+    let row: Option<(Vec<u8>, String)> = tx
+        .prepare_cached(concat!(
+            "SELECT file_id, mask FROM working_aces ",
+            "WHERE canonical_path = ?1 AND kind = ?2"
+        ))?
+        .query_row(params![canon, kind], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()
+        .context("SELECT working ACE for reconciliation")?;
+    let desired = effective_ace_at(&tx, canon, kind)?;
+
+    let Some((file_id, stored)) = row else {
+        return match desired {
+            None => {
+                tx.commit().context("commit empty ACE reconciliation")?;
+                Ok(ReconcileOutcome::Skipped)
+            }
+            Some(SbAce::Grant(_)) => {
+                bail!(
+                    "holder-only grant '{canon}' lacks original file identity; refusing current-path TOFU"
+                )
+            }
+            Some(ace @ (SbAce::Deny(_) | SbAce::DenyFdc)) => {
+                let file_id = capture(canon).with_context(|| {
+                    format!("capture holder-only {kind} file identity '{canon}'")
+                })?;
+                tx.execute(
+                    concat!(
+                        "INSERT INTO working_aces ",
+                        "(canonical_path, kind, file_id, mask) ",
+                        "VALUES (?1, ?2, ?3, ?4)"
+                    ),
+                    params![canon, kind, file_id.as_bytes().as_slice(), ace.as_str()],
+                )
+                .context("INSERT holder-only working ACE")?;
+                recompose(&tx, canon, canon, sandbox_sid)
+                    .with_context(|| format!("rebuild holder-only {kind} '{canon}'"))?;
+                tx.commit()
+                    .with_context(|| format!("commit holder-only {kind} rebuild for '{canon}'"))?;
+                Ok(ReconcileOutcome::Reconciled)
+            }
+        };
+    };
+
+    let desired_mask = desired.map(SbAce::as_str);
+    let needs_transition = desired_mask != Some(stored.as_str());
+    if !force && !needs_transition {
+        tx.commit().context("commit skipped ACE reconciliation")?;
+        return Ok(ReconcileOutcome::Skipped);
+    }
+
+    update_working_ace(&tx, canon, kind, desired)?;
+    let want = FileId::from_bytes(&file_id)?;
+    match identity(canon, want) {
+        IdGate::Match => recompose(&tx, canon, canon, sandbox_sid)
+            .with_context(|| format!("reconcile {kind} '{canon}'"))?,
+        IdGate::Mismatch if !needs_transition => {
+            bail!("force recompose {kind} '{canon}': file identity mismatch")
+        }
+        IdGate::Mismatch if kind == "grant" => {
+            if let Some(at) = locate(&want)? {
+                recompose(&tx, canon, &at, sandbox_sid)
+                    .with_context(|| format!("reconcile relocated grant '{canon}' at '{at}'"))?;
+            }
+        }
+        IdGate::Mismatch => {
+            // Never weaken a substituted path. An ACE that travelled
+            // with the original inode may remain, which is fail-closed.
+        }
+        IdGate::Unreadable => {
+            bail!("reconcile {kind} '{canon}': file identity unreadable")
+        }
+    }
+    tx.commit()
+        .with_context(|| format!("commit {kind} reconciliation for '{canon}'"))?;
+    Ok(ReconcileOutcome::Reconciled)
 }
 
 enum IdGate {
@@ -1218,7 +1802,7 @@ fn identity_gate(path: &str, expect: FileId) -> IdGate {
             } else {
                 eprintln!(
                     "srt-win: '{path}': cannot read file_id ({e:#}); \
-                     leaving row (use `acl recover --force`)"
+                     leaving row; fix access and retry `acl recover`"
                 );
                 IdGate::Unreadable
             }
@@ -1230,9 +1814,9 @@ fn identity_gate(path: &str, expect: FileId) -> IdGate {
 /// matches `expected_create_filetime`. PID-recycle guard.
 fn is_process_alive(pid: u32, expected_create_filetime: i64) -> bool {
     if pid == std::process::id() {
-        // Don't reap ourselves even if the stored CreationTime is
-        // somehow stale.
-        return true;
+        return process_create_time(unsafe { GetCurrentProcess() })
+            .map(|ct| ct == expected_create_filetime)
+            .unwrap_or(true);
     }
     // SYNCHRONIZE so the WaitForSingleObject(0) signaled-check works.
     let h = match unsafe {
@@ -1281,22 +1865,33 @@ fn is_process_alive(pid: u32, expected_create_filetime: i64) -> bool {
     }
 }
 
-/// Creation FILETIME (as i64) of an arbitrary PID. Opens the
-/// process for limited query; special-cases self to avoid needing
-/// OpenProcess rights on our own token.
-fn pid_create_time(pid: u32) -> Result<i64> {
-    if pid == std::process::id() {
-        return process_create_time(unsafe { GetCurrentProcess() });
+/// Open a process object that is still running. The SYNCHRONIZE
+/// handle is checked before returning so registration cannot bind an
+/// already-exited holder.
+fn open_live_process(pid: u32) -> Result<crate::util::OwnedHandle> {
+    let h = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION
+                | windows::Win32::System::Threading::PROCESS_SYNCHRONIZE,
+            false,
+            pid,
+        )
     }
-    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
-        .with_context(|| format!("OpenProcess({pid}) for create-time"))?;
+    .with_context(|| format!("OpenProcess({pid}) for holder identity"))?;
     if h.is_invalid() {
-        bail!("OpenProcess({pid}) returned invalid handle");
+        bail!("OpenProcess({pid}) returned invalid holder handle");
     }
     let h = crate::util::OwnedHandle(h);
-    process_create_time(h.raw())
+    match unsafe { WaitForSingleObject(h.raw(), 0) } {
+        WAIT_OBJECT_0 => bail!("holder pid {pid} has already exited"),
+        WAIT_FAILED => {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("WaitForSingleObject(holder pid {pid})"));
+        }
+        _ => {}
+    }
+    Ok(h)
 }
-
 /// FILETIME (100-ns since 1601-01-01) → i64 for storage.
 fn process_create_time(h: HANDLE) -> Result<i64> {
     let mut create = FILETIME::default();
@@ -1348,6 +1943,7 @@ mod tests {
         let mut db = Locked {
             conn,
             holder_pid: HolderPid(std::process::id()),
+            expected_create_time: None,
         };
         f(&mut db)
     }
@@ -1356,6 +1952,31 @@ mod tests {
     /// not INSERT OR REPLACE — the latter would CASCADE-delete
     /// this holder's existing `ace_holders` rows on a second
     /// stamp/grant.
+    #[test]
+    fn register_broker_refuses_stale_pid_identity() {
+        with_mem_db(|db| {
+            let actual = process_create_time(unsafe { GetCurrentProcess() }).unwrap();
+            db.conn
+                .execute(
+                    "INSERT INTO brokers (pid, process_create_time, started_at) VALUES (?1, ?2, 0)",
+                    params![db.holder_pid.0 as i64, actual + 1],
+                )
+                .unwrap();
+            let error = db
+                .register_broker()
+                .expect_err("stale PID row must fail closed");
+            assert!(format!("{error:#}").contains("collides with stale broker identity"));
+            let stored: i64 = db
+                .conn
+                .query_row(
+                    "SELECT process_create_time FROM brokers WHERE pid = ?1",
+                    params![db.holder_pid.0 as i64],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, actual + 1, "stale row must not be adopted");
+        });
+    }
     #[test]
     fn second_register_broker_keeps_existing_holds() {
         with_mem_db(|db| {
@@ -1397,13 +2018,719 @@ mod tests {
         });
     }
 
+    fn seed_setup_info(conn: &Connection, sandbox_sid: &str) {
+        conn.execute(
+            "INSERT INTO sandbox_user \
+             (username, user_sid, group_sid, cred, marker_version, created_at_unix) \
+             VALUES ('sandbox', ?1, 'S-1-test-group', X'01', 1, 0)",
+            params![sandbox_sid],
+        )
+        .unwrap();
+    }
+
+    fn seed_ace(
+        conn: &Connection,
+        holder_pid: u32,
+        holder_create_time: i64,
+        path: &str,
+        kind: &str,
+        mask: &str,
+    ) -> FileId {
+        let mut id128 = [9; 16];
+        id128[..4].copy_from_slice(&holder_pid.to_le_bytes());
+        let file_id = FileId {
+            volume_serial: 7,
+            id128,
+        };
+        conn.execute(
+            "INSERT INTO brokers (pid, process_create_time, started_at) VALUES (?1, ?2, 0)",
+            params![holder_pid as i64, holder_create_time],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO working_aces (canonical_path, kind, file_id, mask) VALUES (?1, ?2, ?3, ?4)",
+            params![path, kind, file_id.as_bytes().as_slice(), mask],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ace_holders (canonical_path, kind, pid, want_mask) VALUES (?1, ?2, ?3, ?4)",
+            params![path, kind, holder_pid as i64, mask],
+        )
+        .unwrap();
+        file_id
+    }
+
+    fn seed_grant(
+        conn: &Connection,
+        holder_pid: u32,
+        holder_create_time: i64,
+        path: &str,
+    ) -> FileId {
+        seed_ace(conn, holder_pid, holder_create_time, path, "grant", "read")
+    }
+
+    fn assert_ace_row_counts(conn: &Connection, path: &str, kind: &str, expected: (i64, i64)) {
+        let working: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM working_aces WHERE canonical_path = ?1 AND kind = ?2",
+                params![path, kind],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let holders: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ace_holders WHERE canonical_path = ?1 AND kind = ?2",
+                params![path, kind],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((working, holders), expected);
+    }
+    fn assert_grant_rows_remain(conn: &Connection, path: &str) {
+        let working: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM working_aces \
+                 WHERE canonical_path = ?1 AND kind = 'grant'",
+                params![path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let holders: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM ace_holders \
+                 WHERE canonical_path = ?1 AND kind = 'grant'",
+                params![path],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((working, holders), (1, 1));
+    }
+
+    #[test]
+    fn release_recompose_failure_rolls_back_tracking_rows() {
+        with_mem_db(|db| {
+            let path = r"\\?\C:\retry-release.exe";
+            let ct = process_create_time(unsafe { GetCurrentProcess() }).unwrap();
+            seed_grant(&db.conn, db.holder_pid.0, ct, path);
+
+            let error = db
+                .release_one_ace_with(
+                    path,
+                    "grant",
+                    "S-1-test",
+                    |_, _| IdGate::Match,
+                    |_| Ok(None),
+                    |_, _, _, _| Err(anyhow::anyhow!("injected recompose failure")),
+                )
+                .expect_err("release must propagate recompose failure");
+            assert!(format!("{error:#}").contains("injected recompose failure"));
+            assert_grant_rows_remain(&db.conn, path);
+        });
+    }
+
+    #[test]
+    fn moved_grant_lookup_failure_rolls_back_tracking_rows() {
+        with_mem_db(|db| {
+            let path = r"\\?\C:\retry-moved.exe";
+            let ct = process_create_time(unsafe { GetCurrentProcess() }).unwrap();
+            seed_grant(&db.conn, db.holder_pid.0, ct, path);
+
+            let error = db
+                .release_one_ace_with(
+                    path,
+                    "grant",
+                    "S-1-test",
+                    |_, _| IdGate::Mismatch,
+                    |_| Err(anyhow::anyhow!("injected relocation lookup failure")),
+                    |_, _, _, _| Ok(()),
+                )
+                .expect_err("release must propagate relocation lookup failure");
+            assert!(format!("{error:#}").contains("injected relocation lookup failure"));
+            assert_grant_rows_remain(&db.conn, path);
+        });
+    }
+
+    #[test]
+    fn moved_grant_recompose_failure_rolls_back_tracking_rows() {
+        with_mem_db(|db| {
+            let path = r"\\?\C:\retry-moved-recompose.exe";
+            let ct = process_create_time(unsafe { GetCurrentProcess() }).unwrap();
+            seed_grant(&db.conn, db.holder_pid.0, ct, path);
+            let error = db
+                .release_one_ace_with(
+                    path,
+                    "grant",
+                    "S-1-test",
+                    |_, _| IdGate::Mismatch,
+                    |_| Ok(Some(r"\\?\C:\moved.exe".to_string())),
+                    |_, _, _, _| Err(anyhow::anyhow!("injected moved recompose failure")),
+                )
+                .expect_err("moved cleanup failure must propagate");
+            assert!(format!("{error:#}").contains("injected moved recompose failure"));
+            assert_grant_rows_remain(&db.conn, path);
+        });
+    }
+    #[test]
+    fn deny_holder_commit_failure_does_not_weaken_acl() {
+        with_mem_db(|db| {
+            let path = r"\\?\C:\deny-holder-commit.exe";
+            let ct = process_create_time(unsafe { GetCurrentProcess() }).unwrap();
+            seed_ace(&db.conn, db.holder_pid.0, ct, path, "deny", "denyRead");
+            let recomposed = std::cell::Cell::new(false);
+
+            let error = db
+                .release_one_deny_with(
+                    path,
+                    "deny",
+                    "S-1-test",
+                    |_, _| IdGate::Match,
+                    |_, _, _, _| {
+                        recomposed.set(true);
+                        Ok(())
+                    },
+                    || Err(anyhow::anyhow!("injected holder commit failure")),
+                    |_| Ok(()),
+                    || Ok(()),
+                )
+                .expect_err("holder transition failure must abort before ACL change");
+
+            assert!(format!("{error:#}").contains("injected holder commit failure"));
+            assert!(!recomposed.get(), "ACL convergence must not run");
+            assert_ace_row_counts(&db.conn, path, "deny", (1, 1));
+        });
+    }
+
+    #[test]
+    fn deny_post_recompose_commit_failure_is_retryable() {
+        with_mem_db(|db| {
+            let path = r"\\?\C:\deny-state-commit.exe";
+            let ct = process_create_time(unsafe { GetCurrentProcess() }).unwrap();
+            seed_setup_info(&db.conn, "S-1-test");
+            seed_ace(&db.conn, db.holder_pid.0, ct, path, "deny", "denyRead");
+            let recompose_calls = std::cell::Cell::new(0u32);
+
+            let error = db
+                .release_one_deny_with(
+                    path,
+                    "deny",
+                    "S-1-test",
+                    |_, _| IdGate::Match,
+                    |_, _, _, _| {
+                        recompose_calls.set(recompose_calls.get() + 1);
+                        Ok(())
+                    },
+                    || Ok(()),
+                    |_| Ok(()),
+                    || Err(anyhow::anyhow!("injected state commit failure")),
+                )
+                .expect_err("post-recompose commit failure must be surfaced");
+
+            assert!(format!("{error:#}").contains("injected state commit failure"));
+            assert_eq!(recompose_calls.get(), 1);
+            assert_ace_row_counts(&db.conn, path, "deny", (1, 0));
+
+            let report = crash_recovery_with(
+                &db.conn,
+                false,
+                |_, _| true,
+                |_| panic!("capture must not run"),
+                |_, _| IdGate::Match,
+                |_| Ok(None),
+                |_, _, _, _| {
+                    recompose_calls.set(recompose_calls.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(report.dead_brokers, 0);
+            assert_eq!(report.aces_revoked, 1);
+            assert_eq!(report.cleanup_failures, 0);
+            assert_eq!(recompose_calls.get(), 2);
+            assert_ace_row_counts(&db.conn, path, "deny", (0, 0));
+        });
+    }
+
+    #[test]
+    fn crash_recovery_isolates_poisoned_path_and_continues() {
+        with_mem_db(|db| {
+            let poison = r"\\?\C:\poison-recovery.exe";
+            let good = r"\\?\C:\good-recovery.exe";
+            let dead_poison_pid = 4_000_000_000u32;
+            let dead_good_pid = 3_999_999_999u32;
+            seed_setup_info(&db.conn, "S-1-test");
+            seed_grant(&db.conn, dead_poison_pid, 1, poison);
+            seed_grant(&db.conn, dead_good_pid, 2, good);
+
+            let report = crash_recovery_with(
+                &db.conn,
+                false,
+                |_, _| false,
+                |_| panic!("capture must not run"),
+                |_, _| IdGate::Match,
+                |_| Ok(None),
+                |_, _, path, _| {
+                    if path == poison {
+                        Err(anyhow::anyhow!("injected poison path"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .expect("a poisoned path must not abort recovery");
+
+            assert_eq!(report.dead_brokers, 2);
+            assert_eq!(report.aces_revoked, 1);
+            assert_eq!(report.cleanup_failures, 1);
+            assert_ace_row_counts(&db.conn, poison, "grant", (1, 0));
+            assert_ace_row_counts(&db.conn, good, "grant", (0, 0));
+            let brokers: i64 = db
+                .conn
+                .query_row("SELECT COUNT(*) FROM brokers", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(brokers, 0);
+
+            db.register_broker()
+                .expect("current operation must proceed after isolated failure");
+        });
+    }
+
+    #[test]
+    fn force_recomposes_even_when_tracking_matches_holders() {
+        with_mem_db(|db| {
+            let path = r"\\?\C:\force-recompose.exe";
+            let ct = process_create_time(unsafe { GetCurrentProcess() }).unwrap();
+            seed_setup_info(&db.conn, "S-1-test");
+            seed_grant(&db.conn, db.holder_pid.0, ct, path);
+            let calls = std::cell::Cell::new(0u32);
+
+            let normal = crash_recovery_with(
+                &db.conn,
+                false,
+                |_, _| true,
+                |_| panic!("capture must not run"),
+                |_, _| IdGate::Match,
+                |_| Ok(None),
+                |_, _, _, _| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(normal.aces_revoked, 0);
+            assert_eq!(calls.get(), 0);
+
+            let forced = crash_recovery_with(
+                &db.conn,
+                true,
+                |_, _| true,
+                |_| panic!("capture must not run"),
+                |_, _| IdGate::Match,
+                |_| Ok(None),
+                |_, _, _, _| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(forced.aces_revoked, 1);
+            assert_eq!(forced.cleanup_failures, 0);
+            assert_eq!(calls.get(), 1);
+            assert_ace_row_counts(&db.conn, path, "grant", (1, 1));
+        });
+    }
+    #[test]
+    fn recovery_orders_parent_fdc_shallowest_first() {
+        let mut keys = [
+            (r"\\?\C:\root\child".to_string(), "deny_fdc".to_string()),
+            (r"\\?\C:\root".to_string(), "deny".to_string()),
+            (r"\\?\C:\root".to_string(), "deny_fdc".to_string()),
+        ];
+        keys.sort_by(recovery_key_cmp);
+        assert_eq!(
+            keys[0],
+            (r"\\?\C:\root".to_string(), "deny_fdc".to_string())
+        );
+        assert_eq!(
+            keys[1],
+            (r"\\?\C:\root\child".to_string(), "deny_fdc".to_string())
+        );
+        assert_eq!(keys[2], (r"\\?\C:\root".to_string(), "deny".to_string()));
+    }
+
+    #[test]
+    fn same_parent_fdc_stays_until_last_holder_releases() {
+        with_mem_db(|db| {
+            let parent = r"\\?\C:\shared-parent";
+            let ct = process_create_time(unsafe { GetCurrentProcess() }).unwrap();
+            seed_ace(&db.conn, db.holder_pid.0, ct, parent, "deny_fdc", "fdc");
+            let other_pid = 3_999_999_996u32;
+            db.conn
+                .execute(
+                    concat!(
+                        "INSERT INTO brokers ",
+                        "(pid, process_create_time, started_at) ",
+                        "VALUES (?1, 1, 0)"
+                    ),
+                    params![other_pid as i64],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    concat!(
+                        "INSERT INTO ace_holders ",
+                        "(canonical_path, kind, pid, want_mask) ",
+                        "VALUES (?1, 'deny_fdc', ?2, 'fdc')"
+                    ),
+                    params![parent, other_pid as i64],
+                )
+                .unwrap();
+
+            let first = db
+                .release_one_deny_with(
+                    parent,
+                    "deny_fdc",
+                    "S-1-test",
+                    |_, _| IdGate::Match,
+                    |conn, source, target, _| {
+                        let set = sandbox_ace_set_for_object(conn, source, target)?;
+                        assert!(set.deny_fdc);
+                        Ok(())
+                    },
+                    || Ok(()),
+                    |_| Ok(()),
+                    || Ok(()),
+                )
+                .unwrap();
+            assert_eq!(first, AceRelease::StillHeld);
+            assert_ace_row_counts(&db.conn, parent, "deny_fdc", (1, 1));
+
+            db.holder_pid = HolderPid(other_pid);
+            let last = db
+                .release_one_deny_with(
+                    parent,
+                    "deny_fdc",
+                    "S-1-test",
+                    |_, _| IdGate::Match,
+                    |conn, source, target, _| {
+                        let set = sandbox_ace_set_for_object(conn, source, target)?;
+                        assert!(!set.deny_fdc);
+                        Ok(())
+                    },
+                    || Ok(()),
+                    |_| Ok(()),
+                    || Ok(()),
+                )
+                .unwrap();
+            assert_eq!(last, AceRelease::Revoked);
+            assert_ace_row_counts(&db.conn, parent, "deny_fdc", (0, 0));
+        });
+    }
+
+    #[test]
+    fn moved_grant_cleanup_preserves_original_deny() {
+        with_mem_db(|db| {
+            let source = r"\\?\C:\moved-grant-source.exe";
+            let target = r"\\?\C:\moved-grant-target.exe";
+            let ct = process_create_time(unsafe { GetCurrentProcess() }).unwrap();
+            let file_id = seed_grant(&db.conn, db.holder_pid.0, ct, source);
+            db.conn
+                .execute(
+                    concat!(
+                        "INSERT INTO working_aces ",
+                        "(canonical_path, kind, file_id, mask) ",
+                        "VALUES (?1, 'deny', ?2, 'denyRead')"
+                    ),
+                    params![source, file_id.as_bytes().as_slice()],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    concat!(
+                        "INSERT INTO ace_holders ",
+                        "(canonical_path, kind, pid, want_mask) ",
+                        "VALUES (?1, 'deny', ?2, 'denyRead')"
+                    ),
+                    params![source, db.holder_pid.0 as i64],
+                )
+                .unwrap();
+
+            let outcome = db
+                .release_one_ace_with(
+                    source,
+                    "grant",
+                    "S-1-test",
+                    |_, _| IdGate::Mismatch,
+                    |_| Ok(Some(target.to_string())),
+                    |conn, original, current, _| {
+                        assert_eq!(original, source);
+                        assert_eq!(current, target);
+                        let set = sandbox_ace_set_for_object(conn, original, current)?;
+                        assert_eq!(set.grant, None);
+                        assert_eq!(set.deny, Some(crate::acl::DenyMask::ReadDeny));
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                outcome,
+                AceRelease::Relocated {
+                    moved_to: target.to_string()
+                }
+            );
+            assert_ace_row_counts(&db.conn, source, "grant", (0, 0));
+            assert_ace_row_counts(&db.conn, source, "deny", (1, 1));
+        });
+    }
+
+    #[test]
+    fn deny_phase_two_reloads_holder_added_between_phases() {
+        with_mem_db(|db| {
+            let path = r"\\?\C:\deny-cross-session.exe";
+            let ct = process_create_time(unsafe { GetCurrentProcess() }).unwrap();
+            seed_ace(&db.conn, db.holder_pid.0, ct, path, "deny", "denyRead");
+            let other_pid = 3_999_999_998u32;
+
+            let outcome = db
+                .release_one_deny_with(
+                    path,
+                    "deny",
+                    "S-1-test",
+                    |_, _| IdGate::Match,
+                    |conn, source, target, _| {
+                        let set = sandbox_ace_set_for_object(conn, source, target)?;
+                        assert_eq!(set.deny, Some(crate::acl::DenyMask::ReadDeny));
+                        Ok(())
+                    },
+                    || Ok(()),
+                    |conn| {
+                        conn.execute(
+                            concat!(
+                                "INSERT INTO brokers ",
+                                "(pid, process_create_time, started_at) ",
+                                "VALUES (?1, 1, 0)"
+                            ),
+                            params![other_pid as i64],
+                        )?;
+                        conn.execute(
+                            concat!(
+                                "INSERT INTO ace_holders ",
+                                "(canonical_path, kind, pid, want_mask) ",
+                                "VALUES (?1, 'deny', ?2, 'denyRead')"
+                            ),
+                            params![path, other_pid as i64],
+                        )?;
+                        Ok(())
+                    },
+                    || Ok(()),
+                )
+                .unwrap();
+
+            assert_eq!(outcome, AceRelease::StillHeld);
+            assert_ace_row_counts(&db.conn, path, "deny", (1, 1));
+        });
+    }
+
+    #[test]
+    fn recovery_reloads_desired_inside_immediate_transaction() {
+        with_mem_db(|db| {
+            let path = r"\\?\C:\recovery-current-holder.exe";
+            let ct = process_create_time(unsafe { GetCurrentProcess() }).unwrap();
+            seed_setup_info(&db.conn, "S-1-test");
+            seed_ace(&db.conn, db.holder_pid.0, ct, path, "deny", "denyWrite");
+            let other_pid = 3_999_999_997u32;
+            db.conn
+                .execute(
+                    concat!(
+                        "INSERT INTO brokers ",
+                        "(pid, process_create_time, started_at) ",
+                        "VALUES (?1, 1, 0)"
+                    ),
+                    params![other_pid as i64],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    concat!(
+                        "INSERT INTO ace_holders ",
+                        "(canonical_path, kind, pid, want_mask) ",
+                        "VALUES (?1, 'deny', ?2, 'denyRead')"
+                    ),
+                    params![path, other_pid as i64],
+                )
+                .unwrap();
+
+            let outcome = reconcile_working_ace_with(
+                &db.conn,
+                path,
+                "deny",
+                false,
+                "S-1-test",
+                &|_| panic!("capture must not run"),
+                &|_, _| IdGate::Match,
+                &|_| Ok(None),
+                &|conn, source, target, _| {
+                    let set = sandbox_ace_set_for_object(conn, source, target)?;
+                    assert_eq!(set.deny, Some(crate::acl::DenyMask::ReadDeny));
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+            assert_eq!(outcome, ReconcileOutcome::Reconciled);
+            let stored: String = db
+                .conn
+                .query_row(
+                    concat!(
+                        "SELECT mask FROM working_aces ",
+                        "WHERE canonical_path = ?1 AND kind = 'deny'"
+                    ),
+                    params![path],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, "denyRead");
+        });
+    }
+
+    #[test]
+    fn holder_only_grant_is_retained_without_current_path_tofu() {
+        with_mem_db(|db| {
+            let path = r"\\?\C:\holder-only-grant.exe";
+            seed_setup_info(&db.conn, "S-1-test");
+            db.register_broker().unwrap();
+            db.conn
+                .execute(
+                    concat!(
+                        "INSERT INTO ace_holders ",
+                        "(canonical_path, kind, pid, want_mask) ",
+                        "VALUES (?1, 'grant', ?2, 'read')"
+                    ),
+                    params![path, db.holder_pid.0 as i64],
+                )
+                .unwrap();
+
+            let report = crash_recovery_with(
+                &db.conn,
+                false,
+                |_, _| true,
+                |_| panic!("holder-only grant must not capture current file identity"),
+                |_, _| IdGate::Match,
+                |_| Ok(None),
+                |_, _, _, _| panic!("holder-only grant must not touch the filesystem"),
+            )
+            .unwrap();
+
+            assert_eq!(report.aces_revoked, 0);
+            assert_eq!(report.cleanup_failures, 1);
+            assert_ace_row_counts(&db.conn, path, "grant", (0, 1));
+        });
+    }
+
+    #[test]
+    fn holder_only_deny_is_rebuilt_conservatively() {
+        with_mem_db(|db| {
+            let path = r"\\?\C:\holder-only-deny.exe";
+            seed_setup_info(&db.conn, "S-1-test");
+            db.register_broker().unwrap();
+            db.conn
+                .execute(
+                    concat!(
+                        "INSERT INTO ace_holders ",
+                        "(canonical_path, kind, pid, want_mask) ",
+                        "VALUES (?1, 'deny', ?2, 'denyRead')"
+                    ),
+                    params![path, db.holder_pid.0 as i64],
+                )
+                .unwrap();
+            let file_id = FileId {
+                volume_serial: 7,
+                id128: [42; 16],
+            };
+
+            let report = crash_recovery_with(
+                &db.conn,
+                false,
+                |_, _| true,
+                |_| Ok(file_id),
+                |_, _| IdGate::Match,
+                |_| Ok(None),
+                |conn, source, target, _| {
+                    let set = sandbox_ace_set_for_object(conn, source, target)?;
+                    assert_eq!(set.deny, Some(crate::acl::DenyMask::ReadDeny));
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+            assert_eq!(report.aces_revoked, 1);
+            assert_eq!(report.cleanup_failures, 0);
+            assert_ace_row_counts(&db.conn, path, "deny", (1, 1));
+        });
+    }
+
+    #[test]
+    fn release_rejects_wrong_sandbox_sid_without_mutation() {
+        with_mem_db(|db| {
+            let path = r"\\?\C:\wrong-sid-release.exe";
+            let ct = process_create_time(unsafe { GetCurrentProcess() }).unwrap();
+            seed_setup_info(&db.conn, "S-1-installed");
+            seed_grant(&db.conn, db.holder_pid.0, ct, path);
+
+            let error = db
+                .release_aces("S-1-other", KIND_GRANT)
+                .expect_err("wrong sandbox SID must fail closed");
+            assert!(format!("{error:#}").contains("sandbox user SID mismatch"));
+            assert_grant_rows_remain(&db.conn, path);
+        });
+    }
+
+    #[test]
+    fn force_recovery_never_bypasses_file_identity() {
+        with_mem_db(|db| {
+            let path = r"\\?\C:\force-identity-mismatch.exe";
+            let ct = process_create_time(unsafe { GetCurrentProcess() }).unwrap();
+            seed_setup_info(&db.conn, "S-1-test");
+            seed_grant(&db.conn, db.holder_pid.0, ct, path);
+
+            let report = crash_recovery_with(
+                &db.conn,
+                true,
+                |_, _| true,
+                |_| panic!("capture must not run"),
+                |_, _| IdGate::Mismatch,
+                |_| panic!("force mismatch without transition must not relocate"),
+                |_, _, _, _| panic!("force mismatch must not recompose"),
+            )
+            .unwrap();
+
+            assert_eq!(report.aces_revoked, 0);
+            assert_eq!(report.cleanup_failures, 1);
+            assert_grant_rows_remain(&db.conn, path);
+        });
+    }
+
+    #[test]
+    fn bound_identity_rejects_creation_time_mismatch_without_mutation() {
+        with_mem_db(|db| {
+            let path = r"\\?\C:\bound-holder.exe";
+            let ct = process_create_time(unsafe { GetCurrentProcess() }).unwrap();
+            seed_grant(&db.conn, db.holder_pid.0, ct, path);
+            db.expected_create_time = Some(ct + 1);
+
+            let error = db
+                .release_aces("S-1-test", KIND_GRANT)
+                .expect_err("mismatched holder identity must fail closed");
+            assert!(format!("{error:#}").contains("no longer identifies"));
+            assert_grant_rows_remain(&db.conn, path);
+        });
+    }
     #[test]
     fn aliveness_self_is_alive() {
         let ct = process_create_time(unsafe { GetCurrentProcess() }).unwrap();
         assert!(is_process_alive(std::process::id(), ct));
-        // Same PID, wrong create time would normally be "recycled →
-        // dead", but we special-case ourselves.
-        assert!(is_process_alive(std::process::id(), ct + 1));
+        // The same PID with a different creation time is a recycled
+        // process identity and must be treated as dead.
+        assert!(!is_process_alive(std::process::id(), ct + 1));
     }
 
     #[test]

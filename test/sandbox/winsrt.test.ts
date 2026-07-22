@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from 'bun:test'
 import { spawn, spawnSync } from 'node:child_process'
 import {
+  copyFileSync,
   existsSync,
   mkdtempSync,
   readFileSync,
@@ -52,6 +53,114 @@ const TEST_SUBLAYER = '7c1f0e90-3a2b-4f5d-9e8c-1d2e3f4a5b6c'
 
 // Match smoke-exec.ps1's range; the WFP install below uses it.
 const PORT_RANGE: readonly [number, number] = DEFAULT_WINDOWS_PROXY_PORT_RANGE
+
+interface WindowsAclStateCounts {
+  path: string
+  workingAces: number
+  aceHolders: number
+}
+
+function runWindowsTestCommand(
+  executable: string,
+  args: readonly string[],
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const result = spawnSync(executable, args, {
+    encoding: 'utf8',
+    env,
+    timeout: 60_000,
+    windowsHide: true,
+  })
+  if (result.error || result.status !== 0) {
+    throw new Error(
+      `${executable} ${args.join(' ')} failed (status=${result.status}): ` +
+        (result.error?.message || result.stderr || result.stdout),
+    )
+  }
+  return result.stdout
+}
+
+function protectWindowsTestDirectory(path: string, realUserSid: string): void {
+  runWindowsTestCommand('icacls.exe', [
+    path,
+    '/grant:r',
+    `*${realUserSid}:(OI)(CI)F`,
+    '*S-1-5-18:(OI)(CI)F',
+    '*S-1-5-32-544:(OI)(CI)F',
+  ])
+  runWindowsTestCommand('icacls.exe', [path, '/inheritance:r'])
+}
+
+function protectWindowsTestFile(path: string, realUserSid: string): void {
+  const script = [
+    '$acl = Get-Acl -LiteralPath $env:SRT_TEST_ACL_PATH;',
+    '$acl.SetAccessRuleProtection($true, $false);',
+    'foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleSpecific($rule) };',
+    '$rights = [Security.AccessControl.FileSystemRights]::FullControl;',
+    '$allow = [Security.AccessControl.AccessControlType]::Allow;',
+    'foreach ($value in @($env:SRT_TEST_REAL_SID, "S-1-5-18", "S-1-5-32-544")) {',
+    '$sid = [Security.Principal.SecurityIdentifier]::new($value);',
+    '$rule = [Security.AccessControl.FileSystemAccessRule]::new($sid, $rights, $allow);',
+    '[void]$acl.AddAccessRule($rule)',
+    '};',
+    'Set-Acl -LiteralPath $env:SRT_TEST_ACL_PATH -AclObject $acl',
+  ].join(' ')
+  runWindowsTestCommand(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-Command', script],
+    {
+      ...process.env,
+      SRT_TEST_ACL_PATH: path,
+      SRT_TEST_REAL_SID: realUserSid,
+    },
+  )
+}
+
+function forbiddenWindowsAceCount(
+  path: string,
+  sandboxUserSid: string,
+  sandboxGroupSid: string,
+): number {
+  const script = [
+    '$wanted = @($env:SRT_TEST_SANDBOX_SID, $env:SRT_TEST_GROUP_SID, "S-1-5-32-545");',
+    '$count = @((Get-Acl -LiteralPath $env:SRT_TEST_ACL_PATH).Access | Where-Object {',
+    '$value = $_.IdentityReference.Value;',
+    'try { $value = $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch {};',
+    '$wanted -contains $value',
+    '}).Count;',
+    '[Console]::Out.Write($count)',
+  ].join(' ')
+  const output = runWindowsTestCommand(
+    'powershell.exe',
+    ['-NoProfile', '-NonInteractive', '-Command', script],
+    {
+      ...process.env,
+      SRT_TEST_ACL_PATH: path,
+      SRT_TEST_SANDBOX_SID: sandboxUserSid,
+      SRT_TEST_GROUP_SID: sandboxGroupSid,
+    },
+  )
+  const count = Number.parseInt(output.trim(), 10)
+  if (!Number.isInteger(count)) {
+    throw new Error(
+      `Could not parse ACL principal count from ${JSON.stringify(output)}`,
+    )
+  }
+  return count
+}
+
+function getWindowsAclState(
+  srtWinExe: string,
+  path: string,
+): WindowsAclStateCounts {
+  const output = runWindowsTestCommand(srtWinExe, [
+    'acl',
+    'state',
+    '--path',
+    path,
+  ])
+  return JSON.parse(output) as WindowsAclStateCounts
+}
 
 // Bash userland gates (Group E). git-for-windows ships the first;
 // msys2 wget only exists on runners with msys2 installed.
@@ -569,32 +678,74 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
   // The non-elevated readiness check that initialize() runs.
   // Hermetic sublayer + full-uninstall in finally so the
   // round-trips test below starts from an unprovisioned state.
-  it('verifyWindowsWfpEgress: blocked after install; throws after uninstall --keep-user', async () => {
+  it('verifyWindowsWfpEgress bootstraps a protected runner without residue', async () => {
     const sl = '6a1e0f80-2b3c-4d5e-9f8a-1b2c3d4e5f60'
+    const protectedDir = mkdtempSync(join(tmpdir(), 'srt-protected-runner-'))
     installWindowsSandbox({
       sublayerGuid: sl,
       proxyPortRange: PORT_RANGE,
     })
     try {
-      // Fence active: WFP block-user filter fires at
-      // ALE_AUTH_CONNECT before any packet leaves → WSAEACCES. The
-      // probe binds a local out-of-range loopback listener; no
-      // external host involved.
-      const v = await verifyWindowsWfpEgress({ proxyPortRange: PORT_RANGE })
+      const user = getWindowsSandboxUserStatus()
+      if (!user.sid || !user.groupSid) {
+        throw new Error(
+          `Sandbox principals are missing: ${JSON.stringify(user)}`,
+        )
+      }
+
+      protectWindowsTestDirectory(protectedDir, user.realUserSid)
+      const protectedRunner = join(protectedDir, 'srt-win.exe')
+      copyFileSync(getSrtWinPath(), protectedRunner)
+      protectWindowsTestFile(protectedRunner, user.realUserSid)
+
+      expect(
+        forbiddenWindowsAceCount(protectedRunner, user.sid, user.groupSid),
+      ).toBe(0)
+      expect(
+        getWindowsAclState(getSrtWinPath(), protectedRunner),
+      ).toMatchObject({
+        workingAces: 0,
+        aceHolders: 0,
+      })
+
+      // Prove the protected file itself reproduces the original
+      // CreateProcessWithLogonW failure before the bootstrap grant.
+      const rawVerify = spawnSync(
+        protectedRunner,
+        ['wfp', 'verify', '--target', '127.0.0.1:9'],
+        { encoding: 'utf8', timeout: 30_000, windowsHide: true },
+      )
+      expect(rawVerify.error).toBeUndefined()
+      expect(rawVerify.status).not.toBe(0)
+      expect(rawVerify.stderr).toMatch(/CreateProcessWithLogonW.*0x80070005/is)
+
+      // The broker remains in the caller CWD; only the native CPWLW
+      // probe pins System32.
+      const v = await verifyWindowsWfpEgress({
+        proxyPortRange: PORT_RANGE,
+        srtWin: { exe: protectedRunner, prependArgs: [] },
+      })
       expect(v.target).toMatch(/^127\.0\.0\.1:\d+$/)
-      // Filters removed, sandbox user kept → fence inactive →
-      // throws. This is the throw initialize() relays when a stale
-      // install (user provisioned, filters since removed) would
-      // otherwise run every exec with full egress. The regex
-      // matches both the exit-3 (`is not active`) and exit-2
-      // (`could not be verified`) messages — either is correct
-      // fail-closed behaviour.
+
+      expect(
+        forbiddenWindowsAceCount(protectedRunner, user.sid, user.groupSid),
+      ).toBe(0)
+      expect(
+        getWindowsAclState(getSrtWinPath(), protectedRunner),
+      ).toMatchObject({
+        workingAces: 0,
+        aceHolders: 0,
+      })
+
+      // Filters removed, sandbox user kept -- fence inactive and the
+      // public gate still fails closed.
       uninstallWindowsSandbox({ sublayerGuid: sl, keepUser: true })
       // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
       await expect(
         verifyWindowsWfpEgress({ proxyPortRange: PORT_RANGE }),
       ).rejects.toThrow(/WFP egress fence/i)
     } finally {
+      rmSync(protectedDir, { recursive: true, force: true })
       uninstallWindowsSandbox({ sublayerGuid: sl })
     }
   }, 60_000)
@@ -701,13 +852,17 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
 
 describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
   let sbSid: string
+  let sbGroupSid: string
+  let managerGrantDir: string
+  let managerGrantMarker: string
+  let managerGrantState: WindowsAclStateCounts
 
   beforeAll(async () => {
     // Checkpoints to stderr (flushed synchronously) so that if the
     // runtime faults mid-setup the LAST line in the CI log
     // localizes the faulting step.
     console.error('[winsrt beforeAll] start')
-    // Full install under the test sublayer — provisions
+    // Full install under the test sublayer -- provisions
     // srt-sandbox + cred + user-SID WFP filters. Idempotent (the
     // helpers describe above may have left it installed).
     console.error('[winsrt beforeAll] install: begin')
@@ -715,25 +870,76 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
       sublayerGuid: TEST_SUBLAYER,
       proxyPortRange: PORT_RANGE,
     })
-    if (!r.user.provisioned || !r.user.sid || !r.user.credPresent) {
+    if (
+      !r.user.provisioned ||
+      !r.user.sid ||
+      !r.user.groupSid ||
+      !r.user.credPresent
+    ) {
       throw new Error(
         `srt-sandbox not provisioned after install: ${JSON.stringify(r.user)}`,
       )
     }
     sbSid = r.user.sid
+    sbGroupSid = r.user.groupSid
     console.error('[winsrt beforeAll] install: done')
     expect(r.wfp.state).toBe('installed')
     expect(r.wfp.portRange).toEqual([PORT_RANGE[0], PORT_RANGE[1]])
 
+    managerGrantDir = mkdtempSync(join(tmpdir(), 'srt-manager-grant-'))
+    protectWindowsTestDirectory(managerGrantDir, r.user.realUserSid)
+    managerGrantMarker = join(managerGrantDir, 'marker.txt')
+    writeFileSync(managerGrantMarker, 'manager grant survived')
+    expect(forbiddenWindowsAceCount(managerGrantDir, sbSid, sbGroupSid)).toBe(0)
+
     console.error('[winsrt beforeAll] SandboxManager.initialize: begin')
-    await SandboxManager.initialize(createTestConfig())
+    const config = createTestConfig()
+    // CPWLW preserves the caller CWD; grant it separately so this
+    // assertion remains about the protected marker directory.
+    config.filesystem.allowRead = [managerGrantDir, process.cwd()]
+    await SandboxManager.initialize(config)
+    managerGrantState = getWindowsAclState(getSrtWinPath(), managerGrantDir)
+    expect(managerGrantState).toMatchObject({
+      workingAces: 1,
+      aceHolders: 1,
+    })
+    expect(forbiddenWindowsAceCount(managerGrantDir, sbSid, sbGroupSid)).toBe(1)
     console.error('[winsrt beforeAll] done')
   })
 
   afterAll(async () => {
-    await SandboxManager.reset()
-    uninstallWindowsSandbox({ sublayerGuid: TEST_SUBLAYER })
+    try {
+      await SandboxManager.reset()
+      if (managerGrantDir) {
+        expect(
+          getWindowsAclState(getSrtWinPath(), managerGrantDir),
+        ).toMatchObject({
+          workingAces: 0,
+          aceHolders: 0,
+        })
+        expect(
+          forbiddenWindowsAceCount(managerGrantDir, sbSid, sbGroupSid),
+        ).toBe(0)
+      }
+    } finally {
+      if (managerGrantDir) {
+        rmSync(managerGrantDir, { recursive: true, force: true })
+      }
+      uninstallWindowsSandbox({ sublayerGuid: TEST_SUBLAYER })
+    }
   })
+
+  it('public WFP verification preserves manager-owned filesystem grants', async () => {
+    await verifyWindowsWfpEgress({ proxyPortRange: PORT_RANGE })
+
+    expect(getWindowsAclState(getSrtWinPath(), managerGrantDir)).toEqual(
+      managerGrantState,
+    )
+    expect(forbiddenWindowsAceCount(managerGrantDir, sbSid, sbGroupSid)).toBe(1)
+    const r = await runSandboxed(`type "${managerGrantMarker}"`)
+    expect(r.status).toBe(0)
+    expect(r.stdout).toContain('manager grant survived')
+  }, 60_000)
 
   it('wrapWithSandbox() throws on Windows (use wrapWithSandboxArgv)', async () => {
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
