@@ -305,6 +305,19 @@ describe('parent-proxy: utilities', () => {
     expect(out).toEqual({ host: 'example.com', 'x-keep': 'keep' })
   })
 
+  test('stripHopByHop preserves expect (end-to-end; SigV4 clients may sign it)', () => {
+    // Expect must NOT be blanket-stripped: a masked-credential SigV4
+    // request that lists `expect` in SignedHeaders would fail the planner's
+    // signed-header presence check. The framing hazard it poses on
+    // non-auto-chunk methods is handled narrowly by
+    // prepareOutboundBodyFraming instead.
+    const out = stripHopByHop({
+      expect: '100-continue',
+      'x-keep': 'keep',
+    })
+    expect(out).toEqual({ expect: '100-continue', 'x-keep': 'keep' })
+  })
+
   test('stripHopByHop preserves content-length (end-to-end header)', () => {
     const out = stripHopByHop({
       'content-length': '42',

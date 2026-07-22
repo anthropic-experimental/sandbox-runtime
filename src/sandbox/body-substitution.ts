@@ -84,6 +84,9 @@ export function prepareBodySubstitution(
     return undefined
   }
   if (!allLengthMatched(pairs)) {
+    // The caller's prepareOutboundBodyFraming (parent-proxy.ts) re-frames
+    // the now-lengthless body as chunked on every method, not just the
+    // ones Node auto-chunks.
     delete fwdHeaders['content-length']
   }
   return createBodySubstitutionTransform(pairs)

@@ -26,7 +26,9 @@ import type { ResolvedParentProxy } from './parent-proxy.js'
 import {
   connectViaParentProxy,
   dialDirect,
+  applyOutboundBodyFraming,
   openConnectTunnel,
+  prepareOutboundBodyFraming,
   proxyAuthHeader,
   selectParentProxyUrl,
   shouldBypassParentProxy,
@@ -489,22 +491,14 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         }
       }
 
-      // When the client declared a body but the forwarded headers carry no
-      // framing (chunked TE stripped as hop-by-hop, or a body transform
-      // deleted content-length), the upstream leg must re-frame
-      // explicitly: for bodyless-method requests the runtime would
-      // otherwise write the piped body bytes raw after complete-framed
-      // headers — a request-smuggling primitive.
-      const clientDeclaredBody = Boolean(
-        req.headers['content-length'] || req.headers['transfer-encoding'],
-      )
-      if (
-        clientDeclaredBody &&
-        fwdHeaders['content-length'] === undefined &&
-        fwdHeaders['transfer-encoding'] === undefined
-      ) {
-        fwdHeaders['transfer-encoding'] = 'chunked'
-      }
+      // A body without an outbound Content-Length must leave chunk-framed —
+      // stripHopByHop dropped Transfer-Encoding and Node does not re-frame
+      // bodies on GET/HEAD/OPTIONS/DELETE by itself (an explicit
+      // Transfer-Encoding header would collide with Bun's own framing, so
+      // the flag flip below is used instead). Decide (and neutralize any
+      // framing-defeating Expect header) after ALL header mutation, so a
+      // hook cannot reopen the hole; apply right after construction.
+      const needsChunkedFraming = prepareOutboundBodyFraming(req, fwdHeaders)
 
       let proxyReq
       if (mitmSocketPath) {
@@ -592,6 +586,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           },
         )
       }
+
+      applyOutboundBodyFraming(proxyReq, needsChunkedFraming)
 
       proxyReq.on('error', err => {
         logForDebugging(`Proxy request failed: ${err.message}`, {
