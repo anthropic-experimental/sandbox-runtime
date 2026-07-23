@@ -4,7 +4,7 @@ import { connect } from 'node:net'
 import type { AddressInfo } from 'node:net'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { connect as tlsConnect } from 'node:tls'
+import { connect as tlsConnect, type TLSSocket } from 'node:tls'
 import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
 import { createMitmCA, disposeMitmCA } from '../../src/sandbox/mitm-ca.js'
 
@@ -176,7 +176,9 @@ describe('http proxy with filterRequest survives client aborts', () => {
         )
         setTimeout(() => {
           if (rst && 'resetAndDestroy' in sock) {
-            ;(sock as unknown as { resetAndDestroy: () => void }).resetAndDestroy()
+            ;(
+              sock as unknown as { resetAndDestroy: () => void }
+            ).resetAndDestroy()
           } else {
             sock.destroy()
           }
@@ -235,8 +237,12 @@ describe('client-abort delivery semantics', () => {
     process.on('uncaughtException', onUncaught)
     upstream = createServer((req, res) => {
       upstreamRequests++
-      req.on('error', () => upstreamEvents.push({ url: req.url!, event: 'error' }))
-      req.on('aborted', () => upstreamEvents.push({ url: req.url!, event: 'aborted' }))
+      req.on('error', () =>
+        upstreamEvents.push({ url: req.url!, event: 'error' }),
+      )
+      req.on('aborted', () =>
+        upstreamEvents.push({ url: req.url!, event: 'aborted' }),
+      )
       req.on('end', () => upstreamEvents.push({ url: req.url!, event: 'end' }))
       req.resume()
       if (req.url === '/download') {
@@ -251,7 +257,9 @@ describe('client-abort delivery semantics', () => {
         if (!res.writableEnded) {
           try {
             res.end('ok')
-          } catch {}
+          } catch {
+            // client already gone
+          }
         }
       }, 300)
     })
@@ -272,10 +280,12 @@ describe('client-abort delivery semantics', () => {
   afterAll(async () => {
     // Lingering keep-alive client sockets (the malformed-bytes and smuggle
     // tests) would otherwise make close() wait out its own timeouts.
-    ;(proxy as Server & { closeAllConnections?: () => void })
-      .closeAllConnections?.()
-    ;(upstream as Server & { closeAllConnections?: () => void })
-      .closeAllConnections?.()
+    ;(
+      proxy as Server & { closeAllConnections?: () => void }
+    ).closeAllConnections?.()
+    ;(
+      upstream as Server & { closeAllConnections?: () => void }
+    ).closeAllConnections?.()
     await Promise.all([
       new Promise<void>(r => {
         const t = setTimeout(r, 2000)
@@ -492,8 +502,9 @@ describe('client-abort delivery semantics', () => {
       setTimeout(resolve, 3000)
     })
     await new Promise(r => setTimeout(r, 500))
-    ;(bare as Server & { closeAllConnections?: () => void })
-      .closeAllConnections?.()
+    ;(
+      bare as Server & { closeAllConnections?: () => void }
+    ).closeAllConnections?.()
     await new Promise<void>(r => {
       const t = setTimeout(r, 1500)
       bare.close(() => {
@@ -575,11 +586,13 @@ describe('client aborts through the TLS-terminating path', () => {
 
   /** CONNECT through the proxy, complete the TLS handshake, run fn. */
   const throughTunnel = (
-    fn: (tls: import('node:tls').TLSSocket, done: () => void) => void,
+    fn: (tls: TLSSocket, done: () => void) => void,
   ): Promise<void> =>
     new Promise(resolve => {
       const raw = connect(proxyPort, '127.0.0.1', () => {
-        raw.write('CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n')
+        raw.write(
+          'CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n',
+        )
       })
       raw.on('error', () => {})
       raw.once('data', () => {
