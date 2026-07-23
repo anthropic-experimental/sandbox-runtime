@@ -13,7 +13,7 @@ import type {
   IncomingMessage,
   ServerResponse,
 } from 'node:http'
-import { Readable } from 'node:stream'
+import { PassThrough, Readable } from 'node:stream'
 import { logForDebugging } from '../utils/debug.js'
 
 export type RequestDecision = {
@@ -78,11 +78,42 @@ export async function decideAndRespond(
 ): Promise<Readable | null> {
   let forCallback: ReadableStream<Uint8Array> | undefined
   let forUpstream: Readable = req
-  if (!BODYLESS_METHODS.has(req.method ?? 'GET')) {
-    const web = Readable.toWeb(req) as ReadableStream<Uint8Array>
+  // Gate on a declared body, not just the method: a GET/HEAD/OPTIONS with
+  // Content-Length or Transfer-Encoding is legal HTTP and its body must go
+  // through the tee like any other — skipping it here would hide the body
+  // from filterRequest AND (with transfer-encoding stripped as hop-by-hop)
+  // let its decoded bytes be written raw after a complete-framed bodyless
+  // request upstream: a request-smuggling primitive.
+  const declaresBody =
+    req.headers['content-length'] !== undefined ||
+    req.headers['transfer-encoding'] !== undefined
+  if (!BODYLESS_METHODS.has(req.method ?? 'GET') || declaresBody) {
+    // Never hand toWeb a stream that can error: when its source errors,
+    // the toWeb/tee/fromWeb bridge leaks the error as internal promise
+    // rejections (and, under Bun, uncaught exceptions) that no userland
+    // listener can catch. A client abort mid-body becomes a clean EOF on
+    // the shim instead, and the abort is propagated by destroying the
+    // upstream branch directly — a truncated body must never be forwarded
+    // framed as complete (chunked framing would otherwise emit a valid
+    // terminator; on the SigV4 path a truncated buffer would be signed).
+    // The shim's own error listener covers the tee cancelling it while
+    // the client is still piping.
+    const shim = new PassThrough()
+    shim.on('error', () => {})
+    req.pipe(shim)
+    const web = Readable.toWeb(shim) as ReadableStream<Uint8Array>
     const [a, b] = web.tee()
     forCallback = a
     forUpstream = Readable.fromWeb(b)
+    const upstreamBranch = forUpstream
+    // The caller only wires its own 'error' handler after this function
+    // resolves; a client abort during the filterRequest await must not
+    // land on a listener-less stream.
+    upstreamBranch.on('error', () => {})
+    req.on('error', err => {
+      shim.end()
+      upstreamBranch.destroy(err)
+    })
   }
 
   let webReq: Request
@@ -99,8 +130,12 @@ export async function decideAndRespond(
       action: 'deny',
       reason: `malformed request: ${(err as Error).message}`,
     })
-    void forCallback?.cancel()
+    forCallback?.cancel().catch(() => {})
     forUpstream.destroy()
+    // The shim breaks the old fromWeb→tee→toWeb cancel cascade that used
+    // to destroy req; without this a denied client keeps uploading into a
+    // stalled pipe and holds the connection open.
+    if (forUpstream !== req) req.destroy()
     return null
   }
 
@@ -118,7 +153,9 @@ export async function decideAndRespond(
   // buffering bytes nobody will consume. If it did, the tee already buffered
   // whatever was read; the upstream branch sees the same bytes.
   if (forCallback && !webReq.bodyUsed) {
-    void forCallback.cancel()
+    // cancel() rejects with the stream's stored error if it already
+    // failed; that rejection must not escape.
+    forCallback.cancel().catch(() => {})
   }
 
   if (decision.action === 'allow') {
@@ -128,6 +165,7 @@ export async function decideAndRespond(
 
   deny(res, decision)
   forUpstream.destroy()
+  if (forUpstream !== req) req.destroy()
   return null
 }
 

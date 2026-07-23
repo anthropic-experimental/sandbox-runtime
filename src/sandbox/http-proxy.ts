@@ -154,6 +154,37 @@ export interface HttpProxyServerOptions {
 export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
   const server = createServer()
 
+  // A client that is killed mid-exchange (sandboxed process tree teardown)
+  // resets its connection; without a listener that surfaces as an
+  // ECONNRESET uncaughtException from node:_http_server and can take down
+  // the host process. Parse errors get the RFC-required 400; resets and
+  // already-unwritable sockets are just dropped.
+  server.on('clientError', (err, socket) => {
+    logForDebugging(`Client connection error: ${err.message}`, {
+      level: 'error',
+    })
+    // The peer may reset while the 400 flushes; without a listener that
+    // write failure is itself an uncaughtException.
+    socket.on('error', () => {})
+    if (
+      (err as NodeJS.ErrnoException).code !== 'ECONNRESET' &&
+      socket.writable
+    ) {
+      // Destroy only after the flush: destroying immediately races the
+      // write and can reset the connection before the 400 reaches the
+      // client, while end() alone can leave a half-open socket from a
+      // client that never closes its side. Under Bun the flush callback
+      // may never fire on a parse-errored socket (the 400 is dropped;
+      // verified empirically), so back-stop with a timer or the socket
+      // leaks.
+      socket.end('HTTP/1.1 400 Bad Request\r\n\r\n', () => socket.destroy())
+      const backstop = setTimeout(() => socket.destroy(), 1000)
+      backstop.unref?.()
+      return
+    }
+    socket.destroy()
+  })
+
   const checkAuth = (got: string | undefined): boolean => {
     if (!options.proxyAuthToken) return true
     const m = /^basic\s+([a-z0-9+/=]+)\s*$/i.exec(got ?? '')
@@ -328,6 +359,20 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
 
   // Handle regular HTTP requests
   server.on('request', async (req, res) => {
+    // A client abort mid-request destroys req/res with an error; with no
+    // listener it escapes as an uncaughtException (the runtime emits it
+    // from node:_http_server). `pipe()` does not forward error events, so
+    // the body pipelines below never see it either.
+    req.on('error', err => {
+      logForDebugging(`Client request error: ${err.message}`, {
+        level: 'error',
+      })
+    })
+    res.on('error', err => {
+      logForDebugging(`Client response error: ${err.message}`, {
+        level: 'error',
+      })
+    })
     try {
       // Serve the empty CRL for Schannel's revocation check on MITM-minted
       // leaves (see MitmCA.crlDer). CryptoAPI fetches the leaf's
@@ -423,6 +468,37 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         )
         if (out === null) return
         body = out
+        // The client may have aborted during the filterRequest await —
+        // the tee branch is already destroyed and res 'close' has already
+        // fired, so the teardown listeners attached below would never
+        // run. Don't dial an upstream for a dead client. A COMPLETED
+        // request is also destroyed=true (normal stream lifecycle after
+        // 'end'); only a destroy without a clean end is an abort.
+        if (
+          (req.destroyed && !req.readableEnded) ||
+          res.destroyed ||
+          body.destroyed
+        ) {
+          body.destroy()
+          return
+        }
+      }
+
+      // When the client declared a body but the forwarded headers carry no
+      // framing (chunked TE stripped as hop-by-hop, or a body transform
+      // deleted content-length), the upstream leg must re-frame
+      // explicitly: for bodyless-method requests the runtime would
+      // otherwise write the piped body bytes raw after complete-framed
+      // headers — a request-smuggling primitive.
+      const clientDeclaredBody =
+        req.headers['content-length'] !== undefined ||
+        req.headers['transfer-encoding'] !== undefined
+      if (
+        clientDeclaredBody &&
+        fwdHeaders['content-length'] === undefined &&
+        fwdHeaders['transfer-encoding'] === undefined
+      ) {
+        fwdHeaders['transfer-encoding'] = 'chunked'
       }
 
       let proxyReq
@@ -442,6 +518,15 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             headers: fwdHeaders,
           },
           proxyRes => {
+            // The response stream errors independently of proxyReq (e.g.
+            // upstream reset mid-body after headers); pipe() does not
+            // handle source errors.
+            proxyRes.on('error', err => {
+              logForDebugging(`Upstream response error: ${err.message}`, {
+                level: 'error',
+              })
+              res.destroy()
+            })
             res.writeHead(proxyRes.statusCode!, stripHopByHop(proxyRes.headers))
             proxyRes.pipe(res)
           },
@@ -464,6 +549,15 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
               : fwdHeaders,
           },
           proxyRes => {
+            // The response stream errors independently of proxyReq (e.g.
+            // upstream reset mid-body after headers); pipe() does not
+            // handle source errors.
+            proxyRes.on('error', err => {
+              logForDebugging(`Upstream response error: ${err.message}`, {
+                level: 'error',
+              })
+              res.destroy()
+            })
             res.writeHead(proxyRes.statusCode!, stripHopByHop(proxyRes.headers))
             proxyRes.pipe(res)
           },
@@ -479,6 +573,15 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             headers: fwdHeaders,
           },
           proxyRes => {
+            // The response stream errors independently of proxyReq (e.g.
+            // upstream reset mid-body after headers); pipe() does not
+            // handle source errors.
+            proxyRes.on('error', err => {
+              logForDebugging(`Upstream response error: ${err.message}`, {
+                level: 'error',
+              })
+              res.destroy()
+            })
             res.writeHead(proxyRes.statusCode!, stripHopByHop(proxyRes.headers))
             proxyRes.pipe(res)
           },
@@ -509,6 +612,11 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         res.on('close', () => bodyTransform.destroy())
         body.pipe(bodyTransform).pipe(proxyReq)
       } else {
+        // pipe() does not handle source errors. `body` may be a tee branch
+        // from decideAndRespond (not `req` itself), so a client abort
+        // surfaces here as an 'error' that would otherwise escape as an
+        // uncaughtException.
+        body.on('error', err => proxyReq.destroy(err))
         body.pipe(proxyReq)
       }
     } catch (err) {
