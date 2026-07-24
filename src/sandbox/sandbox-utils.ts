@@ -554,11 +554,16 @@ export function generateProxyEnvVars(
     const sshMuxOverride = '-o ControlMaster=no -o ControlPath=none'
     const platform = getPlatform()
     if (platform === 'macos') {
-      // macOS: use BSD nc SOCKS5 proxy support (-X 5 -x). nc has no SOCKS5
-      // auth, so when proxyAuthToken is set, git-over-ssh fails at the SOCKS
-      // handshake — use git-over-https (HTTP_PROXY carries the credential).
+      // macOS: use BSD nc SOCKS5 proxy support (-X 5 -x). Apple's nc cannot
+      // speak SOCKS5 auth (no -P flag, offers only the no-auth method), so
+      // when the proxy requires a token the credential rides in the one
+      // field nc transmits verbatim instead: the destination hostname. Our
+      // SOCKS server admits an unauthenticated connection only when the
+      // destination starts with `<token>.`, strips the prefix, then applies
+      // the normal allowlist — see socks-proxy.ts.
+      const destPrefix = proxyAuthToken ? `${proxyAuthToken}.` : ''
       envVars.push(
-        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='nc -X 5 -x localhost:${socksProxyPort} %h %p'`,
+        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='nc -X 5 -x localhost:${socksProxyPort} ${destPrefix}%h %p'`,
       )
     } else if (platform === 'linux' && httpProxyPort) {
       // Linux: use socat HTTP CONNECT via the HTTP proxy bridge.
