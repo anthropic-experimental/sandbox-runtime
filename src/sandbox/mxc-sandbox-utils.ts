@@ -99,7 +99,7 @@ import type { MxcConfig } from './sandbox-config.js'
 // ────────────────────────────────────────────────────────────────────────
 // Structural subset of @microsoft/mxc-sdk@0.7 that srt actually uses.
 //
-// The SDK is an OPTIONAL peer dependency (Windows-only, ~40 MB with
+// The SDK is an optionalDependency (Windows-only, ~40 MB with
 // the bundled runners) loaded via dynamic import, so its types cannot
 // be `import type`d unconditionally on macOS/Linux dev machines. These
 // interfaces mirror sdk/node/src/types.ts for policy version

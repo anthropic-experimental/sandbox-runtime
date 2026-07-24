@@ -30,13 +30,8 @@
     "node-forge": "^1.4.0",
     "zod": "^3.24.1"
   },
-  "peerDependencies": {
+  "optionalDependencies": {
     "@microsoft/mxc-sdk": "^0.7.0"
-  },
-  "peerDependenciesMeta": {
-    "@microsoft/mxc-sdk": {
-      "optional": true
-    }
   },
   "devDependencies": {
     "@eslint/js": "^9.14.0",

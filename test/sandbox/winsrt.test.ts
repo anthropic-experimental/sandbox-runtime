@@ -727,18 +727,23 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
 
     console.error('[winsrt beforeAll] SandboxManager.initialize: begin')
     await SandboxManager.initialize(createTestConfig())
-    // Surface which Windows enforcement backend this run selected —
-    // srt-win on today's CI runners; mxc on BaseContainer-capable
-    // hosts (where the srt-win-shaped assertions below would need a
-    // different suite — test/sandbox/mxc.test.ts is the
-    // backend-agnostic boundary suite for those machines).
+    // Surface which Windows enforcement backend this run selected,
+    // then PIN it: this suite asserts srt-win-shaped behavior (argv,
+    // WFP, ACLs). @microsoft/mxc-sdk is an optionalDependency, so CI
+    // runners now carry wxc-exec and the selection probe runs — if a
+    // CI image upgrade ever makes it answer base-container, fail HERE
+    // with a legible reason instead of wholesale argv mismatches
+    // below. mxc coverage lives in test/sandbox/mxc.test.ts.
     const backend = SandboxManager.getWindowsBackend?.()
     console.error(
       `[winsrt beforeAll] windows backend: ${backend?.backend} ` +
         `(${backend?.reason})`,
     )
+    expect(backend?.backend).toBe('srt-win')
     console.error('[winsrt beforeAll] done')
-  })
+    // 60s: install + WFP verify + (SDK present) wxc-exec --probe
+    // exceed bun's 5s default hook timeout.
+  }, 60_000)
 
   afterAll(async () => {
     await SandboxManager.reset()
