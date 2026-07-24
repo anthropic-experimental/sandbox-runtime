@@ -446,6 +446,102 @@ describe('client-abort delivery semantics', () => {
     expect(uncaught).toEqual([])
   })
 
+  test('GET with a body: callback sees a bodyless Request, upstream gets the body', async () => {
+    uncaught.length = 0
+    const received: string[] = []
+    const echo = createServer((req, res) => {
+      const chunks: Buffer[] = []
+      req.on('error', () => {})
+      req.on('data', c => chunks.push(c))
+      req.on('end', () => {
+        received.push(Buffer.concat(chunks).toString())
+        res.end('ok')
+      })
+    })
+    await new Promise<void>(r => echo.listen(0, '127.0.0.1', r))
+    const eport = (echo.address() as AddressInfo).port
+    let callbackBody: unknown = 'unset'
+    const p2 = createHttpProxyServer({
+      filter: () => true,
+      filterRequest: async r => {
+        callbackBody = r.body
+        return { action: 'allow' }
+      },
+    })
+    await new Promise<void>(r => p2.listen(0, '127.0.0.1', () => r()))
+    const pport = (p2.address() as AddressInfo).port
+    let resp = ''
+    await new Promise<void>(resolve => {
+      const s = connect(pport, '127.0.0.1', () => {
+        const body = 'get-body-payload'
+        s.write(
+          `GET http://127.0.0.1:${eport}/g HTTP/1.1\r\n` +
+            `Host: 127.0.0.1:${eport}\r\n` +
+            'Transfer-Encoding: chunked\r\n' +
+            '\r\n' +
+            `${body.length.toString(16)}\r\n${body}\r\n0\r\n\r\n`,
+        )
+      })
+      s.on('data', d => {
+        resp += d.toString()
+        if (resp.includes('ok')) {
+          s.destroy()
+          resolve()
+        }
+      })
+      s.on('error', () => {})
+      setTimeout(resolve, 3000)
+    })
+    ;(
+      p2 as Server & { closeAllConnections?: () => void }
+    ).closeAllConnections?.()
+    ;(
+      echo as Server & { closeAllConnections?: () => void }
+    ).closeAllConnections?.()
+    await new Promise<void>(r => {
+      const t = setTimeout(r, 1500)
+      p2.close(() => {
+        clearTimeout(t)
+        r()
+      })
+    })
+    await new Promise<void>(r => {
+      const t = setTimeout(r, 1500)
+      echo.close(() => {
+        clearTimeout(t)
+        r()
+      })
+    })
+    expect(resp.startsWith('HTTP/1.1 200')).toBe(true)
+    expect(callbackBody).toBe(null)
+    expect(received).toEqual(['get-body-payload'])
+    expect(uncaught).toEqual([])
+  })
+
+  test('oversized header block gets 431 (Node) or a silent close (Bun), never a crash', async () => {
+    uncaught.length = 0
+    let resp = ''
+    await new Promise<void>(resolve => {
+      const s = connect(proxyPort, '127.0.0.1', () => {
+        s.write(
+          `GET http://127.0.0.1:${upstreamPort}/hdr HTTP/1.1\r\n` +
+            `Host: 127.0.0.1:${upstreamPort}\r\n` +
+            'X-Big: ' +
+            'a'.repeat(40000) +
+            '\r\n\r\n',
+        )
+      })
+      s.on('data', d => {
+        resp += d.toString()
+      })
+      s.on('close', resolve)
+      s.on('error', () => {})
+      setTimeout(resolve, 2500)
+    })
+    expect(resp === '' || resp.startsWith('HTTP/1.1 431')).toBe(true)
+    expect(uncaught).toEqual([])
+  })
+
   test('abort mid-upload to a blocked host does not crash', async () => {
     uncaught.length = 0
     const blocking = createHttpProxyServer({ filter: () => false })
@@ -469,6 +565,63 @@ describe('client-abort delivery semantics', () => {
     })
     await new Promise(r => setTimeout(r, 500))
     await new Promise<void>(r => blocking.close(() => r()))
+    expect(uncaught).toEqual([])
+  })
+
+  test('GET with Content-Length: 0 passes the filter and succeeds', async () => {
+    // Fetch-spec Requests reject a body on GET (Node throws; Bun is
+    // lenient): the declared-body tee must not leak into the callback's
+    // Request or innocent bodyless-framed GETs get 403'd as malformed.
+    uncaught.length = 0
+    filterMode = 'allow'
+    let resp = ''
+    await new Promise<void>(resolve => {
+      const s = connect(proxyPort, '127.0.0.1', () => {
+        s.write(
+          `GET http://127.0.0.1:${upstreamPort}/empty-get HTTP/1.1\r\n` +
+            `Host: 127.0.0.1:${upstreamPort}\r\n` +
+            'Content-Length: 0\r\n' +
+            '\r\n',
+        )
+      })
+      s.on('data', d => {
+        resp += d.toString()
+        if (resp.includes('ok')) {
+          s.destroy()
+          resolve()
+        }
+      })
+      s.on('error', () => {})
+      setTimeout(resolve, 3000)
+    })
+    expect(resp.startsWith('HTTP/1.1 200')).toBe(true)
+    expect(uncaught).toEqual([])
+  })
+
+  test('empty Transfer-Encoding value does not trigger teeing or re-framing', async () => {
+    uncaught.length = 0
+    filterMode = 'allow'
+    let resp = ''
+    await new Promise<void>(resolve => {
+      const s = connect(proxyPort, '127.0.0.1', () => {
+        s.write(
+          `GET http://127.0.0.1:${upstreamPort}/empty-te HTTP/1.1\r\n` +
+            `Host: 127.0.0.1:${upstreamPort}\r\n` +
+            'Transfer-Encoding:\r\n' +
+            '\r\n',
+        )
+      })
+      s.on('data', d => {
+        resp += d.toString()
+        if (resp.includes('ok')) {
+          s.destroy()
+          resolve()
+        }
+      })
+      s.on('error', () => {})
+      setTimeout(resolve, 3000)
+    })
+    expect(resp.startsWith('HTTP/1.1 200')).toBe(true)
     expect(uncaught).toEqual([])
   })
 

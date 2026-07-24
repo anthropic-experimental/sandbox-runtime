@@ -281,6 +281,19 @@ export function terminateAndForward(
   inner.unref()
 }
 
+/**
+ * Destroy a denied client's request only after the 403 has flushed —
+ * destroying the shared socket in the same tick can RST the response away.
+ */
+function destroyAfterDenial(req: IncomingMessage, res: ServerResponse): void {
+  if (res.writableFinished || res.destroyed) {
+    req.destroy()
+    return
+  }
+  res.once('finish', () => req.destroy())
+  res.once('close', () => req.destroy())
+}
+
 function forwardUpstreamGuarded(
   ...args: Parameters<typeof forwardUpstream>
 ): void {
@@ -354,6 +367,7 @@ async function forwardUpstream(
     if (
       (req.destroyed && !req.readableEnded) ||
       res.destroyed ||
+      req.socket.destroyed ||
       body.destroyed
     ) {
       body.destroy()
@@ -401,7 +415,7 @@ async function forwardUpstream(
   if (sigv4Plan?.action === 'deny') {
     respondDenied(res, sigv4Plan.reason)
     body.destroy()
-    if (body !== req) req.destroy()
+    if (body !== req) destroyAfterDenial(req, res)
     return
   }
   if (sigv4Plan?.action === 'resign') {
@@ -443,13 +457,11 @@ async function forwardUpstream(
         return
       }
       payloadHash = sha256Hex(bufferedBody)
-      // Substitution may have re-framed the request (Content-Length is
-      // deleted when a sentinel is not length-matched); the body is now
-      // fully buffered so its exact length is known — restore the header
-      // so the upstream leg and any signed content-length stay consistent.
-      if (bodyTransform) {
-        fwdHeaders['content-length'] = String(bufferedBody.length)
-      }
+      // The body is fully buffered so its exact length is known — set the
+      // header unconditionally. end(Buffer) only auto-computes a
+      // content-length for methods that default to chunked encoding; on
+      // bodyless-default methods it would raw-append the buffer unframed.
+      fwdHeaders['content-length'] = String(bufferedBody.length)
     }
     // Mirror the Host value the runtime derives from {host, port} below.
     const bracketedHost =
@@ -467,7 +479,7 @@ async function forwardUpstream(
         `AWS SigV4 re-signing failed: ${(err as Error).message}`,
       )
       body.destroy()
-      if (body !== req) req.destroy()
+      if (body !== req) destroyAfterDenial(req, res)
       return
     }
   }
@@ -479,9 +491,9 @@ async function forwardUpstream(
   // piped body bytes raw after complete-framed headers — a
   // request-smuggling primitive. The SigV4 buffered path is exempt:
   // end(bufferedBody) computes its own content-length.
-  const clientDeclaredBody =
-    req.headers['content-length'] !== undefined ||
-    req.headers['transfer-encoding'] !== undefined
+  const clientDeclaredBody = Boolean(
+    req.headers['content-length'] || req.headers['transfer-encoding'],
+  )
   if (
     clientDeclaredBody &&
     bufferedBody === undefined &&

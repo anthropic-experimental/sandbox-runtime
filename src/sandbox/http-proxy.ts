@@ -177,7 +177,11 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // may never fire on a parse-errored socket (the 400 is dropped;
       // verified empirically), so back-stop with a timer or the socket
       // leaks.
-      socket.end('HTTP/1.1 400 Bad Request\r\n\r\n', () => socket.destroy())
+      const status =
+        (err as NodeJS.ErrnoException).code === 'HPE_HEADER_OVERFLOW'
+          ? '431 Request Header Fields Too Large'
+          : '400 Bad Request'
+      socket.end(`HTTP/1.1 ${status}\r\n\r\n`, () => socket.destroy())
       const backstop = setTimeout(() => socket.destroy(), 1000)
       backstop.unref?.()
       return
@@ -477,6 +481,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         if (
           (req.destroyed && !req.readableEnded) ||
           res.destroyed ||
+          req.socket.destroyed ||
           body.destroyed
         ) {
           body.destroy()
@@ -490,9 +495,9 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // explicitly: for bodyless-method requests the runtime would
       // otherwise write the piped body bytes raw after complete-framed
       // headers — a request-smuggling primitive.
-      const clientDeclaredBody =
-        req.headers['content-length'] !== undefined ||
-        req.headers['transfer-encoding'] !== undefined
+      const clientDeclaredBody = Boolean(
+        req.headers['content-length'] || req.headers['transfer-encoding'],
+      )
       if (
         clientDeclaredBody &&
         fwdHeaders['content-length'] === undefined &&
