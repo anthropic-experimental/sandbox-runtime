@@ -90,7 +90,11 @@ import {
   redactUrl,
   resolveParentProxy,
 } from './parent-proxy.js'
-import { matchesDomainPattern } from './domain-pattern.js'
+import {
+  matchesDomainPattern,
+  matchesDomainPatternWithPort,
+  stripDomainPatternPort,
+} from './domain-pattern.js'
 import type { ChildProcess } from 'node:child_process'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import { EOL } from 'node:os'
@@ -208,7 +212,7 @@ async function filterNetworkRequest(
 
   // Check denied domains first
   for (const deniedDomain of config.network.deniedDomains) {
-    if (matchesDomainPattern(canonicalHost, deniedDomain)) {
+    if (matchesDomainPatternWithPort(canonicalHost, port, deniedDomain)) {
       logForDebugging(`Denied by config rule: ${host}:${port}`)
       return false
     }
@@ -216,7 +220,7 @@ async function filterNetworkRequest(
 
   // Check allowed domains
   for (const allowedDomain of config.network.allowedDomains) {
-    if (matchesDomainPattern(canonicalHost, allowedDomain)) {
+    if (matchesDomainPatternWithPort(canonicalHost, port, allowedDomain)) {
       logForDebugging(`Allowed by config rule: ${host}:${port}`)
       return true
     }
@@ -906,6 +910,13 @@ function getCredentialRestrictions(
 
   const denyReadPaths = getCredentialDenyReadPaths(credentials)
 
+  // Default injectHosts (= allowedDomains) is host-scoped: drop any
+  // `:port` suffixes, otherwise the sentinel would carry an entry no bare
+  // destination host can ever match and the credential would never inject.
+  const defaultInjectHosts = [
+    ...new Set((allowedDomains ?? []).map(stripDomainPatternPort)),
+  ]
+
   const unsetEnvVars: string[] = []
   for (const v of credentials.envVars ?? []) {
     if (v.mode === 'deny') unsetEnvVars.push(v.name)
@@ -918,7 +929,7 @@ function getCredentialRestrictions(
   // unsetEnvVars below so the value is withheld rather than exposed.
   const { setEnvVars, degradeToUnsetNames } = buildMaskedEnvVars(
     credentials.envVars ?? [],
-    allowedDomains ?? [],
+    defaultInjectHosts,
     sentinelRegistry,
   )
   unsetEnvVars.push(...degradeToUnsetNames)
@@ -929,7 +940,7 @@ function getCredentialRestrictions(
   registerAwsPairs(
     credentials.envVars ?? [],
     credentials.awsPairs,
-    allowedDomains ?? [],
+    defaultInjectHosts,
     setEnvVars,
     awsPairRegistry,
   )
@@ -943,7 +954,7 @@ function getCredentialRestrictions(
   const files = credentials.files ?? []
   const { binds: maskedFileBinds, degradeToDenyPaths } = buildMaskedFileBinds(
     files,
-    allowedDomains ?? [],
+    defaultInjectHosts,
     sentinelRegistry,
     maskedFileStore,
   )
