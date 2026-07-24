@@ -727,6 +727,16 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
 
     console.error('[winsrt beforeAll] SandboxManager.initialize: begin')
     await SandboxManager.initialize(createTestConfig())
+    // Surface which Windows enforcement backend this run selected —
+    // srt-win on today's CI runners; mxc on BaseContainer-capable
+    // hosts (where the srt-win-shaped assertions below would need a
+    // different suite — test/sandbox/mxc.test.ts is the
+    // backend-agnostic boundary suite for those machines).
+    const backend = SandboxManager.getWindowsBackend?.()
+    console.error(
+      `[winsrt beforeAll] windows backend: ${backend?.backend} ` +
+        `(${backend?.reason})`,
+    )
     console.error('[winsrt beforeAll] done')
   })
 
