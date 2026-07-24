@@ -541,20 +541,37 @@ describe.if(isWindows)('Windows sandbox boundaries: tlsTerminate', () => {
 
   beforeAll(async () => {
     await SandboxManager.reset()
-    await SandboxManager.initialize({
-      ...createBoundaryConfig(),
-      network: {
-        allowedDomains: ['example.com'],
-        deniedDomains: [],
-        tlsTerminate: {},
-      },
-    })
-    mxcSelected = SandboxManager.getWindowsBackend?.()?.backend === 'mxc'
-    console.error(
-      `[boundaries tls] windows backend: ` +
-        `${SandboxManager.getWindowsBackend?.()?.backend}` +
-        (mxcSelected ? '' : ' — G rows skipped (covered by winsrt.test.ts)'),
-    )
+    try {
+      await SandboxManager.initialize({
+        ...createBoundaryConfig(),
+        network: {
+          allowedDomains: ['example.com'],
+          deniedDomains: [],
+          tlsTerminate: {},
+        },
+      })
+      const backend = SandboxManager.getWindowsBackend?.()?.backend
+      mxcSelected = backend === 'mxc'
+      console.error(
+        `[boundaries tls] windows backend: ${backend}` +
+          (mxcSelected ? '' : ' — G rows skipped (covered by winsrt.test.ts)'),
+      )
+    } catch (e) {
+      // The ONLY expected miss: srt-win's trust-ca thumbprint gate
+      // (its message starts "tlsTerminate on Windows", it throws
+      // before any manager state exists, and it only exists on the
+      // srt-win path — whose tls flow winsrt.test.ts covers with the
+      // install-time trust-ca step). Anything else — including any
+      // failure on an mxc host, the suite's actual target — stays
+      // loud. Backend state can't discriminate here: network-phase
+      // failures reset the manager, clearing the selection, before
+      // this catch runs.
+      const msg = e instanceof Error ? e.message : String(e)
+      if (!/^tlsTerminate on Windows/.test(msg)) throw e
+      console.error(
+        `[boundaries tls] srt-win without trust-ca — G rows skipped: ${msg}`,
+      )
+    }
   })
 
   afterAll(async () => {
@@ -566,7 +583,12 @@ describe.if(isWindows)('Windows sandbox boundaries: tlsTerminate', () => {
   it.skipIf(!existsSync(GIT_CURL))(
     'G1: OpenSSL-backed client trusts the MITM leaf via env CA',
     async () => {
-      if (!mxcSelected) return
+      if (!mxcSelected) {
+        console.error(
+          '[boundaries tls] SKIPPED (not mxc) — this pass proves nothing',
+        )
+        return
+      }
       const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
         `"${GIT_CURL}" -fsS -o NUL https://example.com`,
       )
@@ -580,7 +602,12 @@ describe.if(isWindows)('Windows sandbox boundaries: tlsTerminate', () => {
   )
 
   it('G2: schannel client (System32 curl.exe) trusts the MITM leaf', async () => {
-    if (!mxcSelected) return
+    if (!mxcSelected) {
+      console.error(
+        '[boundaries tls] SKIPPED (not mxc) — this pass proves nothing',
+      )
+      return
+    }
     // --ssl-no-revoke isolates the trust question from the known
     // CRL-fetch-through-the-fence issue (see README). A TLS trust
     // failure here means BaseContainer children do NOT see the
