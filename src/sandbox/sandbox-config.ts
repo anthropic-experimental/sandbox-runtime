@@ -7,50 +7,91 @@ import type { FilterRequestCallback } from './request-filter.js'
 
 import { isAbsolute } from 'node:path'
 import { z } from 'zod'
-import { isInjectHostCoveredByAllowedDomains } from './domain-pattern.js'
+import {
+  isInjectHostCoveredByAllowedDomains,
+  splitDomainPatternPort,
+  stripDomainPatternPort,
+} from './domain-pattern.js'
+
+/**
+ * Host-only pattern check (e.g., "example.com", "*.npmjs.org"). Rejects
+ * protocols, paths, ports, and overly broad wildcards.
+ */
+function isValidDomainPattern(val: string): boolean {
+  // Reject protocols, paths, ports, etc.
+  if (val.includes('://') || val.includes('/') || val.includes(':')) {
+    return false
+  }
+
+  // Allow localhost
+  if (val === 'localhost') return true
+
+  // Allow wildcard domains like *.example.com
+  if (val.startsWith('*.')) {
+    const domain = val.slice(2)
+    // After the *. there must be a valid domain with at least one more dot
+    // e.g., *.example.com is valid, *.com is not (too broad)
+    if (
+      !domain.includes('.') ||
+      domain.startsWith('.') ||
+      domain.endsWith('.')
+    ) {
+      return false
+    }
+    // Count dots - must have at least 2 parts after the wildcard (e.g., example.com)
+    const parts = domain.split('.')
+    return parts.length >= 2 && parts.every(p => p.length > 0)
+  }
+
+  // Reject any other use of wildcards (e.g., *, *., etc.)
+  if (val.includes('*')) {
+    return false
+  }
+
+  // Regular domains must have at least one dot and only valid characters
+  return val.includes('.') && !val.startsWith('.') && !val.endsWith('.')
+}
+
+const DOMAIN_PATTERN_MESSAGE =
+  'Invalid domain pattern. Must be a valid domain (e.g., "example.com") or wildcard (e.g., "*.example.com"). Overly broad patterns like "*.com" or "*" are not allowed for security reasons.'
 
 /**
  * Schema for domain patterns (e.g., "example.com", "*.npmjs.org")
  * Validates that domain patterns are safe and don't include overly broad wildcards
  */
-const domainPatternSchema = z.string().refine(
+const domainPatternSchema = z
+  .string()
+  .refine(isValidDomainPattern, { message: DOMAIN_PATTERN_MESSAGE })
+
+/**
+ * Domain pattern with an optional `:port` suffix (e.g., "example.com:443",
+ * "*.npmjs.org:8443"). Used for allowedDomains / deniedDomains, where the
+ * proxy knows the destination port; an entry without a port matches any port.
+ */
+const domainPortPatternSchema = z
+  .string()
+  .refine(
+    val => isValidDomainPattern(splitDomainPatternPort(val).hostPattern),
+    {
+      message:
+        DOMAIN_PATTERN_MESSAGE +
+        ' An optional ":port" suffix (1-65535) restricts the entry to that port.',
+    },
+  )
+
+/**
+ * deniedDomains entry: a domainPortPattern, or a bare "*" / "*:port"
+ * (deny-all, optionally per-port).
+ */
+const deniedDomainPatternSchema = z.string().refine(
   val => {
-    // Reject protocols, paths, ports, etc.
-    if (val.includes('://') || val.includes('/') || val.includes(':')) {
-      return false
-    }
-
-    // Allow localhost
-    if (val === 'localhost') return true
-
-    // Allow wildcard domains like *.example.com
-    if (val.startsWith('*.')) {
-      const domain = val.slice(2)
-      // After the *. there must be a valid domain with at least one more dot
-      // e.g., *.example.com is valid, *.com is not (too broad)
-      if (
-        !domain.includes('.') ||
-        domain.startsWith('.') ||
-        domain.endsWith('.')
-      ) {
-        return false
-      }
-      // Count dots - must have at least 2 parts after the wildcard (e.g., example.com)
-      const parts = domain.split('.')
-      return parts.length >= 2 && parts.every(p => p.length > 0)
-    }
-
-    // Reject any other use of wildcards (e.g., *, *., etc.)
-    if (val.includes('*')) {
-      return false
-    }
-
-    // Regular domains must have at least one dot and only valid characters
-    return val.includes('.') && !val.startsWith('.') && !val.endsWith('.')
+    const { hostPattern } = splitDomainPatternPort(val)
+    return hostPattern === '*' || isValidDomainPattern(hostPattern)
   },
   {
     message:
-      'Invalid domain pattern. Must be a valid domain (e.g., "example.com") or wildcard (e.g., "*.example.com"). Overly broad patterns like "*.com" or "*" are not allowed for security reasons.',
+      DOMAIN_PATTERN_MESSAGE +
+      ' In deniedDomains a bare "*" (deny-all) is also accepted, and an optional ":port" suffix (1-65535) restricts the entry to that port.',
   },
 )
 
@@ -644,12 +685,16 @@ export const CredentialsConfigSchema = z
  */
 export const NetworkConfigSchema = z.object({
   allowedDomains: z
-    .array(domainPatternSchema)
-    .describe('List of allowed domains (e.g., ["github.com", "*.npmjs.org"])'),
-  deniedDomains: z
-    .array(z.union([z.literal('*'), domainPatternSchema]))
+    .array(domainPortPatternSchema)
     .describe(
-      'List of denied domains. Unlike allowedDomains, a bare "*" is accepted here (deny-all).',
+      'List of allowed domains (e.g., ["github.com", "*.npmjs.org", "api.example.com:443"]). ' +
+        'An optional ":port" suffix restricts the entry to that destination port.',
+    ),
+  deniedDomains: z
+    .array(deniedDomainPatternSchema)
+    .describe(
+      'List of denied domains. Unlike allowedDomains, a bare "*" is accepted here (deny-all). ' +
+        'An optional ":port" suffix (e.g., "*:22") restricts the entry to that destination port.',
     ),
   strictAllowlist: z
     .boolean()
@@ -733,8 +778,11 @@ export const NetworkConfigSchema = z.object({
         .describe(
           'Path to a PEM-encoded CA certificate. The sandboxed child is ' +
             'configured to trust this CA, and the TLS-terminating proxy uses ' +
-            'it to sign per-host certificates. If omitted, SRT generates an ' +
-            'ephemeral CA into a temp directory for the lifetime of the ' +
+            'it to sign per-host certificates. If omitted, on Windows SRT ' +
+            'generates-if-absent a persistent CA under ' +
+            '%LOCALAPPDATA%\\sandbox-runtime\\ca\\ and trusts it in the ' +
+            "sandbox user's Root store; on other platforms SRT generates " +
+            'an ephemeral CA into a temp directory for the lifetime of the ' +
             'session.',
         ),
       caKeyPath: z
@@ -887,12 +935,13 @@ export const SrtWinConfigSchema = z.object({
   path: z
     .string()
     .min(1)
-    .optional()
     .describe(
-      'Path to the srt-win binary. When unset, getSrtWinPath() resolves ' +
-        'the packaged vendor/srt-win/<arch>/srt-win.exe. When set, the ' +
-        'binary is spawned with the `--srt-win` argv[1] sentinel so a ' +
-        "multicall dispatcher can route to srt-win's CLI.",
+      'Path to the srt-win binary. Pass the exported ' +
+        'VENDORED_SRT_WIN_EXE constant to use the packaged ' +
+        'vendor/srt-win/<arch>/srt-win.exe (see its WARNING: in a dev ' +
+        'checkout that file may sit inside your sandbox write grant). ' +
+        'The binary is spawned with the `--srt-win` argv[1] sentinel so ' +
+        "a multicall dispatcher can route to srt-win's CLI.",
     ),
 })
 
@@ -970,9 +1019,9 @@ export const WindowsConfigSchema = z.object({
         'permit only covers ports in that range.',
     ),
   srtWin: SrtWinConfigSchema.optional().describe(
-    'How to locate/invoke the srt-win helper binary. Omit to resolve the ' +
-      'packaged vendor binary; set when embedding srt-win into a multicall ' +
-      'binary.',
+    'How to locate/invoke the srt-win helper binary. `srtWin.path` is ' +
+      'required to use the Windows sandbox — your own (multicall) binary, ' +
+      'or the exported VENDORED_SRT_WIN_EXE constant for the packaged exe.',
   ),
   mxc: MxcConfigSchema.optional().describe(
     'Where to find the MXC wxc-exec.exe runner (backend selection ' +
@@ -1088,13 +1137,15 @@ export const SandboxRuntimeConfigSchema = z
     // allowedDomains — semantic (wildcard-aware) coverage, not literal
     // string membership, so `injectHosts: ['api.github.com']` is accepted
     // when `allowedDomains: ['*.github.com']`.
-    const allowed = cfg.network.allowedDomains
+    // Host-scoped view of the allowlist (":port" suffixes dropped) —
+    // injection is per-host, not per-port.
+    const allowedHosts = cfg.network.allowedDomains.map(stripDomainPatternPort)
     const checkSubset = (
       hosts: readonly string[],
       path: (string | number)[],
     ) => {
       for (const [i, host] of hosts.entries()) {
-        if (!isInjectHostCoveredByAllowedDomains(host, allowed)) {
+        if (!isInjectHostCoveredByAllowedDomains(host, allowedHosts)) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
             path: [...path, i],
@@ -1152,8 +1203,10 @@ export const SandboxRuntimeConfigSchema = z
             }
           }
         } else if (
-          allowed.length > 0 &&
-          allowed.every(p => isInjectHostCoveredByAllowedDomains(p, exclude))
+          allowedHosts.length > 0 &&
+          allowedHosts.every(p =>
+            isInjectHostCoveredByAllowedDomains(p, exclude),
+          )
         ) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,

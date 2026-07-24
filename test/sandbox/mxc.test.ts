@@ -15,6 +15,7 @@ import type { AddressInfo } from 'node:net'
 import { isWindows } from '../helpers/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
+import { WindowsSandboxError } from '../../src/sandbox/windows-sandbox-utils.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 
 /**
@@ -557,19 +558,23 @@ describe.if(isWindows)('Windows sandbox boundaries: tlsTerminate', () => {
           (mxcSelected ? '' : ' — G rows skipped (covered by winsrt.test.ts)'),
       )
     } catch (e) {
-      // The ONLY expected miss: srt-win's trust-ca thumbprint gate
-      // (its message starts "tlsTerminate on Windows", it throws
-      // before any manager state exists, and it only exists on the
-      // srt-win path — whose tls flow winsrt.test.ts covers with the
-      // install-time trust-ca step). Anything else — including any
-      // failure on an mxc host, the suite's actual target — stays
-      // loud. Backend state can't discriminate here: network-phase
-      // failures reset the manager, clearing the selection, before
-      // this catch runs.
+      // Only srt-win-flavored initialize failures are an expected
+      // miss here — that path's tls flow lives in winsrt.test.ts
+      // with the install-time trust-ca step. Discriminators: the
+      // typed WindowsSandboxError family (trust-ca gates,
+      // provisioning — thrown only by srt-win machinery), the
+      // persistent-CA reconcile, and the explicit-path thumbprint
+      // gate messages. Anything else — including any failure on an
+      // mxc host, the suite's actual target — stays loud. Backend
+      // state can't discriminate here: network-phase failures reset
+      // the manager, clearing the selection, before this catch runs.
       const msg = e instanceof Error ? e.message : String(e)
-      if (!/^tlsTerminate on Windows/.test(msg)) throw e
+      const srtWinFlavored =
+        e instanceof WindowsSandboxError ||
+        /^ensurePersistentWindowsCa|^tlsTerminate on Windows/.test(msg)
+      if (!srtWinFlavored) throw e
       console.error(
-        `[boundaries tls] srt-win without trust-ca — G rows skipped: ${msg}`,
+        `[boundaries tls] srt-win tls init failed — G rows skipped: ${msg}`,
       )
     }
   })

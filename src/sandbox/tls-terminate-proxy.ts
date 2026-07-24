@@ -193,7 +193,20 @@ export function terminateAndForward(
   })
 
   inner.on('request', (req, res) => {
-    void forwardUpstream(
+    // A client abort mid-request destroys req/res with an error; with no
+    // listener it escapes as an uncaughtException (the runtime emits it
+    // from node:_http_server).
+    req.on('error', err => {
+      logForDebugging(`[tls-terminate] client request error: ${err.message}`, {
+        level: 'error',
+      })
+    })
+    res.on('error', err => {
+      logForDebugging(`[tls-terminate] client response error: ${err.message}`, {
+        level: 'error',
+      })
+    })
+    forwardUpstreamGuarded(
       filterRequest,
       mutateHeaders,
       getBodySubstitutions,
@@ -203,6 +216,16 @@ export function terminateAndForward(
       planSigv4,
       maxSigv4BodyBytes,
     )
+  })
+  inner.on('clientError', (err, sock) => {
+    // Post-handshake parse errors / resets on the loopback leg would
+    // otherwise escalate to an uncaughtException, same class as the
+    // request-stream errors handled above.
+    logForDebugging(
+      `[tls-terminate] client connection error for ${target.hostname}: ${err.message}`,
+      { level: 'error' },
+    )
+    sock.destroy()
   })
   inner.on('tlsClientError', (err, sock) => {
     logForDebugging(
@@ -258,6 +281,33 @@ export function terminateAndForward(
   inner.unref()
 }
 
+/**
+ * Destroy a denied client's request only after the 403 has flushed —
+ * destroying the shared socket in the same tick can RST the response away.
+ */
+function destroyAfterDenial(req: IncomingMessage, res: ServerResponse): void {
+  if (res.writableFinished || res.destroyed) {
+    req.destroy()
+    return
+  }
+  res.once('finish', () => req.destroy())
+  res.once('close', () => req.destroy())
+}
+
+function forwardUpstreamGuarded(
+  ...args: Parameters<typeof forwardUpstream>
+): void {
+  // Fire-and-forget from the request handler: a rejection (e.g. a
+  // synchronous throw writing a denial to a client that already reset)
+  // must not become an unhandledRejection.
+  forwardUpstream(...args).catch(err => {
+    logForDebugging(
+      `[tls-terminate] forwardUpstream failed: ${(err as Error).message}`,
+      { level: 'error' },
+    )
+  })
+}
+
 async function forwardUpstream(
   filterRequest: FilterRequestCallback | undefined,
   mutateHeaders: MutateForwardedHeaders | undefined,
@@ -308,6 +358,21 @@ async function forwardUpstream(
     )
     if (out === null) return
     body = out
+    // The client may have aborted during the filterRequest await — the tee
+    // branch is already destroyed and res 'close' already fired, so the
+    // teardown listeners attached below would never run. Don't dial an
+    // upstream for a dead client. A COMPLETED request is also
+    // destroyed=true (normal stream lifecycle after 'end'); only a
+    // destroy without a clean end is an abort.
+    if (
+      (req.destroyed && !req.readableEnded) ||
+      res.destroyed ||
+      req.socket.destroyed ||
+      body.destroyed
+    ) {
+      body.destroy()
+      return
+    }
   }
 
   // Bun's https.request verifies the upstream cert against headers.host
@@ -350,6 +415,7 @@ async function forwardUpstream(
   if (sigv4Plan?.action === 'deny') {
     respondDenied(res, sigv4Plan.reason)
     body.destroy()
+    if (body !== req) destroyAfterDenial(req, res)
     return
   }
   if (sigv4Plan?.action === 'resign') {
@@ -391,13 +457,11 @@ async function forwardUpstream(
         return
       }
       payloadHash = sha256Hex(bufferedBody)
-      // Substitution may have re-framed the request (Content-Length is
-      // deleted when a sentinel is not length-matched); the body is now
-      // fully buffered so its exact length is known — restore the header
-      // so the upstream leg and any signed content-length stay consistent.
-      if (bodyTransform) {
-        fwdHeaders['content-length'] = String(bufferedBody.length)
-      }
+      // The body is fully buffered so its exact length is known — set the
+      // header unconditionally. end(Buffer) only auto-computes a
+      // content-length for methods that default to chunked encoding; on
+      // bodyless-default methods it would raw-append the buffer unframed.
+      fwdHeaders['content-length'] = String(bufferedBody.length)
     }
     // Mirror the Host value the runtime derives from {host, port} below.
     const bracketedHost =
@@ -414,8 +478,29 @@ async function forwardUpstream(
         res,
         `AWS SigV4 re-signing failed: ${(err as Error).message}`,
       )
+      body.destroy()
+      if (body !== req) destroyAfterDenial(req, res)
       return
     }
+  }
+
+  // When the client declared a body but the forwarded headers carry no
+  // framing (chunked TE stripped as hop-by-hop, or a body transform
+  // deleted content-length), the upstream leg must re-frame explicitly:
+  // for bodyless-method requests the runtime would otherwise write the
+  // piped body bytes raw after complete-framed headers — a
+  // request-smuggling primitive. The SigV4 buffered path is exempt:
+  // end(bufferedBody) computes its own content-length.
+  const clientDeclaredBody = Boolean(
+    req.headers['content-length'] || req.headers['transfer-encoding'],
+  )
+  if (
+    clientDeclaredBody &&
+    bufferedBody === undefined &&
+    fwdHeaders['content-length'] === undefined &&
+    fwdHeaders['transfer-encoding'] === undefined
+  ) {
+    fwdHeaders['transfer-encoding'] = 'chunked'
   }
 
   // TODO(terminating-tls): honour parentProxy for the upstream leg.
@@ -441,6 +526,15 @@ async function forwardUpstream(
       agent: false,
     },
     upRes => {
+      // The response stream errors independently of the ClientRequest;
+      // pipe() does not handle source errors.
+      upRes.on('error', err => {
+        logForDebugging(
+          `[tls-terminate] upstream response error: ${err.message}`,
+          { level: 'error' },
+        )
+        res.destroy()
+      })
       res.writeHead(upRes.statusCode ?? 502, stripHopByHop(upRes.headers))
       upRes.pipe(res)
     },
@@ -472,6 +566,11 @@ async function forwardUpstream(
     res.on('close', () => bodyTransform.destroy())
     body.pipe(bodyTransform).pipe(upstream)
   } else {
+    // pipe() does not handle source errors. `body` may be a tee branch
+    // from decideAndRespond (not `req` itself), so a client abort surfaces
+    // here as an 'error' that would otherwise escape as an
+    // uncaughtException.
+    body.on('error', err => upstream.destroy(err))
     body.pipe(upstream)
   }
 }

@@ -16,6 +16,7 @@ import {
   type PlanSigv4,
 } from './credential-aws-pairs.js'
 import {
+  certThumbprint,
   createMitmCA,
   CRL_PATH,
   disposeMitmCA,
@@ -25,7 +26,7 @@ import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
-import { randomBytes, X509Certificate } from 'node:crypto'
+import { randomBytes } from 'node:crypto'
 import type {
   CredentialsConfig,
   SandboxRuntimeConfig,
@@ -56,6 +57,7 @@ import {
 } from './linux-violation-monitor.js'
 import {
   checkWindowsDependencies,
+  checkWindowsDependenciesAsync,
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
   expandWindowsFsPaths,
@@ -63,10 +65,12 @@ import {
   restoreWindowsAcl,
   grantWindowsAcl,
   revokeWindowsAcl,
-  getWindowsSandboxUserStatus,
+  getWindowsSandboxUserStatusAsync,
   getWindowsSandboxCaCert,
+  ensurePersistentWindowsCa,
   verifyWindowsWfpEgress,
   resolveSrtWin,
+  WindowsSandboxError,
   type SrtWinSpawn,
   type WindowsBinShell,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
@@ -96,7 +100,11 @@ import {
   redactUrl,
   resolveParentProxy,
 } from './parent-proxy.js'
-import { matchesDomainPattern } from './domain-pattern.js'
+import {
+  matchesDomainPattern,
+  matchesDomainPatternWithPort,
+  stripDomainPatternPort,
+} from './domain-pattern.js'
 import type { ChildProcess } from 'node:child_process'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import { EOL } from 'node:os'
@@ -232,7 +240,7 @@ async function filterNetworkRequest(
 
   // Check denied domains first
   for (const deniedDomain of config.network.deniedDomains) {
-    if (matchesDomainPattern(canonicalHost, deniedDomain)) {
+    if (matchesDomainPatternWithPort(canonicalHost, port, deniedDomain)) {
       logForDebugging(`Denied by config rule: ${host}:${port}`)
       return false
     }
@@ -240,7 +248,7 @@ async function filterNetworkRequest(
 
   // Check allowed domains
   for (const allowedDomain of config.network.allowedDomains) {
-    if (matchesDomainPattern(canonicalHost, allowedDomain)) {
+    if (matchesDomainPatternWithPort(canonicalHost, port, allowedDomain)) {
       logForDebugging(`Allowed by config rule: ${host}:${port}`)
       return true
     }
@@ -487,12 +495,25 @@ async function initialize(
       'network.tlsTerminate and network.mitmProxy are mutually exclusive',
     )
   }
-  mitmCA = runtimeConfig.network.tlsTerminate
-    ? createMitmCA(runtimeConfig.network.tlsTerminate)
-    : undefined
+  // On Windows with tlsTerminate and no explicit caCertPath/caKeyPath,
+  // defer CA creation until the Windows block below has resolved
+  // srt-win and fetched user status — the persistent CA is
+  // generated-if-absent under %LOCALAPPDATA%\sandbox-runtime\ca\ and
+  // trusted in the sandbox user's Root store, then loaded here.
+  // Explicit paths (or non-Windows) go straight to createMitmCA.
+  const tlsTerminate = runtimeConfig.network.tlsTerminate
+  const useWindowsPersistentCa =
+    getPlatform() === 'windows' &&
+    tlsTerminate !== undefined &&
+    !tlsTerminate.caCertPath &&
+    !tlsTerminate.caKeyPath
+  mitmCA =
+    tlsTerminate && !useWindowsPersistentCa
+      ? createMitmCA(tlsTerminate)
+      : undefined
 
   // Check dependencies
-  const deps = checkDependencies()
+  const deps = await checkDependenciesAsync()
   if (deps.errors.length > 0) {
     throw new Error(
       `Sandbox dependencies not available: ${deps.errors.join(', ')}`,
@@ -604,6 +625,22 @@ async function initialize(
         // policy per exec, in its own elevated context — no sandbox
         // user, no WFP install, no session ACL stamping, nothing to
         // verify or restore.
+        //
+        // tlsTerminate with default (unset) CA paths: the Windows
+        // persistent-CA flow is srt-win machinery — it persists into
+        // the SANDBOX USER's CurrentUser\Root via srt-win, and mxc
+        // has no sandbox user. Mint a session CA the same way
+        // macOS/Linux do; the env-var CA layer covers OpenSSL-backed
+        // clients, and schannel trust under BaseContainer is manual
+        // test #4. Created here (after selection, before capturing
+        // the fs sets) so the trust bundle's read grant lands in
+        // every wrap-time config; the probe config predates it by
+        // one readonly path, which cannot flip the tier answer
+        // (tier selection keys on denies).
+        if (useWindowsPersistentCa && tlsTerminate) {
+          mitmCA = createMitmCA(tlsTerminate)
+          acc.grantRead.push(dirname(mitmCA.trustBundlePath))
+        }
         windowsMxcState = {
           mxc: windowsSelection.mxc,
           denyPathsSupported: windowsSelection.denyPathsSupported,
@@ -620,10 +657,11 @@ async function initialize(
     // Resolve once (stats disk); captured module-level for wrap/reset.
     srtWinSpawn = resolveSrtWin(runtimeConfig.windows?.srtWin)
     const srtWin = srtWinSpawn
-    const u = getWindowsSandboxUserStatus({ srtWin })
+    const u = await getWindowsSandboxUserStatusAsync({ srtWin })
     if (!u.provisioned || !u.credPresent) {
       config = undefined
-      throw new Error(
+      throw new WindowsSandboxError(
+        'not_provisioned',
         `Windows sandbox user is not provisioned (user=` +
           `${u.provisioned}, cred=${u.credPresent}). Run \`npx ` +
           `sandbox-runtime windows-install\` (one UAC prompt) to ` +
@@ -650,21 +688,39 @@ async function initialize(
       }
       windowsWfpVerified = true
     }
-    // schannel-level trust under the sandbox user is install-time
-    // (cert lifecycle = sandbox-user lifecycle), not per-session.
-    // System32 curl / IWR / .NET / default-backend git only trust
-    // what's in the sandbox user's `CurrentUser\Root` — which
-    // `srt-win exec` does not (and must not) write. Compare
-    // thumbprints so a stale install-time CA doesn't pass the gate
-    // while schannel rejects the session's proxy-minted leaves.
-    if (runtimeConfig.network.tlsTerminate && mitmCA) {
+    // Persistent-CA branch (see the deferral comment above).
+    // `ensurePersistentWindowsCa` reconciles the registry thumb
+    // itself (so initialize() after uninstall→reinstall repairs
+    // trust) and may make `u.caCertThumb` stale — hence the
+    // explicit-path thumb check below skips this branch.
+    if (useWindowsPersistentCa && tlsTerminate) {
+      try {
+        const p = await ensurePersistentWindowsCa({ status: u, srtWin })
+        mitmCA = createMitmCA({
+          caCertPem: p.certPem,
+          caKeyPem: p.keyPem,
+          caCertPath: p.certPath,
+          caKeyPath: p.keyPath,
+          extraCaCertPaths: tlsTerminate.extraCaCertPaths,
+        })
+      } catch (e) {
+        config = undefined
+        throw e
+      }
+    }
+    // Explicit-path branch: schannel clients (System32 curl, IWR,
+    // .NET, default-backend git) only trust what's in the sandbox
+    // user's `CurrentUser\Root` — which `srt-win exec` does not (and
+    // must not) write. Compare thumbprints so a stale install-time
+    // CA doesn't pass the gate while schannel rejects the session's
+    // proxy-minted leaves.
+    if (tlsTerminate && mitmCA && !useWindowsPersistentCa) {
       const installed = getWindowsSandboxCaCert(u)
-      const sessionThumb = new X509Certificate(mitmCA.certPem).fingerprint
-        .replace(/:/g, '')
-        .toUpperCase()
+      const sessionThumb = certThumbprint(mitmCA.certPem)
       if (!installed) {
         config = undefined
-        throw new Error(
+        throw new WindowsSandboxError(
+          'trust_ca_not_installed',
           `tlsTerminate on Windows requires the sandbox to be ` +
             `installed with this CA (thumb=${sessionThumb}): run ` +
             `\`srt-win user trust-ca ${mitmCA.certPath}\`. Per-exec ` +
@@ -674,7 +730,8 @@ async function initialize(
       }
       if (installed.thumb !== sessionThumb) {
         config = undefined
-        throw new Error(
+        throw new WindowsSandboxError(
+          'trust_ca_thumbprint_mismatch',
           `tlsTerminate on Windows: the sandbox's installed CA ` +
             `(thumb=${installed.thumb}) doesn't match this ` +
             `session's CA (thumb=${sessionThumb}). Run \`srt-win ` +
@@ -866,16 +923,19 @@ function isSandboxingEnabled(): boolean {
 }
 
 /**
- * Check sandbox dependencies for the current platform
- * @param ripgrepConfig - Ripgrep command to check. If not provided, uses config from initialization or defaults to 'rg'
- * @returns { warnings, errors } - errors mean sandbox cannot run, warnings mean degraded functionality
+ * Platform-independent part of the dependency check. Returns either
+ * a finished result (POSIX, unsupported platform, or a Windows
+ * srt-win resolution failure) or the inputs for the Windows probe —
+ * the only platform where the sync and async variants differ.
  */
-function checkDependencies(ripgrepConfig?: {
+function checkDependenciesCommon(ripgrepConfig?: {
   command: string
   args?: string[]
-}): SandboxDependencyCheck {
+}):
+  | { done: SandboxDependencyCheck }
+  | { windows: { sublayerGuid?: string; srtWin: SrtWinSpawn } } {
   if (!isSupportedPlatform()) {
-    return { errors: ['Unsupported platform'], warnings: [] }
+    return { done: { errors: ['Unsupported platform'], warnings: [] } }
   }
 
   const errors: string[] = []
@@ -899,47 +959,87 @@ function checkDependencies(ripgrepConfig?: {
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
   } else if (platform === 'windows') {
-    // Backend selection is decided at initialize() (async probe).
-    // When an MXC runner is present it may take over entirely — a
-    // BaseContainer host needs neither srt-win.exe nor the WFP/user
-    // install — so srt-win problems downgrade to warnings here,
-    // labelled so the report is honest about the remaining risk:
-    // runner PRESENCE is not selection (a 24H2 host with the SDK
-    // installed still probes to srt-win), and on such a host
-    // initialize() hard-fails with these same messages. Hosts that
-    // need a true preflight for the mxc path can run
-    // `selectWindowsBackend` themselves.
-    const mxcPresent = resolveMxc(config?.windows?.mxc) !== undefined
-    const pushSrtWinProblems = (msgs: string[]) => {
-      if (mxcPresent) {
-        warnings.push(
-          ...msgs.map(
-            m =>
-              `srt-win (required unless initialize() selects the MXC ` +
-              `BaseContainer backend): ${m}`,
-          ),
-        )
-      } else {
-        errors.push(...msgs)
-      }
-    }
-    let srtWin: SrtWinSpawn | undefined
+    let srtWin: SrtWinSpawn
     try {
       srtWin = resolveSrtWin(config?.windows?.srtWin)
     } catch (e) {
-      pushSrtWinProblems([(e as Error).message])
-      return { errors, warnings }
+      errors.push((e as Error).message)
+      return {
+        done: downgradeSrtWinProblemsIfMxcPresent({ errors, warnings }),
+      }
     }
-    const winDeps = checkWindowsDependencies({
-      sublayerGuid:
-        config?.windows?.sublayerGuid ?? config?.windows?.wfpSublayerGuid,
-      srtWin,
-    })
-    pushSrtWinProblems(winDeps.errors)
-    warnings.push(...winDeps.warnings)
+    return {
+      windows: {
+        sublayerGuid:
+          config?.windows?.sublayerGuid ?? config?.windows?.wfpSublayerGuid,
+        srtWin,
+      },
+    }
   }
 
-  return { errors, warnings }
+  return { done: { errors, warnings } }
+}
+
+/**
+ * Backend selection is decided at initialize() (async probe). When an
+ * MXC runner is present it may take over entirely — a BaseContainer
+ * host needs neither srt-win.exe nor the WFP/user install — so
+ * srt-win problems downgrade to warnings, labelled so the report is
+ * honest about the remaining risk: runner PRESENCE is not selection
+ * (a 24H2 host with the SDK installed still probes to srt-win), and
+ * on such a host initialize() hard-fails with these same messages.
+ * Hosts that need a true preflight for the mxc path can run
+ * `selectWindowsBackend` themselves.
+ */
+function downgradeSrtWinProblemsIfMxcPresent(
+  deps: SandboxDependencyCheck,
+): SandboxDependencyCheck {
+  if (resolveMxc(config?.windows?.mxc) === undefined) return deps
+  return {
+    errors: [],
+    warnings: [
+      ...deps.errors.map(
+        m =>
+          `srt-win (required unless initialize() selects the MXC ` +
+          `BaseContainer backend): ${m}`,
+      ),
+      ...deps.warnings,
+    ],
+  }
+}
+
+/**
+ * Check sandbox dependencies for the current platform
+ * @param ripgrepConfig - Ripgrep command to check. If not provided, uses config from initialization or defaults to 'rg'
+ * @returns { warnings, errors } - errors mean sandbox cannot run, warnings mean degraded functionality
+ */
+function checkDependencies(ripgrepConfig?: {
+  command: string
+  args?: string[]
+}): SandboxDependencyCheck {
+  const common = checkDependenciesCommon(ripgrepConfig)
+  if ('done' in common) return common.done
+  return downgradeSrtWinProblemsIfMxcPresent(
+    checkWindowsDependencies(common.windows),
+  )
+}
+
+/**
+ * Async variant of {@link checkDependencies} — same result for the
+ * same underlying state. On Windows the srt-win probes run via
+ * `spawn` (never blocking the event loop) and concurrently; on other
+ * platforms the checks are native and this simply wraps the sync
+ * result. Windows callers should prefer this variant.
+ */
+async function checkDependenciesAsync(ripgrepConfig?: {
+  command: string
+  args?: string[]
+}): Promise<SandboxDependencyCheck> {
+  const common = checkDependenciesCommon(ripgrepConfig)
+  if ('done' in common) return common.done
+  return downgradeSrtWinProblemsIfMxcPresent(
+    await checkWindowsDependenciesAsync(common.windows),
+  )
 }
 
 /**
@@ -969,6 +1069,13 @@ function getCredentialRestrictions(
 
   const denyReadPaths = getCredentialDenyReadPaths(credentials)
 
+  // Default injectHosts (= allowedDomains) is host-scoped: drop any
+  // `:port` suffixes, otherwise the sentinel would carry an entry no bare
+  // destination host can ever match and the credential would never inject.
+  const defaultInjectHosts = [
+    ...new Set((allowedDomains ?? []).map(stripDomainPatternPort)),
+  ]
+
   const unsetEnvVars: string[] = []
   for (const v of credentials.envVars ?? []) {
     if (v.mode === 'deny') unsetEnvVars.push(v.name)
@@ -981,7 +1088,7 @@ function getCredentialRestrictions(
   // unsetEnvVars below so the value is withheld rather than exposed.
   const { setEnvVars, degradeToUnsetNames } = buildMaskedEnvVars(
     credentials.envVars ?? [],
-    allowedDomains ?? [],
+    defaultInjectHosts,
     sentinelRegistry,
   )
   unsetEnvVars.push(...degradeToUnsetNames)
@@ -992,7 +1099,7 @@ function getCredentialRestrictions(
   registerAwsPairs(
     credentials.envVars ?? [],
     credentials.awsPairs,
-    allowedDomains ?? [],
+    defaultInjectHosts,
     setEnvVars,
     awsPairRegistry,
   )
@@ -1006,7 +1113,7 @@ function getCredentialRestrictions(
   const files = credentials.files ?? []
   const { binds: maskedFileBinds, degradeToDenyPaths } = buildMaskedFileBinds(
     files,
-    allowedDomains ?? [],
+    defaultInjectHosts,
     sentinelRegistry,
     maskedFileStore,
   )
@@ -1171,20 +1278,27 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
     return { grantRead: [], grantWrite: [], denyRead: [], denyWrite: [] }
   }
   const expand = expandWindowsFsPaths
-  const denyRead = expand([
-    ...new Set([
-      ...(fs?.denyRead ?? []),
-      ...getCredentialDenyReadPaths(c.credentials),
-    ]),
-  ])
-  const denyWrite = expand(fs?.denyWrite ?? [])
+  // `mode: 'deny'` — non-existent literals reach srt-win, which
+  // creates a placeholder chain and stamps it (deny lands on the
+  // exact target path). `mode: 'grant'` drops them (a grant on
+  // nothing is meaningless).
+  const denyRead = expand(
+    [
+      ...new Set([
+        ...(fs?.denyRead ?? []),
+        ...getCredentialDenyReadPaths(c.credentials),
+      ]),
+    ],
+    { mode: 'deny' },
+  )
+  const denyWrite = expand(fs?.denyWrite ?? [], { mode: 'deny' })
   return {
     // `allowRead` also serves as `allowWithinDeny`: a file under a
     // denied dir gets an explicit ALLOW ACE for the sandbox user,
     // and explicit DENY on the parent doesn't override it because
     // the recompose chokepoint orders deny-before-allow per-path.
-    grantRead: expand(fs?.allowRead ?? []),
-    grantWrite: expand(fs?.allowWrite ?? []),
+    grantRead: expand(fs?.allowRead ?? [], { mode: 'grant' }),
+    grantWrite: expand(fs?.allowWrite ?? [], { mode: 'grant' }),
     denyRead,
     denyWrite,
   }
@@ -1725,8 +1839,10 @@ async function wrapWithSandboxArgv(
         const sessRead = new Set(windowsFsStampedSet?.denyRead ?? [])
         const sessWrite = new Set(windowsFsStampedSet?.denyWrite ?? [])
         const expand = expandWindowsFsPaths
-        perExecDenyRead = expand(rawRead).filter(p => !sessRead.has(p))
-        perExecDenyWrite = expand(rawWrite).filter(
+        perExecDenyRead = expand(rawRead, { mode: 'deny' }).filter(
+          p => !sessRead.has(p),
+        )
+        perExecDenyWrite = expand(rawWrite, { mode: 'deny' }).filter(
           p => !sessRead.has(p) && !sessWrite.has(p),
         )
       }
@@ -2200,6 +2316,10 @@ export interface ISandboxManager {
     command: string
     args?: string[]
   }): SandboxDependencyCheck
+  checkDependenciesAsync(ripgrepConfig?: {
+    command: string
+    args?: string[]
+  }): Promise<SandboxDependencyCheck>
   getFsReadConfig(): FsReadRestrictionConfig
   getFsWriteConfig(): FsWriteRestrictionConfig
   getNetworkRestrictionConfig(): NetworkRestrictionConfig
@@ -2256,6 +2376,7 @@ export const SandboxManager: ISandboxManager = {
   isSupportedPlatform,
   isSandboxingEnabled,
   checkDependencies,
+  checkDependenciesAsync,
   getFsReadConfig,
   getFsWriteConfig,
   getNetworkRestrictionConfig,
