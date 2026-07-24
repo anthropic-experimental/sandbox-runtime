@@ -1288,11 +1288,18 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
 
   afterAll(async () => {
     await SandboxManager.reset()
+    // 55s spawn inside the 60s hook (like the H-rows teardown): the
+    // default internal timeout (120s) exceeds the hook budget, so a
+    // slow uninstall would be hook-killed into an opaque
+    // `uninstall failed (exit null)` instead of the legible
+    // srt_win_timeout. Uninstall removes the sandbox user + profile
+    // and routinely exceeds bun's 5s default hook timeout.
     uninstallWindowsSandbox({
       sublayerGuid: TEST_SUBLAYER,
       srtWin: TEST_SRT_WIN,
+      timeoutMs: 55_000,
     })
-  })
+  }, 60_000)
 
   it('wrapWithSandbox() throws on Windows (use wrapWithSandboxArgv)', async () => {
     // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
