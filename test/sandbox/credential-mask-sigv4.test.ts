@@ -17,6 +17,8 @@ import { createServer as createHttpsServer } from 'node:https'
 import type { IncomingHttpHeaders, IncomingMessage } from 'node:http'
 import type { Server, AddressInfo } from 'node:net'
 import { spawn } from 'node:child_process'
+import { connect as netConnect } from 'node:net'
+import { connect as tlsConnect } from 'node:tls'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -304,6 +306,95 @@ describe('SigV4 re-signing through the TLS-terminating proxy', () => {
     // curl signs the body hash without emitting x-amz-content-sha256, so
     // the proxy had to buffer the body and recompute the hash itself —
     // the recomputed signature only verifies if it covers sha256(body).
+    verifyUpstreamSignature(captured)
+  }, 20000)
+
+  test('DELETE with a chunked literal-hash body: proxy re-frames with content-length', async () => {
+    // The unsound case needs a client that sends its body chunked WITHOUT
+    // signing Transfer-Encoding (curl signs every header it sends, so this
+    // is hand-rolled with the repo's own signing primitives). Without the
+    // unconditional content-length restore, Node's end(Buffer) emits NO
+    // framing for bodyless-default methods — the upstream parses an empty
+    // DELETE and the raw-appended body poisons the connection (verified:
+    // 400 + empty body on Node). Bun auto-computes a content-length, so
+    // under bun this pins the e2e scenario rather than the regression.
+    state.captured = undefined
+    const body = 'delete-with-chunked-body'
+    const payloadHash = sha256Hex(Buffer.from(body))
+    const amzDate = new Date()
+      .toISOString()
+      .replace(/[-:]/g, '')
+      .replace(/\..*/, 'Z')
+    const scope = {
+      date: amzDate.slice(0, 8),
+      region: REGION,
+      service: SERVICE,
+    }
+    const hostHeader = `${DEST}:${state.upstreamPort}`
+    const signed = signSigv4({
+      method: 'DELETE',
+      requestTarget: '/bucket/key',
+      headers: {
+        'x-amz-content-sha256': payloadHash,
+        'x-amz-date': amzDate,
+      },
+      hostHeader,
+      signedHeaders: ['host', 'x-amz-content-sha256', 'x-amz-date'],
+      payloadHash,
+      amzDate,
+      scope,
+      accessKeyId: state.fakeAkid,
+      secretAccessKey: state.fakeSecret,
+    })
+    const status = await new Promise<string>(resolve => {
+      let resp = ''
+      const raw = netConnect(state.proxyPort!, '127.0.0.1', () => {
+        raw.write(
+          `CONNECT ${DEST}:${state.upstreamPort} HTTP/1.1\r\nHost: ${DEST}:${state.upstreamPort}\r\n\r\n`,
+        )
+      })
+      raw.on('error', () => {})
+      raw.once('data', () => {
+        const tls = tlsConnect(
+          // SNI cannot carry an IP literal; the CA is pinned, so skip the
+          // hostname identity check instead.
+          {
+            socket: raw,
+            ca: CA_PEM,
+            checkServerIdentity: () => undefined,
+          },
+          () => {
+            tls.write(
+              `DELETE /bucket/key HTTP/1.1\r\n` +
+                `Host: ${hostHeader}\r\n` +
+                `Authorization: ${signed.authorization}\r\n` +
+                `x-amz-date: ${amzDate}\r\n` +
+                `x-amz-content-sha256: ${payloadHash}\r\n` +
+                'Transfer-Encoding: chunked\r\n' +
+                '\r\n' +
+                `${body.length.toString(16)}\r\n${body}\r\n0\r\n\r\n`,
+            )
+          },
+        )
+        tls.on('data', d => {
+          resp += d.toString()
+          if (resp.includes('\r\n\r\n')) {
+            tls.destroy()
+            resolve(resp.split('\r\n')[0] ?? '')
+          }
+        })
+        tls.on('error', () => resolve(resp.split('\r\n')[0] ?? ''))
+      })
+      setTimeout(() => resolve(resp.split('\r\n')[0] ?? ''), 8000)
+    })
+    expect(status).toContain('200')
+    const captured = state.captured!
+    expect(captured).toBeDefined()
+    expect(captured.method).toBe('DELETE')
+    expect(captured.body.toString()).toBe(body)
+    expect(singleHeader(captured.headers['content-length'])).toBe(
+      String(body.length),
+    )
     verifyUpstreamSignature(captured)
   }, 20000)
 

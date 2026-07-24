@@ -13,7 +13,7 @@ import type {
   IncomingMessage,
   ServerResponse,
 } from 'node:http'
-import { Readable } from 'node:stream'
+import { PassThrough, Readable } from 'node:stream'
 import { logForDebugging } from '../utils/debug.js'
 
 export type RequestDecision = {
@@ -57,6 +57,20 @@ export type MutateForwardedHeaders = (
 export const BODYLESS_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
 
 /**
+ * Destroy a denied client's request only after the 403 has flushed —
+ * destroying the shared socket in the same tick can RST the response
+ * away (observed on Node; the unread request body makes close send RST).
+ */
+function destroyAfterResponse(req: IncomingMessage, res: ServerResponse): void {
+  if (res.writableFinished || res.destroyed) {
+    req.destroy()
+    return
+  }
+  res.once('finish', () => req.destroy())
+  res.once('close', () => req.destroy())
+}
+
+/**
  * Build a `Request`, run the callback, and if denied write the 403 response
  * and return `null`. On allow, returns the body stream the caller must pipe
  * upstream — this is the original `IncomingMessage` when no tee was needed
@@ -78,20 +92,61 @@ export async function decideAndRespond(
 ): Promise<Readable | null> {
   let forCallback: ReadableStream<Uint8Array> | undefined
   let forUpstream: Readable = req
-  if (!BODYLESS_METHODS.has(req.method ?? 'GET')) {
-    const web = Readable.toWeb(req) as ReadableStream<Uint8Array>
+  // Gate on a declared body, not just the method: a GET/HEAD/OPTIONS with
+  // Content-Length or Transfer-Encoding is legal HTTP and its body must go
+  // through the tee like any other — skipping it here would hide the body
+  // from filterRequest AND (with transfer-encoding stripped as hop-by-hop)
+  // let its decoded bytes be written raw after a complete-framed bodyless
+  // request upstream: a request-smuggling primitive.
+  // Truthiness, not presence: an empty Content-Length/Transfer-Encoding
+  // value declares nothing and must not trigger teeing or re-framing.
+  const declaresBody = Boolean(
+    req.headers['content-length'] || req.headers['transfer-encoding'],
+  )
+  const bodylessMethod = BODYLESS_METHODS.has(req.method ?? 'GET')
+  if (!bodylessMethod || declaresBody) {
+    // Never hand toWeb a stream that can error: when its source errors,
+    // the toWeb/tee/fromWeb bridge leaks the error as internal promise
+    // rejections (and, under Bun, uncaught exceptions) that no userland
+    // listener can catch. A client abort mid-body becomes a clean EOF on
+    // the shim instead, and the abort is propagated by destroying the
+    // upstream branch directly — a truncated body must never be forwarded
+    // framed as complete (chunked framing would otherwise emit a valid
+    // terminator; on the SigV4 path a truncated buffer would be signed).
+    // The shim's own error listener covers the tee cancelling it while
+    // the client is still piping.
+    const shim = new PassThrough()
+    shim.on('error', () => {})
+    req.pipe(shim)
+    const web = Readable.toWeb(shim) as ReadableStream<Uint8Array>
     const [a, b] = web.tee()
     forCallback = a
     forUpstream = Readable.fromWeb(b)
+    const upstreamBranch = forUpstream
+    // The caller only wires its own 'error' handler after this function
+    // resolves; a client abort during the filterRequest await must not
+    // land on a listener-less stream.
+    upstreamBranch.on('error', () => {})
+    req.on('error', err => {
+      shim.end()
+      upstreamBranch.destroy(err)
+    })
   }
 
   let webReq: Request
   try {
+    // Fetch-spec Requests reject a body on GET/HEAD (Node throws; Bun is
+    // lenient) — a GET with a declared body is still teed above so the
+    // upstream leg stays framed, but the callback sees a bodyless Request.
+    const callbackBody =
+      forCallback && !bodylessMethod
+        ? { body: forCallback, duplex: 'half' as const }
+        : {}
     webReq = new Request(url, {
       method: req.method,
       headers: incomingHeaders(req),
       signal,
-      ...(forCallback ? { body: forCallback, duplex: 'half' as const } : {}),
+      ...callbackBody,
     })
   } catch (err) {
     // Malformed URL/headers from the client — deny rather than crash.
@@ -99,8 +154,12 @@ export async function decideAndRespond(
       action: 'deny',
       reason: `malformed request: ${(err as Error).message}`,
     })
-    void forCallback?.cancel()
+    forCallback?.cancel().catch(() => {})
     forUpstream.destroy()
+    // The shim breaks the old fromWeb→tee→toWeb cancel cascade that used
+    // to destroy req; without this a denied client keeps uploading into a
+    // stalled pipe and holds the connection open.
+    if (forUpstream !== req) destroyAfterResponse(req, res)
     return null
   }
 
@@ -118,7 +177,9 @@ export async function decideAndRespond(
   // buffering bytes nobody will consume. If it did, the tee already buffered
   // whatever was read; the upstream branch sees the same bytes.
   if (forCallback && !webReq.bodyUsed) {
-    void forCallback.cancel()
+    // cancel() rejects with the stream's stored error if it already
+    // failed; that rejection must not escape.
+    forCallback.cancel().catch(() => {})
   }
 
   if (decision.action === 'allow') {
@@ -128,6 +189,7 @@ export async function decideAndRespond(
 
   deny(res, decision)
   forUpstream.destroy()
+  if (forUpstream !== req) destroyAfterResponse(req, res)
   return null
 }
 
