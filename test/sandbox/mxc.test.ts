@@ -15,7 +15,13 @@ import type { AddressInfo } from 'node:net'
 import { isWindows } from '../helpers/platform.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
-import { WindowsSandboxError } from '../../src/sandbox/windows-sandbox-utils.js'
+import {
+  WindowsSandboxError,
+  getSrtWinPath,
+  resolveSrtWin,
+  installWindowsSandbox,
+  uninstallWindowsSandbox,
+} from '../../src/sandbox/windows-sandbox-utils.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 
 /**
@@ -89,12 +95,28 @@ const profileProbeDir = join(homedir(), `srt-boundary-probe-${process.pid}`)
 const cwdProbeFile = join(process.cwd(), `srt-boundary-cwd-${process.pid}.txt`)
 let installedHere = false // this run performed windows-install → uninstall after
 
+// srt-win resolution is explicit post-`srt_win_not_found` typed errors:
+// there is no implicit binary fallback. On a BaseContainer-capable
+// machine WITHOUT the srt-win binary this stays undefined — selection
+// goes to mxc and srt-win is never resolved; if selection lands on
+// srt-win anyway, initialize() fails with the actionable
+// srt_win_not_found message.
+const SRT_WIN_PATH = (() => {
+  if (!isWindows) return undefined
+  try {
+    return getSrtWinPath()
+  } catch {
+    return undefined
+  }
+})()
+
 function createBoundaryConfig(): SandboxRuntimeConfig {
   return {
     network: {
       allowedDomains: ['example.com'],
       deniedDomains: [],
     },
+    windows: SRT_WIN_PATH ? { srtWin: { path: SRT_WIN_PATH } } : undefined,
     filesystem: {
       allowRead: [root],
       allowWrite: [allowWriteDir],
@@ -213,12 +235,14 @@ setTimeout(() => process.exit(2), 5000)
     } catch (e) {
       // srt-win selected on a machine without the one-time install:
       // self-provision (one UAC prompt) and retry. Never reached on a
-      // BaseContainer host — the mxc path needs no install.
+      // BaseContainer host — the mxc path needs no install. The
+      // not-provisioned path implies srt-win resolved, so the binary
+      // path is necessarily known here.
       if (!/provisioned|windows-install/i.test((e as Error).message)) throw e
-      const { installWindowsSandbox } = await import(
-        '../../src/sandbox/windows-sandbox-utils.js'
-      )
-      installWindowsSandbox({})
+      if (SRT_WIN_PATH === undefined) throw e
+      installWindowsSandbox({
+        srtWin: resolveSrtWin({ path: SRT_WIN_PATH }),
+      })
       installedHere = true
       await SandboxManager.initialize(createBoundaryConfig())
     }
@@ -232,11 +256,10 @@ setTimeout(() => process.exit(2), 5000)
 
   afterAll(async () => {
     await SandboxManager.reset()
-    if (installedHere) {
-      const { uninstallWindowsSandbox } = await import(
-        '../../src/sandbox/windows-sandbox-utils.js'
-      )
-      uninstallWindowsSandbox({})
+    if (installedHere && SRT_WIN_PATH !== undefined) {
+      uninstallWindowsSandbox({
+        srtWin: resolveSrtWin({ path: SRT_WIN_PATH }),
+      })
     }
     delete process.env.SRT_BOUNDARY_MASKED
     delete process.env.SRT_BOUNDARY_DENIED
