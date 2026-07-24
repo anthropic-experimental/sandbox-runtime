@@ -311,13 +311,12 @@ export function selectWindowsBackend(
   if (probe.error) return srtWin(`probe error: ${probe.error}`)
   if (probe.tier !== 'base-container') {
     return srtWin(
-      `MXC would dispatch tier '${probe.tier}' — only base-container ` +
-        `is acceptable (its AppContainer tiers are weaker than srt-win)`,
+      `host supports mxc tier '${probe.tier}' only; BaseContainer required`,
     )
   }
   return {
     backend: 'mxc',
-    reason: 'wxc-exec --probe selected base-container for this policy',
+    reason: 'host supports BaseContainer for this policy',
     mxc: spawn,
     denyPathsSupported: probe.probes?.baseContainerSupportsDenyPaths === true,
   }
@@ -466,12 +465,16 @@ export async function buildMxcContainerConfig(
   const sh = p.binShell ?? parseWindowsBinShell(undefined)
   const commandLine = buildShellCommandLine(sh, p.command)
 
+  // 'process' is the ABSTRACT intent — the only spelling the SDK's
+  // config compiler accepts (it resolves per-platform itself; the
+  // concrete 'processcontainer' name is understood by wxc-exec's
+  // parser but throws in createConfigFromPolicy).
   const cfg = sdk.buildSandboxPayload(
     commandLine,
     policy,
     p.cwd ?? process.cwd(),
     undefined,
-    'processcontainer',
+    'process',
   )
   cfg.process.env = buildChildEnv(
     p,

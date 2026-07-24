@@ -90,9 +90,43 @@ let denyReadFile: string // session read deny, inside `root`
 let denyWriteFile: string // session write deny, inside `allowWriteDir`
 let perExecDenyFile: string // denied per-exec only
 let credFile: string // credentials.files mode:'deny'
-let connectJs: string // TCP connect probe script
+/**
+ * TCP connect probe as inline `node -e` — no script FILE, because node
+ * realpaths a script's path and lstats every ancestor, and under
+ * srt-win the sandbox user has no metadata rights on the broker's
+ * profile chain (the child died at startup with EPERM before ever
+ * touching the network, turning block rows into false passes). The JS
+ * is single-quoted throughout so the outer double quotes are the sole
+ * quoting level through cmd /s /c. PROBE-START lets callers prove the
+ * probe RAN — a block row asserts "started AND not connected", never
+ * just a non-zero exit.
+ */
+function connectProbeCmd(host: string, port: number): string {
+  // process.exitCode + natural drain, never process.exit(): Windows
+  // pipes stdout asynchronously, and exit() right after console.log
+  // races the buffered write — dropping the very markers the rows
+  // assert on (a blocked connect errors within milliseconds of the
+  // PROBE-START write).
+  const js =
+    `const n=require('net');console.log('PROBE-START');` +
+    `const s=n.connect(${port},'${host}');` +
+    `const t=setTimeout(()=>{process.exitCode=2;s.destroy()},5000);` +
+    `s.on('connect',()=>{console.log('CONNECTED');process.exitCode=0;` +
+    `clearTimeout(t);s.destroy()});` +
+    `s.on('error',e=>{console.error(String(e));process.exitCode=1;` +
+    `clearTimeout(t)})`
+  return `node -e "${js}"`
+}
 const profileProbeDir = join(homedir(), `srt-boundary-probe-${process.pid}`)
-const cwdProbeFile = join(process.cwd(), `srt-boundary-cwd-${process.pid}.txt`)
+// D6's cwd lives under the REAL USER's profile, not the repo
+// checkout: CI work directories (D:\a\...) carry permissive ACLs
+// that legitimately let the srt-win sandbox user write — srt-win is
+// deny-list + user isolation, not allow-list, so "cwd unwritable"
+// only holds where the machine's own ACLs say so. A profile-owned
+// dir is unwritable under BOTH backends: srt-win's child has no
+// rights on the real user's profile, and under mxc it is readable
+// (system-drive grant) but not in allowWrite.
+const cwdProbeDir = join(homedir(), `srt-boundary-cwd-${process.pid}`)
 let installedHere = false // this run performed windows-install → uninstall after
 
 // srt-win resolution is explicit post-`srt_win_not_found` typed errors:
@@ -213,20 +247,9 @@ describe.if(isWindows)('Windows sandbox boundaries', () => {
     writeFileSync(perExecDenyFile, FIXTURE_SECRET)
     credFile = join(root, 'cred.txt')
     writeFileSync(credFile, FIXTURE_SECRET)
-    // TCP connect probe: `node connect.js <host> <port>` exits 0 on
-    // connect, 1 on error, 2 on 5s timeout. A file (not `node -e`) so
-    // the command line carries no nested quotes — quoting round-trips
-    // are exercised separately.
-    connectJs = join(root, 'connect.js')
-    writeFileSync(
-      connectJs,
-      `const net = require('net')
-const s = net.connect(Number(process.argv[3]), process.argv[2])
-s.on('connect', () => { console.log('CONNECTED'); process.exit(0) })
-s.on('error', e => { console.error(String(e)); process.exit(1) })
-setTimeout(() => process.exit(2), 5000)
-`,
-    )
+    // Must exist so the BROKER spawn (real user) succeeds and D6
+    // exercises the CHILD's write, not a spawn-on-missing-cwd error.
+    mkdirSync(cwdProbeDir, { recursive: true })
     process.env.SRT_BOUNDARY_MASKED = FIXTURE_SECRET
     process.env.SRT_BOUNDARY_DENIED = FIXTURE_SECRET
 
@@ -247,9 +270,7 @@ setTimeout(() => process.exit(2), 5000)
       await SandboxManager.initialize(createBoundaryConfig())
     }
     const backend = SandboxManager.getWindowsBackend?.()
-    console.error(
-      `[boundaries] windows backend: ${backend?.backend} (${backend?.reason})`,
-    )
+    console.error(`[boundaries] using ${backend?.backend} (${backend?.reason})`)
     // Install + double initialize + wxc-exec --probe exceed bun's 5s
     // default hook timeout (same class as winsrt's beforeAll).
   }, 180_000)
@@ -265,7 +286,7 @@ setTimeout(() => process.exit(2), 5000)
     delete process.env.SRT_BOUNDARY_DENIED
     rmSync(root, { recursive: true, force: true })
     rmSync(profileProbeDir, { recursive: true, force: true })
-    rmSync(cwdProbeFile, { force: true })
+    rmSync(cwdProbeDir, { recursive: true, force: true })
   }, 120_000)
 
   // ── B: network egress ────────────────────────────────────────────
@@ -289,9 +310,13 @@ setTimeout(() => process.exit(2), 5000)
       // 1.1.1.1:443 answers instantly when reachable, so exit 0 here
       // means the egress fence does not bind raw sockets — the
       // cooperative-proxy failure mode.
-      const r = await runSandboxed(`node "${connectJs}" 1.1.1.1 443`)
-      expectBlocked('B3', r)
+      const r = await runSandboxed(connectProbeCmd('1.1.1.1', 443))
+      // A missing PROBE-START means the child never ran (spawn/env
+      // problem), NOT a network verdict — deliberate: a silent
+      // can't-even-start must read as red, never as "blocked".
+      expect(r.stdout).toContain('PROBE-START')
       expect(r.stdout).not.toContain('CONNECTED')
+      expectBlocked('B3', r)
     },
     30_000,
   )
@@ -314,9 +339,11 @@ setTimeout(() => process.exit(2), 5000)
         port = (server.address() as AddressInfo).port
       }
       try {
-        const r = await runSandboxed(`node "${connectJs}" 127.0.0.1 ${port}`)
-        expectBlocked('B4', r)
+        const r = await runSandboxed(connectProbeCmd('127.0.0.1', port))
+        // See B3: PROBE-START missing = child never ran, not blocked.
+        expect(r.stdout).toContain('PROBE-START')
         expect(r.stdout).not.toContain('CONNECTED')
+        expectBlocked('B4', r)
       } finally {
         server.close()
       }
@@ -331,7 +358,7 @@ setTimeout(() => process.exit(2), 5000)
       // process, not an AppContainer peer.
       const port = SandboxManager.getProxyPort()
       expect(port).toBeDefined()
-      const r = await runSandboxed(`node "${connectJs}" 127.0.0.1 ${port}`)
+      const r = await runSandboxed(connectProbeCmd('127.0.0.1', port!))
       expectStatus('B5', r, [0])
       expect(r.stdout).toContain('CONNECTED')
     },
@@ -342,11 +369,18 @@ setTimeout(() => process.exit(2), 5000)
     'B6: direct UDP/53 to an external resolver is blocked',
     async () => {
       const r = await runSandboxed('nslookup -timeout=3 example.com 8.8.8.8')
-      // nslookup's exit code is unreliable across builds; the row
-      // holds if the query never got an answer from 8.8.8.8.
-      const answered =
-        r.status === 0 && /Address(es)?:\s.*\d+\.\d+\.\d+\.\d+/.test(r.stdout)
-      if (answered) {
+      // nslookup's exit code is unreliable across builds, and its
+      // header ECHOES the queried server ("Server: UnKnown /
+      // Address: 8.8.8.8") even on total timeout — matching on
+      // Address: alone reads the echo as an answer. A real answer
+      // carries a "Name:" section; the row holds if none appeared.
+      const answered = /Name:\s/.test(r.stdout)
+      // Blocked UDP shows as query timeouts (en-US output; the one
+      // localization-sensitive assertion in the file). Neither an
+      // answer NOR timeouts — e.g. a REFUSED/SERVFAIL response —
+      // means a packet round-tripped: egress open, row red.
+      const timedOut = /timed?[- ]?out/i.test(r.stdout)
+      if (answered || !timedOut) {
         throw new Error(
           `B6: direct DNS to 8.8.8.8 succeeded · stdout=${JSON.stringify(r.stdout)}`,
         )
@@ -432,12 +466,11 @@ setTimeout(() => process.exit(2), 5000)
   }, 60_000)
 
   it('D6: cwd is not implicitly writable', async () => {
-    const r = await runSandboxed(
-      `echo x > srt-boundary-cwd-${process.pid}.txt`,
-      { cwd: process.cwd() },
-    )
+    const r = await runSandboxed(`echo x > d6-probe.txt`, {
+      cwd: cwdProbeDir,
+    })
     expectBlocked('D6', r)
-    expect(existsSync(cwdProbeFile)).toBe(false)
+    expect(existsSync(join(cwdProbeDir, 'd6-probe.txt'))).toBe(false)
   }, 60_000)
 
   it('D7: per-exec allowWrite (mxc grants it; srt-win rejects it)', async () => {
@@ -579,7 +612,7 @@ describe.if(isWindows)('Windows sandbox boundaries: tlsTerminate', () => {
       const backend = SandboxManager.getWindowsBackend?.()?.backend
       mxcSelected = backend === 'mxc'
       console.error(
-        `[boundaries tls] windows backend: ${backend}` +
+        `[boundaries tls] using ${backend}` +
           (mxcSelected ? '' : ' — G rows skipped (covered by winsrt.test.ts)'),
       )
     } catch (e) {

@@ -617,7 +617,7 @@ async function initialize(
         // Runner exists but the SDK import/compile failed.
         windowsSelection = {
           backend: 'srt-win',
-          reason: `mxc sdk unavailable: ${(e as Error).message}`,
+          reason: `mxc sdk error: ${(e as Error).message}`,
         }
       }
       if (windowsSelection.backend === 'mxc') {
@@ -649,8 +649,8 @@ async function initialize(
       }
     }
     logForDebugging(
-      `[Sandbox Windows] backend=${windowsSelection.backend}: ` +
-        windowsSelection.reason,
+      `[Sandbox Windows] using ${windowsSelection.backend} ` +
+        `(${windowsSelection.reason})`,
     )
   }
   if (getPlatform() === 'windows' && !windowsMxcState) {

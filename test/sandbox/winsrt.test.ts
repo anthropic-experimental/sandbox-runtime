@@ -1278,8 +1278,7 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
     // below. mxc coverage lives in test/sandbox/mxc.test.ts.
     const backend = SandboxManager.getWindowsBackend?.()
     console.error(
-      `[winsrt beforeAll] windows backend: ${backend?.backend} ` +
-        `(${backend?.reason})`,
+      `[winsrt beforeAll] using ${backend?.backend} ` + `(${backend?.reason})`,
     )
     expect(backend?.backend).toBe('srt-win')
     console.error('[winsrt beforeAll] done')
