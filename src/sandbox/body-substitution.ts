@@ -18,7 +18,7 @@
 import type { IncomingHttpHeaders, IncomingMessage } from 'node:http'
 import { Transform } from 'node:stream'
 import { logForDebugging } from '../utils/debug.js'
-import { BODYLESS_METHODS } from './request-filter.js'
+import { requestDeclaresBody } from './request-filter.js'
 
 /** One sentinel→real replacement, as raw bytes. */
 export interface SentinelBufferPair {
@@ -46,9 +46,9 @@ export function allLengthMatched(
 
 /**
  * Build the substitution Transform for one forwarded request, or undefined
- * when the body must keep the existing bare pipe, byte-identical: bodyless
- * method, no credential injectable at `destHost`, or a Content-Encoding the
- * byte scan cannot see through.
+ * when the body must keep the existing bare pipe, byte-identical: no body
+ * declared, no credential injectable at `destHost`, or a Content-Encoding
+ * the byte scan cannot see through.
  *
  * When substitution can change the body length (some injectable sentinel is
  * not length-matched with its real value — e.g. a caller-minted JWT-shaped
@@ -62,15 +62,11 @@ export function prepareBodySubstitution(
   destHost: string,
 ): Transform | undefined {
   if (getBodySubstitutions === undefined) return undefined
-  // A bodyless-method request can still carry a declared body (GET-with-body
-  // APIs are legal HTTP and forwarded today) — skip only when there is
-  // provably nothing to scan.
-  const declaresBody =
-    req.headers['content-length'] !== undefined ||
-    req.headers['transfer-encoding'] !== undefined
-  if (BODYLESS_METHODS.has(req.method ?? 'GET') && !declaresBody) {
-    return undefined
-  }
+  // Body presence is decided by framing headers, not method (same predicate
+  // as the filterRequest tee) — a bodyless-method request can still carry a
+  // declared body (GET-with-body APIs are legal HTTP and forwarded today).
+  // Skip only when there is provably nothing to scan.
+  if (!requestDeclaresBody(req)) return undefined
   const pairs = getBodySubstitutions(destHost)
   if (!pairs?.length) return undefined
   if (req.headers['content-encoding'] !== undefined) {
@@ -88,6 +84,9 @@ export function prepareBodySubstitution(
     return undefined
   }
   if (!allLengthMatched(pairs)) {
+    // The caller's prepareOutboundBodyFraming (parent-proxy.ts) re-frames
+    // the now-lengthless body as chunked on every method, not just the
+    // ones Node auto-chunks.
     delete fwdHeaders['content-length']
   }
   return createBodySubstitutionTransform(pairs)

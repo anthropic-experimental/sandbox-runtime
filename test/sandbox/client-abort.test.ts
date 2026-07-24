@@ -412,14 +412,17 @@ describe('client-abort delivery semantics', () => {
         resolve()
       })
       s.on('error', () => {})
-      setTimeout(resolve, 4000)
+      // A denied upload that neither completes nor aborts is drained for
+      // up to the bounded-drain window (5 s) before the proxy tears the
+      // connection down — the backstop must sit beyond it.
+      setTimeout(resolve, 6500)
     })
     filterMode = 'allow'
     expect(resp).toContain('403')
     expect(resp).toContain('semantics')
     expect(closed).toBe(true)
     expect(uncaught).toEqual([])
-  })
+  }, 10_000)
 
   test('malformed bytes get an HTTP 400 back (Node) or a prompt close (Bun), never a crash', async () => {
     uncaught.length = 0
@@ -446,7 +449,11 @@ describe('client-abort delivery semantics', () => {
     expect(uncaught).toEqual([])
   })
 
-  test('GET with a body: callback sees a bodyless Request, upstream gets the body', async () => {
+  test('GET with a body: denied uninspectable, upstream never sees it', async () => {
+    // A fetch-spec Request cannot represent a GET/HEAD body, so a
+    // body-inspecting filterRequest policy could never see these bytes —
+    // the proxy fails closed with a 403 instead of forwarding a body the
+    // policy never saw (see request-filter.ts decideAndRespond).
     uncaught.length = 0
     const received: string[] = []
     const echo = createServer((req, res) => {
@@ -460,11 +467,11 @@ describe('client-abort delivery semantics', () => {
     })
     await new Promise<void>(r => echo.listen(0, '127.0.0.1', r))
     const eport = (echo.address() as AddressInfo).port
-    let callbackBody: unknown = 'unset'
+    let callbackRan = false
     const p2 = createHttpProxyServer({
       filter: () => true,
-      filterRequest: async r => {
-        callbackBody = r.body
+      filterRequest: async () => {
+        callbackRan = true
         return { action: 'allow' }
       },
     })
@@ -484,7 +491,7 @@ describe('client-abort delivery semantics', () => {
       })
       s.on('data', d => {
         resp += d.toString()
-        if (resp.includes('ok')) {
+        if (resp.includes('cannot be inspected')) {
           s.destroy()
           resolve()
         }
@@ -512,9 +519,12 @@ describe('client-abort delivery semantics', () => {
         r()
       })
     })
-    expect(resp.startsWith('HTTP/1.1 200')).toBe(true)
-    expect(callbackBody).toBe(null)
-    expect(received).toEqual(['get-body-payload'])
+    expect(resp.startsWith('HTTP/1.1 403')).toBe(true)
+    expect(resp).toContain(
+      'GET request with a body cannot be inspected by filterRequest',
+    )
+    expect(callbackRan).toBe(false)
+    expect(received).toEqual([])
     expect(uncaught).toEqual([])
   })
 

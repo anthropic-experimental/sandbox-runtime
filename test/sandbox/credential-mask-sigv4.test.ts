@@ -465,6 +465,84 @@ describe('SigV4 re-signing through the TLS-terminating proxy', () => {
     verifyUpstreamSignature(captured)
   }, 20000)
 
+  test('a signed Expect header is preserved and the request still re-signs', async () => {
+    // SigV4 permits signing Expect (some HTTP stacks sign every outgoing
+    // header). Expect must therefore survive stripHopByHop — the planner's
+    // signed-header presence check would otherwise deny the request. The
+    // framing hazard Expect poses on the outbound leg only applies to
+    // methods Node does not auto-chunk; PUT is not one, so the header
+    // rides through untouched.
+    state.captured = undefined
+    const amzDate = '20260715T000000Z'
+    const hostHeader = `${DEST}:${state.upstreamPort}`
+    const headers: IncomingHttpHeaders = {
+      expect: '100-continue',
+      'x-amz-date': amzDate,
+      'x-amz-content-sha256': UNSIGNED_PAYLOAD,
+    }
+    const { authorization } = signSigv4({
+      method: 'PUT',
+      requestTarget: '/bucket/expect-key',
+      headers,
+      hostHeader,
+      signedHeaders: ['expect', 'host', 'x-amz-date', 'x-amz-content-sha256'],
+      payloadHash: UNSIGNED_PAYLOAD,
+      amzDate,
+      scope: { date: '20260715', region: REGION, service: SERVICE },
+      accessKeyId: state.fakeAkid,
+      secretAccessKey: state.fakeSecret,
+    })
+    const r = await curlViaProxy(
+      state.proxyPort!,
+      `https://${DEST}:${state.upstreamPort}/bucket/expect-key`,
+      {
+        method: 'PUT',
+        data: 'streamed-bytes',
+        headers: [
+          `Authorization: ${authorization}`,
+          `X-Amz-Date: ${amzDate}`,
+          `X-Amz-Content-Sha256: ${UNSIGNED_PAYLOAD}`,
+          'Expect: 100-continue',
+        ],
+      },
+    )
+    expect(r.exit).toBe(0)
+    expect(r.status).toBe(200)
+    const captured = state.captured!
+    expect(captured.body.toString()).toBe('streamed-bytes')
+    expect(singleHeader(captured.headers.expect)).toBe('100-continue')
+    verifyUpstreamSignature(captured)
+  }, 20000)
+
+  test('signed Expect on a method needing re-framing: clean plan-time deny', async () => {
+    // A chunked DELETE needs the useChunkedEncodingByDefault flip, whose
+    // prepare step deletes Expect BEFORE SigV4 planning — so the planner
+    // sees the final header set and denies cleanly on the missing signed
+    // header, instead of the signature being applied over a header the
+    // forwarded request no longer carries (an upstream signature
+    // mismatch the client cannot diagnose).
+    state.captured = undefined
+    const amzDate = '20260715T000000Z'
+    const r = await curlViaProxy(
+      state.proxyPort!,
+      `https://${DEST}:${state.upstreamPort}/bucket/key`,
+      {
+        method: 'DELETE',
+        data: 'chunked-delete-body',
+        headers: [
+          `Authorization: AWS4-HMAC-SHA256 Credential=${state.fakeAkid}/20260715/${REGION}/${SERVICE}/aws4_request, ` +
+            'SignedHeaders=expect;host;x-amz-date, Signature=ff00',
+          `X-Amz-Date: ${amzDate}`,
+          'Expect: 100-continue',
+          'Transfer-Encoding: chunked',
+        ],
+      },
+    )
+    expect(r.status).toBe(403)
+    expect(r.body).toContain('signed header "expect" is missing')
+    expect(state.captured).toBeUndefined()
+  }, 20000)
+
   test('an AWS-shaped request with unmasked credentials is untouched', async () => {
     state.captured = undefined
     const otherAkid = 'AKIDUNRELATEDEXAMPLE'

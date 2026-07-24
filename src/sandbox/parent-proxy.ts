@@ -16,11 +16,16 @@
  */
 
 import type { Socket } from 'node:net'
-import type { IncomingHttpHeaders } from 'node:http'
+import type {
+  ClientRequest,
+  IncomingHttpHeaders,
+  IncomingMessage,
+} from 'node:http'
 import { BlockList, connect as netConnect, isIP } from 'node:net'
 import { connect as tlsConnect } from 'node:tls'
 import { URL } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
+import { requestDeclaresBody } from './request-filter.js'
 import type { ParentProxyConfig } from './sandbox-config.js'
 
 export interface ResolvedParentProxy {
@@ -42,6 +47,9 @@ const CONNECT_TIMEOUT_MS = 30_000
  * MUST NOT be forwarded to the upstream. `transfer-encoding` is included
  * because we re-frame bodies via Node's client; Content-Length is preserved
  * end-to-end (Node's llhttp already rejects the TE+CL smuggling vector).
+ * `expect` is end-to-end and forwarded — SigV4 clients may sign it into
+ * SignedHeaders — except in the narrow case where it would defeat outbound
+ * re-framing; see {@link prepareOutboundBodyFraming}.
  */
 const HOP_BY_HOP = new Set([
   'connection',
@@ -413,6 +421,91 @@ export function stripHopByHop(h: IncomingHttpHeaders): IncomingHttpHeaders {
     if (!HOP_BY_HOP.has(lk) && !extra.has(lk)) out[k] = v
   }
   return out
+}
+
+/**
+ * Methods for which Node's http client does not apply chunked
+ * Transfer-Encoding by default (`useChunkedEncodingByDefault === false`).
+ */
+const NO_AUTO_CHUNK_METHODS = new Set([
+  'GET',
+  'HEAD',
+  'OPTIONS',
+  'DELETE',
+  'CONNECT',
+  'TRACE',
+])
+
+/**
+ * Decide whether an outbound request whose body arrives by pipe needs the
+ * `useChunkedEncodingByDefault` flip to leave with SOME framing, and make
+ * the outbound headers safe for it. Returns true when the caller must set
+ * `useChunkedEncodingByDefault = true` on the ClientRequest it constructs
+ * from `outboundHeaders`; see {@link applyOutboundBodyFraming}.
+ *
+ * Transfer-Encoding is hop-by-hop: {@link stripHopByHop} removes it and the
+ * proxy relies on the outbound client to re-frame the (already de-chunked)
+ * body stream. Node only auto-chunks methods for which chunked encoding is
+ * on by default (POST, PUT, PATCH, …) — for GET/HEAD/OPTIONS/DELETE the
+ * piped body bytes would land on the upstream socket after the header block
+ * with no framing at all, and the upstream would read them as the start of
+ * a separate pipelined request (a request-smuggling shape). Flipping
+ * `useChunkedEncodingByDefault` makes Node chunk-encode these methods
+ * exactly as it does POST.
+ *
+ * The flag, not an explicit `Transfer-Encoding: chunked` header, on
+ * purpose: Bun's client frames every method by itself (Content-Length when
+ * the body is already buffered, chunked when streaming) but does not honour
+ * the flag or reconcile an explicit header with that choice — it would send
+ * BOTH the header and a Content-Length, which upstream parsers reject.
+ * Under Bun the flip is therefore a harmless no-op; under Node it restores
+ * the missing framing.
+ *
+ * Returns false unless the method is one Node will not auto-chunk, the
+ * inbound request declares a body, and the outbound headers carry neither
+ * framing header (an intact Content-Length keeps identity framing;
+ * body-substitution deletes Content-Length when the substitution can
+ * change the body length, which lands here too). The outbound
+ * Transfer-Encoding check is defensive only — stripHopByHop-derived
+ * headers never carry one.
+ *
+ * When the flip applies, `expect` is deleted from the outbound headers: an
+ * Expect header makes Node's ClientRequest store its header block in the
+ * CONSTRUCTOR, before the caller can set the flag, silently reopening the
+ * unframed-body hole. That matters no matter who put the header there —
+ * the sandboxed client or a mutateHeaders hook — so call this AFTER all
+ * header mutation, immediately before constructing the outbound request.
+ * Everywhere else (POST uploads and anything auto-chunked) Expect is
+ * forwarded end-to-end, so SigV4 requests that sign it keep re-signing.
+ */
+export function prepareOutboundBodyFraming(
+  inboundReq: IncomingMessage,
+  outboundHeaders: IncomingHttpHeaders,
+): boolean {
+  if (
+    !NO_AUTO_CHUNK_METHODS.has(inboundReq.method ?? 'GET') ||
+    !requestDeclaresBody(inboundReq) ||
+    outboundHeaders['content-length'] !== undefined ||
+    outboundHeaders['transfer-encoding'] !== undefined
+  ) {
+    return false
+  }
+  delete outboundHeaders.expect
+  return true
+}
+
+/**
+ * Apply the {@link prepareOutboundBodyFraming} decision to the constructed
+ * ClientRequest. Node reads the flag when it stores the header block —
+ * lazily, on the first body write — so setting it here, before any body
+ * bytes are piped, is early enough (the constructor-time storage trigger,
+ * an Expect header, was removed by the prepare step).
+ */
+export function applyOutboundBodyFraming(
+  outboundReq: ClientRequest,
+  needsChunkedFraming: boolean,
+): void {
+  if (needsChunkedFraming) outboundReq.useChunkedEncodingByDefault = true
 }
 
 /** Remove surrounding square brackets from an IPv6 literal. */

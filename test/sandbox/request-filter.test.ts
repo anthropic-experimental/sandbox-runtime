@@ -1,12 +1,15 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
+import { createServer as createHttpServer } from 'node:http'
 import { createServer as createHttpsServer } from 'node:https'
 import type { Server, AddressInfo } from 'node:net'
+import { connect } from 'node:net'
 import { spawn } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
 import { createMitmCA } from '../../src/sandbox/mitm-ca.js'
 import { mintLeafCert } from '../../src/sandbox/mitm-leaf.js'
+import { rawHttpRequest } from '../helpers/raw-http.js'
 import type {
   FilterRequestCallback,
   RequestDecision,
@@ -304,6 +307,323 @@ describe('network.filterRequest', () => {
             const b = await curl(port, `http://127.0.0.1:${httpUpPort}/bad`)
             expect(b.status).toBe(403)
             expect(b.body.trim()).toBe('nope')
+          },
+        )
+      } finally {
+        await new Promise<void>(r => httpUp.close(() => r()))
+      }
+    },
+    TEST_TIMEOUT,
+  )
+
+  // Body presence is a property of framing headers, not the method: GET,
+  // HEAD, and OPTIONS requests can carry a body on the wire and the server
+  // parses it. The tee gate must key on Content-Length/Transfer-Encoding —
+  // when it keyed on the method instead, the callback received a body-less
+  // Request while the body bytes still piped upstream, so any
+  // body-inspecting policy was bypassable by putting the payload in a
+  // GET/HEAD/OPTIONS body.
+  test(
+    'GET with a body is denied, not forwarded uninspected',
+    async () => {
+      let upstreamSawRequest = false
+      const onReq = () => {
+        upstreamSawRequest = true
+      }
+      upstream.on('request', onReq)
+      let callbackRan = false
+      try {
+        await withProxy(
+          async () => {
+            callbackRan = true
+            return { action: 'allow' }
+          },
+          async port => {
+            const r = await curl(port, `https://127.0.0.1:${upstreamPort}/g`, {
+              method: 'GET',
+              body: 'smuggled payload',
+            })
+            expect(r.status).toBe(403)
+            expect(r.body).toContain(
+              'GET request with a body cannot be inspected by filterRequest',
+            )
+          },
+        )
+      } finally {
+        upstream.removeListener('request', onReq)
+      }
+      // The body could never have reached the callback (the web Request
+      // constructor cannot represent a GET body), so nothing may forward.
+      expect(callbackRan).toBe(false)
+      expect(upstreamSawRequest).toBe(false)
+    },
+    TEST_TIMEOUT,
+  )
+
+  test(
+    'HEAD and chunked GET with a body are denied on the plain-HTTP path',
+    async () => {
+      let upstreamSawRequest = false
+      const httpUp = createHttpServer((_req, res) => {
+        upstreamSawRequest = true
+        res.end('plain')
+      })
+      await new Promise<void>(r => httpUp.listen(0, '127.0.0.1', () => r()))
+      const upPort = (httpUp.address() as AddressInfo).port
+      try {
+        await withProxy(
+          async () => ({ action: 'allow' }),
+          async port => {
+            // curl cannot send a HEAD/chunked-GET body; write the raw bytes.
+            const head = await rawHttpRequest(
+              port,
+              `HEAD http://127.0.0.1:${upPort}/h HTTP/1.1\r\n` +
+                `Host: 127.0.0.1:${upPort}\r\n` +
+                `Connection: close\r\n` +
+                `Content-Length: 9\r\n\r\nBODYBYTES`,
+            )
+            expect(head).toContain('403')
+            expect(head).toContain(
+              'HEAD request with a body cannot be inspected',
+            )
+
+            const chunked = await rawHttpRequest(
+              port,
+              `GET http://127.0.0.1:${upPort}/c HTTP/1.1\r\n` +
+                `Host: 127.0.0.1:${upPort}\r\n` +
+                `Connection: close\r\n` +
+                `Transfer-Encoding: chunked\r\n\r\n9\r\nBODYBYTES\r\n0\r\n\r\n`,
+            )
+            expect(chunked).toContain('403')
+            expect(chunked).toContain(
+              'GET request with a body cannot be inspected',
+            )
+          },
+        )
+      } finally {
+        await new Promise<void>(r => httpUp.close(() => r()))
+      }
+      expect(upstreamSawRequest).toBe(false)
+    },
+    TEST_TIMEOUT,
+  )
+
+  // Runtime divergence: Node's http server delivers OPTIONS request bodies
+  // to user code; Bun's discards them before the request handler runs (the
+  // Content-Length header survives, the stream is empty). Under Node the
+  // tee makes the body inspectable and enforceable — that path shares its
+  // code with the POST tee covered above, and only Bun runs this suite, so
+  // it is pinned here from the Bun side: the bytes never reach the
+  // callback, but they never reach the upstream either (nothing uninspected
+  // is forwarded — the safe failure direction).
+  test(
+    'OPTIONS body under Bun: dropped by the runtime, never forwarded uninspected',
+    async () => {
+      let callbackRan = false
+      let seenBody: string | null = null
+      await withProxy(
+        async req => {
+          callbackRan = true
+          seenBody = req.body === null ? null : await req.text()
+          return { action: 'allow' }
+        },
+        async port => {
+          const r = await curl(port, `https://127.0.0.1:${upstreamPort}/o`, {
+            method: 'OPTIONS',
+            body: 'this is forbidden content',
+          })
+          expect(r.status).toBe(200)
+          // What the callback saw is exactly what the upstream received:
+          // nothing. If Bun ever starts delivering OPTIONS bodies this
+          // starts failing — replace it with the Node-shaped assertion
+          // (callback sees the body, deny on match, forward on allow).
+          expect(JSON.parse(r.body).echoed).toBe('')
+        },
+      )
+      expect(callbackRan).toBe(true)
+      expect(seenBody ?? '').toBe('')
+    },
+    TEST_TIMEOUT,
+  )
+
+  test(
+    'mid-upload GET deny: the 403 reaches the client, not a reset',
+    async () => {
+      // The deny path drains the unread body (bounded) before tearing the
+      // connection down; destroying a socket with unread inbound data can
+      // RST-clobber the response. Send the headers plus a partial body,
+      // read the 403 while the body is still incomplete, then finish the
+      // upload and expect a clean close.
+      const httpUp = createHttpServer((_req, res) => res.end('plain'))
+      await new Promise<void>(r => httpUp.listen(0, '127.0.0.1', () => r()))
+      const upPort = (httpUp.address() as AddressInfo).port
+      try {
+        await withProxy(
+          async () => ({ action: 'allow' }),
+          async port => {
+            const resp = await new Promise<string>((resolve, reject) => {
+              const sock = connect(port, '127.0.0.1', () => {
+                sock.write(
+                  `GET http://127.0.0.1:${upPort}/big HTTP/1.1\r\n` +
+                    `Host: 127.0.0.1:${upPort}\r\n` +
+                    `Content-Length: 30\r\n\r\n` +
+                    `first-ten-`,
+                )
+              })
+              let buf = ''
+              let finished = false
+              sock.setEncoding('latin1')
+              sock.on('data', (c: string) => {
+                buf += c
+                if (!finished && buf.includes('cannot be inspected')) {
+                  // 403 arrived while 20 body bytes were still owed —
+                  // complete the upload so the drain reaches stream end.
+                  finished = true
+                  sock.write('rest-of-the-request-')
+                }
+              })
+              sock.on('error', (err: Error) =>
+                buf ? resolve(buf) : reject(err),
+              )
+              sock.on('close', () => resolve(buf))
+              sock.setTimeout(10_000, () => sock.destroy())
+            })
+            expect(resp).toContain('403')
+            expect(resp).toContain(
+              'GET request with a body cannot be inspected',
+            )
+          },
+        )
+      } finally {
+        await new Promise<void>(r => httpUp.close(() => r()))
+      }
+    },
+    TEST_TIMEOUT,
+  )
+
+  test(
+    'mid-upload POST deny: the 403 reaches the client, not a reset',
+    async () => {
+      // The ordinary callback-deny path shares the bounded-drain teardown:
+      // a policy that denies without reading the body (here, by path) must
+      // not RST-clobber the 403 while the client is still uploading.
+      const httpUp = createHttpServer((_req, res) => res.end('plain'))
+      await new Promise<void>(r => httpUp.listen(0, '127.0.0.1', () => r()))
+      const upPort = (httpUp.address() as AddressInfo).port
+      try {
+        await withProxy(
+          async req =>
+            new URL(req.url).pathname === '/blocked'
+              ? { action: 'deny', reason: 'path not allowed' }
+              : { action: 'allow' },
+          async port => {
+            const resp = await new Promise<string>((resolve, reject) => {
+              const sock = connect(port, '127.0.0.1', () => {
+                sock.write(
+                  `POST http://127.0.0.1:${upPort}/blocked HTTP/1.1\r\n` +
+                    `Host: 127.0.0.1:${upPort}\r\n` +
+                    `Content-Length: 30\r\n\r\n` +
+                    `first-ten-`,
+                )
+              })
+              let buf = ''
+              let finished = false
+              sock.setEncoding('latin1')
+              sock.on('data', (c: string) => {
+                buf += c
+                if (!finished && buf.includes('path not allowed')) {
+                  finished = true
+                  sock.write('rest-of-the-request-')
+                }
+              })
+              sock.on('error', (err: Error) =>
+                buf ? resolve(buf) : reject(err),
+              )
+              sock.on('close', () => resolve(buf))
+              sock.setTimeout(10_000, () => sock.destroy())
+            })
+            expect(resp).toContain('403')
+            expect(resp).toContain('path not allowed')
+          },
+        )
+      } finally {
+        await new Promise<void>(r => httpUp.close(() => r()))
+      }
+    },
+    TEST_TIMEOUT,
+  )
+
+  test(
+    'POST without framing headers gives the callback an empty body, not null',
+    async () => {
+      // Pre-framing-gate contract: policies that unconditionally read
+      // request.body must keep working for methods that CAN carry a body.
+      let seen: Request | undefined
+      let readBody: string | undefined
+      await withProxy(
+        async req => {
+          seen = req
+          readBody = req.body === null ? undefined : await req.text()
+          return { action: 'allow' }
+        },
+        async port => {
+          const httpUp = createHttpServer((_req, res) => res.end('plain'))
+          await new Promise<void>(r => httpUp.listen(0, '127.0.0.1', () => r()))
+          const upPort = (httpUp.address() as AddressInfo).port
+          try {
+            const resp = await rawHttpRequest(
+              port,
+              `POST http://127.0.0.1:${upPort}/nobody HTTP/1.1\r\n` +
+                `Host: 127.0.0.1:${upPort}\r\n` +
+                `Connection: close\r\n\r\n`,
+            )
+            expect(resp).toContain('200')
+          } finally {
+            await new Promise<void>(r => httpUp.close(() => r()))
+          }
+        },
+      )
+      expect(seen!.method).toBe('POST')
+      expect(seen!.body).not.toBeNull()
+      expect(readBody).toBe('')
+    },
+    TEST_TIMEOUT,
+  )
+
+  test(
+    'Content-Length: 0 declares no body — GET and POST pass unchanged',
+    async () => {
+      let seen: Request | undefined
+      const httpUp = createHttpServer((_req, res) => {
+        res.end('plain')
+      })
+      await new Promise<void>(r => httpUp.listen(0, '127.0.0.1', () => r()))
+      const upPort = (httpUp.address() as AddressInfo).port
+      try {
+        await withProxy(
+          async req => {
+            seen = req
+            return { action: 'allow' }
+          },
+          async port => {
+            const post = await curl(
+              port,
+              `https://127.0.0.1:${upstreamPort}/p`,
+              { method: 'POST', body: '' },
+            )
+            expect(post.status).toBe(200)
+            expect(seen!.method).toBe('POST')
+
+            const get = await rawHttpRequest(
+              port,
+              `GET http://127.0.0.1:${upPort}/z HTTP/1.1\r\n` +
+                `Host: 127.0.0.1:${upPort}\r\n` +
+                `Connection: close\r\n` +
+                `Content-Length: 0\r\n\r\n`,
+            )
+            expect(get).toContain('200')
+            expect(seen!.method).toBe('GET')
+            expect(seen!.body).toBeNull()
           },
         )
       } finally {

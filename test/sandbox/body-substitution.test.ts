@@ -191,7 +191,7 @@ describe('prepareBodySubstitution', () => {
     const fwd: IncomingHttpHeaders = { 'content-length': '10' }
     const t = prepareBodySubstitution(
       () => [pair(SENTINEL, REAL)],
-      msg('POST'),
+      msg('POST', { 'content-length': '10' }),
       fwd,
       'h',
     )
@@ -203,11 +203,26 @@ describe('prepareBodySubstitution', () => {
     const fwd: IncomingHttpHeaders = { 'content-length': '10' }
     const t = prepareBodySubstitution(
       () => [pair(SENTINEL, REAL), pair('fake_value_odd-size', 'tiny')],
-      msg('POST'),
+      msg('POST', { 'content-length': '10' }),
       fwd,
       'h',
     )
     expect(t).toBeDefined()
     expect(fwd['content-length']).toBeUndefined()
+  })
+
+  test('POST with no framing headers → no body to scan, no transform', () => {
+    // Body presence is decided by framing headers, not method: a POST whose
+    // inbound request declares neither Content-Length nor Transfer-Encoding
+    // provably has no body.
+    const fwd: IncomingHttpHeaders = {}
+    expect(
+      prepareBodySubstitution(
+        () => [pair(SENTINEL, REAL)],
+        msg('POST'),
+        fwd,
+        'h',
+      ),
+    ).toBeUndefined()
   })
 })
