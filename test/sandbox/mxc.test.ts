@@ -226,7 +226,9 @@ setTimeout(() => process.exit(2), 5000)
     console.error(
       `[boundaries] windows backend: ${backend?.backend} (${backend?.reason})`,
     )
-  })
+    // Install + double initialize + wxc-exec --probe exceed bun's 5s
+    // default hook timeout (same class as winsrt's beforeAll).
+  }, 180_000)
 
   afterAll(async () => {
     await SandboxManager.reset()
@@ -241,7 +243,7 @@ setTimeout(() => process.exit(2), 5000)
     rmSync(root, { recursive: true, force: true })
     rmSync(profileProbeDir, { recursive: true, force: true })
     rmSync(cwdProbeFile, { force: true })
-  })
+  }, 120_000)
 
   // ── B: network egress ────────────────────────────────────────────
 
@@ -577,11 +579,11 @@ describe.if(isWindows)('Windows sandbox boundaries: tlsTerminate', () => {
         `[boundaries tls] srt-win tls init failed — G rows skipped: ${msg}`,
       )
     }
-  })
+  }, 120_000)
 
   afterAll(async () => {
     await SandboxManager.reset()
-  })
+  }, 60_000)
 
   const GIT_CURL = 'C:\\Program Files\\Git\\mingw64\\bin\\curl.exe'
 
