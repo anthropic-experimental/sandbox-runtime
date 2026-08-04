@@ -49,12 +49,30 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
 
   const savedCwd = process.cwd()
 
-  // Runtime arm: only where bwrap can actually create namespaces (bare CI
-  // containers often cannot).
+  // Runtime arm: only where bwrap can actually run the same namespace/proc
+  // surface the wrapped commands use (--unshare-pid/--unshare-user/--proc —
+  // a bare --ro-bind probe passes on hosts where mounting a fresh /proc in
+  // the new PID namespace still EPERMs, turning the arm into a false red).
+  // No --unshare-net: wrap() passes needsNetworkRestriction: false, so the
+  // commands under test never create a netns and the probe must not require
+  // one (a netns-restricted host would otherwise silently skip the arm).
   const BWRAP_CAN_NAMESPACE =
-    spawnSync('bwrap', ['--unshare-net', '--ro-bind', '/', '/', 'true'], {
-      timeout: 5000,
-    }).status === 0
+    spawnSync(
+      'bwrap',
+      [
+        '--unshare-pid',
+        '--unshare-user',
+        '--cap-drop',
+        'ALL',
+        '--ro-bind',
+        '/',
+        '/',
+        '--proc',
+        '/proc',
+        'true',
+      ],
+      { timeout: 5000 },
+    ).status === 0
 
   beforeEach(() => {
     BASE = realpathSync(mkdtempSync(join(tmpdir(), 'ro-deny-stub-')))
@@ -327,5 +345,71 @@ describe.if(isLinux)('Deny stubs under a read-only denied directory', () => {
       expect(run.stderr ?? '').not.toMatch(/Read-only file system/i)
       expect(run.status).toBe(0)
     }
+  })
+
+  it('enforces denyWithinAllow under a trailing-slash allowOnly spelling', async () => {
+    // A trailing-slash allowOnly entry survives normalizePathForSandbox and
+    // used to defeat every `allowedPath + '/'` prefix comparison
+    // ('<dir>//'), silently dropping denyWithinAllow re-binds while the
+    // tree stayed bind-mounted writable. Allow paths are now recorded with
+    // the slash stripped, so the deny is enforced and the bind spelling is
+    // canonical.
+    const secrets = join(PROJ, 'secrets')
+    mkdirSync(secrets)
+    writeFileSync(join(secrets, 'token.txt'), 'x\n')
+
+    const command = await wrap([secrets], [], [`${AREA}/`])
+
+    expect(command).toContain(`--bind ${AREA} ${AREA}`)
+    expect(command).toContain(`--ro-bind ${secrets} ${secrets}`)
+  })
+
+  it('skips stubs under a trailing-slash allow spelled at the denied dir (no startup abort)', async () => {
+    // The allow and the covering deny name the same directory in different
+    // spellings (allowOnly '<proj>/', denyWithinAllow '<proj>'). With raw
+    // spellings, veto (i) would misread '<proj>/' as strictly beneath
+    // '<proj>' (prefix match against '<proj>' + '/') and keep the stubs —
+    // resurrecting the startup abort. With the recorded spelling stripped,
+    // the allow is AT the covering dir, no veto fires, and the stubs are
+    // skipped.
+    process.chdir(PROJ)
+
+    const command = await wrap([PROJ], [], [`${PROJ}/`])
+
+    expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
+    expect(command).not.toContain(
+      `--ro-bind /dev/null ${join(PROJ, '.gitconfig')}`,
+    )
+
+    if (BWRAP_CAN_NAMESPACE) {
+      const run = spawnSync(command, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 15000,
+        cwd: PROJ,
+      })
+      expect(run.stderr ?? '').not.toMatch(/Read-only file system/i)
+      expect(run.status).toBe(0)
+    }
+  })
+
+  it('re-applies a denyWithinAllow bind under a trailing-slash allow re-bound over a denyRead tmpfs', async () => {
+    // The emission filter drops deny binds hidden by a denyRead tmpfs
+    // UNLESS a write re-bind re-exposes them (reExposedByWriteBind). That
+    // exception also compares `writePath + '/'` prefixes, so a
+    // trailing-slash allow spelling used to defeat it: the writable
+    // re-bind was emitted but the deny bind beneath it was dropped —
+    // leaving the explicitly denied file writable. With the recorded
+    // spelling stripped, the deny bind survives the filter.
+    const nestedAllow = join(PROJ, 'w')
+    mkdirSync(nestedAllow, { recursive: true })
+    const secret = join(nestedAllow, 'secret.txt')
+    writeFileSync(secret, 'x\n')
+
+    const command = await wrap([secret], [PROJ], [`${nestedAllow}/`])
+
+    expect(command).toContain(`--tmpfs ${PROJ}`)
+    expect(command).toContain(`--bind ${nestedAllow} ${nestedAllow}`)
+    expect(command).toContain(`--ro-bind ${secret} ${secret}`)
   })
 })
