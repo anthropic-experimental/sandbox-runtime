@@ -222,7 +222,8 @@ function recordProxyViolation(
 
 /**
  * The request URL as it should appear in a model-visible violation line:
- * origin + path, with any query string reduced to a `?…` marker. Query
+ * origin + path, with any query string reduced to a `?…` marker (origin
+ * carries no userinfo, so an embedded `name:pass@` is dropped too). Query
  * strings routinely carry credentials (api_key=, access_token=, signed
  * URLs) that the sandboxed client interpolated at runtime and that were
  * never in the model's context, so they must not enter the transcript via

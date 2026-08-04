@@ -157,7 +157,7 @@ describe('proxy auth + network deny semantics', () => {
       const auth = Buffer.from(`srt:${token}`).toString('base64')
       const socket = connect(port, '127.0.0.1', () => {
         socket.write(
-          `GET http://blocked.test/x?access_token=SECRET123 HTTP/1.1\r\n` +
+          `GET http://alice:PASSW0RD@blocked.test/x?access_token=SECRET123 HTTP/1.1\r\n` +
             `Host: blocked.test\r\n` +
             `Proxy-Authorization: Basic ${auth}\r\n` +
             `Connection: close\r\n\r\n`,
@@ -176,7 +176,11 @@ describe('proxy auth + network deny semantics', () => {
     expect(lines).toContain(
       'deny http-request GET http://blocked.test/x?… (policy says no)',
     )
-    expect(lines.join('\n')).not.toContain('SECRET123')
+    const joined = lines.join('\n')
+    expect(joined).not.toContain('SECRET123')
+    // userinfo (name:pass@) is dropped along with the query.
+    expect(joined).not.toContain('PASSW0RD')
+    expect(joined).not.toContain('alice')
   })
 
   it('strictAllowlist denies off-allowlist hosts without consulting the callback', async () => {
