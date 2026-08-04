@@ -1020,3 +1020,35 @@ describe.if(isMacOS)('macOS Seatbelt allowMachLookup', () => {
     expect(result.status).toBe(0)
   })
 })
+
+/**
+ * The move-blocking rules protect each denied path and every ancestor
+ * directory. Paths that share ancestors must not repeat those rules, so the
+ * profile stays proportional to the unique paths rather than to path count
+ * times depth.
+ */
+describe.if(isMacOS)('macOS Seatbelt move-blocking rule deduplication', () => {
+  it('emits each shared ancestor rule once for sibling protected paths', () => {
+    const parent = join(realpathSync(tmpdir()), 'seatbelt-dedup-shared-parent')
+    const writeConfig: FsWriteRestrictionConfig = {
+      allowOnly: [parent],
+      denyWithinAllow: [
+        join(parent, 'a', '.claude', 'settings.json'),
+        join(parent, 'b', '.claude', 'settings.json'),
+        join(parent, 'c', '.claude', 'settings.json'),
+      ],
+    }
+
+    const wrappedCommand = wrapCommandWithSandboxMacOS({
+      command: 'true',
+      needsNetworkRestriction: false,
+      readConfig: undefined,
+      writeConfig,
+    })
+
+    // All three siblings share `parent` as an ancestor. It must be pinned
+    // exactly once per op (unlink + create), not once per protected path.
+    const occurrences = wrappedCommand.split(`(literal "${parent}")`).length - 1
+    expect(occurrences).toBe(2)
+  })
+})

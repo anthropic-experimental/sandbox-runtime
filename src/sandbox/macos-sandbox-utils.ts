@@ -151,79 +151,49 @@ function generateMoveBlockingRules(
   pathPatterns: string[],
   logTag: string,
 ): string[] {
-  const rules: string[] = []
   const ops = ['file-write-unlink', 'file-write-create'] as const
+
+  // Filters to deny moves for: the protected paths themselves (regex for
+  // glob patterns, subpath for literal paths) and every ancestor directory
+  // (literal). Sibling paths share ancestors, so filters are collected as
+  // a set and each is emitted once no matter how many paths lead to it.
+  const filters = new Set<string>()
+  const addAncestorLiterals = (dir: string): void => {
+    for (const ancestorDir of getAncestorDirectories(dir)) {
+      filters.add(`(literal ${escapePath(ancestorDir)})`)
+    }
+  }
 
   for (const pathPattern of pathPatterns) {
     const normalizedPath = normalizePathForSandbox(pathPattern)
 
     if (containsGlobChars(normalizedPath)) {
-      // Use regex matching for glob patterns
-      const regexPattern = globToRegex(normalizedPath)
+      // Block moving/renaming files matching this glob pattern
+      filters.add(`(regex ${escapePath(globToRegex(normalizedPath))})`)
 
-      // Block moving/renaming files matching this pattern
-      for (const op of ops) {
-        rules.push(
-          `(deny ${op}`,
-          `  (regex ${escapePath(regexPattern)})`,
-          `  (with message "${logTag}"))`,
-        )
-      }
-
-      // For glob patterns, extract the static prefix and block ancestor moves
-      // Remove glob characters to get the directory prefix
+      // For glob patterns, extract the static prefix and block moves of
+      // the directory containing the pattern plus its ancestors
       const staticPrefix = normalizedPath.split(/[*?[\]]/)[0]
       if (staticPrefix && staticPrefix !== '/') {
-        // Get the directory containing the glob pattern
         const baseDir = staticPrefix.endsWith('/')
           ? staticPrefix.slice(0, -1)
           : path.dirname(staticPrefix)
-
-        // Block moves of the base directory itself
-        for (const op of ops) {
-          rules.push(
-            `(deny ${op}`,
-            `  (literal ${escapePath(baseDir)})`,
-            `  (with message "${logTag}"))`,
-          )
-        }
-
-        // Block moves of ancestor directories
-        for (const ancestorDir of getAncestorDirectories(baseDir)) {
-          for (const op of ops) {
-            rules.push(
-              `(deny ${op}`,
-              `  (literal ${escapePath(ancestorDir)})`,
-              `  (with message "${logTag}"))`,
-            )
-          }
-        }
+        filters.add(`(literal ${escapePath(baseDir)})`)
+        addAncestorLiterals(baseDir)
       }
     } else {
-      // Use subpath matching for literal paths
-
-      // Block moving/renaming the denied path itself
-      for (const op of ops) {
-        rules.push(
-          `(deny ${op}`,
-          `  (subpath ${escapePath(normalizedPath)})`,
-          `  (with message "${logTag}"))`,
-        )
-      }
-
-      // Block moves of ancestor directories
-      for (const ancestorDir of getAncestorDirectories(normalizedPath)) {
-        for (const op of ops) {
-          rules.push(
-            `(deny ${op}`,
-            `  (literal ${escapePath(ancestorDir)})`,
-            `  (with message "${logTag}"))`,
-          )
-        }
-      }
+      // Block moving/renaming the denied path itself and its ancestors
+      filters.add(`(subpath ${escapePath(normalizedPath)})`)
+      addAncestorLiterals(normalizedPath)
     }
   }
 
+  const rules: string[] = []
+  for (const filter of filters) {
+    for (const op of ops) {
+      rules.push(`(deny ${op}`, `  ${filter}`, `  (with message "${logTag}"))`)
+    }
+  }
   return rules
 }
 
