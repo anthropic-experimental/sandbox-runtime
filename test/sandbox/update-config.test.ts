@@ -110,6 +110,75 @@ describe('proxy auth + network deny semantics', () => {
     )
   })
 
+  it('honors ignoreViolations for proxy-recorded network denials', async () => {
+    await SandboxManager.initialize({
+      network: {
+        allowedDomains: [],
+        deniedDomains: ['ignored.test', 'kept.test'],
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      ignoreViolations: { '*': ['ignored.test'] },
+    })
+    const port = SandboxManager.getProxyPort()!
+    const store = SandboxManager.getSandboxViolationStore()
+    store.clear()
+
+    expect((await proxyRequest(port, 'ignored.test')).statusCode).toBe(403)
+    expect((await proxyRequest(port, 'kept.test')).statusCode).toBe(403)
+
+    // The deny still happens (403), only the recorded violation is dropped.
+    const lines = store.getViolations().map(v => v.line)
+    expect(lines.some(l => l.includes('ignored.test'))).toBe(false)
+    expect(lines).toContain(
+      'deny network-outbound kept.test:443 (host is on the deny list)',
+    )
+  })
+
+  it('redacts the query string from filterRequest deny lines', async () => {
+    await SandboxManager.initialize({
+      network: {
+        allowedDomains: ['blocked.test'],
+        deniedDomains: [],
+        filterRequest: async () => ({
+          action: 'deny',
+          reason: 'policy says no',
+        }),
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+    const port = SandboxManager.getProxyPort()!
+    const store = SandboxManager.getSandboxViolationStore()
+    store.clear()
+
+    // Plain-HTTP GET through the proxy so filterRequest sees (and denies) it
+    // without any upstream connection.
+    await new Promise<void>(resolve => {
+      const token = SandboxManager.getProxyAuthToken()
+      const auth = Buffer.from(`srt:${token}`).toString('base64')
+      const socket = connect(port, '127.0.0.1', () => {
+        socket.write(
+          `GET http://blocked.test/x?access_token=SECRET123 HTTP/1.1\r\n` +
+            `Host: blocked.test\r\n` +
+            `Proxy-Authorization: Basic ${auth}\r\n` +
+            `Connection: close\r\n\r\n`,
+        )
+      })
+      socket.on('data', () => socket.destroy())
+      socket.on('close', () => resolve())
+      socket.on('error', () => resolve())
+      socket.setTimeout(2000, () => {
+        socket.destroy()
+        resolve()
+      })
+    })
+
+    const lines = store.getViolations().map(v => v.line)
+    expect(lines).toContain(
+      'deny http-request GET http://blocked.test/x?… (policy says no)',
+    )
+    expect(lines.join('\n')).not.toContain('SECRET123')
+  })
+
   it('strictAllowlist denies off-allowlist hosts without consulting the callback', async () => {
     let asked = false
     await SandboxManager.initialize(

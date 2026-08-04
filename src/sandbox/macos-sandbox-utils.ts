@@ -14,6 +14,7 @@ import {
   DANGEROUS_FILES,
   getDangerousDirectories,
 } from './sandbox-utils.js'
+import { shouldIgnoreViolation } from './sandbox-violation-store.js'
 
 import type {
   FsReadRestrictionConfig,
@@ -983,12 +984,6 @@ export function startMacOSSandboxLogMonitor(
   const cmdExtractRegex = /CMD64_(.+?)_END/
   const sandboxExtractRegex = /Sandbox:\s+(.+)$/
 
-  // Pre-process ignore patterns for faster lookup
-  const wildcardPaths = ignoreViolations?.['*'] || []
-  const commandPatterns = ignoreViolations
-    ? Object.entries(ignoreViolations).filter(([pattern]) => pattern !== '*')
-    : []
-
   // Stream and filter kernel logs for all sandbox violations
   // We can't filter by specific logTag since it's dynamic per command
   const logProcess = spawn('log', [
@@ -1041,24 +1036,8 @@ export function startMacOSSandboxLogMonitor(
     }
 
     // Check if we should ignore this violation
-    if (ignoreViolations && command) {
-      // Check wildcard patterns first
-      if (wildcardPaths.length > 0) {
-        const shouldIgnore = wildcardPaths.some(path =>
-          violationDetails.includes(path),
-        )
-        if (shouldIgnore) return
-      }
-
-      // Check command-specific patterns
-      for (const [pattern, paths] of commandPatterns) {
-        if (command.includes(pattern)) {
-          const shouldIgnore = paths.some(path =>
-            violationDetails.includes(path),
-          )
-          if (shouldIgnore) return
-        }
-      }
+    if (shouldIgnoreViolation(violationDetails, command, ignoreViolations)) {
+      return
     }
 
     // Not ignored - report the violation

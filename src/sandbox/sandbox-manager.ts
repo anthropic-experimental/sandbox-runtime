@@ -82,7 +82,10 @@ import {
   expandGlobPattern,
   decodeSandboxedCommand,
 } from './sandbox-utils.js'
-import { SandboxViolationStore } from './sandbox-violation-store.js'
+import {
+  SandboxViolationStore,
+  shouldIgnoreViolation,
+} from './sandbox-violation-store.js'
 import type { MutateForwardedHeaders } from './request-filter.js'
 import type { GetBodySubstitutions } from './body-substitution.js'
 import {
@@ -196,6 +199,15 @@ function recordProxyViolation(
   line: string,
   encodedCommand: string | undefined,
 ): void {
+  const command = encodedCommand
+    ? decodeSandboxedCommand(encodedCommand)
+    : undefined
+  // Same suppression the seatbelt / seccomp monitors apply, so a
+  // configured ignoreViolations pattern silences the event no matter
+  // which producer saw it.
+  if (shouldIgnoreViolation(line, command, config?.ignoreViolations)) {
+    return
+  }
   sandboxViolationStore.addViolation({
     // One physical line inside the <sandbox_violations> block: an embedder-
     // supplied reason (deniedDomainReasons / filterRequest) must not be able
@@ -203,11 +215,30 @@ function recordProxyViolation(
     // eslint-disable-next-line no-control-regex -- stripping control chars is the point
     line: line.replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/[<>]/g, ''),
     encodedCommand,
-    command: encodedCommand
-      ? decodeSandboxedCommand(encodedCommand)
-      : undefined,
+    command,
     timestamp: new Date(),
   })
+}
+
+/**
+ * The request URL as it should appear in a model-visible violation line:
+ * origin + path, with any query string reduced to a `?…` marker. Query
+ * strings routinely carry credentials (api_key=, access_token=, signed
+ * URLs) that the sandboxed client interpolated at runtime and that were
+ * never in the model's context, so they must not enter the transcript via
+ * the <sandbox_violations> block. The full URL still reaches the embedder's
+ * filterRequest callback and its own debug logging.
+ */
+function redactUrlForViolation(url: string): string {
+  try {
+    const u = new URL(url)
+    return `${u.origin}${u.pathname}${u.search ? '?…' : ''}`
+  } catch {
+    // Not an absolute URL (shouldn't happen for proxy requests) — drop
+    // anything after '?' rather than risk leaking it.
+    const q = url.indexOf('?')
+    return q === -1 ? url : `${url.slice(0, q)}?…`
+  }
 }
 
 async function filterNetworkRequest(
@@ -425,7 +456,7 @@ async function startMuxProxyServer(
     filterRequest: config?.network.filterRequest,
     onFilterRequestDenied: ({ method, url, reason, encodedCommand }) => {
       recordProxyViolation(
-        `deny http-request ${method} ${url} (${reason})`,
+        `deny http-request ${method} ${redactUrlForViolation(url)} (${reason})`,
         encodedCommand,
       )
     },
