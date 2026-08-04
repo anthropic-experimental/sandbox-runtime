@@ -80,6 +80,7 @@ import {
   containsGlobChars,
   removeTrailingGlobSuffix,
   expandGlobPattern,
+  decodeSandboxedCommand,
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
 import type { MutateForwardedHeaders } from './request-filter.js'
@@ -182,14 +183,46 @@ function registerCleanup(): void {
   cleanupRegistered = true
 }
 
+/**
+ * Record a proxy-side denial in the violation store so the model sees a
+ * structured <sandbox_violations> block alongside the raw 403 / SOCKS
+ * failure in stderr — parity with the macOS seatbelt log monitor and the
+ * Linux seccomp observer. The proxy is the only component that knows the
+ * destination host of a network deny, so neither of those can produce
+ * this line. `encodedCommand` (from the proxy username) attributes it to
+ * the invocation; without one the event is stored unattributed.
+ */
+function recordProxyViolation(
+  line: string,
+  encodedCommand: string | undefined,
+): void {
+  sandboxViolationStore.addViolation({
+    line,
+    encodedCommand,
+    command: encodedCommand
+      ? decodeSandboxedCommand(encodedCommand)
+      : undefined,
+    timestamp: new Date(),
+  })
+}
+
 async function filterNetworkRequest(
   port: number,
   host: string,
-  sandboxAskCallback?: SandboxAskCallback,
+  sandboxAskCallback: SandboxAskCallback | undefined,
+  encodedCommand?: string,
 ): Promise<boolean> {
+  const denied = (reason: string): false => {
+    recordProxyViolation(
+      `deny network-outbound ${host}:${port} (${reason})`,
+      encodedCommand,
+    )
+    return false
+  }
+
   if (!config) {
     logForDebugging('No config available, denying network request')
-    return false
+    return denied('sandbox policy unavailable')
   }
 
   // Reject hosts containing control characters before pattern matching.
@@ -202,7 +235,7 @@ async function filterNetworkRequest(
     logForDebugging(`Denying malformed host: ${JSON.stringify(host)}:${port}`, {
       level: 'error',
     })
-    return false
+    return denied('malformed host')
   }
 
   // Canonicalize so string comparisons match what getaddrinfo() will dial.
@@ -214,7 +247,7 @@ async function filterNetworkRequest(
   for (const deniedDomain of config.network.deniedDomains) {
     if (matchesDomainPatternWithPort(canonicalHost, port, deniedDomain)) {
       logForDebugging(`Denied by config rule: ${host}:${port}`)
-      return false
+      return denied('host is on the deny list')
     }
   }
 
@@ -230,7 +263,7 @@ async function filterNetworkRequest(
   // allowlist deterministic enforcement: never fall through to the callback.
   if (!sandboxAskCallback || config.network.strictAllowlist) {
     logForDebugging(`No matching config rule, denying: ${host}:${port}`)
-    return false
+    return denied('host is not on the allow list')
   }
 
   logForDebugging(`No matching config rule, asking user: ${host}:${port}`)
@@ -239,15 +272,14 @@ async function filterNetworkRequest(
     if (userAllowed) {
       logForDebugging(`User allowed: ${host}:${port}`)
       return true
-    } else {
-      logForDebugging(`User denied: ${host}:${port}`)
-      return false
     }
+    logForDebugging(`User denied: ${host}:${port}`)
+    return denied('user denied')
   } catch (error) {
     logForDebugging(`Error in permission callback: ${error}`, {
       level: 'error',
     })
-    return false
+    return denied('permission prompt failed')
   }
 }
 
@@ -375,12 +407,18 @@ async function startMuxProxyServer(
   const injectCredentials = buildCredentialInjector()
   const injectBodyCredentials = buildBodyCredentialInjector()
   httpProxyServer = createHttpProxyServer({
-    filter: (port: number, host: string) =>
-      filterNetworkRequest(port, host, sandboxAskCallback),
+    filter: (port, host, _socket, encodedCommand) =>
+      filterNetworkRequest(port, host, sandboxAskCallback, encodedCommand),
     getMitmSocketPath,
     mitmCA,
     shouldTerminateTLS: shouldTerminateTLSForHost,
     filterRequest: config?.network.filterRequest,
+    onFilterRequestDenied: ({ method, url, reason, encodedCommand }) => {
+      recordProxyViolation(
+        `deny http-request ${method} ${url} (${reason})`,
+        encodedCommand,
+      )
+    },
     // TLS-terminated path always gets the injector; the plain-HTTP path
     // only when explicitly opted in. Without the opt-in, a sentinel sent
     // over plain HTTP reaches the upstream unchanged (fails closed).
@@ -400,8 +438,8 @@ async function startMuxProxyServer(
   })
 
   socksProxyServer = createSocksProxyServer({
-    filter: (port: number, host: string) =>
-      filterNetworkRequest(port, host, sandboxAskCallback),
+    filter: (port, host, encodedCommand) =>
+      filterNetworkRequest(port, host, sandboxAskCallback, encodedCommand),
     parentProxy,
     proxyAuthToken,
   })

@@ -57,6 +57,13 @@ export type MutateForwardedHeaders = (
 export const BODYLESS_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
 
 /**
+ * User-facing reason when a filterRequest denial doesn't supply one. This
+ * text reaches the sandboxed client (403 body) and the model
+ * (<sandbox_violations>), so it names the policy, not the internal hook.
+ */
+export const DEFAULT_DENY_REASON = 'denied by sandbox policy'
+
+/**
  * Destroy a denied client's request only after the 403 has flushed —
  * destroying the shared socket in the same tick can RST the response
  * away (observed on Node; the unread request body makes close send RST).
@@ -89,7 +96,9 @@ export async function decideAndRespond(
   res: ServerResponse,
   url: string,
   signal: AbortSignal,
+  onDeny?: (method: string, url: string, reason: string) => void,
 ): Promise<Readable | null> {
+  const method = req.method ?? 'GET'
   let forCallback: ReadableStream<Uint8Array> | undefined
   let forUpstream: Readable = req
   // Gate on a declared body, not just the method: a GET/HEAD/OPTIONS with
@@ -103,7 +112,7 @@ export async function decideAndRespond(
   const declaresBody = Boolean(
     req.headers['content-length'] || req.headers['transfer-encoding'],
   )
-  const bodylessMethod = BODYLESS_METHODS.has(req.method ?? 'GET')
+  const bodylessMethod = BODYLESS_METHODS.has(method)
   if (!bodylessMethod || declaresBody) {
     // Never hand toWeb a stream that can error: when its source errors,
     // the toWeb/tee/fromWeb bridge leaks the error as internal promise
@@ -143,17 +152,16 @@ export async function decideAndRespond(
         ? { body: forCallback, duplex: 'half' as const }
         : {}
     webReq = new Request(url, {
-      method: req.method,
+      method,
       headers: incomingHeaders(req),
       signal,
       ...callbackBody,
     })
   } catch (err) {
     // Malformed URL/headers from the client — deny rather than crash.
-    deny(res, {
-      action: 'deny',
-      reason: `malformed request: ${(err as Error).message}`,
-    })
+    const reason = `malformed request: ${(err as Error).message}`
+    onDeny?.(method, url, reason)
+    deny(res, { action: 'deny', reason })
     forCallback?.cancel().catch(() => {})
     forUpstream.destroy()
     // The shim breaks the old fromWeb→tee→toWeb cancel cascade that used
@@ -169,7 +177,7 @@ export async function decideAndRespond(
   } catch (err) {
     decision = {
       action: 'deny',
-      reason: `filterRequest threw: ${(err as Error).message}`,
+      reason: `sandbox policy check failed: ${(err as Error).message}`,
     }
   }
 
@@ -183,10 +191,11 @@ export async function decideAndRespond(
   }
 
   if (decision.action === 'allow') {
-    logForDebugging(`[request-filter] allow ${req.method} ${url}`)
+    logForDebugging(`[request-filter] allow ${method} ${url}`)
     return forUpstream
   }
 
+  onDeny?.(method, url, decision.reason ?? DEFAULT_DENY_REASON)
   deny(res, decision)
   forUpstream.destroy()
   if (forUpstream !== req) destroyAfterResponse(req, res)
@@ -194,7 +203,7 @@ export async function decideAndRespond(
 }
 
 function deny(res: ServerResponse, decision: RequestDecision): void {
-  respondDenied(res, decision.reason ?? 'denied by filterRequest')
+  respondDenied(res, decision.reason ?? DEFAULT_DENY_REASON)
 }
 
 /**

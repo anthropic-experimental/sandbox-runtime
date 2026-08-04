@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
 import {
   generateProxyEnvVars,
+  encodeSandboxedCommand,
   buildGitConfigEnv,
   normalizePathForSandbox,
   containsGlobCharsWin,
@@ -2016,6 +2017,8 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
       p.socksProxyPort,
       p.caCertPath?.replace(/\\/g, '/'),
       p.proxyAuthToken,
+      undefined,
+      encodeSandboxedCommand(p.command),
     ),
   )
   // TMPDIR is a POSIX path meant for the macOS/Linux FS sandbox — it

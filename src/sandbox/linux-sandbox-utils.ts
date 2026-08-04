@@ -1591,6 +1591,7 @@ export async function wrapCommandWithSandboxLinux(
           caCertPath,
           proxyAuthToken,
           writeConfig === undefined,
+          encodeSandboxedCommand(command),
         )
         bwrapArgs.push(
           ...proxyEnv.flatMap((env: string) => {
