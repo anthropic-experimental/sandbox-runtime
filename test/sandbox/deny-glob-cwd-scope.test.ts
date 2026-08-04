@@ -15,86 +15,62 @@ import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-uti
 import { isMacOS } from '../helpers/platform.js'
 
 /**
- * A deny entry written as a location-independent glob (`**\/<name>`) is resolved
- * against process.cwd() by normalizePathForSandbox() and then anchored by
- * globToRegex(), so it is only enforced beneath cwd.
+ * On macOS, location-independent deny globs such as `**\/.env` are normalized
+ * against `process.cwd()`. These tests show that they apply beneath cwd but not
+ * to matching paths elsewhere in the same sandbox root. See #432.
  *
- * Every case below uses the same layout, with cwd a strict subdirectory of the
- * allowed write root:
- *
- *   ROOT/            <- allowOnly root
- *     proj/          <- process.cwd()
- *       sub/
- *     outside/       <- inside the allowed write root, outside cwd
- *
- * The `it()` cases are controls: they hold today and pin the harness — two of them
- * assert a permitted operation, so a profile that never applied cannot satisfy
- * the whole set. A red run points at the scope and not at the setup. The `it.failing()` cases are the
- * ones this PR is about — they pass because the assertion inside them currently
- * fails, and they start failing the moment the behaviour changes, which is the
- * signal to drop the marker.
- *
- * macOS only: the Linux and Windows backends consume these patterns through
- * different code, which is not exercised here.
- *
- * See #432.
+ * Bun accepts any throw in `it.failing` as the expected failure, so those bodies
+ * return early when the sandbox did not run. An infrastructure failure then
+ * surfaces as "marked failing but passed" instead of as a passing test.
  */
 describe.if(isMacOS)('deny globs outside process.cwd()', () => {
-  let ROOT_RAW: string
   const ORIGINAL = 'ORIGINAL'
   const MODIFIED = 'MODIFIED'
-  // Printed by the sandboxed shell before the command under test. If it is
-  // missing, the profile never applied and every "blocked" assertion below
-  // would otherwise pass for the wrong reason.
   const STARTED = '__DENY_GLOB_CWD_SCOPE_STARTED__'
 
-  let ROOT: string
-  let PROJ: string
-  let OUTSIDE: string
+  let tempRoot: string
+  let allowedRoot: string
+  let projectDir: string
+  let outsideDir: string
   let originalCwd: string
 
   beforeAll(() => {
     originalCwd = process.cwd()
-    // mkdtemp rather than a timestamp: two runs starting in the same millisecond
-    // would otherwise share a root and delete each other's fixtures.
-    ROOT_RAW = mkdtempSync(join(tmpdir(), 'deny-glob-cwd-scope-'))
-    // On macOS tmpdir() sits behind a symlink; resolve it so the allow root and
-    // the paths the sandbox sees are the same strings.
-    ROOT = realpathSync(ROOT_RAW)
-    PROJ = join(ROOT, 'proj')
-    OUTSIDE = join(ROOT, 'outside')
+    // Timestamp-based roots can collide when runs start in the same millisecond.
+    tempRoot = mkdtempSync(join(tmpdir(), 'deny-glob-cwd-scope-'))
+    // Resolve macOS's symlinked temp path to the canonical path Seatbelt sees.
+    allowedRoot = realpathSync(tempRoot)
+    projectDir = join(allowedRoot, 'proj')
+    outsideDir = join(allowedRoot, 'outside')
   })
 
   afterAll(() => {
     process.chdir(originalCwd)
-    rmSync(ROOT_RAW, { recursive: true, force: true })
+    rmSync(tempRoot, { recursive: true, force: true })
   })
 
   beforeEach(() => {
     process.chdir(originalCwd)
-    rmSync(PROJ, { recursive: true, force: true })
-    rmSync(OUTSIDE, { recursive: true, force: true })
-    mkdirSync(join(PROJ, 'sub'), { recursive: true })
-    mkdirSync(join(OUTSIDE, 'newdir'), { recursive: true })
+    rmSync(projectDir, { recursive: true, force: true })
+    rmSync(outsideDir, { recursive: true, force: true })
+    mkdirSync(join(projectDir, 'sub'), { recursive: true })
+    mkdirSync(join(outsideDir, 'newdir'), { recursive: true })
 
-    writeFileSync(join(PROJ, '.env'), ORIGINAL)
-    writeFileSync(join(PROJ, 'sub', '.env'), ORIGINAL)
-    writeFileSync(join(OUTSIDE, '.env'), ORIGINAL)
-    writeFileSync(join(PROJ, 'secret.txt'), ORIGINAL)
-    writeFileSync(join(OUTSIDE, 'secret.txt'), ORIGINAL)
-    // OUTSIDE/newdir/.env is deliberately NOT created: that case exercises
-    // file-write-create rather than file-write-data.
+    writeFileSync(join(projectDir, '.env'), ORIGINAL)
+    writeFileSync(join(projectDir, 'sub', '.env'), ORIGINAL)
+    writeFileSync(join(outsideDir, '.env'), ORIGINAL)
+    writeFileSync(join(projectDir, 'secret.txt'), ORIGINAL)
+    writeFileSync(join(outsideDir, 'secret.txt'), ORIGINAL)
+    // Leave `outside/newdir/.env` absent to exercise `file-write-create`.
 
-    // cwd is a strict subdirectory of the allowed write root.
-    process.chdir(PROJ)
+    process.chdir(projectDir)
   })
 
   function runSandboxed(
     command: string,
     policy: { denyWrite?: string[]; denyRead?: string[] },
   ): { executed: boolean; success: boolean; stdout: string; stderr: string } {
-    const prefix = `${STARTED}
-`
+    const prefix = `${STARTED}\n`
 
     const wrappedCommand = wrapCommandWithSandboxMacOS({
       command: `printf '%s\\n' '${STARTED}'; ${command}`,
@@ -103,7 +79,7 @@ describe.if(isMacOS)('deny globs outside process.cwd()', () => {
         ? { denyOnly: policy.denyRead, allowWithinDeny: [] }
         : undefined,
       writeConfig: {
-        allowOnly: [ROOT],
+        allowOnly: [allowedRoot],
         denyWithinAllow: policy.denyWrite ?? [],
       },
     })
@@ -115,10 +91,9 @@ describe.if(isMacOS)('deny globs outside process.cwd()', () => {
     })
 
     const rawStdout = result.stdout ?? ''
+    // Requiring the sentinel keeps sandbox startup failures from masquerading
+    // as denied operations.
     const markerSeen = rawStdout.startsWith(prefix)
-    // `executed` is what separates "the sandbox ran and denied this" from
-    // "the sandbox never started": a failed profile, a syntax error, a spawn
-    // failure and a timeout all leave the marker unprinted.
     const executed =
       result.error === undefined && result.signal === null && markerSeen
 
@@ -132,52 +107,46 @@ describe.if(isMacOS)('deny globs outside process.cwd()', () => {
 
   describe('user-written denyWrite glob', () => {
     it('control: blocks an overwrite under cwd', () => {
-      const target = join(PROJ, 'sub', '.env')
+      const target = join(projectDir, 'sub', '.env')
 
       const result = runSandboxed(`echo '${MODIFIED}' > '${target}'`, {
         denyWrite: ['**/.env'],
       })
 
       expect(result.executed).toBe(true)
-
       expect(result.success).toBe(false)
       expect(readFileSync(target, 'utf8').trim()).toBe(ORIGINAL)
     })
 
     it('control: an absolute entry outside cwd is enforced', () => {
-      const target = join(OUTSIDE, '.env')
+      const target = join(outsideDir, '.env')
 
       const result = runSandboxed(`echo '${MODIFIED}' > '${target}'`, {
         denyWrite: [target],
       })
 
       expect(result.executed).toBe(true)
-
       expect(result.success).toBe(false)
       expect(readFileSync(target, 'utf8').trim()).toBe(ORIGINAL)
     })
 
     it('control: an absolute-prefixed glob outside cwd is enforced', () => {
-      // Same wildcard, but the pattern starts with a path separator, so
-      // normalizePathForSandbox() leaves it alone. This is what pins the defect
-      // to the leading `**/` form rather than to glob handling in general.
-      const target = join(OUTSIDE, '.env')
+      // The absolute prefix prevents cwd rebasing, isolating the defect to
+      // leading `**/` patterns rather than glob handling in general.
+      const target = join(outsideDir, '.env')
 
       const result = runSandboxed(`echo '${MODIFIED}' > '${target}'`, {
-        denyWrite: [join(ROOT, '**', '.env')],
+        denyWrite: [join(allowedRoot, '**', '.env')],
       })
 
       expect(result.executed).toBe(true)
-
       expect(result.success).toBe(false)
       expect(readFileSync(target, 'utf8').trim()).toBe(ORIGINAL)
     })
 
     it('control: a write outside cwd matching no deny entry succeeds', () => {
-      // Positive control. Every other write case asserts a denial, so a profile
-      // that failed to apply would satisfy all of them. This one only passes if
-      // the sandbox is running and permissive where it should be.
-      const target = join(OUTSIDE, 'safe.txt')
+      // Prevents a blanket write failure from satisfying every write assertion.
+      const target = join(outsideDir, 'safe.txt')
       writeFileSync(target, ORIGINAL)
 
       const result = runSandboxed(`echo '${MODIFIED}' > '${target}'`, {
@@ -192,15 +161,11 @@ describe.if(isMacOS)('deny globs outside process.cwd()', () => {
     it.failing(
       'blocks an overwrite outside cwd but inside the allowed write root',
       () => {
-        const target = join(OUTSIDE, '.env')
+        const target = join(outsideDir, '.env')
 
         const result = runSandboxed(`echo '${MODIFIED}' > '${target}'`, {
           denyWrite: ['**/.env'],
         })
-
-        // `.failing` passes on any throw, so an infrastructure failure has to
-
-        // return normally here: that reports as "marked failing but passed", i.e. red.
 
         if (!result.executed) return
 
@@ -212,15 +177,11 @@ describe.if(isMacOS)('deny globs outside process.cwd()', () => {
     it.failing(
       'blocks creating a new file outside cwd (file-write-create)',
       () => {
-        const target = join(OUTSIDE, 'newdir', '.env')
+        const target = join(outsideDir, 'newdir', '.env')
 
         const result = runSandboxed(`echo '${MODIFIED}' > '${target}'`, {
           denyWrite: ['**/.env'],
         })
-
-        // `.failing` passes on any throw, so an infrastructure failure has to
-
-        // return normally here: that reports as "marked failing but passed", i.e. red.
 
         if (!result.executed) return
 
@@ -232,32 +193,30 @@ describe.if(isMacOS)('deny globs outside process.cwd()', () => {
 
   describe('user-written denyRead glob', () => {
     it('control: denies reading a matched file under cwd', () => {
-      const target = join(PROJ, 'secret.txt')
+      const target = join(projectDir, 'secret.txt')
 
       const result = runSandboxed(`cat '${target}'`, {
         denyRead: ['**/secret.txt'],
       })
 
       expect(result.executed).toBe(true)
-
       expect(result.success).toBe(false)
       expect(result.stdout).not.toContain(ORIGINAL)
     })
 
     it('control: an absolute entry outside cwd is enforced', () => {
-      const target = join(OUTSIDE, 'secret.txt')
+      const target = join(outsideDir, 'secret.txt')
 
       const result = runSandboxed(`cat '${target}'`, { denyRead: [target] })
 
       expect(result.executed).toBe(true)
-
       expect(result.success).toBe(false)
       expect(result.stdout).not.toContain(ORIGINAL)
     })
 
     it('control: a read outside cwd matching no deny entry succeeds', () => {
-      // Positive control for the read side, same reasoning as the write one.
-      const target = join(OUTSIDE, 'public.txt')
+      // Prevents a blanket read failure from satisfying every read assertion.
+      const target = join(outsideDir, 'public.txt')
       writeFileSync(target, ORIGINAL)
 
       const result = runSandboxed(`cat '${target}'`, {
@@ -270,15 +229,11 @@ describe.if(isMacOS)('deny globs outside process.cwd()', () => {
     })
 
     it.failing('denies reading a matched file outside cwd', () => {
-      const target = join(OUTSIDE, 'secret.txt')
+      const target = join(outsideDir, 'secret.txt')
 
       const result = runSandboxed(`cat '${target}'`, {
         denyRead: ['**/secret.txt'],
       })
-
-      // `.failing` passes on any throw, so an infrastructure failure has to
-
-      // return normally here: that reports as "marked failing but passed", i.e. red.
 
       if (!result.executed) return
 
@@ -289,14 +244,10 @@ describe.if(isMacOS)('deny globs outside process.cwd()', () => {
 
   describe('built-in mandatory deny (same normalization)', () => {
     it.failing('blocks an overwrite of .zshrc outside cwd', () => {
-      const target = join(OUTSIDE, '.zshrc')
+      const target = join(outsideDir, '.zshrc')
       writeFileSync(target, ORIGINAL)
 
       const result = runSandboxed(`echo '${MODIFIED}' > '${target}'`, {})
-
-      // `.failing` passes on any throw, so an infrastructure failure has to
-
-      // return normally here: that reports as "marked failing but passed", i.e. red.
 
       if (!result.executed) return
 
@@ -305,15 +256,11 @@ describe.if(isMacOS)('deny globs outside process.cwd()', () => {
     })
 
     it.failing('blocks creating .git/hooks/pre-commit outside cwd', () => {
-      const hooks = join(OUTSIDE, 'repo', '.git', 'hooks')
+      const hooks = join(outsideDir, 'repo', '.git', 'hooks')
       mkdirSync(hooks, { recursive: true })
       const target = join(hooks, 'pre-commit')
 
       const result = runSandboxed(`echo '${MODIFIED}' > '${target}'`, {})
-
-      // `.failing` passes on any throw, so an infrastructure failure has to
-
-      // return normally here: that reports as "marked failing but passed", i.e. red.
 
       if (!result.executed) return
 
