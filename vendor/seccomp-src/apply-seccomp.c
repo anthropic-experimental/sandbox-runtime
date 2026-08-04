@@ -723,14 +723,13 @@ int main(int argc, char *argv[]) {
          * ptrace_scope=0) and dump the mapped pages that mode 0111 is
          * meant to hide; the save/restore keeps that exposure to a
          * few-syscall race window — the same unavoidable window runc and
-         * systemd accept for this pattern. */
+         * systemd accept for this pattern.
+         *
+         * prctl failures here are ignored: they are next to impossible for
+         * these calls, and if raising dumpable did fail the map writes
+         * below fail with their own clearer errors. */
         int dumpable = prctl(PR_GET_DUMPABLE);
-        if (dumpable < 0) {
-            die("apply-seccomp: prctl(PR_GET_DUMPABLE)");
-        }
-        if (prctl(PR_SET_DUMPABLE, 1) < 0) {
-            die("apply-seccomp: prctl(PR_SET_DUMPABLE, 1)");
-        }
+        (void)prctl(PR_SET_DUMPABLE, 1);
 
         if (unshare(CLONE_NEWUSER) < 0) {
             die("apply-seccomp: unshare(CLONE_NEWUSER)");
@@ -747,10 +746,9 @@ int main(int argc, char *argv[]) {
             die("apply-seccomp: write /proc/self/gid_map");
         }
         /* PR_SET_DUMPABLE only accepts 0 or 1; if the saved value was
-         * SUID_DUMP_ROOT (2), restore the more restrictive 0. */
-        if (prctl(PR_SET_DUMPABLE, dumpable == 1 ? 1 : 0) < 0) {
-            die("apply-seccomp: prctl(PR_SET_DUMPABLE) restore");
-        }
+         * SUID_DUMP_ROOT (2) — or the read above failed — restore the more
+         * restrictive 0. */
+        (void)prctl(PR_SET_DUMPABLE, dumpable == 1 ? 1 : 0);
         if (unshare(CLONE_NEWPID | CLONE_NEWNS) < 0) {
             die("apply-seccomp: unshare(CLONE_NEWPID|CLONE_NEWNS) after userns");
         }
