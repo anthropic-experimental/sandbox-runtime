@@ -247,7 +247,13 @@ async function filterNetworkRequest(
   for (const deniedDomain of config.network.deniedDomains) {
     if (matchesDomainPatternWithPort(canonicalHost, port, deniedDomain)) {
       logForDebugging(`Denied by config rule: ${host}:${port}`)
-      return denied('host is on the deny list')
+      // The matched entry's own reason when the caller supplied one, so the
+      // model reads why this destination is off-limits (and the sanctioned
+      // alternative) instead of a generic deny; keyed by the exact entry.
+      return denied(
+        config.network.deniedDomainReasons?.[deniedDomain] ??
+          'host is on the deny list',
+      )
     }
   }
 

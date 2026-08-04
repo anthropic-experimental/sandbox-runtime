@@ -696,6 +696,14 @@ export const NetworkConfigSchema = z.object({
       'List of denied domains. Unlike allowedDomains, a bare "*" is accepted here (deny-all). ' +
         'An optional ":port" suffix (e.g., "*:22") restricts the entry to that destination port.',
     ),
+  deniedDomainReasons: z
+    .record(z.string(), z.string().min(1))
+    .optional()
+    .describe(
+      'Optional model-facing reason keyed by the exact deniedDomains entry it explains (e.g., {"github.com:22": "SSH pushes to GitHub are blocked; use an https remote"}). ' +
+        'Reported in the <sandbox_violations> line when that entry denies a connection; entries without one use a generic reason. ' +
+        'Keys are matched by exact entry string, so a key with no matching deniedDomains entry never fires.',
+    ),
   strictAllowlist: z
     .boolean()
     .optional()
