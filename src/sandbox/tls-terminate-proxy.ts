@@ -146,6 +146,13 @@ export type TerminateTarget = {
    * is read at process start, so tests can't set it from inside the suite).
    */
   upstreamCA?: string | Buffer | Array<string | Buffer>
+  /**
+   * Called when filterRequest denies a parsed request, with the verified
+   * method/URL and the decision reason. Carried on the target so the
+   * per-connection request handler (which closes over `target`) can reach
+   * it without an extra parameter on every layer.
+   */
+  onFilterRequestDeny?: (method: string, url: string, reason: string) => void
 }
 
 /**
@@ -355,6 +362,7 @@ async function forwardUpstream(
       res,
       `https://${host}${path}`,
       ac.signal,
+      target.onFilterRequestDeny,
     )
     if (out === null) return
     body = out

@@ -7,6 +7,7 @@ import { request as httpsRequest } from 'node:https'
 import { connect } from 'node:net'
 import { URL } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
+import { encodedCommandFromProxyUser } from './sandbox-utils.js'
 import { CRL_PATH, type MitmCA } from './mitm-ca.js'
 import {
   decideAndRespond,
@@ -35,10 +36,16 @@ import {
 } from './parent-proxy.js'
 
 export interface HttpProxyServerOptions {
+  /**
+   * Host-allowlist decision. `encodedCommand` is the per-command suffix
+   * parsed from the Proxy-Authorization username (`srt.<encodedCommand>`),
+   * so the manager can attribute a denial to the invocation that made it.
+   */
   filter(
     port: number,
     host: string,
     socket: Socket | Duplex,
+    encodedCommand?: string,
   ): Promise<boolean> | boolean
 
   /**
@@ -79,6 +86,19 @@ export interface HttpProxyServerOptions {
    * HTTPS requests. See request-filter.ts.
    */
   filterRequest?: FilterRequestCallback
+
+  /**
+   * Called when `filterRequest` denies a request, with the verified
+   * method/URL, the decision reason, and the encodedCommand parsed from
+   * the Proxy-Authorization username. Lets the manager record the deny in
+   * the SandboxViolationStore alongside the host-allowlist denials.
+   */
+  onFilterRequestDenied?: (info: {
+    method: string
+    url: string
+    reason: string
+    encodedCommand?: string
+  }) => void
 
   /**
    * Mutate forwarded headers on the TLS-terminated path, after the allow
@@ -144,9 +164,12 @@ export interface HttpProxyServerOptions {
 
   /**
    * Per-session bearer token. When set, every CONNECT and absolute-URI
-   * request must carry `Proxy-Authorization: Basic base64("srt:<token>")`
-   * or it gets a 407. Without this, any host process can dial 127.0.0.1
-   * and reach the filter callback.
+   * request must carry `Proxy-Authorization: Basic
+   * base64("srt[.<encodedCommand>]:<token>")` or it gets a 407. Without
+   * this, any host process can dial 127.0.0.1 and reach the filter
+   * callback. The optional `<encodedCommand>` suffix is parsed and passed to
+   * `filter()` / `onFilterRequestDenied` so denials can be attributed to a
+   * specific command.
    */
   proxyAuthToken?: string
 }
@@ -189,13 +212,20 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
     socket.destroy()
   })
 
-  const checkAuth = (got: string | undefined): boolean => {
-    if (!options.proxyAuthToken) return true
+  type AuthResult = { ok: true; encodedCommand?: string } | { ok: false }
+  const checkAuth = (got: string | undefined): AuthResult => {
+    if (!options.proxyAuthToken) return { ok: true }
     const m = /^basic\s+([a-z0-9+/=]+)\s*$/i.exec(got ?? '')
-    if (!m) return false
+    if (!m) return { ok: false }
     const decoded = Buffer.from(m[1]!, 'base64').toString('utf8')
     const sep = decoded.indexOf(':')
-    return sep > 0 && decoded.slice(sep + 1) === options.proxyAuthToken
+    if (sep <= 0 || decoded.slice(sep + 1) !== options.proxyAuthToken) {
+      return { ok: false }
+    }
+    return {
+      ok: true,
+      encodedCommand: encodedCommandFromProxyUser(decoded.slice(0, sep)),
+    }
   }
 
   // Handle CONNECT requests for HTTPS traffic
@@ -212,7 +242,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
     })
 
     try {
-      if (!checkAuth(req.headers['proxy-authorization'])) {
+      const auth = checkAuth(req.headers['proxy-authorization'])
+      if (!auth.ok) {
         socket.end(
           'HTTP/1.1 407 Proxy Authentication Required\r\n' +
             'Proxy-Authenticate: Basic realm="srt"\r\n\r\n',
@@ -229,7 +260,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       }
       const { hostname, port } = target
 
-      const allowed = await options.filter(port, hostname, socket)
+      const allowed = await options.filter(
+        port,
+        hostname,
+        socket,
+        auth.encodedCommand,
+      )
       if (!allowed) {
         logForDebugging(`Connection blocked to ${hostname}:${port}`, {
           level: 'error',
@@ -276,7 +312,20 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             options.getBodySubstitutions,
             socket,
             peeked.head,
-            { hostname, port, upstreamCA: options.tlsTerminateUpstreamCA },
+            {
+              hostname,
+              port,
+              upstreamCA: options.tlsTerminateUpstreamCA,
+              onFilterRequestDeny: options.onFilterRequestDenied
+                ? (method, url, reason) =>
+                    options.onFilterRequestDenied!({
+                      method,
+                      url,
+                      reason,
+                      encodedCommand: auth.encodedCommand,
+                    })
+                : undefined,
+            },
             options.planSigv4,
             options.maxSigv4ResignBodyBytes,
           )
@@ -399,7 +448,8 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         res.end(options.mitmCA.crlDer)
         return
       }
-      if (!checkAuth(req.headers['proxy-authorization'])) {
+      const auth = checkAuth(req.headers['proxy-authorization'])
+      if (!auth.ok) {
         res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="srt"' })
         res.end()
         return
@@ -412,7 +462,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           ? 443
           : 80
 
-      const allowed = await options.filter(port, hostname, req.socket)
+      const allowed = await options.filter(
+        port,
+        hostname,
+        req.socket,
+        auth.encodedCommand,
+      )
       if (!allowed) {
         logForDebugging(`HTTP request blocked to ${hostname}:${port}`, {
           level: 'error',
@@ -469,6 +524,15 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
           res,
           absUrl,
           ac.signal,
+          options.onFilterRequestDenied
+            ? (method, url, reason) =>
+                options.onFilterRequestDenied!({
+                  method,
+                  url,
+                  reason,
+                  encodedCommand: auth.encodedCommand,
+                })
+            : undefined,
         )
         if (out === null) return
         body = out

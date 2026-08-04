@@ -96,7 +96,9 @@ export async function decideAndRespond(
   res: ServerResponse,
   url: string,
   signal: AbortSignal,
+  onDeny?: (method: string, url: string, reason: string) => void,
 ): Promise<Readable | null> {
+  const method = req.method ?? 'GET'
   let forCallback: ReadableStream<Uint8Array> | undefined
   let forUpstream: Readable = req
   // Gate on a declared body, not just the method: a GET/HEAD/OPTIONS with
@@ -110,7 +112,7 @@ export async function decideAndRespond(
   const declaresBody = Boolean(
     req.headers['content-length'] || req.headers['transfer-encoding'],
   )
-  const bodylessMethod = BODYLESS_METHODS.has(req.method ?? 'GET')
+  const bodylessMethod = BODYLESS_METHODS.has(method)
   if (!bodylessMethod || declaresBody) {
     // Never hand toWeb a stream that can error: when its source errors,
     // the toWeb/tee/fromWeb bridge leaks the error as internal promise
@@ -150,17 +152,16 @@ export async function decideAndRespond(
         ? { body: forCallback, duplex: 'half' as const }
         : {}
     webReq = new Request(url, {
-      method: req.method,
+      method,
       headers: incomingHeaders(req),
       signal,
       ...callbackBody,
     })
   } catch (err) {
     // Malformed URL/headers from the client — deny rather than crash.
-    deny(res, {
-      action: 'deny',
-      reason: `malformed request: ${(err as Error).message}`,
-    })
+    const reason = `malformed request: ${(err as Error).message}`
+    onDeny?.(method, url, reason)
+    deny(res, { action: 'deny', reason })
     forCallback?.cancel().catch(() => {})
     forUpstream.destroy()
     // The shim breaks the old fromWeb→tee→toWeb cancel cascade that used
@@ -190,10 +191,11 @@ export async function decideAndRespond(
   }
 
   if (decision.action === 'allow') {
-    logForDebugging(`[request-filter] allow ${req.method} ${url}`)
+    logForDebugging(`[request-filter] allow ${method} ${url}`)
     return forUpstream
   }
 
+  onDeny?.(method, url, decision.reason ?? DEFAULT_DENY_REASON)
   deny(res, decision)
   forUpstream.destroy()
   if (forUpstream !== req) destroyAfterResponse(req, res)

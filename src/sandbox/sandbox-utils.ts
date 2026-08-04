@@ -446,11 +446,21 @@ export function generateProxyEnvVars(
   caCertPath?: string,
   proxyAuthToken?: string,
   skipTmpdir?: boolean,
+  encodedCommand?: string,
 ): string[] {
   // When the proxy requires auth, embed the credential in the URL so clients
   // send Proxy-Authorization automatically. Only the sandbox child sees this
   // env, so the token never reaches host processes.
-  const auth = proxyAuthToken ? `srt:${proxyAuthToken}@` : ''
+  //
+  // The username carries the per-command encodedCommand so the proxy can
+  // attribute denials to a specific invocation (see
+  // SandboxViolationStore). Standard base64 is percent-encoded in the URL so
+  // `+/=` survive userinfo parsing; clients URL-decode before building the
+  // Basic header / RFC 1929 frame, so the proxy receives the raw base64.
+  const userRaw = proxyUsernameFor(encodedCommand)
+  const userPct =
+    userRaw === PROXY_AUTH_USER ? userRaw : encodeURIComponent(userRaw)
+  const auth = proxyAuthToken ? `${userPct}:${proxyAuthToken}@` : ''
   const envVars: string[] = [`SANDBOX_RUNTIME=1`]
   // TMPDIR is overridden so temp-file writers land in a path the FS sandbox
   // allows (getDefaultWritePaths). When filesystem policy is disabled
@@ -564,7 +574,9 @@ export function generateProxyEnvVars(
       // Linux: use socat HTTP CONNECT via the HTTP proxy bridge.
       // socat is already a required Linux sandbox dependency, and PROXY: is
       // portable across all socat versions (unlike SOCKS5-CONNECT which needs >= 1.8.0).
-      const socatAuth = proxyAuthToken ? `,proxyauth=srt:${proxyAuthToken}` : ''
+      const socatAuth = proxyAuthToken
+        ? `,proxyauth=${userRaw}:${proxyAuthToken}`
+        : ''
       envVars.push(
         `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=${httpProxyPort}${socatAuth}'`,
       )
@@ -612,7 +624,7 @@ export function generateProxyEnvVars(
       envVars.push(`CLOUDSDK_PROXY_ADDRESS=localhost`)
       envVars.push(`CLOUDSDK_PROXY_PORT=${httpProxyPort}`)
       if (proxyAuthToken) {
-        envVars.push(`CLOUDSDK_PROXY_USERNAME=srt`)
+        envVars.push(`CLOUDSDK_PROXY_USERNAME=${userRaw}`)
         envVars.push(`CLOUDSDK_PROXY_PASSWORD=${proxyAuthToken}`)
       }
     }
@@ -765,6 +777,38 @@ export function encodeSandboxedCommand(command: string): string {
  */
 export function decodeSandboxedCommand(encodedCommand: string): string {
   return Buffer.from(encodedCommand, 'base64').toString('utf8')
+}
+
+/** Base proxy username; the auth token is the credential, this is a label. */
+export const PROXY_AUTH_USER = 'srt'
+
+/**
+ * Build the proxy username for a sandboxed command: `srt.<encodedCommand>`
+ * so the proxy can attribute a denial to the invocation that triggered it,
+ * or bare `srt` when there is nothing to attribute. RFC 1929 caps the
+ * SOCKS5 username at 255 bytes; a multibyte command whose 100-code-unit
+ * truncation still base64s past that would fail the SOCKS handshake, so
+ * fall back to bare `srt` (attribution is lost, connectivity is not).
+ */
+export function proxyUsernameFor(encodedCommand: string | undefined): string {
+  if (!encodedCommand) return PROXY_AUTH_USER
+  const user = `${PROXY_AUTH_USER}.${encodedCommand}`
+  return Buffer.byteLength(user) <= 255 ? user : PROXY_AUTH_USER
+}
+
+/**
+ * Inverse of {@link proxyUsernameFor}: extract the encodedCommand suffix
+ * from `srt.<encodedCommand>`, or undefined for bare `srt` / anything else.
+ * The username is client-controlled inside the sandbox, so a forged suffix
+ * can only misattribute a denial in the violation report — it cannot
+ * authenticate (the token does that) or reach another command's data.
+ */
+export function encodedCommandFromProxyUser(
+  username: string | undefined,
+): string | undefined {
+  if (!username || !username.startsWith(`${PROXY_AUTH_USER}.`)) return undefined
+  const suffix = username.slice(PROXY_AUTH_USER.length + 1)
+  return suffix || undefined
 }
 
 /**
