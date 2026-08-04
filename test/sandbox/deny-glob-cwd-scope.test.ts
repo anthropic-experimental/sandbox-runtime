@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import {
   mkdirSync,
+  mkdtempSync,
   rmSync,
   writeFileSync,
   readFileSync,
@@ -39,7 +40,7 @@ import { isMacOS } from '../helpers/platform.js'
  * See #432.
  */
 describe.if(isMacOS)('deny globs outside process.cwd()', () => {
-  const ROOT_RAW = join(tmpdir(), `deny-glob-cwd-scope-${Date.now()}`)
+  let ROOT_RAW: string
   const ORIGINAL = 'ORIGINAL'
   const MODIFIED = 'MODIFIED'
   // Printed by the sandboxed shell before the command under test. If it is
@@ -54,7 +55,9 @@ describe.if(isMacOS)('deny globs outside process.cwd()', () => {
 
   beforeAll(() => {
     originalCwd = process.cwd()
-    mkdirSync(ROOT_RAW, { recursive: true })
+    // mkdtemp rather than a timestamp: two runs starting in the same millisecond
+    // would otherwise share a root and delete each other's fixtures.
+    ROOT_RAW = mkdtempSync(join(tmpdir(), 'deny-glob-cwd-scope-'))
     // On macOS tmpdir() sits behind a symlink; resolve it so the allow root and
     // the paths the sandbox sees are the same strings.
     ROOT = realpathSync(ROOT_RAW)
@@ -195,7 +198,11 @@ describe.if(isMacOS)('deny globs outside process.cwd()', () => {
           denyWrite: ['**/.env'],
         })
 
-        expect(result.executed).toBe(true)
+        // `.failing` passes on any throw, so an infrastructure failure has to
+
+        // return normally here: that reports as "marked failing but passed", i.e. red.
+
+        if (!result.executed) return
 
         expect(result.success).toBe(false)
         expect(readFileSync(target, 'utf8').trim()).toBe(ORIGINAL)
@@ -211,7 +218,11 @@ describe.if(isMacOS)('deny globs outside process.cwd()', () => {
           denyWrite: ['**/.env'],
         })
 
-        expect(result.executed).toBe(true)
+        // `.failing` passes on any throw, so an infrastructure failure has to
+
+        // return normally here: that reports as "marked failing but passed", i.e. red.
+
+        if (!result.executed) return
 
         expect(result.success).toBe(false)
         expect(existsSync(target)).toBe(false)
@@ -265,7 +276,11 @@ describe.if(isMacOS)('deny globs outside process.cwd()', () => {
         denyRead: ['**/secret.txt'],
       })
 
-      expect(result.executed).toBe(true)
+      // `.failing` passes on any throw, so an infrastructure failure has to
+
+      // return normally here: that reports as "marked failing but passed", i.e. red.
+
+      if (!result.executed) return
 
       expect(result.success).toBe(false)
       expect(result.stdout).not.toContain(ORIGINAL)
@@ -279,7 +294,11 @@ describe.if(isMacOS)('deny globs outside process.cwd()', () => {
 
       const result = runSandboxed(`echo '${MODIFIED}' > '${target}'`, {})
 
-      expect(result.executed).toBe(true)
+      // `.failing` passes on any throw, so an infrastructure failure has to
+
+      // return normally here: that reports as "marked failing but passed", i.e. red.
+
+      if (!result.executed) return
 
       expect(result.success).toBe(false)
       expect(readFileSync(target, 'utf8').trim()).toBe(ORIGINAL)
@@ -292,7 +311,11 @@ describe.if(isMacOS)('deny globs outside process.cwd()', () => {
 
       const result = runSandboxed(`echo '${MODIFIED}' > '${target}'`, {})
 
-      expect(result.executed).toBe(true)
+      // `.failing` passes on any throw, so an infrastructure failure has to
+
+      // return normally here: that reports as "marked failing but passed", i.e. red.
+
+      if (!result.executed) return
 
       expect(result.success).toBe(false)
       expect(existsSync(target)).toBe(false)
