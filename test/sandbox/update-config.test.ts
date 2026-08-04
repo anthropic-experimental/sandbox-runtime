@@ -81,6 +81,35 @@ describe('proxy auth + network deny semantics', () => {
     expect((await proxyRequest(port, 'other.net')).statusCode).toBe(403)
   })
 
+  it("reports a deniedDomains entry's deniedDomainReasons text in the violation line", async () => {
+    await SandboxManager.initialize({
+      network: {
+        allowedDomains: ['example.com'],
+        deniedDomains: ['github.com', 'evil.net'],
+        deniedDomainReasons: {
+          'github.com':
+            'SSH pushes to GitHub are blocked; use an https:// remote',
+        },
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    })
+    const port = SandboxManager.getProxyPort()!
+    const store = SandboxManager.getSandboxViolationStore()
+    store.clear()
+
+    expect((await proxyRequest(port, 'github.com')).statusCode).toBe(403)
+    // No reason for this entry → the generic one.
+    expect((await proxyRequest(port, 'evil.net')).statusCode).toBe(403)
+
+    const lines = store.getViolations().map(v => v.line)
+    expect(lines).toContain(
+      'deny network-outbound github.com:443 (SSH pushes to GitHub are blocked; use an https:// remote)',
+    )
+    expect(lines).toContain(
+      'deny network-outbound evil.net:443 (host is on the deny list)',
+    )
+  })
+
   it('strictAllowlist denies off-allowlist hosts without consulting the callback', async () => {
     let asked = false
     await SandboxManager.initialize(

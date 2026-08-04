@@ -197,7 +197,11 @@ function recordProxyViolation(
   encodedCommand: string | undefined,
 ): void {
   sandboxViolationStore.addViolation({
-    line,
+    // One physical line inside the <sandbox_violations> block: an embedder-
+    // supplied reason (deniedDomainReasons / filterRequest) must not be able
+    // to break the framing with a newline or a stray closing tag.
+    // eslint-disable-next-line no-control-regex -- stripping control chars is the point
+    line: line.replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/[<>]/g, ''),
     encodedCommand,
     command: encodedCommand
       ? decodeSandboxedCommand(encodedCommand)
@@ -247,7 +251,13 @@ async function filterNetworkRequest(
   for (const deniedDomain of config.network.deniedDomains) {
     if (matchesDomainPatternWithPort(canonicalHost, port, deniedDomain)) {
       logForDebugging(`Denied by config rule: ${host}:${port}`)
-      return denied('host is on the deny list')
+      // The matched entry's own reason when the caller supplied one, so the
+      // model reads why this destination is off-limits (and the sanctioned
+      // alternative) instead of a generic deny; keyed by the exact entry.
+      return denied(
+        config.network.deniedDomainReasons?.[deniedDomain] ??
+          'host is on the deny list',
+      )
     }
   }
 
