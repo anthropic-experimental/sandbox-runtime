@@ -57,6 +57,13 @@ export type MutateForwardedHeaders = (
 export const BODYLESS_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
 
 /**
+ * User-facing reason when a filterRequest denial doesn't supply one. This
+ * text reaches the sandboxed client (403 body) and the model
+ * (<sandbox_violations>), so it names the policy, not the internal hook.
+ */
+export const DEFAULT_DENY_REASON = 'denied by sandbox policy'
+
+/**
  * Destroy a denied client's request only after the 403 has flushed —
  * destroying the shared socket in the same tick can RST the response
  * away (observed on Node; the unread request body makes close send RST).
@@ -169,7 +176,7 @@ export async function decideAndRespond(
   } catch (err) {
     decision = {
       action: 'deny',
-      reason: `filterRequest threw: ${(err as Error).message}`,
+      reason: `sandbox policy check failed: ${(err as Error).message}`,
     }
   }
 
@@ -194,7 +201,7 @@ export async function decideAndRespond(
 }
 
 function deny(res: ServerResponse, decision: RequestDecision): void {
-  respondDenied(res, decision.reason ?? 'denied by filterRequest')
+  respondDenied(res, decision.reason ?? DEFAULT_DENY_REASON)
 }
 
 /**
