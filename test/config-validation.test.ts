@@ -19,6 +19,50 @@ describe('Config Validation', () => {
     expect(result.success).toBe(true)
   })
 
+  test('should validate explicit host networking with empty proxy policy', () => {
+    const result = SandboxRuntimeConfigSchema.safeParse({
+      network: {
+        hostNetwork: true,
+        allowedDomains: [],
+        deniedDomains: [],
+        allowAllUnixSockets: false,
+      },
+      filesystem: {
+        denyRead: [],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    })
+    expect(result.success).toBe(true)
+  })
+
+  test('should reject proxy filtering and credential masking with host networking', () => {
+    const result = SandboxRuntimeConfigSchema.safeParse({
+      network: {
+        hostNetwork: true,
+        allowedDomains: ['example.com'],
+        deniedDomains: [],
+        httpProxyPort: 3128,
+      },
+      filesystem: {
+        denyRead: [],
+        allowWrite: [],
+        denyWrite: [],
+      },
+      credentials: {
+        envVars: [{ name: 'SYNTHETIC_TOKEN', mode: 'mask' }],
+        allowPlaintextInject: true,
+      },
+    })
+    expect(result.success).toBe(false)
+    if (!result.success) {
+      const paths = result.error.issues.map(issue => issue.path.join('.'))
+      expect(paths).toContain('network.allowedDomains')
+      expect(paths).toContain('network.httpProxyPort')
+      expect(paths).toContain('credentials.envVars.0.mode')
+    }
+  })
+
   test('should validate a config with valid domains', () => {
     const config = {
       network: {

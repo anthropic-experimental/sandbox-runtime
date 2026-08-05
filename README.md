@@ -119,7 +119,7 @@ Both filesystem and network isolation are required for effective sandboxing. Wit
 - **Read** (deny-then-allow pattern): By default, read access is allowed everywhere. You can deny broad regions (e.g., `/Users`) and then re-allow specific paths within them (e.g., `.`). `allowRead` takes precedence over `denyRead` — the opposite of write, where `denyWrite` takes precedence over `allowWrite`.
 - **Write** (allow-only pattern): By default, write access is denied everywhere. You must explicitly allow paths (e.g., `.`, `/tmp`). An empty allow list means no write access.
 
-**Network Isolation** (allow-only pattern): By default, all network access is denied. You must explicitly allow domains. An empty allowedDomains list means no network access. Network traffic is routed through proxy servers running on the host:
+**Network Isolation** (allow-only pattern): By default, all network access is denied. You must explicitly allow domains. An empty allowedDomains list means no network access. Network traffic is routed through proxy servers running on the host. The explicit `network.hostNetwork: true` escape hatch opts out of IP isolation for trusted workloads while retaining filesystem and Unix-domain-socket policy:
 
 - **Linux**: Requests are routed via the filesystem over a Unix domain socket. The network namespace of the sandboxed process is removed entirely, so all network traffic must go through the proxies running on the host (listening on Unix sockets that are bind-mounted into the sandbox)
 
@@ -301,7 +301,8 @@ srt --settings /path/to/srt-settings.json <command>
 
 Uses an **allow-only pattern** - all network access is denied by default.
 
-- `network.allowedDomains` - Array of allowed domains (supports wildcards like `*.example.com`). Empty array = no network access. An optional `:port` suffix (`api.example.com:443`, `*.example.com:8443`) restricts an entry to that destination port; entries without a port match any port.
+- `network.hostNetwork` - Explicitly opt out of IP network isolation and proxy filtering while retaining filesystem and Unix-domain-socket policy. When `true`, raw TCP/UDP, host loopback, LAN/VPN routes, and local listeners work normally. `allowedDomains` and `deniedDomains` must be empty, and proxy/TLS/request-filter/credential-injection options are rejected. Unsupported on Windows. Default: `false`.
+- `network.allowedDomains` - Array of allowed domains (supports wildcards like `*.example.com`). Empty array = no network access unless `hostNetwork` is `true`. An optional `:port` suffix (`api.example.com:443`, `*.example.com:8443`) restricts an entry to that destination port; entries without a port match any port.
 - `network.deniedDomains` - Array of denied domains (checked first, takes precedence over allowedDomains). Same `:port` suffix, and a bare `*` (or `*:22`) is accepted for deny-all.
 - `network.deniedDomainReasons` - Optional map from a `deniedDomains` entry (matched by exact string) to a model-facing reason that appears in the `<sandbox_violations>` line when that entry denies a connection — say what is blocked and the sanctioned alternative (e.g. `{"github.com:22": "SSH pushes to GitHub are blocked; use an https:// remote"}`). Entries without a reason report a generic one.
 - `network.allowLocalBinding` - Allow binding to local ports (boolean, default: false)
@@ -769,7 +770,7 @@ Note: Custom proxy configuration is not yet supported in the new configuration f
 
 ### Security Limitations
 
-- Network Sandboxing Limitations: The network filtering system operates by restricting the domains that processes are allowed to connect to. It does not otherwise inspect the traffic passing through the proxy and users are responsible for ensuring they only allow trusted domains in their policy.
+- Network Sandboxing Limitations: The network filtering system operates by restricting the domains that processes are allowed to connect to. It does not otherwise inspect the traffic passing through the proxy and users are responsible for ensuring they only allow trusted domains in their policy. `network.hostNetwork: true` disables this filtering entirely and permits raw IP networking, UDP, host loopback, LAN/VPN access, and local listeners; use it only when the workload is trusted with the host's network reachability.
 
 <Warning>
 Users should be aware of potential risks that come from allowing broad domains like `github.com` that may allow for data exfiltration. Also, in some cases it may be possible to bypass the network filtering through [domain fronting](https://en.wikipedia.org/wiki/Domain_fronting).
