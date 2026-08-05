@@ -125,6 +125,36 @@ function generateLogTag(command: string): string {
 }
 
 /**
+ * SBPL path filter for a normalized path: `regex` for glob patterns,
+ * `subpath` (the path and everything beneath it) otherwise.
+ */
+function pathFilter(normalizedPath: string): string {
+  return containsGlobChars(normalizedPath)
+    ? `(regex ${escapePath(globToRegex(normalizedPath))})`
+    : `(subpath ${escapePath(normalizedPath)})`
+}
+
+/**
+ * Render one SBPL rule applying `action` for each of `operations` to any
+ * path matching one of `filters`, reporting `logTag` on a match. Emits
+ * nothing for an empty filter set: a rule with no filter would match every
+ * path.
+ */
+function renderRule(
+  action: 'allow' | 'deny',
+  operations: readonly string[],
+  filters: ReadonlySet<string>,
+  logTag: string,
+): string[] {
+  if (filters.size === 0) return []
+  return [
+    `(${action} ${operations.join(' ')}`,
+    ...[...filters].map(f => `  ${f}`),
+    `  (with message "${logTag}"))`,
+  ]
+}
+
+/**
  * Get all ancestor directories for a path, up to (but not including) root
  * Example: /private/tmp/test/file.txt -> ["/private/tmp/test", "/private/tmp", "/private"]
  */
@@ -153,6 +183,10 @@ function getAncestorDirectories(pathStr: string): string[] {
  * not-yet-existing protected path (or one of its ancestors) with an
  * attacker-controlled symlink.
  *
+ * Emitted as a single rule whose filters are the union over all patterns:
+ * protected paths commonly share most of their ancestors, and each distinct
+ * filter both costs argv bytes and adds to sandbox-exec's compile time.
+ *
  * @param pathPatterns - Array of path patterns to protect (can include globs)
  * @param logTag - Log tag for sandbox violations
  * @returns Array of sandbox profile rule lines
@@ -161,80 +195,41 @@ function generateMoveBlockingRules(
   pathPatterns: string[],
   logTag: string,
 ): string[] {
-  const rules: string[] = []
-  const ops = ['file-write-unlink', 'file-write-create'] as const
+  const filters = new Set<string>()
 
   for (const pathPattern of pathPatterns) {
     const normalizedPath = normalizePathForSandbox(pathPattern)
 
+    // Block moving/renaming the denied path itself (or files matching the
+    // pattern)
+    filters.add(pathFilter(normalizedPath))
+
+    let baseDir: string
     if (containsGlobChars(normalizedPath)) {
-      // Use regex matching for glob patterns
-      const regexPattern = globToRegex(normalizedPath)
-
-      // Block moving/renaming files matching this pattern
-      for (const op of ops) {
-        rules.push(
-          `(deny ${op}`,
-          `  (regex ${escapePath(regexPattern)})`,
-          `  (with message "${logTag}"))`,
-        )
-      }
-
-      // For glob patterns, extract the static prefix and block ancestor moves
-      // Remove glob characters to get the directory prefix
+      // For glob patterns, block moves of the directory containing the
+      // pattern's static prefix, then of its ancestors
       const staticPrefix = normalizedPath.split(/[*?[\]]/)[0]
-      if (staticPrefix && staticPrefix !== '/') {
-        // Get the directory containing the glob pattern
-        const baseDir = staticPrefix.endsWith('/')
-          ? staticPrefix.slice(0, -1)
-          : path.dirname(staticPrefix)
-
-        // Block moves of the base directory itself
-        for (const op of ops) {
-          rules.push(
-            `(deny ${op}`,
-            `  (literal ${escapePath(baseDir)})`,
-            `  (with message "${logTag}"))`,
-          )
-        }
-
-        // Block moves of ancestor directories
-        for (const ancestorDir of getAncestorDirectories(baseDir)) {
-          for (const op of ops) {
-            rules.push(
-              `(deny ${op}`,
-              `  (literal ${escapePath(ancestorDir)})`,
-              `  (with message "${logTag}"))`,
-            )
-          }
-        }
-      }
+      if (!staticPrefix || staticPrefix === '/') continue
+      baseDir = staticPrefix.endsWith('/')
+        ? staticPrefix.slice(0, -1)
+        : path.dirname(staticPrefix)
+      filters.add(`(literal ${escapePath(baseDir)})`)
     } else {
-      // Use subpath matching for literal paths
+      baseDir = normalizedPath
+    }
 
-      // Block moving/renaming the denied path itself
-      for (const op of ops) {
-        rules.push(
-          `(deny ${op}`,
-          `  (subpath ${escapePath(normalizedPath)})`,
-          `  (with message "${logTag}"))`,
-        )
-      }
-
-      // Block moves of ancestor directories
-      for (const ancestorDir of getAncestorDirectories(normalizedPath)) {
-        for (const op of ops) {
-          rules.push(
-            `(deny ${op}`,
-            `  (literal ${escapePath(ancestorDir)})`,
-            `  (with message "${logTag}"))`,
-          )
-        }
-      }
+    // Block moves of ancestor directories
+    for (const ancestorDir of getAncestorDirectories(baseDir)) {
+      filters.add(`(literal ${escapePath(ancestorDir)})`)
     }
   }
 
-  return rules
+  return renderRule(
+    'deny',
+    ['file-write-unlink', 'file-write-create'],
+    filters,
+    logTag,
+  )
 }
 
 /**
@@ -266,28 +261,13 @@ function generateReadRules(
   rules.push(`(allow file-read*)`)
 
   // Then deny specific paths
+  const denyFilters = new Set<string>()
   for (const pathPattern of config.denyOnly || []) {
     const normalizedPath = normalizePathForSandbox(pathPattern)
-
     if (normalizedPath === '/') deniesRoot = true
-
-    if (containsGlobChars(normalizedPath)) {
-      // Use regex matching for glob patterns
-      const regexPattern = globToRegex(normalizedPath)
-      rules.push(
-        `(deny file-read*`,
-        `  (regex ${escapePath(regexPattern)})`,
-        `  (with message "${logTag}"))`,
-      )
-    } else {
-      // Use subpath matching for literal paths
-      rules.push(
-        `(deny file-read*`,
-        `  (subpath ${escapePath(normalizedPath)})`,
-        `  (with message "${logTag}"))`,
-      )
-    }
+    denyFilters.add(pathFilter(normalizedPath))
   }
+  rules.push(...renderRule('deny', ['file-read*'], denyFilters, logTag))
 
   // (subpath "/") denies the root inode itself; allowWithinDeny subpaths don't
   // cover "/", so dyld aborts before exec. Re-allow the literal root so path
@@ -298,44 +278,33 @@ function generateReadRules(
 
   // Re-allow specific paths within denied regions (allowWithinDeny takes precedence)
   const allowedSubpaths: string[] = []
+  const allowFilters = new Set<string>()
   for (const pathPattern of config.allowWithinDeny || []) {
     // Non-glob spellings arrive slash-free from normalizePathForSandbox —
     // the nested-deny re-emit below matches by `subpath + '/'` prefix,
     // which a preserved trailing slash would defeat ('<dir>//').
     const normalizedPath = normalizePathForSandbox(pathPattern)
-
-    if (containsGlobChars(normalizedPath)) {
-      const regexPattern = globToRegex(normalizedPath)
-      rules.push(
-        `(allow file-read*`,
-        `  (regex ${escapePath(regexPattern)})`,
-        `  (with message "${logTag}"))`,
-      )
-    } else {
+    if (!containsGlobChars(normalizedPath)) {
       allowedSubpaths.push(normalizedPath)
-      rules.push(
-        `(allow file-read*`,
-        `  (subpath ${escapePath(normalizedPath)})`,
-        `  (with message "${logTag}"))`,
-      )
     }
+    allowFilters.add(pathFilter(normalizedPath))
   }
+  rules.push(...renderRule('allow', ['file-read*'], allowFilters, logTag))
+
   // A literal denyOnly path nested inside a literal allowWithinDeny subpath
   // would otherwise be re-allowed (last-match-wins). Re-emit it so the
   // more-specific deny lands last. Glob denies aren't re-emitted: nesting
   // of regex-vs-subpath isn't decidable here, and the schema's denyReadAlways
   // is the explicit lever for that case.
+  const nestedDenyFilters = new Set<string>()
   for (const denyPath of config.denyOnly || []) {
     if (containsGlobChars(denyPath)) continue
     const normalized = normalizePathForSandbox(denyPath)
     if (allowedSubpaths.some(a => normalized.startsWith(a + '/'))) {
-      rules.push(
-        `(deny file-read*`,
-        `  (subpath ${escapePath(normalized)})`,
-        `  (with message "${logTag}"))`,
-      )
+      nestedDenyFilters.add(pathFilter(normalized))
     }
   }
+  rules.push(...renderRule('deny', ['file-read*'], nestedDenyFilters, logTag))
 
   // Allow stat/lstat on all directories so that realpath() can traverse
   // path components within denied regions. Without this, C realpath() fails
@@ -364,28 +333,18 @@ function generateReadRules(
   // generateMoveBlockingRules() runs later in the profile and re-denies
   // file-write-unlink for those paths (Seatbelt uses last-match-wins). This
   // depends on read rules being emitted before write rules in generateSandboxProfile().
-  if (writeAllowPaths && writeAllowPaths.length > 0) {
-    for (const pathPattern of writeAllowPaths) {
-      const normalizedPath = normalizePathForSandbox(pathPattern)
-
-      for (const op of ['file-write-unlink', 'file-write-create'] as const) {
-        if (containsGlobChars(normalizedPath)) {
-          const regexPattern = globToRegex(normalizedPath)
-          rules.push(
-            `(allow ${op}`,
-            `  (regex ${escapePath(regexPattern)})`,
-            `  (with message "${logTag}"))`,
-          )
-        } else {
-          rules.push(
-            `(allow ${op}`,
-            `  (subpath ${escapePath(normalizedPath)})`,
-            `  (with message "${logTag}"))`,
-          )
-        }
-      }
-    }
+  const writeAllowFilters = new Set<string>()
+  for (const pathPattern of writeAllowPaths || []) {
+    writeAllowFilters.add(pathFilter(normalizePathForSandbox(pathPattern)))
   }
+  rules.push(
+    ...renderRule(
+      'allow',
+      ['file-write-unlink', 'file-write-create'],
+      writeAllowFilters,
+      logTag,
+    ),
+  )
 
   return rules
 }
@@ -405,26 +364,11 @@ function generateWriteRules(
   const rules: string[] = []
 
   // Generate allow rules
+  const allowFilters = new Set<string>()
   for (const pathPattern of config.allowOnly || []) {
-    const normalizedPath = normalizePathForSandbox(pathPattern)
-
-    if (containsGlobChars(normalizedPath)) {
-      // Use regex matching for glob patterns
-      const regexPattern = globToRegex(normalizedPath)
-      rules.push(
-        `(allow file-write*`,
-        `  (regex ${escapePath(regexPattern)})`,
-        `  (with message "${logTag}"))`,
-      )
-    } else {
-      // Use subpath matching for literal paths
-      rules.push(
-        `(allow file-write*`,
-        `  (subpath ${escapePath(normalizedPath)})`,
-        `  (with message "${logTag}"))`,
-      )
-    }
+    allowFilters.add(pathFilter(normalizePathForSandbox(pathPattern)))
   }
+  rules.push(...renderRule('allow', ['file-write*'], allowFilters, logTag))
 
   // Combine user-specified and mandatory deny patterns (no ripgrep needed on macOS)
   const denyPaths = [
@@ -432,26 +376,11 @@ function generateWriteRules(
     ...macGetMandatoryDenyPatterns(allowGitConfig),
   ]
 
+  const denyFilters = new Set<string>()
   for (const pathPattern of denyPaths) {
-    const normalizedPath = normalizePathForSandbox(pathPattern)
-
-    if (containsGlobChars(normalizedPath)) {
-      // Use regex matching for glob patterns
-      const regexPattern = globToRegex(normalizedPath)
-      rules.push(
-        `(deny file-write*`,
-        `  (regex ${escapePath(regexPattern)})`,
-        `  (with message "${logTag}"))`,
-      )
-    } else {
-      // Use subpath matching for literal paths
-      rules.push(
-        `(deny file-write*`,
-        `  (subpath ${escapePath(normalizedPath)})`,
-        `  (with message "${logTag}"))`,
-      )
-    }
+    denyFilters.add(pathFilter(normalizePathForSandbox(pathPattern)))
   }
+  rules.push(...renderRule('deny', ['file-write*'], denyFilters, logTag))
 
   // Block file movement to prevent bypass via mv/rename
   rules.push(...generateMoveBlockingRules(denyPaths, logTag))
