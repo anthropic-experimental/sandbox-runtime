@@ -329,6 +329,24 @@ export function normalizePathForSandbox(pathPattern: string): string {
       return path.win32.normalize(pathPattern)
     }
   }
+  // POSIX: strip trailing slashes from non-glob spellings before any
+  // resolution. Consumers on the Linux and macOS paths compare spellings by
+  // exact match and `path + '/'` prefixes — which a preserved slash silently
+  // defeats ('<dir>//') — and the realpath-acceptance checks below treat a
+  // slash-only difference as a mismatch. bwrap binds and sbpl subpath
+  // filters treat 'dir' and 'dir/' identically, so only the comparisons
+  // change. Glob spellings are left untouched: a slash after a glob segment
+  // is semantic ('/x/*/' compiles to a different regex than '/x/*'). On
+  // Windows a trailing separator is the directory marker for absent deny
+  // targets (srt#404) and must survive.
+  if (
+    getPlatform() !== 'windows' &&
+    pathPattern.endsWith('/') &&
+    pathPattern !== '/' &&
+    !containsGlobCharsForPlatform(pathPattern)
+  ) {
+    pathPattern = pathPattern.replace(/\/+$/, '') || '/'
+  }
   let normalizedPath = expandTilde(pathPattern)
 
   if (normalizedPath !== pathPattern) {
