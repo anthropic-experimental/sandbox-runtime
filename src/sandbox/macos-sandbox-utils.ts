@@ -24,6 +24,15 @@ import type { IgnoreViolationsConfig } from './sandbox-config.js'
 
 export interface MacOSSandboxParams {
   command: string
+  /**
+   * Attribution key for this invocation: the string encoded into the
+   * seatbelt log tag and the proxy username, and reported as the
+   * violation's `command`. Defaults to `command`. Set it when the string
+   * you execute differs from the one you will later look violations up by
+   * (e.g. you wrap an assembled `source snapshot && eval '<cmd>'` but query
+   * `getViolationsForCommand('<cmd>')`).
+   */
+  commandLabel?: string
   needsNetworkRestriction: boolean
   httpProxyPort?: number
   socksProxyPort?: number
@@ -792,6 +801,7 @@ export function wrapCommandWithSandboxMacOS(
 ): string {
   const {
     command,
+    commandLabel,
     needsNetworkRestriction,
     httpProxyPort,
     socksProxyPort,
@@ -855,7 +865,11 @@ export function wrapCommandWithSandboxMacOS(
     return command
   }
 
-  const logTag = generateLogTag(command)
+  // Both correlation carriers (seatbelt log tag, proxy username) encode
+  // the attribution key, which is the caller's commandLabel when the
+  // executed string differs from the one violations are looked up by.
+  const attributionCommand = commandLabel ?? command
+  const logTag = generateLogTag(attributionCommand)
 
   const profile = generateSandboxProfile({
     readConfig,
@@ -881,7 +895,7 @@ export function wrapCommandWithSandboxMacOS(
     caCertPath,
     proxyAuthToken,
     writeConfig === undefined,
-    encodeSandboxedCommand(command),
+    encodeSandboxedCommand(attributionCommand),
   )
 
   // Seatbelt's (remote ip "localhost:*") filter — used for the

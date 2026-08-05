@@ -199,8 +199,13 @@ function recordProxyViolation(
   line: string,
   encodedCommand: string | undefined,
 ): void {
+  // The proxy username is client-supplied inside the sandbox (only the
+  // password is authenticated), so the decoded command is untrusted bytes:
+  // strip control characters so a forged suffix can't inject newlines or
+  // escape sequences into whatever renders `command`.
   const command = encodedCommand
-    ? decodeSandboxedCommand(encodedCommand)
+    ? // eslint-disable-next-line no-control-regex -- stripping control chars is the point
+      decodeSandboxedCommand(encodedCommand).replace(/[\x00-\x1f\x7f]+/g, ' ')
     : undefined
   // Same suppression the seatbelt / seccomp monitors apply, so a
   // configured ignoreViolations pattern silences the event no matter
@@ -1400,13 +1405,35 @@ async function waitForNetworkInitialization(): Promise<boolean> {
   return managerContext !== undefined
 }
 
+/**
+ * Per-invocation options for {@link wrapWithSandbox} /
+ * {@link wrapWithSandboxArgv} that aren't sandbox *policy* (that's
+ * `customConfig`).
+ */
+export type WrapWithSandboxOptions = {
+  /**
+   * Attribution key for this invocation. Violations observed while it runs
+   * (seatbelt log lines, seccomp events, proxy denies) are stored under this
+   * string, so it must equal what you later pass to
+   * `annotateStderrWithSandboxFailures` / `getViolationsForCommand`. Defaults
+   * to `command`. Set it when the string you execute is not the string you
+   * look up by — e.g. an embedder that wraps an assembled
+   * `source <snapshot> && eval '<cmd>'` but queries by the raw `<cmd>`;
+   * otherwise the lookup key never matches the stored one and no
+   * <sandbox_violations> block is ever produced.
+   */
+  commandLabel?: string
+}
+
 async function wrapWithSandbox(
   command: string,
   binShell?: string,
   customConfig?: Partial<SandboxRuntimeConfig>,
   abortSignal?: AbortSignal,
+  options?: WrapWithSandboxOptions,
 ): Promise<string> {
   const platform = getPlatform()
+  const commandLabel = options?.commandLabel
 
   // filesystem.disabled bypasses ALL filesystem rule generation. Both
   // platform wrappers treat readConfig/writeConfig === undefined as "no
@@ -1538,6 +1565,7 @@ async function wrapWithSandbox(
       // macOS sandbox profile supports glob patterns directly, no ripgrep needed
       return wrapCommandWithSandboxMacOS({
         command,
+        commandLabel,
         needsNetworkRestriction,
         // Only pass proxy ports if proxy is running (when there are domains to filter)
         httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
@@ -1565,6 +1593,7 @@ async function wrapWithSandbox(
     case 'linux':
       return wrapCommandWithSandboxLinux({
         command,
+        commandLabel,
         needsNetworkRestriction,
         // Only pass socket paths if proxy is running (when there are domains to filter)
         httpSocketPath: needsNetworkProxy
@@ -1647,6 +1676,7 @@ async function wrapWithSandboxArgv(
   customConfig?: Partial<SandboxRuntimeConfig>,
   abortSignal?: AbortSignal,
   cwd?: string,
+  options?: WrapWithSandboxOptions,
 ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }> {
   const platform = getPlatform()
 
@@ -1723,6 +1753,7 @@ async function wrapWithSandboxArgv(
     // via `computeWindowsFsAccessSet`.
     return wrapCommandWithSandboxWindows({
       command,
+      commandLabel: options?.commandLabel,
       httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
       socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
       proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
@@ -1761,6 +1792,7 @@ async function wrapWithSandboxArgv(
     binShell,
     customConfig,
     abortSignal,
+    options,
   )
   const shell = binShell ?? '/bin/bash'
   return { argv: [shell, '-c', wrapped], env: process.env }
@@ -2188,6 +2220,7 @@ export interface ISandboxManager {
     binShell?: string,
     customConfig?: Partial<SandboxRuntimeConfig>,
     abortSignal?: AbortSignal,
+    options?: WrapWithSandboxOptions,
   ): Promise<string>
   wrapWithSandboxArgv(
     command: string,
@@ -2195,6 +2228,7 @@ export interface ISandboxManager {
     customConfig?: Partial<SandboxRuntimeConfig>,
     abortSignal?: AbortSignal,
     cwd?: string,
+    options?: WrapWithSandboxOptions,
   ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }>
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string

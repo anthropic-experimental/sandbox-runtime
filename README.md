@@ -215,6 +215,20 @@ child.on('exit', async code => {
 })
 ```
 
+**Violation attribution (`commandLabel`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key derived from the command string, and `annotateStderrWithSandboxFailures(cmd, stderr)` / `getViolationsForCommand(cmd)` look them up by that same key. If the string you *execute* is not the string you *look up by* — e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'` but query by the raw `<cmd>` — pass the lookup string as `commandLabel` so the two keys match; otherwise no `<sandbox_violations>` block is ever produced:
+
+```typescript
+const wrapped = await SandboxManager.wrapWithSandbox(
+  assembledCommand, // what actually runs
+  undefined,
+  undefined,
+  undefined,
+  { commandLabel: rawCommand }, // what you'll look violations up by
+)
+// ... run it ...
+const annotated = SandboxManager.annotateStderrWithSandboxFailures(rawCommand, stderr)
+```
+
 #### Available exports
 
 ```typescript
