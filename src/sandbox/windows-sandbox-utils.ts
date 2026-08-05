@@ -354,6 +354,9 @@ export function parseWindowsBinShell(
 
 export interface WindowsSandboxParams {
   command: string
+  /** Attribution key encoded for violation correlation; defaults to
+   *  `command`. See MacOSSandboxParams.commandLabel. */
+  commandLabel?: string
   /**
    * JS HTTP proxy port — fed to `generateProxyEnvVars` for the env
    * overlay. With the in-process proxy this is the mux front-end
@@ -2018,7 +2021,7 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
       p.caCertPath?.replace(/\\/g, '/'),
       p.proxyAuthToken,
       undefined,
-      encodeSandboxedCommand(p.command),
+      encodeSandboxedCommand(p.commandLabel ?? p.command),
     ),
   )
   // TMPDIR is a POSIX path meant for the macOS/Linux FS sandbox — it
