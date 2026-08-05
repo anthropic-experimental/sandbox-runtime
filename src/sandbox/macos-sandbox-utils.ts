@@ -34,6 +34,8 @@ export interface MacOSSandboxParams {
    */
   commandId?: string
   needsNetworkRestriction: boolean
+  /** Explicit host IP networking while retaining Unix-socket policy. */
+  hostNetwork?: boolean
   httpProxyPort?: number
   socksProxyPort?: number
   /** Per-session proxy auth token; embedded in proxy env URLs. */
@@ -388,6 +390,30 @@ function generateWriteRules(
   return rules
 }
 
+function generateUnixSocketRules(
+  allowUnixSockets: string[] | undefined,
+  allowAllUnixSockets: boolean | undefined,
+): string[] {
+  if (allowAllUnixSockets) {
+    return [
+      '(allow system-socket (socket-domain AF_UNIX))',
+      '(allow network-bind (local unix-socket (path-regex #"^/")))',
+      '(allow network-outbound (remote unix-socket (path-regex #"^/")))',
+    ]
+  }
+  if (!allowUnixSockets || allowUnixSockets.length === 0) return []
+  return [
+    '(allow system-socket (socket-domain AF_UNIX))',
+    ...allowUnixSockets.flatMap(socketPath => {
+      const normalizedPath = normalizePathForSandbox(socketPath)
+      return [
+        `(allow network-bind (local unix-socket (subpath ${escapePath(normalizedPath)})))`,
+        `(allow network-outbound (remote unix-socket (subpath ${escapePath(normalizedPath)})))`,
+      ]
+    }),
+  ]
+}
+
 /**
  * Generate complete sandbox profile
  */
@@ -397,6 +423,7 @@ function generateSandboxProfile({
   httpProxyPort,
   socksProxyPort,
   needsNetworkRestriction,
+  hostNetwork,
   allowUnixSockets,
   allowAllUnixSockets,
   allowLocalBinding,
@@ -412,6 +439,7 @@ function generateSandboxProfile({
   httpProxyPort?: number
   socksProxyPort?: number
   needsNetworkRestriction: boolean
+  hostNetwork?: boolean
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
@@ -598,7 +626,18 @@ function generateSandboxProfile({
 
   // Network rules
   profile.push('; Network')
-  if (!needsNetworkRestriction) {
+  if (hostNetwork) {
+    // Normal host IP semantics without granting Unix-domain IPC. The Unix
+    // socket rules below remain an independent explicit allowlist.
+    profile.push('(allow system-socket (socket-domain AF_INET))')
+    profile.push('(allow system-socket (socket-domain AF_INET6))')
+    profile.push('(allow network-bind (local ip "*:*"))')
+    profile.push('(allow network-inbound (local ip "*:*"))')
+    profile.push('(allow network-outbound (remote ip "*:*"))')
+    profile.push(
+      ...generateUnixSocketRules(allowUnixSockets, allowAllUnixSockets),
+    )
+  } else if (!needsNetworkRestriction) {
     profile.push('(allow network*)')
   } else {
     // Allow local binding if requested.
@@ -626,37 +665,10 @@ function generateSandboxProfile({
       profile.push('(allow network-inbound (local ip "*:*"))')
       profile.push('(allow network-outbound (remote ip "localhost:*"))')
     }
-    // Unix domain sockets for local IPC (SSH agent, Docker, Gradle, etc.)
-    // Three separate operations must be allowed:
-    // 1. system-socket: socket(AF_UNIX, ...) syscall — creates the socket fd (no path context)
-    // 2. network-bind: bind() to a local Unix socket path
-    // 3. network-outbound: connect() to a remote Unix socket path
-    // Note: (subpath ...) and (path-regex ...) are path-based filters that can only match
-    // bind/connect operations — socket() creation has no path, so it requires system-socket.
-    if (allowAllUnixSockets) {
-      // Allow creating AF_UNIX sockets and all Unix socket paths
-      profile.push('(allow system-socket (socket-domain AF_UNIX))')
-      profile.push(
-        '(allow network-bind (local unix-socket (path-regex #"^/")))',
-      )
-      profile.push(
-        '(allow network-outbound (remote unix-socket (path-regex #"^/")))',
-      )
-    } else if (allowUnixSockets && allowUnixSockets.length > 0) {
-      // Allow creating AF_UNIX sockets (required for any Unix socket use)
-      profile.push('(allow system-socket (socket-domain AF_UNIX))')
-      // Allow specific Unix socket paths
-      for (const socketPath of allowUnixSockets) {
-        const normalizedPath = normalizePathForSandbox(socketPath)
-        profile.push(
-          `(allow network-bind (local unix-socket (subpath ${escapePath(normalizedPath)})))`,
-        )
-        profile.push(
-          `(allow network-outbound (remote unix-socket (subpath ${escapePath(normalizedPath)})))`,
-        )
-      }
-    }
-    // If both allowAllUnixSockets and allowUnixSockets are false/undefined/empty, Unix sockets are blocked by default
+    // Unix-domain IPC remains an independent explicit allowlist.
+    profile.push(
+      ...generateUnixSocketRules(allowUnixSockets, allowAllUnixSockets),
+    )
 
     // Allow localhost TCP operations for the HTTP proxy
     if (httpProxyPort !== undefined) {
@@ -735,6 +747,7 @@ export function wrapCommandWithSandboxMacOS(
     command,
     commandId,
     needsNetworkRestriction,
+    hostNetwork,
     httpProxyPort,
     socksProxyPort,
     proxyAuthToken,
@@ -789,6 +802,7 @@ export function wrapCommandWithSandboxMacOS(
   // No sandboxing needed
   if (
     !needsNetworkRestriction &&
+    !hostNetwork &&
     !hasReadRestrictions &&
     !hasWriteRestrictions &&
     !hasEnvRestrictions &&
@@ -809,6 +823,7 @@ export function wrapCommandWithSandboxMacOS(
     httpProxyPort,
     socksProxyPort,
     needsNetworkRestriction,
+    hostNetwork,
     allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,

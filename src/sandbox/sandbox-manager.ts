@@ -27,6 +27,7 @@ import { whichSync } from '../utils/which.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
 import { randomBytes } from 'node:crypto'
+import { SandboxRuntimeConfigSchema } from './sandbox-config.js'
 import type {
   CredentialsConfig,
   SandboxRuntimeConfig,
@@ -121,7 +122,9 @@ let httpProxyServer: ReturnType<typeof createHttpProxyServer> | undefined
 let socksProxyServer: SocksProxyWrapper | undefined
 let muxProxyServer: MuxProxyServer | undefined
 let managerContext: HostNetworkManagerContext | undefined
-let initializationPromise: Promise<HostNetworkManagerContext> | undefined
+let initializationPromise:
+  | Promise<HostNetworkManagerContext | undefined>
+  | undefined
 let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
 let linuxMonitor: LinuxViolationMonitor | undefined
@@ -572,12 +575,20 @@ async function initialize(
     return
   }
 
-  // Store config for use by other functions
+  runtimeConfig = SandboxRuntimeConfigSchema.parse(runtimeConfig)
+  const hostNetwork = runtimeConfig.network.hostNetwork === true
+  if (hostNetwork && getPlatform() === 'windows') {
+    throw new Error(
+      'network.hostNetwork is unsupported on Windows because the sandbox user is fenced by install-time WFP policy',
+    )
+  }
   config = runtimeConfig
 
   // Resolve parent/upstream proxy from config or HTTP_PROXY env before we
   // start our own listeners (which will later shadow those vars in the child).
-  parentProxy = resolveParentProxy(runtimeConfig.network.parentProxy)
+  parentProxy = hostNetwork
+    ? undefined
+    : resolveParentProxy(runtimeConfig.network.parentProxy)
   if (parentProxy) {
     logForDebugging(
       `Parent proxy configured: http=${redactUrl(parentProxy.httpUrl)} ` +
@@ -823,6 +834,14 @@ async function initialize(
       config = undefined
       throw e
     }
+  }
+
+  // Host-network mode retains filesystem and Unix-socket sandboxing but
+  // needs no proxy process or Linux network bridge.
+  if (hostNetwork) {
+    initializationPromise = Promise.resolve(undefined)
+    await initializationPromise
+    return
   }
 
   // Initialize network infrastructure
@@ -1326,7 +1345,7 @@ function sameWindowsStampSet(newConfig: SandboxRuntimeConfig): boolean {
 }
 
 function getNetworkRestrictionConfig(): NetworkRestrictionConfig {
-  if (!config) {
+  if (!config || config.network.hostNetwork) {
     return {}
   }
 
@@ -1586,9 +1605,28 @@ async function wrapWithSandbox(
   // 1. customConfig has network.allowedDomains defined (even if empty array = block all)
   // 2. OR config has network.allowedDomains defined (even if empty array = block all)
   // An empty allowedDomains array means "no domains allowed" = block all network access
+  const hostNetwork = config?.network.hostNetwork === true
+  if (
+    customConfig?.network?.hostNetwork !== undefined &&
+    customConfig.network.hostNetwork !== hostNetwork
+  ) {
+    throw new Error(
+      'network.hostNetwork is fixed at initialize(); call reset() before changing it',
+    )
+  }
+  if (
+    hostNetwork &&
+    (customConfig?.network?.allowedDomains?.length ||
+      customConfig?.network?.deniedDomains?.length)
+  ) {
+    throw new Error(
+      'Per-command domain filtering cannot be combined with network.hostNetwork',
+    )
+  }
   const hasNetworkConfig =
-    customConfig?.network?.allowedDomains !== undefined ||
-    config?.network?.allowedDomains !== undefined
+    !hostNetwork &&
+    (customConfig?.network?.allowedDomains !== undefined ||
+      config?.network?.allowedDomains !== undefined)
 
   // Network RESTRICTION is needed whenever network config is specified
   // This includes empty allowedDomains which means "block all network"
@@ -1617,6 +1655,7 @@ async function wrapWithSandbox(
         command,
         commandId,
         needsNetworkRestriction,
+        hostNetwork,
         // Only pass proxy ports if proxy is running (when there are domains to filter)
         httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
         socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
@@ -1877,10 +1916,25 @@ function getConfig(): SandboxRuntimeConfig | undefined {
  * @param newConfig - The new configuration to use
  */
 function updateConfig(newConfig: SandboxRuntimeConfig): void {
+  const validatedConfig = SandboxRuntimeConfigSchema.parse(newConfig)
+  if (validatedConfig.network.hostNetwork && getPlatform() === 'windows') {
+    throw new Error(
+      'network.hostNetwork is unsupported on Windows because the sandbox user is fenced by install-time WFP policy',
+    )
+  }
+  if (
+    config &&
+    (config.network.hostNetwork === true) !==
+      (validatedConfig.network.hostNetwork === true)
+  ) {
+    throw new Error(
+      'network.hostNetwork cannot be changed live; call reset() and initialize() again',
+    )
+  }
   if (
     getPlatform() === 'windows' &&
     config &&
-    !sameWindowsStampSet(newConfig)
+    !sameWindowsStampSet(validatedConfig)
   ) {
     logForDebugging(
       `[Sandbox Windows] updateConfig: the resolved file-access set ` +
@@ -1893,14 +1947,16 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
   // Deep clone the config to avoid mutations. structuredClone cannot clone
   // functions, so pull filterRequest out, clone the rest, and put it back —
   // a function reference is immutable in the sense that matters here.
-  const { filterRequest, ...rest } = newConfig.network
-  config = structuredClone({ ...newConfig, network: rest })
+  const { filterRequest, ...rest } = validatedConfig.network
+  config = structuredClone({ ...validatedConfig, network: rest })
   config.network.filterRequest = filterRequest
   // Re-resolve parent proxy so hot-reload picks up changes. Note: the proxy
   // servers capture `parentProxy` by value at creation, so changes here take
   // effect only on re-initialize. This keeps the state consistent for the
   // next initialize() call.
-  parentProxy = resolveParentProxy(newConfig.network.parentProxy)
+  parentProxy = validatedConfig.network.hostNetwork
+    ? undefined
+    : resolveParentProxy(validatedConfig.network.parentProxy)
   logForDebugging('Sandbox configuration updated')
 }
 

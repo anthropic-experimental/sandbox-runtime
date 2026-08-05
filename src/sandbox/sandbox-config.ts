@@ -684,6 +684,14 @@ export const CredentialsConfigSchema = z
  * Network configuration schema for validation
  */
 export const NetworkConfigSchema = z.object({
+  hostNetwork: z
+    .boolean()
+    .optional()
+    .describe(
+      'Use the host IP network directly instead of an isolated namespace and HTTP/SOCKS proxies. ' +
+        'This disables destination filtering and permits raw TCP/UDP, loopback, and local listeners. ' +
+        'Filesystem and Unix-socket policy remain active. Unsupported on Windows. Default: false.',
+    ),
   allowedDomains: z
     .array(domainPortPatternSchema)
     .describe(
@@ -1111,6 +1119,55 @@ export const SandboxRuntimeConfigSchema = z
   })
   .superRefine((cfg, ctx) => {
     const creds = cfg.credentials
+    if (cfg.network.hostNetwork) {
+      const incompatible: Array<[string, boolean]> = [
+        ['allowedDomains', cfg.network.allowedDomains.length > 0],
+        ['deniedDomains', cfg.network.deniedDomains.length > 0],
+        ['deniedDomainReasons', cfg.network.deniedDomainReasons !== undefined],
+        ['strictAllowlist', cfg.network.strictAllowlist !== undefined],
+        ['allowLocalBinding', cfg.network.allowLocalBinding !== undefined],
+        ['httpProxyPort', cfg.network.httpProxyPort !== undefined],
+        ['socksProxyPort', cfg.network.socksProxyPort !== undefined],
+        ['mitmProxy', cfg.network.mitmProxy !== undefined],
+        ['filterRequest', cfg.network.filterRequest !== undefined],
+        ['tlsTerminate', cfg.network.tlsTerminate !== undefined],
+        ['parentProxy', cfg.network.parentProxy !== undefined],
+      ]
+      for (const [field, present] of incompatible) {
+        if (!present) continue
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['network', field],
+          message: `${field} cannot be combined with network.hostNetwork because host networking bypasses proxy filtering`,
+        })
+      }
+      for (const [kind, entries] of [
+        ['envVars', creds?.envVars ?? []],
+        ['files', creds?.files ?? []],
+      ] as const) {
+        for (const [index, entry] of entries.entries()) {
+          if (entry.mode !== 'mask') continue
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['credentials', kind, index, 'mode'],
+            message:
+              'Credential masking cannot be combined with network.hostNetwork because substitution requires the terminating proxy',
+          })
+        }
+      }
+      if (
+        creds?.awsPairs?.length ||
+        creds?.allowPlaintextInject ||
+        creds?.sigv4
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['credentials'],
+          message:
+            'Proxy credential injection and SigV4 rewriting cannot be combined with network.hostNetwork',
+        })
+      }
+    }
     if (!creds) return
 
     // Every per-entry injectHosts pattern must be reachable via
