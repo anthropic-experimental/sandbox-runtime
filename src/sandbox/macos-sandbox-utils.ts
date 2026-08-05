@@ -289,6 +289,9 @@ function generateReadRules(
   // Re-allow specific paths within denied regions (allowWithinDeny takes precedence)
   const allowedSubpaths: string[] = []
   for (const pathPattern of config.allowWithinDeny || []) {
+    // Non-glob spellings arrive slash-free from normalizePathForSandbox —
+    // the nested-deny re-emit below matches by `subpath + '/'` prefix,
+    // which a preserved trailing slash would defeat ('<dir>//').
     const normalizedPath = normalizePathForSandbox(pathPattern)
 
     if (containsGlobChars(normalizedPath)) {

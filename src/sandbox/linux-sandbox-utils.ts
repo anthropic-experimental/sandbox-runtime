@@ -1158,7 +1158,10 @@ async function generateFilesystemArgs(
   }
   // denyWriteArgs is emitted after the denyRead loop below.
 
-  // Handle read restrictions by mounting tmpfs over denied paths
+  // Handle read restrictions by mounting tmpfs over denied paths.
+  // Non-glob spellings arrive slash-free from normalizePathForSandbox — the
+  // comparisons below (hidden-by-tmpfs prefixes, the exact-match allowRead
+  // skip, pushReadDenyDirMounts' re-bind checks) depend on that.
   const readDenyPaths: string[] = []
   const readAllowPaths = (readConfig?.allowWithinDeny || []).map(p =>
     normalizePathForSandbox(p),
