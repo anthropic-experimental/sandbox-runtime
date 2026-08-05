@@ -32,7 +32,7 @@ export interface MacOSSandboxParams {
    * (e.g. you wrap an assembled `source snapshot && eval '<cmd>'` but query
    * `getViolationsForCommand('<cmd>')`).
    */
-  commandLabel?: string
+  commandId?: string
   needsNetworkRestriction: boolean
   httpProxyPort?: number
   socksProxyPort?: number
@@ -804,7 +804,7 @@ export function wrapCommandWithSandboxMacOS(
 ): string {
   const {
     command,
-    commandLabel,
+    commandId,
     needsNetworkRestriction,
     httpProxyPort,
     socksProxyPort,
@@ -869,9 +869,9 @@ export function wrapCommandWithSandboxMacOS(
   }
 
   // Both correlation carriers (seatbelt log tag, proxy username) encode
-  // the attribution key, which is the caller's commandLabel when the
+  // the attribution key, which is the caller's commandId when the
   // executed string differs from the one violations are looked up by.
-  const attributionCommand = commandLabel ?? command
+  const attributionCommand = commandId ?? command
   const logTag = generateLogTag(attributionCommand)
 
   const profile = generateSandboxProfile({
@@ -996,6 +996,10 @@ export function wrapCommandWithSandboxMacOS(
 export function startMacOSSandboxLogMonitor(
   callback: SandboxViolationCallback,
   ignoreViolations?: IgnoreViolationsConfig,
+  /** Map a decoded attribution key (commandId) to the command text it
+   *  represents; identity when omitted. Applied before ignoreViolations
+   *  matching and before the event's `command` is set. */
+  resolveCommandText: (decodedId: string) => string = id => id,
 ): () => void {
   // Pre-compile regex patterns for better performance
   const cmdExtractRegex = /CMD64_(.+?)_END/
@@ -1036,7 +1040,7 @@ export function startMacOSSandboxLogMonitor(
       encodedCommand = cmdMatch?.[1]
       if (encodedCommand) {
         try {
-          command = decodeSandboxedCommand(encodedCommand)
+          command = resolveCommandText(decodeSandboxedCommand(encodedCommand))
         } catch {
           // Failed to decode, continue without command
         }

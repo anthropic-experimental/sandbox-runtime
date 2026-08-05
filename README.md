@@ -215,7 +215,7 @@ child.on('exit', async code => {
 })
 ```
 
-**Violation attribution (`commandLabel`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key derived from the command string, and `annotateStderrWithSandboxFailures(cmd, stderr)` / `getViolationsForCommand(cmd)` look them up by that same key. If the string you *execute* is not the string you *look up by* — e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'` but query by the raw `<cmd>` — pass the lookup string as `commandLabel` so the two keys match; otherwise no `<sandbox_violations>` block is ever produced:
+**Violation attribution (`commandId` / `commandText`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key, and `annotateStderrWithSandboxFailures(key, stderr)` / `getViolationsForCommand(key)` look them up by that same key. By default the key is the wrapped string itself. Pass an opaque per-invocation `commandId` (e.g. a tool-use id) to key by that instead — recommended: keys compare on their first 100 characters, so long commands sharing a prefix would otherwise cross-attribute, and a rerun of the same text would inherit the earlier run's events. If the string you *execute* is not the command the invocation *represents* (e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'`), also pass `commandText: '<cmd>'`: it is what `ignoreViolations` command patterns match against and what each violation reports as its `command`.
 
 ```typescript
 const wrapped = await SandboxManager.wrapWithSandbox(
@@ -223,10 +223,10 @@ const wrapped = await SandboxManager.wrapWithSandbox(
   undefined,
   undefined,
   undefined,
-  { commandLabel: rawCommand }, // what you'll look violations up by
+  { commandId: invocationId, commandText: rawCommand },
 )
 // ... run it ...
-const annotated = SandboxManager.annotateStderrWithSandboxFailures(rawCommand, stderr)
+const annotated = SandboxManager.annotateStderrWithSandboxFailures(invocationId, stderr)
 ```
 
 #### Available exports
