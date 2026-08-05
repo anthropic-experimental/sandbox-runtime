@@ -37,8 +37,8 @@ export interface LinuxNetworkBridgeContext {
 export interface LinuxSandboxParams {
   command: string
   /** Attribution key encoded for violation correlation; defaults to
-   *  `command`. See MacOSSandboxParams.commandLabel. */
-  commandLabel?: string
+   *  `command`. See MacOSSandboxParams.commandId. */
+  commandId?: string
   needsNetworkRestriction: boolean
   httpSocketPath?: string
   socksSocketPath?: string
@@ -1682,7 +1682,7 @@ export async function wrapCommandWithSandboxLinux(
 ): Promise<string> {
   const {
     command,
-    commandLabel,
+    commandId,
     needsNetworkRestriction,
     httpSocketPath,
     socksSocketPath,
@@ -1783,7 +1783,7 @@ export async function wrapCommandWithSandboxLinux(
         bwrapArgs.push(
           '--setenv',
           'SRT_ENCODED_CMD',
-          encodeSandboxedCommand(commandLabel ?? command),
+          encodeSandboxedCommand(commandId ?? command),
         )
       } else {
         logForDebugging(
@@ -1868,7 +1868,7 @@ export async function wrapCommandWithSandboxLinux(
           caCertPath,
           proxyAuthToken,
           writeConfig === undefined,
-          encodeSandboxedCommand(commandLabel ?? command),
+          encodeSandboxedCommand(commandId ?? command),
         )
         bwrapArgs.push(
           ...proxyEnv.flatMap((env: string) => {
