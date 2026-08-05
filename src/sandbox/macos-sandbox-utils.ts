@@ -125,14 +125,6 @@ function generateLogTag(command: string): string {
 }
 
 /**
- * SBPL variable the profile binds to the log tag. Every filesystem rule
- * reports the tag via `(with message …)`; referencing a variable instead of
- * repeating the ~160-byte literal keeps the profile, which is passed to
- * sandbox-exec in argv, small.
- */
-const LOG_TAG_VAR = 'log-tag'
-
-/**
  * SBPL path filter for a normalized path: `regex` for glob patterns,
  * `subpath` (the path and everything beneath it) otherwise.
  */
@@ -144,19 +136,21 @@ function pathFilter(normalizedPath: string): string {
 
 /**
  * Render one SBPL rule applying `action` for each of `operations` to any
- * path matching one of `filters`. Emits nothing for an empty filter set: a
- * rule with no filter would match every path.
+ * path matching one of `filters`, reporting `logTag` on a match. Emits
+ * nothing for an empty filter set: a rule with no filter would match every
+ * path.
  */
 function renderRule(
   action: 'allow' | 'deny',
   operations: readonly string[],
   filters: ReadonlySet<string>,
+  logTag: string,
 ): string[] {
   if (filters.size === 0) return []
   return [
     `(${action} ${operations.join(' ')}`,
     ...[...filters].map(f => `  ${f}`),
-    `  (with message ${LOG_TAG_VAR}))`,
+    `  (with message "${logTag}"))`,
   ]
 }
 
@@ -194,9 +188,13 @@ function getAncestorDirectories(pathStr: string): string[] {
  * filter both costs argv bytes and adds to sandbox-exec's compile time.
  *
  * @param pathPatterns - Array of path patterns to protect (can include globs)
+ * @param logTag - Log tag for sandbox violations
  * @returns Array of sandbox profile rule lines
  */
-function generateMoveBlockingRules(pathPatterns: string[]): string[] {
+function generateMoveBlockingRules(
+  pathPatterns: string[],
+  logTag: string,
+): string[] {
   const filters = new Set<string>()
 
   for (const pathPattern of pathPatterns) {
@@ -226,7 +224,12 @@ function generateMoveBlockingRules(pathPatterns: string[]): string[] {
     }
   }
 
-  return renderRule('deny', ['file-write-unlink', 'file-write-create'], filters)
+  return renderRule(
+    'deny',
+    ['file-write-unlink', 'file-write-create'],
+    filters,
+    logTag,
+  )
 }
 
 /**
@@ -244,6 +247,7 @@ function generateMoveBlockingRules(pathPatterns: string[]): string[] {
  */
 function generateReadRules(
   config: FsReadRestrictionConfig | undefined,
+  logTag: string,
   writeAllowPaths?: string[],
 ): string[] {
   if (!config) {
@@ -263,7 +267,7 @@ function generateReadRules(
     if (normalizedPath === '/') deniesRoot = true
     denyFilters.add(pathFilter(normalizedPath))
   }
-  rules.push(...renderRule('deny', ['file-read*'], denyFilters))
+  rules.push(...renderRule('deny', ['file-read*'], denyFilters, logTag))
 
   // (subpath "/") denies the root inode itself; allowWithinDeny subpaths don't
   // cover "/", so dyld aborts before exec. Re-allow the literal root so path
@@ -285,7 +289,7 @@ function generateReadRules(
     }
     allowFilters.add(pathFilter(normalizedPath))
   }
-  rules.push(...renderRule('allow', ['file-read*'], allowFilters))
+  rules.push(...renderRule('allow', ['file-read*'], allowFilters, logTag))
 
   // A literal denyOnly path nested inside a literal allowWithinDeny subpath
   // would otherwise be re-allowed (last-match-wins). Re-emit it so the
@@ -300,7 +304,7 @@ function generateReadRules(
       nestedDenyFilters.add(pathFilter(normalized))
     }
   }
-  rules.push(...renderRule('deny', ['file-read*'], nestedDenyFilters))
+  rules.push(...renderRule('deny', ['file-read*'], nestedDenyFilters, logTag))
 
   // Allow stat/lstat on all directories so that realpath() can traverse
   // path components within denied regions. Without this, C realpath() fails
@@ -313,7 +317,7 @@ function generateReadRules(
   }
 
   // Block file movement to prevent bypass via mv/rename
-  rules.push(...generateMoveBlockingRules(config.denyOnly || []))
+  rules.push(...generateMoveBlockingRules(config.denyOnly || [], logTag))
 
   // Re-allow file-write-unlink / file-write-create for paths that are explicitly
   // write-allowed. The move-blocking rules above emit broad
@@ -338,6 +342,7 @@ function generateReadRules(
       'allow',
       ['file-write-unlink', 'file-write-create'],
       writeAllowFilters,
+      logTag,
     ),
   )
 
@@ -349,6 +354,7 @@ function generateReadRules(
  */
 function generateWriteRules(
   config: FsWriteRestrictionConfig | undefined,
+  logTag: string,
   allowGitConfig = false,
 ): string[] {
   if (!config) {
@@ -362,7 +368,7 @@ function generateWriteRules(
   for (const pathPattern of config.allowOnly || []) {
     allowFilters.add(pathFilter(normalizePathForSandbox(pathPattern)))
   }
-  rules.push(...renderRule('allow', ['file-write*'], allowFilters))
+  rules.push(...renderRule('allow', ['file-write*'], allowFilters, logTag))
 
   // Combine user-specified and mandatory deny patterns (no ripgrep needed on macOS)
   const denyPaths = [
@@ -374,10 +380,10 @@ function generateWriteRules(
   for (const pathPattern of denyPaths) {
     denyFilters.add(pathFilter(normalizePathForSandbox(pathPattern)))
   }
-  rules.push(...renderRule('deny', ['file-write*'], denyFilters))
+  rules.push(...renderRule('deny', ['file-write*'], denyFilters, logTag))
 
   // Block file movement to prevent bypass via mv/rename
-  rules.push(...generateMoveBlockingRules(denyPaths))
+  rules.push(...generateMoveBlockingRules(denyPaths, logTag))
 
   return rules
 }
@@ -418,8 +424,9 @@ function generateSandboxProfile({
 }): string {
   const profile: string[] = [
     '(version 1)',
-    `(define ${LOG_TAG_VAR} ${escapePath(logTag)})`,
-    `(deny default (with message ${LOG_TAG_VAR}))`,
+    `(deny default (with message "${logTag}"))`,
+    '',
+    `; LogTag: ${logTag}`,
     '',
     '; Essential permissions - based on Chrome sandbox policy',
     '; Process permissions',
@@ -686,12 +693,12 @@ function generateSandboxProfile({
   // can be overridden for paths where file deletion should be permitted.
   const writeAllowPaths = writeConfig?.allowOnly
   profile.push('; File read')
-  profile.push(...generateReadRules(readConfig, writeAllowPaths))
+  profile.push(...generateReadRules(readConfig, logTag, writeAllowPaths))
   profile.push('')
 
   // Write rules
   profile.push('; File write')
-  profile.push(...generateWriteRules(writeConfig, allowGitConfig))
+  profile.push(...generateWriteRules(writeConfig, logTag, allowGitConfig))
 
   // Pseudo-terminal (pty) support
   if (allowPty) {

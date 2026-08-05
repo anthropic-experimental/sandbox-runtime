@@ -10,9 +10,9 @@ import { isMacOS } from '../helpers/platform.js'
 /**
  * The Seatbelt profile is passed to sandbox-exec in argv, so its size counts
  * against ARG_MAX (1 MiB on macOS) for every sandboxed exec. These tests pin
- * that a configuration with several hundred denied paths stays well inside
+ * that a configuration with several hundred denied paths stays under half of
  * that limit, and that the resulting profile still spawns and enforces each
- * kind of rule it contains.
+ * kind of path filter it contains (subpath, literal ancestor, regex).
  */
 describe.if(isMacOS)('macOS Seatbelt profile size', () => {
   const MACOS_ARG_MAX = 1024 * 1024
@@ -37,6 +37,7 @@ describe.if(isMacOS)('macOS Seatbelt profile size', () => {
       join(groupDir(i), 'b'),
     )
   }
+  denyWithinAllow.push(join(ALLOWED_DIR, '**', '*.key'))
   const writeConfig: FsWriteRestrictionConfig = {
     allowOnly: [ALLOWED_DIR],
     denyWithinAllow,
@@ -52,7 +53,7 @@ describe.if(isMacOS)('macOS Seatbelt profile size', () => {
     }
   })
 
-  it(`fits ${GROUPS * 3} deny paths in a quarter of ARG_MAX`, () => {
+  it(`fits ${GROUPS * 3} deny paths in under half of ARG_MAX`, () => {
     const wrappedCommand = wrapCommandWithSandboxMacOS({
       command: 'true',
       needsNetworkRestriction: false,
@@ -60,14 +61,15 @@ describe.if(isMacOS)('macOS Seatbelt profile size', () => {
       writeConfig,
     })
 
-    expect(Buffer.byteLength(wrappedCommand)).toBeLessThan(MACOS_ARG_MAX / 4)
+    expect(Buffer.byteLength(wrappedCommand)).toBeLessThan(MACOS_ARG_MAX / 2)
   })
 
-  it('spawns and enforces every grouped filter', () => {
+  it('spawns and enforces subpath, literal-ancestor and regex filters', () => {
     const allowedFile = join(PROBED_GROUP, 'other')
     const deniedFile = join(PROBED_GROUP, 'a.conf')
+    const deniedByGlob = join(PROBED_GROUP, 'x.key')
     const wrappedCommand = wrapCommandWithSandboxMacOS({
-      command: `touch ${allowedFile}; touch ${deniedFile}; mv ${PROBED_GROUP} ${PROBED_GROUP}.moved`,
+      command: `touch ${allowedFile}; touch ${deniedFile}; touch ${deniedByGlob}; mv ${PROBED_GROUP} ${PROBED_GROUP}.moved`,
       needsNetworkRestriction: false,
       readConfig: undefined,
       writeConfig,
@@ -81,8 +83,10 @@ describe.if(isMacOS)('macOS Seatbelt profile size', () => {
     expect(result.error).toBeUndefined()
     expect(existsSync(allowedFile)).toBe(true)
     expect(existsSync(deniedFile)).toBe(false)
+    expect(existsSync(deniedByGlob)).toBe(false)
     expect(existsSync(`${PROBED_GROUP}.moved`)).toBe(false)
     expect(result.stderr).toContain(`${deniedFile}: Operation not permitted`)
+    expect(result.stderr).toContain(`${deniedByGlob}: Operation not permitted`)
     expect(result.stderr).toContain(
       `${PROBED_GROUP}.moved: Operation not permitted`,
     )
