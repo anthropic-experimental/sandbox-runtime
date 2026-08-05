@@ -647,3 +647,78 @@ describe('rm in allowWrite under denyRead ancestor (issue #171)', () => {
     )
   })
 })
+
+describe('allowWrite nested inside allowRead under denyRead ancestor (issue #446)', () => {
+  // The nested sibling of #171/#190: there the write path EQUALS the read
+  // carve-out and the skip clause covers it. Here the write path is strictly
+  // deeper than a read carve-out that is itself inside a denyRead directory —
+  // the carve-out's ro-bind used to be emitted after the restored write bind
+  // and shadowed it, so the "allowed" write path was read-only in the jail.
+  const TEST_BASE_DIR = join(tmpdir(), 'rw-in-ro-in-deny-' + Date.now())
+  const TEST_PROJECT_DIR = join(TEST_BASE_DIR, 'project')
+  const TEST_STATE_DIR = join(TEST_PROJECT_DIR, 'state')
+
+  beforeAll(() => {
+    if (!isSupportedPlatform) return
+    mkdirSync(TEST_STATE_DIR, { recursive: true })
+    writeFileSync(join(TEST_PROJECT_DIR, 'readme.txt'), 'readable')
+  })
+
+  afterAll(() => {
+    if (existsSync(TEST_BASE_DIR)) {
+      rmSync(TEST_BASE_DIR, { recursive: true, force: true })
+    }
+  })
+
+  it.if(isLinux)(
+    'emits the read carve-out ro-bind before the nested write bind',
+    async () => {
+      const wrappedCommand = await wrapCommandWithSandboxLinux({
+        command: 'true',
+        needsNetworkRestriction: false,
+        readConfig: {
+          denyOnly: [TEST_BASE_DIR],
+          allowWithinDeny: [TEST_PROJECT_DIR],
+        },
+        writeConfig: {
+          allowOnly: [TEST_STATE_DIR],
+          denyWithinAllow: [],
+        },
+      })
+      const roBind = wrappedCommand.indexOf(`--ro-bind ${TEST_PROJECT_DIR}`)
+      const rwBind = wrappedCommand.lastIndexOf(`--bind ${TEST_STATE_DIR}`)
+      expect(roBind).toBeGreaterThan(-1)
+      expect(rwBind).toBeGreaterThan(-1)
+      // Later mounts stack over earlier ones, so the deeper rw bind must
+      // come after its ancestor's ro-bind or it is shadowed read-only.
+      expect(rwBind).toBeGreaterThan(roBind)
+    },
+  )
+
+  it.if(isLinux)(
+    'nested write path is writable while the carve-out stays read-only',
+    async () => {
+      const probe = join(TEST_STATE_DIR, 'probe.txt')
+      const wrappedCommand = await wrapCommandWithSandboxLinux({
+        command: `touch ${probe} && cat ${join(TEST_PROJECT_DIR, 'readme.txt')} && ! touch ${join(TEST_PROJECT_DIR, 'not-writable.txt')}`,
+        needsNetworkRestriction: false,
+        readConfig: {
+          denyOnly: [TEST_BASE_DIR],
+          allowWithinDeny: [TEST_PROJECT_DIR],
+        },
+        writeConfig: {
+          allowOnly: [TEST_STATE_DIR],
+          denyWithinAllow: [],
+        },
+      })
+      const result = spawnSync(wrappedCommand, {
+        shell: true,
+        encoding: 'utf8',
+        timeout: 5000,
+      })
+      expect(result.status).toBe(0)
+      expect(existsSync(probe)).toBe(true)
+      expect(existsSync(join(TEST_PROJECT_DIR, 'not-writable.txt'))).toBe(false)
+    },
+  )
+})
