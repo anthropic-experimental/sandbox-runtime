@@ -13,7 +13,16 @@ export class SandboxViolationStore {
     new Set()
 
   addViolation(violation: SandboxViolationEvent): void {
-    this.violations.push(violation)
+    // Every producer funnels through here (seatbelt log lines and seccomp
+    // events embed raw paths, which may legally contain `<`, `>` or
+    // newlines; proxy lines carry embedder-supplied reasons). Reduce `line`
+    // to one physical, tag-free line so nothing can close an embedder's
+    // <sandbox_violations> envelope early or smuggle terminal escapes
+    // (C0, DEL and C1 — the latter covers 8-bit CSI/OSC introducers).
+    this.violations.push({
+      ...violation,
+      line: sanitizeViolationText(violation.line).replace(/[<>]/g, ''),
+    })
     this.totalCount++
     if (this.violations.length > this.maxSize) {
       this.violations = this.violations.slice(-this.maxSize)
@@ -97,4 +106,13 @@ export function shouldIgnoreViolation(
     }
   }
   return false
+}
+
+/**
+ * Collapse control characters (C0, DEL, C1) to spaces. Shared by the store
+ * (for `line`) and the proxy path (for a client-supplied decoded id).
+ */
+export function sanitizeViolationText(text: string): string {
+  // eslint-disable-next-line no-control-regex -- stripping control chars is the point
+  return text.replace(/[\x00-\x1f\x7f-\x9f]+/g, ' ').trim()
 }

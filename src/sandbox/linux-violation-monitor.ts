@@ -26,6 +26,10 @@ export interface LinuxViolationMonitorOptions {
   /** Paths bwrap re-mounts read-only inside an allowWrite region. */
   denyWritePaths: string[]
   ignoreViolations?: IgnoreViolationsConfig
+  /** Map a decoded attribution key (commandId) to the command text it
+   *  represents; identity when omitted. Applied before ignoreViolations
+   *  matching and before the event's `command` is set. */
+  resolveCommandText?: (decodedId: string) => string
 }
 
 export interface LinuxViolationMonitor {
@@ -73,7 +77,12 @@ export function startLinuxSandboxViolationMonitor(
   callback: SandboxViolationCallback,
   opts: LinuxViolationMonitorOptions,
 ): LinuxViolationMonitor {
-  const { allowWritePaths, denyWritePaths, ignoreViolations } = opts
+  const {
+    allowWritePaths,
+    denyWritePaths,
+    ignoreViolations,
+    resolveCommandText = (id: string) => id,
+  } = opts
 
   // sun_path is 108 bytes; mkdtemp under tmpdir() keeps us well under.
   const sockDir = mkdtempSync(join(tmpdir(), 'srt-obs-'))
@@ -113,7 +122,7 @@ export function startLinuxSandboxViolationMonitor(
     let command: string | undefined
     if (encodedCommand) {
       try {
-        command = decodeSandboxedCommand(encodedCommand)
+        command = resolveCommandText(decodeSandboxedCommand(encodedCommand))
       } catch {
         /* ignore */
       }
