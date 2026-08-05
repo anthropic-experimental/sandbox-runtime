@@ -1126,9 +1126,25 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     }
   }
 
+  // Process denyReadAlways paths (final denies that beat allowRead)
+  const denyAlwaysPaths: string[] = []
+  for (const p of config.filesystem.denyReadAlways ?? []) {
+    const stripped = removeTrailingGlobSuffix(p)
+    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
+      const expanded = expandGlobPattern(p)
+      logForDebugging(
+        `[Sandbox] Expanded denyReadAlways glob pattern "${p}" to ${expanded.length} paths on Linux`,
+      )
+      denyAlwaysPaths.push(...expanded)
+    } else {
+      denyAlwaysPaths.push(stripped)
+    }
+  }
+
   return {
     denyOnly: denyPaths,
     allowWithinDeny: allowPaths,
+    denyAlways: denyAlwaysPaths,
   }
 }
 
@@ -1525,9 +1541,27 @@ async function wrapWithSandbox(
     if (mitmCA) {
       expandedAllowRead.push(mitmCA.certPath, mitmCA.trustBundlePath)
     }
+    // denyReadAlways: paths denied even when they fall inside an allowRead
+    // region. Expanded with the same Linux-glob treatment as denyRead; the
+    // platform rule generators emit these as a final-deny pass that wins over
+    // allowWithinDeny.
+    const rawDenyReadAlways =
+      customConfig?.filesystem?.denyReadAlways ??
+      config?.filesystem.denyReadAlways ??
+      []
+    const expandedDenyReadAlways: string[] = []
+    for (const p of rawDenyReadAlways) {
+      const stripped = removeTrailingGlobSuffix(p)
+      if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
+        expandedDenyReadAlways.push(...expandGlobPattern(p))
+      } else {
+        expandedDenyReadAlways.push(stripped)
+      }
+    }
     readConfig = {
       denyOnly: expandedDenyRead,
       allowWithinDeny: expandedAllowRead,
+      denyAlways: expandedDenyReadAlways,
     }
   }
 

@@ -87,6 +87,25 @@ describe('Config Validation', () => {
     expect(result.success).toBe(false)
   })
 
+  test('should validate config with denyReadAlways', () => {
+    const config = {
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+      },
+      filesystem: {
+        denyRead: ['/Users'],
+        allowRead: ['~/src'],
+        denyReadAlways: ['/**/.env*', '/**/credentials'],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(true)
+  })
+
   test('should validate config with optional fields', () => {
     const config = {
       network: {

@@ -1,7 +1,7 @@
 // Filesystem restriction configs (internal structures built from permission rules)
 
 /**
- * Read restriction config using a "deny then allow-back" pattern.
+ * Read restriction config using a three-layer "deny → allow-back → final-deny" pattern.
  *
  * Semantics:
  * - `undefined` = no restrictions (allow all reads)
@@ -9,13 +9,20 @@
  * - `{denyOnly: [...paths]}` = deny reads from these paths, allow all others
  * - `{denyOnly: [...paths], allowWithinDeny: [...paths]}` = deny reads from
  *   denyOnly paths, but re-allow reads within allowWithinDeny paths.
- *   allowWithinDeny takes precedence over denyOnly (most-specific rule wins).
+ *   allowWithinDeny takes precedence over denyOnly.
+ * - `{denyAlways: [...paths]}` = deny reads from these paths even if they
+ *   also match allowWithinDeny. Intended for credential-style patterns
+ *   (e.g. "/**\/.env*") that should never be readable regardless of
+ *   broader allow-rules.
+ *
+ * Rule priority (high → low): denyAlways > allowWithinDeny > denyOnly > default-allow.
  *
  * This is maximally permissive by default - only explicitly denied paths are blocked.
  */
 export interface FsReadRestrictionConfig {
   denyOnly: string[]
   allowWithinDeny?: string[]
+  denyAlways?: string[]
 }
 
 /**

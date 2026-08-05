@@ -334,18 +334,49 @@ function generateReadRules(
     }
   }
 
+  // denyAlways: final-deny pass that takes precedence over allowWithinDeny.
+  // Seatbelt is last-match-wins, so these deny rules emitted after the
+  // allowWithinDeny loop will fire when both match. Intended for
+  // credential-style globs (e.g. "/**/.env*") inside a broadly-allowed
+  // directory.
+  for (const pathPattern of config.denyAlways || []) {
+    const normalizedPath = normalizePathForSandbox(pathPattern)
+
+    if (containsGlobChars(normalizedPath)) {
+      const regexPattern = globToRegex(normalizedPath)
+      rules.push(
+        `(deny file-read*`,
+        `  (regex ${escapePath(regexPattern)})`,
+        `  (with message "${logTag}"))`,
+      )
+    } else {
+      rules.push(
+        `(deny file-read*`,
+        `  (subpath ${escapePath(normalizedPath)})`,
+        `  (with message "${logTag}"))`,
+      )
+    }
+  }
+
   // Allow stat/lstat on all directories so that realpath() can traverse
   // path components within denied regions. Without this, C realpath() fails
   // when resolving symlinks because it needs to lstat every intermediate
   // directory (e.g. /Users, /Users/chris) even if only a subdirectory like
   // ~/.local is in allowWithinDeny. This only allows metadata reads on
   // directories — not listing contents (readdir) or reading files.
-  if (config.denyOnly.length > 0) {
+  if (config.denyOnly.length > 0 || (config.denyAlways || []).length > 0) {
     rules.push(`(allow file-read-metadata`, `  (vnode-type DIRECTORY))`)
   }
 
-  // Block file movement to prevent bypass via mv/rename
-  rules.push(...generateMoveBlockingRules(config.denyOnly || [], logTag))
+  // Block file movement to prevent bypass via mv/rename.
+  // Include denyAlways paths so a compromised tool can't rename a credential
+  // file out of a denyAlways match.
+  rules.push(
+    ...generateMoveBlockingRules(
+      [...(config.denyOnly || []), ...(config.denyAlways || [])],
+      logTag,
+    ),
+  )
 
   // Re-allow file-write-unlink / file-write-create for paths that are explicitly
   // write-allowed. The move-blocking rules above emit broad

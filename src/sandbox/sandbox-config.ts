@@ -869,6 +869,15 @@ export const FilesystemConfigSchema = z.object({
       'Paths to re-allow reading within denied regions (takes precedence over denyRead). ' +
         'Use with denyRead to deny a broad region then allow back specific subdirectories.',
     ),
+  denyReadAlways: z
+    .array(filesystemPathSchema)
+    .optional()
+    .describe(
+      'Paths denied for reading that take precedence over allowRead. ' +
+        'Use for credential-style patterns (e.g. "/**/.env*", "/**/credentials") ' +
+        'inside a broadly-allowed directory. Patterns with a leading "/" match ' +
+        'globally; otherwise they are CWD-relative.',
+    ),
   allowWrite: z
     .array(filesystemPathSchema)
     .describe('Paths allowed for writing'),

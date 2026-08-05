@@ -1536,6 +1536,35 @@ async function generateFilesystemArgs(
     maskedFiles.set(realPath, fakePath)
   }
 
+  // denyReadAlways: final-deny pass that takes precedence over allowRead.
+  // Emitted AFTER the allowRead re-bind loop above so these binds win.
+  // Bubblewrap applies binds in argument order — later binds shadow earlier
+  // ones for the same destination path.
+  for (const denyPath of readConfig?.denyAlways || []) {
+    const normalizedPath = normalizePathForSandbox(denyPath)
+    if (!fs.existsSync(normalizedPath)) {
+      logForDebugging(
+        `[Sandbox Linux] Skipping non-existent denyReadAlways path: ${normalizedPath}`,
+      )
+      continue
+    }
+    const stat = fs.statSync(normalizedPath)
+    if (stat.isDirectory()) {
+      args.push('--tmpfs', normalizedPath)
+      logForDebugging(
+        `[Sandbox Linux] denyReadAlways masked directory with tmpfs: ${normalizedPath}`,
+      )
+    } else {
+      const denyDest = resolveSymlinkDenyDest(normalizedPath)
+      args.push('--ro-bind', '/dev/null', denyDest)
+      maskedFiles.set(denyDest, '/dev/null')
+      maskedFiles.set(normalizedPath, '/dev/null')
+      logForDebugging(
+        `[Sandbox Linux] denyReadAlways masked file: ${normalizedPath}`,
+      )
+    }
+  }
+
   // Emitting denyWrite last means these ro-binds layer on top of any write
   // paths the denyRead loop just re-bound. Before this ordering, tmpfs over
   // an ancestor of cwd would wipe the .git/hooks protection. But skip any
