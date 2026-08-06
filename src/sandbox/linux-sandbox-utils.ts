@@ -1743,10 +1743,13 @@ export async function wrapCommandWithSandboxLinux(
   } = params
 
   // Determine if we have restrictions to apply
-  // Read: denyOnly pattern - empty array means no restrictions
+  // Read: denyOnly pattern - empty array means no restrictions; denyAlways
+  // alone also counts (a config may carry only credential globs)
   // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
   const hasReadRestrictions =
-    (readConfig && readConfig.denyOnly.length > 0) ||
+    (readConfig &&
+      (readConfig.denyOnly.length > 0 ||
+        (readConfig.denyAlways ?? []).length > 0)) ||
     (maskedFileBinds !== undefined && maskedFileBinds.length > 0)
   const hasWriteRestrictions = writeConfig !== undefined
   const hasEnvRestrictions =

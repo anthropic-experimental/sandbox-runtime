@@ -81,6 +81,7 @@ import {
   removeTrailingGlobSuffix,
   expandGlobPattern,
   decodeSandboxedCommand,
+  normalizePathForSandbox,
 } from './sandbox-utils.js'
 import {
   SandboxViolationStore,
@@ -1141,11 +1142,55 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     }
   }
 
+  // Process denyReadAlwaysExcept paths (re-allows that beat denyReadAlways).
+  // On Linux both sides are concrete paths after glob expansion, so
+  // exceptions apply as set-subtraction here; on macOS the patterns pass
+  // through and the profile emits them as allow rules after the denyAlways
+  // denies (Seatbelt last-match-wins).
+  const denyAlwaysExceptPaths: string[] = []
+  for (const p of config.filesystem.denyReadAlwaysExcept ?? []) {
+    const stripped = removeTrailingGlobSuffix(p)
+    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
+      const expanded = expandGlobPattern(p)
+      logForDebugging(
+        `[Sandbox] Expanded denyReadAlwaysExcept glob pattern "${p}" to ${expanded.length} paths on Linux`,
+      )
+      denyAlwaysExceptPaths.push(...expanded)
+    } else {
+      denyAlwaysExceptPaths.push(stripped)
+    }
+  }
+
   return {
     denyOnly: denyPaths,
     allowWithinDeny: allowPaths,
-    denyAlways: denyAlwaysPaths,
+    denyAlways: subtractDenyAlwaysExceptOnLinux(
+      denyAlwaysPaths,
+      denyAlwaysExceptPaths,
+    ),
+    denyAlwaysExcept: denyAlwaysExceptPaths,
   }
+}
+
+/**
+ * On Linux the platform layer only ever sees concrete paths (globs are
+ * expanded upstream), so denyAlwaysExcept is applied by removing excepted
+ * paths from the denyAlways list. Paths are compared after
+ * normalizePathForSandbox so spellings like "~/x" and its expansion match.
+ * On other platforms the list passes through untouched — the rule
+ * generators emit the exceptions themselves.
+ */
+function subtractDenyAlwaysExceptOnLinux(
+  denyAlwaysPaths: string[],
+  denyAlwaysExceptPaths: string[],
+): string[] {
+  if (getPlatform() !== 'linux' || denyAlwaysExceptPaths.length === 0) {
+    return denyAlwaysPaths
+  }
+  const except = new Set(
+    denyAlwaysExceptPaths.map(p => normalizePathForSandbox(p)),
+  )
+  return denyAlwaysPaths.filter(p => !except.has(normalizePathForSandbox(p)))
 }
 
 function getFsWriteConfig(): FsWriteRestrictionConfig {
@@ -1558,10 +1603,27 @@ async function wrapWithSandbox(
         expandedDenyReadAlways.push(stripped)
       }
     }
+    const rawDenyReadAlwaysExcept =
+      customConfig?.filesystem?.denyReadAlwaysExcept ??
+      config?.filesystem.denyReadAlwaysExcept ??
+      []
+    const expandedDenyReadAlwaysExcept: string[] = []
+    for (const p of rawDenyReadAlwaysExcept) {
+      const stripped = removeTrailingGlobSuffix(p)
+      if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
+        expandedDenyReadAlwaysExcept.push(...expandGlobPattern(p))
+      } else {
+        expandedDenyReadAlwaysExcept.push(stripped)
+      }
+    }
     readConfig = {
       denyOnly: expandedDenyRead,
       allowWithinDeny: expandedAllowRead,
-      denyAlways: expandedDenyReadAlways,
+      denyAlways: subtractDenyAlwaysExceptOnLinux(
+        expandedDenyReadAlways,
+        expandedDenyReadAlwaysExcept,
+      ),
+      denyAlwaysExcept: expandedDenyReadAlwaysExcept,
     }
   }
 

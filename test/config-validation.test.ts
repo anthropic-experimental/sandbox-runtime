@@ -106,6 +106,25 @@ describe('Config Validation', () => {
     expect(result.success).toBe(true)
   })
 
+  test('should validate config with denyReadAlwaysExcept', () => {
+    const config = {
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+      },
+      filesystem: {
+        denyRead: [],
+        denyReadAlways: ['/**/.env*', '/**/id_*'],
+        denyReadAlwaysExcept: ['/**/.env.example', '/**/id_*.pub'],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(true)
+  })
+
   test('should validate config with optional fields', () => {
     const config = {
       network: {

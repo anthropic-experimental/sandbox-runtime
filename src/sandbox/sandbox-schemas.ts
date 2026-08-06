@@ -14,8 +14,13 @@
  *   also match allowWithinDeny. Intended for credential-style patterns
  *   (e.g. "/**\/.env*") that should never be readable regardless of
  *   broader allow-rules.
+ * - `{denyAlways: [...], denyAlwaysExcept: [...paths]}` = re-allow reads for
+ *   these paths even when they match denyAlways. Intended for known-safe
+ *   names caught by a broad credential glob (e.g. "/**\/.env.example"
+ *   alongside a "/**\/.env*" deny).
  *
- * Rule priority (high → low): denyAlways > allowWithinDeny > denyOnly > default-allow.
+ * Rule priority (high → low):
+ * denyAlwaysExcept > denyAlways > allowWithinDeny > denyOnly > default-allow.
  *
  * This is maximally permissive by default - only explicitly denied paths are blocked.
  */
@@ -23,6 +28,7 @@ export interface FsReadRestrictionConfig {
   denyOnly: string[]
   allowWithinDeny?: string[]
   denyAlways?: string[]
+  denyAlwaysExcept?: string[]
 }
 
 /**

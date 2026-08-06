@@ -876,7 +876,18 @@ export const FilesystemConfigSchema = z.object({
       'Paths denied for reading that take precedence over allowRead. ' +
         'Use for credential-style patterns (e.g. "/**/.env*", "/**/credentials") ' +
         'inside a broadly-allowed directory. Patterns with a leading "/" match ' +
-        'globally; otherwise they are CWD-relative.',
+        'globally; otherwise they are CWD-relative. Known-safe names caught by ' +
+        'a broad pattern can be carved back out with denyReadAlwaysExcept.',
+    ),
+  denyReadAlwaysExcept: z
+    .array(filesystemPathSchema)
+    .optional()
+    .describe(
+      'Paths re-allowed for reading even when they match denyReadAlways. ' +
+        'Use for known-safe names caught by a broad credential glob — e.g. ' +
+        '"/**/.env.example" alongside a "/**/.env*" deny, or "/**/id_*.pub" ' +
+        'alongside "/**/id_*". Highest-priority read rule; same glob syntax ' +
+        'and leading-"/" anchoring as denyReadAlways.',
     ),
   allowWrite: z
     .array(filesystemPathSchema)

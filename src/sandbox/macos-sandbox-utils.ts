@@ -361,6 +361,29 @@ function generateReadRules(
     }
   }
 
+  // denyAlwaysExcept: re-allow pass that takes precedence over denyAlways.
+  // Emitted after the denyAlways loop so these allow rules win
+  // (last-match-wins). Intended for known-safe names caught by a broad
+  // credential glob — e.g. "/**/.env.example" alongside a "/**/.env*" deny.
+  for (const pathPattern of config.denyAlwaysExcept || []) {
+    const normalizedPath = normalizePathForSandbox(pathPattern)
+
+    if (containsGlobChars(normalizedPath)) {
+      const regexPattern = globToRegex(normalizedPath)
+      rules.push(
+        `(allow file-read*`,
+        `  (regex ${escapePath(regexPattern)})`,
+        `  (with message "${logTag}"))`,
+      )
+    } else {
+      rules.push(
+        `(allow file-read*`,
+        `  (subpath ${escapePath(normalizedPath)})`,
+        `  (with message "${logTag}"))`,
+      )
+    }
+  }
+
   // Allow stat/lstat on all directories so that realpath() can traverse
   // path components within denied regions. Without this, C realpath() fails
   // when resolving symlinks because it needs to lstat every intermediate
@@ -875,13 +898,18 @@ export function wrapCommandWithSandboxMacOS(
         ...maskedFileBinds.map(b => b.realPath),
       ],
       allowWithinDeny: readConfigIn?.allowWithinDeny,
+      denyAlways: readConfigIn?.denyAlways,
+      denyAlwaysExcept: readConfigIn?.denyAlwaysExcept,
     }
   }
 
   // Determine if we have restrictions to apply
-  // Read: denyOnly pattern - empty array means no restrictions
+  // Read: denyOnly pattern - empty array means no restrictions; denyAlways
+  // alone also counts (a config may carry only credential globs)
   // Write: allowOnly pattern - undefined means no restrictions, any config means restrictions
-  const hasReadRestrictions = readConfig && readConfig.denyOnly.length > 0
+  const hasReadRestrictions =
+    readConfig !== undefined &&
+    (readConfig.denyOnly.length > 0 || (readConfig.denyAlways ?? []).length > 0)
   const hasWriteRestrictions = writeConfig !== undefined
   const hasEnvRestrictions =
     (unsetEnvVars !== undefined && unsetEnvVars.length > 0) ||
