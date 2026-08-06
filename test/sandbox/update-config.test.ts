@@ -331,6 +331,39 @@ describe('proxy auth + network deny semantics', () => {
     expect(v!.line).toContain('/sandbox_violations')
   })
 
+  it('a bracketed IPv6 deniedDomains entry blocks a CONNECT to that literal', async () => {
+    let asked = false
+    await SandboxManager.initialize(
+      {
+        network: {
+          allowedDomains: [],
+          deniedDomains: ['[2001:db8::1]:443', '[fd00:ec2::254]'],
+        },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      },
+      async () => {
+        asked = true
+        return true
+      },
+    )
+    const port = SandboxManager.getProxyPort()!
+    const store = SandboxManager.getSandboxViolationStore()
+    store.clear()
+
+    // proxyRequest sends `CONNECT <target>:443`; give it the bracketed host
+    // (and a non-canonical spelling, to prove both sides canonicalize).
+    expect((await proxyRequest(port, '[2001:DB8:0::1]')).statusCode).toBe(403)
+    expect((await proxyRequest(port, '[fd00:ec2::254]')).statusCode).toBe(403)
+    // Denied by the list, so the ask callback was never consulted.
+    expect(asked).toBe(false)
+    const lines = store.getViolations().map(v => v.line)
+    // The line reports the host as the client sent it; match loosely.
+    expect(
+      lines.some(l => /2001:db8:0?:?:1/i.test(l) && l.includes('deny list')),
+    ).toBe(true)
+    expect(lines.some(l => l.includes('fd00:ec2::254'))).toBe(true)
+  })
+
   it('strictAllowlist denies off-allowlist hosts without consulting the callback', async () => {
     let asked = false
     await SandboxManager.initialize(
