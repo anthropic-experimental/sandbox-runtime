@@ -465,6 +465,10 @@ export function generateProxyEnvVars(
   proxyAuthToken?: string,
   skipTmpdir?: boolean,
   encodedCommand?: string,
+  httpProxyHost: 'localhost' | '::1' = 'localhost',
+  socksProxyHost: 'localhost' | '127.0.0.1' = httpProxyHost === '::1'
+    ? '127.0.0.1'
+    : 'localhost',
 ): string[] {
   // When the proxy requires auth, embed the credential in the URL so clients
   // send Proxy-Authorization automatically. Only the sandbox child sees this
@@ -479,6 +483,9 @@ export function generateProxyEnvVars(
   const userPct =
     userRaw === PROXY_AUTH_USER ? userRaw : encodeURIComponent(userRaw)
   const auth = proxyAuthToken ? `${userPct}:${proxyAuthToken}@` : ''
+  const httpUrlHost = httpProxyHost === '::1' ? '[::1]' : httpProxyHost
+  // BSD nc cannot proxy over IPv6, so the owned macOS mux keeps its IPv4
+  // listener for SOCKS-specific clients while HTTP uses native IPv6.
   const envVars: string[] = [`SANDBOX_RUNTIME=1`]
   // TMPDIR is overridden so temp-file writers land in a path the FS sandbox
   // allows (getDefaultWritePaths). When filesystem policy is disabled
@@ -527,11 +534,11 @@ export function generateProxyEnvVars(
   envVars.push(`no_proxy=${noProxyAddresses}`)
 
   if (httpProxyPort) {
-    envVars.push(`HTTP_PROXY=http://${auth}localhost:${httpProxyPort}`)
-    envVars.push(`HTTPS_PROXY=http://${auth}localhost:${httpProxyPort}`)
+    envVars.push(`HTTP_PROXY=http://${auth}${httpUrlHost}:${httpProxyPort}`)
+    envVars.push(`HTTPS_PROXY=http://${auth}${httpUrlHost}:${httpProxyPort}`)
     // Lowercase versions for compatibility with some tools
-    envVars.push(`http_proxy=http://${auth}localhost:${httpProxyPort}`)
-    envVars.push(`https_proxy=http://${auth}localhost:${httpProxyPort}`)
+    envVars.push(`http_proxy=http://${auth}${httpUrlHost}:${httpProxyPort}`)
+    envVars.push(`https_proxy=http://${auth}${httpUrlHost}:${httpProxyPort}`)
     if (proxyAuthToken) {
       // Pre-send Basic so git never gets a 407 and never invokes a
       // credential helper for the proxy URL (Windows GCM intercepts the
@@ -547,8 +554,8 @@ export function generateProxyEnvVars(
   // SOCKS to it still reaches the SOCKS handler. Falls back to socks5h://
   // only when no HTTP proxy port exists, which no current caller configures.
   const connectProxyUrl = httpProxyPort
-    ? `http://${auth}localhost:${httpProxyPort}`
-    : `socks5h://${auth}localhost:${socksProxyPort}`
+    ? `http://${auth}${httpUrlHost}:${httpProxyPort}`
+    : `socks5h://${auth}${socksProxyHost}:${socksProxyPort}`
 
   // ALL_PROXY: prefer the HTTP proxy URL over SOCKS. httpx (and similar
   // Python clients) eagerly import `socksio` at client construction when
@@ -586,7 +593,7 @@ export function generateProxyEnvVars(
       // auth, so when proxyAuthToken is set, git-over-ssh fails at the SOCKS
       // handshake — use git-over-https (HTTP_PROXY carries the credential).
       envVars.push(
-        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='nc -X 5 -x localhost:${socksProxyPort} %h %p'`,
+        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='nc -X 5 -x ${socksProxyHost}:${socksProxyPort} %h %p'`,
       )
     } else if (platform === 'linux' && httpProxyPort) {
       // Linux: use socat HTTP CONNECT via the HTTP proxy bridge.
@@ -606,24 +613,29 @@ export function generateProxyEnvVars(
     // `GET ftp://host/path HTTP/1.1` to the proxy — which the mux does not
     // implement, and an env var can't ask curl for --proxytunnel. socks5h is
     // transparent at the TCP layer, so it is the value that works here.
-    envVars.push(`FTP_PROXY=socks5h://${auth}localhost:${socksProxyPort}`)
-    envVars.push(`ftp_proxy=socks5h://${auth}localhost:${socksProxyPort}`)
+    envVars.push(
+      `FTP_PROXY=socks5h://${auth}${socksProxyHost}:${socksProxyPort}`,
+    )
+    envVars.push(
+      `ftp_proxy=socks5h://${auth}${socksProxyHost}:${socksProxyPort}`,
+    )
 
     // rsync proxy support — RSYNC_PROXY is host:port only, no userinfo. With
     // proxy auth on, rsync via this var fails at the CONNECT (407); use SSH
     // transport or wrap with proxychains instead.
-    envVars.push(`RSYNC_PROXY=localhost:${socksProxyPort}`)
+    envVars.push(`RSYNC_PROXY=${socksProxyHost}:${socksProxyPort}`)
 
     // Database tools NOTE: Most database clients don't have built-in proxy support
     // You typically need to use SSH tunneling or a SOCKS wrapper like tsocks/proxychains
 
     // Docker CLI uses HTTP for the API
     // This makes Docker use the HTTP proxy for registry operations
+    const dockerProxyHost = httpProxyPort ? httpUrlHost : socksProxyHost
     envVars.push(
-      `DOCKER_HTTP_PROXY=http://${auth}localhost:${httpProxyPort || socksProxyPort}`,
+      `DOCKER_HTTP_PROXY=http://${auth}${dockerProxyHost}:${httpProxyPort || socksProxyPort}`,
     )
     envVars.push(
-      `DOCKER_HTTPS_PROXY=http://${auth}localhost:${httpProxyPort || socksProxyPort}`,
+      `DOCKER_HTTPS_PROXY=http://${auth}${dockerProxyHost}:${httpProxyPort || socksProxyPort}`,
     )
 
     // Kubernetes kubectl - uses standard HTTPS_PROXY
@@ -639,7 +651,7 @@ export function generateProxyEnvVars(
     // socks4, socks5; "https" is rejected at startup).
     if (httpProxyPort) {
       envVars.push(`CLOUDSDK_PROXY_TYPE=http`)
-      envVars.push(`CLOUDSDK_PROXY_ADDRESS=localhost`)
+      envVars.push(`CLOUDSDK_PROXY_ADDRESS=${httpProxyHost}`)
       envVars.push(`CLOUDSDK_PROXY_PORT=${httpProxyPort}`)
       if (proxyAuthToken) {
         envVars.push(`CLOUDSDK_PROXY_USERNAME=${userRaw}`)

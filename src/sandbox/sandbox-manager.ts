@@ -108,7 +108,9 @@ import { dirname } from 'node:path'
 
 interface HostNetworkManagerContext {
   httpProxyPort: number
+  httpProxyHost: 'localhost' | '::1'
   socksProxyPort: number
+  socksProxyHost: 'localhost' | '127.0.0.1'
   linuxBridge: LinuxNetworkBridgeContext | undefined
 }
 
@@ -490,6 +492,7 @@ function shouldTerminateTLSForHost(host: string): boolean {
 async function startMuxProxyServer(
   sandboxAskCallback: SandboxAskCallback | undefined,
   portRange: readonly [number, number] | undefined,
+  enableIpv6Http: boolean,
 ): Promise<number> {
   const injectCredentials = buildCredentialInjector()
   const injectBodyCredentials = buildBodyCredentialInjector()
@@ -542,19 +545,45 @@ async function startMuxProxyServer(
   // dispatch to an unbound backend. On Windows the backend's port is
   // excluded when binding the front-end in the same WFP range.
   const backendPort = await mux.listenHttpBackend()
-  await listenInRange(
-    mux.server,
-    p => mux.server.listen(p, '127.0.0.1'),
-    portRange,
-    backendPort !== undefined ? new Set([backendPort]) : new Set(),
-  )
-  const muxPort = mux.getPort()
-  if (muxPort === undefined) {
-    throw new Error('Failed to get mux proxy server port')
+  const excludedPorts =
+    backendPort !== undefined ? new Set([backendPort]) : new Set<number>()
+  for (let attempt = 0; attempt < 5; attempt++) {
+    await listenInRange(
+      mux.server,
+      p => mux.server.listen(p, '127.0.0.1'),
+      portRange,
+      excludedPorts,
+    )
+    const muxPort = mux.getPort()
+    if (muxPort === undefined) {
+      throw new Error('Failed to get mux proxy server port')
+    }
+    if (!enableIpv6Http) {
+      mux.unref()
+      return muxPort
+    }
+    try {
+      await new Promise<void>((resolve, reject) => {
+        mux.ipv6Server.once('error', reject)
+        mux.ipv6Server.listen(
+          { host: '::1', port: muxPort, ipv6Only: true },
+          () => {
+            mux.ipv6Server.removeListener('error', reject)
+            resolve()
+          },
+        )
+      })
+      mux.unref()
+      logForDebugging(
+        `Mux proxy (HTTP+SOCKS) listening on 127.0.0.1 and ::1:${muxPort}`,
+      )
+      return muxPort
+    } catch (error) {
+      await new Promise<void>(resolve => mux.server.close(() => resolve()))
+      if (attempt === 4) throw error
+    }
   }
-  mux.unref()
-  logForDebugging(`Mux proxy (HTTP+SOCKS) listening on localhost:${muxPort}`)
-  return muxPort
+  throw new Error('Failed to bind mux proxy server')
 }
 
 // ============================================================================
@@ -852,8 +881,23 @@ async function initialize(
       const needLocalProxy =
         config.network.httpProxyPort === undefined ||
         config.network.socksProxyPort === undefined
+      const httpProxyHost =
+        getPlatform() === 'macos'
+          ? (config.network.httpProxyHost ?? 'localhost')
+          : 'localhost'
+      const socksProxyHost =
+        getPlatform() === 'macos' &&
+        config.network.socksProxyPort === undefined &&
+        httpProxyHost === '::1'
+          ? '127.0.0.1'
+          : 'localhost'
       const muxPort = needLocalProxy
-        ? await startMuxProxyServer(sandboxAskCallback, portRange)
+        ? await startMuxProxyServer(
+            sandboxAskCallback,
+            portRange,
+            httpProxyHost === '::1' &&
+              config.network.httpProxyPort === undefined,
+          )
         : undefined
       const httpProxyPort = config.network.httpProxyPort ?? muxPort!
       const socksProxyPort = config.network.socksProxyPort ?? muxPort!
@@ -888,7 +932,9 @@ async function initialize(
 
       const context: HostNetworkManagerContext = {
         httpProxyPort,
+        httpProxyHost,
         socksProxyPort,
+        socksProxyHost,
         linuxBridge,
       }
       managerContext = context
@@ -898,7 +944,7 @@ async function initialize(
       // Clear state on error so initialization can be retried
       initializationPromise = undefined
       managerContext = undefined
-      reset().catch(e => {
+      await reset().catch(e => {
         logForDebugging(`Cleanup failed in initializationPromise ${e}`, {
           level: 'error',
         })
@@ -1621,6 +1667,8 @@ async function wrapWithSandbox(
         httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
         socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
         proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
+        httpProxyHost: managerContext?.httpProxyHost,
+        socksProxyHost: managerContext?.socksProxyHost,
         caCertPath: mitmCA?.trustBundlePath,
         readConfig,
         writeConfig,
@@ -1866,7 +1914,8 @@ function getConfig(): SandboxRuntimeConfig | undefined {
  * reassigning `config` here takes effect on the next connection
  * with no proxy rebind and no port change — on every platform,
  * including Windows. This is what lets a host enable/deny domains
- * for already-running sandboxed children.
+ * for already-running sandboxed children. Proxy endpoint changes such as
+ * `httpProxyHost` and `httpProxyPort` require reset() + initialize().
  *
  * Filesystem changes (denyRead/denyWrite) are NOT applied live:
  * macOS bakes them into the seatbelt profile at wrap time, and

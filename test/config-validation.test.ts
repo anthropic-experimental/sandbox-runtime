@@ -95,6 +95,7 @@ describe('Config Validation', () => {
         allowUnixSockets: ['/var/run/docker.sock'],
         allowAllUnixSockets: false,
         allowLocalBinding: true,
+        httpProxyHost: '::1',
       },
       filesystem: {
         denyRead: ['/etc/shadow'],
@@ -111,6 +112,24 @@ describe('Config Validation', () => {
 
     const result = SandboxRuntimeConfigSchema.safeParse(config)
     expect(result.success).toBe(true)
+  })
+
+  test('should reject an unsupported HTTP proxy host', () => {
+    const config = {
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+        httpProxyHost: '127.0.0.1',
+      },
+      filesystem: {
+        denyRead: [],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(false)
   })
 
   test('should reject missing required fields', () => {

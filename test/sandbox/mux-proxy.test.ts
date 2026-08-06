@@ -51,10 +51,10 @@ describe('mux-proxy first-byte dispatch', () => {
     await mux.close()
   })
 
-  function send(bytes: Buffer): Promise<Buffer> {
+  function send(bytes: Buffer, host = '127.0.0.1'): Promise<Buffer> {
     return new Promise((resolve, reject) => {
       const chunks: Buffer[] = []
-      const c: Socket = connect(port, '127.0.0.1', () => c.write(bytes))
+      const c: Socket = connect(port, host, () => c.write(bytes))
       c.on('data', d => chunks.push(d))
       c.on('close', () => resolve(Buffer.concat(chunks)))
       c.on('error', reject)
@@ -88,6 +88,23 @@ describe('mux-proxy first-byte dispatch', () => {
     expect(text).toContain('http-request:GET:http://x/')
     expect(socksHits.length).toBe(0)
   })
+
+  it.if(process.platform === 'darwin')(
+    'shares dispatch with the IPv6 front end',
+    async () => {
+      await new Promise<void>((resolve, reject) => {
+        mux.ipv6Server.once('error', reject)
+        mux.ipv6Server.listen({ host: '::1', port, ipv6Only: true }, resolve)
+      })
+      const reply = await send(
+        Buffer.from(
+          'GET http://x/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n',
+        ),
+        '::1',
+      )
+      expect(reply.toString()).toContain('http-request:GET:http://x/')
+    },
+  )
 
   it('routes CONNECT to the HTTP backend connect handler', async () => {
     const reply = await send(

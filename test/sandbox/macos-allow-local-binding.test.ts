@@ -3,6 +3,20 @@ import { spawnSync } from 'node:child_process'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 import { isMacOS } from '../helpers/platform.js'
 
+function wrapWithJavaEnv(options: {
+  setEnvVars?: Record<string, string>
+  unsetEnvVars?: string[]
+}): string {
+  return wrapCommandWithSandboxMacOS({
+    command: 'true',
+    needsNetworkRestriction: true,
+    allowLocalBinding: true,
+    readConfig: undefined,
+    writeConfig: undefined,
+    ...options,
+  })
+}
+
 function runInSandbox(
   pythonCode: string,
   allowLocalBinding: boolean,
@@ -100,6 +114,52 @@ describe.if(isMacOS)('macOS Seatbelt allowLocalBinding', () => {
 
       expect(result.status).not.toBe(0)
       expect(result.stderr).toContain('Operation not permitted')
+    })
+  })
+
+  describe('JAVA_TOOL_OPTIONS compatibility', () => {
+    it('preserves inherited options', () => {
+      const previous = process.env.JAVA_TOOL_OPTIONS
+      process.env.JAVA_TOOL_OPTIONS = '-Dinherited=true'
+      try {
+        const wrapped = wrapWithJavaEnv({})
+        expect(wrapped).toContain('-Dinherited=true')
+        expect(wrapped).toContain('-Djava.net.preferIPv4Stack=true')
+      } finally {
+        if (previous === undefined) delete process.env.JAVA_TOOL_OPTIONS
+        else process.env.JAVA_TOOL_OPTIONS = previous
+      }
+    })
+
+    it('preserves a masked value instead of restoring the inherited value', () => {
+      const previous = process.env.JAVA_TOOL_OPTIONS
+      process.env.JAVA_TOOL_OPTIONS = '-Dsecret=true'
+      try {
+        const wrapped = wrapWithJavaEnv({
+          setEnvVars: { JAVA_TOOL_OPTIONS: 'masked-value' },
+        })
+        expect(wrapped).toContain('masked-value')
+        expect(wrapped).toContain('-Djava.net.preferIPv4Stack=true')
+        expect(wrapped).not.toContain('-Dsecret=true')
+      } finally {
+        if (previous === undefined) delete process.env.JAVA_TOOL_OPTIONS
+        else process.env.JAVA_TOOL_OPTIONS = previous
+      }
+    })
+
+    it('does not restore an unset inherited value', () => {
+      const previous = process.env.JAVA_TOOL_OPTIONS
+      process.env.JAVA_TOOL_OPTIONS = '-Dsecret=true'
+      try {
+        const wrapped = wrapWithJavaEnv({
+          unsetEnvVars: ['JAVA_TOOL_OPTIONS'],
+        })
+        expect(wrapped).toContain('-Djava.net.preferIPv4Stack=true')
+        expect(wrapped).not.toContain('-Dsecret=true')
+      } finally {
+        if (previous === undefined) delete process.env.JAVA_TOOL_OPTIONS
+        else process.env.JAVA_TOOL_OPTIONS = previous
+      }
     })
   })
 

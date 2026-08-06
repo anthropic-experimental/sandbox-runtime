@@ -9,7 +9,7 @@ import {
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { spawnAsync } from '../helpers/spawn.js'
-import { isLinux } from '../helpers/platform.js'
+import { isLinux, isMacOS } from '../helpers/platform.js'
 
 describe('generateProxyEnvVars', () => {
   it('sets CLOUDSDK_PROXY_TYPE to http (gcloud rejects "https")', () => {
@@ -29,6 +29,138 @@ describe('generateProxyEnvVars', () => {
 
     expect(env.some(v => v.startsWith('CLOUDSDK_PROXY_'))).toBe(false)
   })
+
+  it('uses native IPv6 for HTTP and keeps SOCKS on IPv4', () => {
+    const env = generateProxyEnvVars(
+      3128,
+      1080,
+      undefined,
+      'tok',
+      undefined,
+      undefined,
+      '::1',
+    )
+
+    expect(env).toContain('HTTPS_PROXY=http://srt:tok@[::1]:3128')
+    expect(env).toContain('GRPC_PROXY=http://srt:tok@[::1]:3128')
+    expect(env).toContain('CLOUDSDK_PROXY_ADDRESS=::1')
+    expect(env).toContain('FTP_PROXY=socks5h://srt:tok@127.0.0.1:1080')
+    expect(env).toContain('RSYNC_PROXY=127.0.0.1:1080')
+  })
+
+  it.if(isMacOS)(
+    'keeps the compatible Java workaround by default',
+    async () => {
+      try {
+        await SandboxManager.initialize({
+          network: {
+            allowedDomains: [],
+            deniedDomains: [],
+            allowLocalBinding: true,
+          },
+          filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+        })
+        const wrapped = await SandboxManager.wrapWithSandbox('true')
+        expect(wrapped).toContain('@localhost:')
+        expect(wrapped).toContain('-Djava.net.preferIPv4Stack=true')
+      } finally {
+        await SandboxManager.reset()
+      }
+    },
+  )
+
+  it.if(isMacOS)(
+    'keeps the initialized IPv6 HTTP proxy through policy updates',
+    async () => {
+      try {
+        await SandboxManager.initialize({
+          network: {
+            allowedDomains: [],
+            deniedDomains: [],
+            allowLocalBinding: true,
+            httpProxyHost: '::1',
+            socksProxyPort: 1080,
+          },
+          filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+        })
+        // Proxy endpoints are fixed until reset; live policy updates must not
+        // change the host used by already-running sandboxed processes.
+        SandboxManager.updateConfig({
+          network: {
+            allowedDomains: [],
+            deniedDomains: [],
+            allowLocalBinding: true,
+            httpProxyHost: 'localhost',
+            httpProxyPort: 1,
+          },
+          filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+        })
+        const wrapped = await SandboxManager.wrapWithSandbox(
+          "curl --max-time 5 -s -o /dev/null -w '%{http_code}' http://example.invalid/",
+        )
+        expect(wrapped).toContain('HTTP_PROXY=http://srt.')
+        expect(wrapped).toContain('@[::1]:')
+        expect(wrapped).toContain('@localhost:1080')
+        expect(wrapped).not.toContain('-Djava.net.preferIPv4Stack=true')
+
+        const result = await spawnAsync(wrapped, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 10000,
+        })
+        expect(result.status).toBe(0)
+        expect(result.stdout).toBe('403')
+      } finally {
+        await SandboxManager.reset()
+      }
+    },
+  )
+
+  it.if(isMacOS)(
+    'uses external IPv6 HTTP and owned IPv4 SOCKS endpoints together',
+    async () => {
+      let proxy: Server | undefined
+      try {
+        proxy = createServer((_req, res) => {
+          res.writeHead(200)
+          res.end('ok')
+        })
+        const proxyPort = await new Promise<number>((resolve, reject) => {
+          proxy!.once('error', reject)
+          proxy!.listen(0, '::1', () =>
+            resolve((proxy!.address() as AddressInfo).port),
+          )
+        })
+        await SandboxManager.initialize({
+          network: {
+            allowedDomains: [],
+            deniedDomains: [],
+            httpProxyHost: '::1',
+            httpProxyPort: proxyPort,
+          },
+          filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+        })
+        const socksPort = SandboxManager.getSocksProxyPort()
+        const wrapped = await SandboxManager.wrapWithSandbox(
+          "curl --max-time 5 -s -o /dev/null -w '%{http_code}' http://example.invalid/",
+        )
+        expect(wrapped).toContain(`HTTP_PROXY=http://[::1]:${proxyPort}`)
+        expect(wrapped).toContain(`FTP_PROXY=socks5h://127.0.0.1:${socksPort}`)
+
+        const result = await spawnAsync(wrapped, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 10000,
+        })
+        expect(result.status).toBe(0)
+        expect(result.stdout).toBe('200')
+      } finally {
+        await SandboxManager.reset()
+        if (proxy)
+          await new Promise<void>(resolve => proxy!.close(() => resolve()))
+      }
+    },
+  )
 
   describe('GRPC_PROXY', () => {
     const grpcNames = ['GRPC_PROXY', 'grpc_proxy']

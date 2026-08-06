@@ -38,6 +38,10 @@ export interface MacOSSandboxParams {
   socksProxyPort?: number
   /** Per-session proxy auth token; embedded in proxy env URLs. */
   proxyAuthToken?: string
+  /** Host advertised by HTTP proxy environment variables. */
+  httpProxyHost?: 'localhost' | '::1'
+  /** Host advertised by SOCKS-specific proxy environment variables. */
+  socksProxyHost?: 'localhost' | '127.0.0.1'
   /** Path to the TLS-termination CA cert; injected as trust env vars. */
   caCertPath?: string
   allowUnixSockets?: string[]
@@ -619,8 +623,8 @@ function generateSandboxProfile({
     // time — Seatbelt's "localhost" matches the any-address, so any
     // (local ip ...) host value admits every outbound connection. (remote ip
     // "localhost:*") matches connect() to 127.0.0.1 and ::1 but not
-    // ::ffff:127.0.0.1; runtimes that connect to loopback via dual-stack
-    // sockets need to use AF_INET (see JAVA_TOOL_OPTIONS injection below).
+    // ::ffff:127.0.0.1. The owned HTTP proxy avoids that mapped address by
+    // advertising its native ::1 listener.
     if (allowLocalBinding) {
       profile.push('(allow network-bind (local ip "*:*"))')
       profile.push('(allow network-inbound (local ip "*:*"))')
@@ -738,6 +742,8 @@ export function wrapCommandWithSandboxMacOS(
     httpProxyPort,
     socksProxyPort,
     proxyAuthToken,
+    httpProxyHost,
+    socksProxyHost,
     caCertPath,
     allowUnixSockets,
     allowAllUnixSockets,
@@ -828,6 +834,8 @@ export function wrapCommandWithSandboxMacOS(
     proxyAuthToken,
     writeConfig === undefined,
     encodeSandboxedCommand(attributionCommand),
+    httpProxyHost,
+    socksProxyHost,
   )
 
   // Seatbelt's (remote ip "localhost:*") filter — used for the
@@ -838,11 +846,14 @@ export function wrapCommandWithSandboxMacOS(
   // stack makes Java open AF_INET sockets so loopback connect matches the
   // Seatbelt filter. The flag is appended after any inherited
   // JAVA_TOOL_OPTIONS unless that var is on the credential-deny list, in
-  // which case the inherited value is dropped so the deny holds.
-  if (allowLocalBinding && needsNetworkRestriction) {
+  // which case the inherited value is dropped so the deny holds. This is not
+  // needed when the HTTP proxy uses native IPv6.
+  if (allowLocalBinding && needsNetworkRestriction && httpProxyHost !== '::1') {
     const flag = '-Djava.net.preferIPv4Stack=true'
     const denied = (unsetEnvVars ?? []).includes('JAVA_TOOL_OPTIONS')
-    const inherited = denied ? '' : (process.env.JAVA_TOOL_OPTIONS ?? '')
+    const inherited = denied
+      ? ''
+      : (setEnvVars?.JAVA_TOOL_OPTIONS ?? process.env.JAVA_TOOL_OPTIONS ?? '')
     const value = inherited.includes(flag)
       ? inherited
       : [inherited, flag].filter(Boolean).join(' ')
