@@ -132,10 +132,14 @@ describe('SOCKS unauthenticated probe', () => {
 })
 
 /**
- * The end-to-end claim: real `ssh` through the stock BSD `nc -X 5`
- * ProxyCommand against a denied host prints the configured reason instead
- * of "authentication method negotiation failed". macOS-only: GNU netcat
- * lacks -X.
+ * The end-to-end claim: real `ssh` through a no-auth SOCKS ProxyCommand
+ * against a denied host prints the configured reason instead of an opaque
+ * tunnel failure. The ProxyCommand is our own minimal no-auth SOCKS pipe
+ * (test/helpers/socks-noauth-pipe.ts) rather than `nc -X 5`: it exercises
+ * the identical wire behavior while being independent of which netcat
+ * flavor the host ships (GNU/nmap variants lack -X and fail instantly).
+ * macOS-gated for a real OpenSSH; the wire path itself is covered
+ * cross-platform by the raw-socket tests above.
  */
 describe.if(isMacOS)('ssh-over-nc against the real sandbox proxy', () => {
   afterEach(async () => {
@@ -148,7 +152,7 @@ describe.if(isMacOS)('ssh-over-nc against the real sandbox proxy', () => {
         'ssh',
         [
           '-o',
-          `ProxyCommand=nc -X 5 -x localhost:${port} %h %p`,
+          `ProxyCommand=${process.execPath} ${import.meta.dir}/../helpers/socks-noauth-pipe.ts ${port} %h %p`,
           '-o',
           'StrictHostKeyChecking=no',
           '-o',
