@@ -529,6 +529,26 @@ async function startMuxProxyServer(
       filterNetworkRequest(port, host, sandboxAskCallback, encodedCommand),
     parentProxy,
     proxyAuthToken,
+    probeUnauthenticated: async (port, host) => {
+      // Explicit deny rules only: an unauthenticated peer must never reach
+      // the ask callback, and a merely off-list host gets the generic
+      // cannot-authenticate refusal rather than a policy claim.
+      if (!config) return {}
+      const canonical = canonicalizeHost(host) ?? host
+      for (const entry of config.network.deniedDomains) {
+        if (matchesDomainPatternWithPort(canonical, port, entry)) {
+          const reason =
+            config.network.deniedDomainReasons?.[entry] ??
+            'host is on the deny list'
+          recordProxyViolation(
+            `deny network-outbound ${host}:${port} (${reason})`,
+            undefined,
+          )
+          return { deniedReason: reason }
+        }
+      }
+      return {}
+    },
   })
 
   muxProxyServer = createMuxProxyServer({
