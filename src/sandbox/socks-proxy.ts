@@ -313,11 +313,14 @@ async function refuseUnauthenticated(
     socket.end(socksReply(0x02))
     return
   }
+  // The built-in fallback states only what the proxy itself knows. An
+  // embedder that wants environment-specific guidance (e.g. "use an
+  // https:// remote") should express it as a deny rule with a reason —
+  // a `*:22` deniedDomains entry covers every SSH destination.
   const reason =
     probe.deniedReason ??
-    'This network proxy requires authentication that ssh ProxyCommand ' +
-      'tunnels cannot provide, so git-over-ssh cannot work here. Use an ' +
-      'https:// remote instead (git remote set-url origin https://...).'
+    'This proxy requires authentication, and this client did not offer an ' +
+      'authentication method, so the connection was refused.'
   // SOCKS success (bind address 0.0.0.0:0), then speak SSH.
   socket.write(socksReply(0x00))
   socket.write(Buffer.from('SSH-2.0-policy_refusal\r\n'))

@@ -102,12 +102,12 @@ describe('SOCKS unauthenticated probe', () => {
     expect(filterCalls).toBe(0)
   })
 
-  it('port-22 non-denied: SSH disconnect says the proxy needs auth and to use https', async () => {
+  it('port-22 non-denied: SSH disconnect says the proxy requires authentication', async () => {
     const port = await startServer({})
     const out = await drive(port, { host: 'allowed.test', port: 22 })
     const text = out.toString('latin1')
     expect(text).toContain('SSH-2.0-')
-    expect(text).toContain('Use an https:// remote')
+    expect(text).toContain('requires authentication')
   })
 
   it('non-22 target: plain SOCKS refusal, no SSH bytes, no tunnel', async () => {
@@ -186,7 +186,7 @@ describe.if(isMacOS)('ssh-over-nc against the real sandbox proxy', () => {
     expect(lines.some(l => l.includes('ssh-blocked.example:22'))).toBe(true)
   })
 
-  it('non-denied host: ssh stderr says the proxy needs auth, use https', async () => {
+  it('non-denied host: ssh stderr says the proxy requires authentication', async () => {
     await SandboxManager.initialize({
       network: { allowedDomains: ['anything.example'], deniedDomains: [] },
       filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
@@ -195,6 +195,6 @@ describe.if(isMacOS)('ssh-over-nc against the real sandbox proxy', () => {
       SandboxManager.getProxyPort()!,
       'anything.example',
     )
-    expect(stderr).toContain('Use an https:// remote')
+    expect(stderr).toContain('requires authentication')
   })
 })
