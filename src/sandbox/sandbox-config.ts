@@ -3,6 +3,7 @@
  * This is the main configuration interface that consumers pass to SandboxManager.initialize()
  */
 
+import { isIP } from 'node:net'
 import type { FilterRequestCallback } from './request-filter.js'
 
 import { isAbsolute } from 'node:path'
@@ -18,6 +19,12 @@ import {
  * protocols, paths, ports, and overly broad wildcards.
  */
 function isValidDomainPattern(val: string): boolean {
+  // A bare IPv6 literal as produced by splitDomainPatternPort for a
+  // bracketed entry (`[::1]`, `[2001:db8::1]:443` → `::1`, `2001:db8::1`).
+  // Whether the *raw* entry was bracketed is enforced separately
+  // (hasValidIpv6Bracketing) before the split.
+  if (isIP(val) === 6) return true
+
   // Reject protocols, paths, ports, etc.
   if (val.includes('://') || val.includes('/') || val.includes(':')) {
     return false
@@ -53,7 +60,7 @@ function isValidDomainPattern(val: string): boolean {
 }
 
 const DOMAIN_PATTERN_MESSAGE =
-  'Invalid domain pattern. Must be a valid domain (e.g., "example.com") or wildcard (e.g., "*.example.com"). Overly broad patterns like "*.com" or "*" are not allowed for security reasons.'
+  'Invalid domain pattern. Must be a valid domain (e.g., "example.com"), a wildcard (e.g., "*.example.com"), or a bracketed IPv6 literal (e.g., "[::1]", "[2001:db8::1]:443"). Overly broad patterns like "*.com" or "*" are not allowed for security reasons.'
 
 /**
  * Schema for domain patterns (e.g., "example.com", "*.npmjs.org")
@@ -68,10 +75,25 @@ const domainPatternSchema = z
  * "*.npmjs.org:8443"). Used for allowedDomains / deniedDomains, where the
  * proxy knows the destination port; an entry without a port matches any port.
  */
+/**
+ * Raw-entry rule applied before the port split: an entry with two or more
+ * colons is an IPv6 literal and must use RFC 3986 brackets (`[::1]`,
+ * `[::1]:443`). Unbracketed it is ambiguous — `2001:db8::1:443` is itself a
+ * valid 8-hextet address — so reject it and make the user say which they
+ * mean, rather than accept an entry that can silently match the wrong thing.
+ */
+function hasValidIpv6Bracketing(val: string): boolean {
+  const first = val.indexOf(':')
+  const multiColon = first !== -1 && val.indexOf(':', first + 1) !== -1
+  return !multiColon || val.startsWith('[')
+}
+
 const domainPortPatternSchema = z
   .string()
   .refine(
-    val => isValidDomainPattern(splitDomainPatternPort(val).hostPattern),
+    val =>
+      hasValidIpv6Bracketing(val) &&
+      isValidDomainPattern(splitDomainPatternPort(val).hostPattern),
     {
       message:
         DOMAIN_PATTERN_MESSAGE +
@@ -85,6 +107,7 @@ const domainPortPatternSchema = z
  */
 const deniedDomainPatternSchema = z.string().refine(
   val => {
+    if (!hasValidIpv6Bracketing(val)) return false
     const { hostPattern } = splitDomainPatternPort(val)
     return hostPattern === '*' || isValidDomainPattern(hostPattern)
   },

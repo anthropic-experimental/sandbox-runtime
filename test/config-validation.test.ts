@@ -158,6 +158,9 @@ describe('Config Validation', () => {
   test('should accept ":port" suffixes on allowed/denied domains', () => {
     const valid = [
       'example.com:443',
+      '[::1]',
+      '[::1]:443',
+      '[2001:db8::1]:8443',
       '*.example.com:8080',
       'localhost:3000',
       'example.com:65535',
@@ -186,6 +189,12 @@ describe('Config Validation', () => {
       'example.com:80:443',
       'example.com:', // empty suffix
       '*:22', // "*" is deny-only, still rejected in allowedDomains
+      '::1', // IPv6 literals must be bracketed
+      'fd00:ec2::254',
+      '2001:db8::1:443', // ambiguous — is 443 a port or the last hextet?
+      '[::1', // unterminated bracket
+      '[::1]:0',
+      '[not-an-ip]',
     ]
     for (const domain of invalid) {
       const result = SandboxRuntimeConfigSchema.safeParse({

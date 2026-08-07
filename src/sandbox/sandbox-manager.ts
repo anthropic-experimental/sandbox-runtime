@@ -81,9 +81,11 @@ import {
   removeTrailingGlobSuffix,
   expandGlobPattern,
   decodeSandboxedCommand,
+  encodeSandboxedCommand,
 } from './sandbox-utils.js'
 import {
   SandboxViolationStore,
+  sanitizeViolationText,
   shouldIgnoreViolation,
 } from './sandbox-violation-store.js'
 import type { MutateForwardedHeaders } from './request-filter.js'
@@ -187,6 +189,45 @@ function registerCleanup(): void {
 }
 
 /**
+ * commandId → commandText for invocations wrapped with an explicit id, so
+ * every producer can report (and ignoreViolations can match) the command an
+ * event belongs to rather than the opaque key. Keyed by what
+ * decodeSandboxedCommand yields for the id (its first 100 characters).
+ * Bounded FIFO: the violation store itself only retains the last 100
+ * events, so long-gone invocations don't need resolving.
+ */
+const MAX_COMMAND_TEXTS = 1024
+const commandTextsById = new Map<string, string>()
+
+function registerCommandText(
+  command: string,
+  options: WrapWithSandboxOptions | undefined,
+): void {
+  const id = options?.commandId
+  const text = options?.commandText ?? command
+  if (id === undefined || id === text) {
+    return
+  }
+  const key = decodeSandboxedCommand(encodeSandboxedCommand(id))
+  commandTextsById.delete(key)
+  commandTextsById.set(key, text)
+  while (commandTextsById.size > MAX_COMMAND_TEXTS) {
+    const oldest = commandTextsById.keys().next().value
+    if (oldest === undefined) break
+    commandTextsById.delete(oldest)
+  }
+}
+
+/**
+ * The command text for a decoded attribution key: the registered
+ * commandText when the key is a known commandId, else the key itself (an
+ * un-id'd wrap, where the key *is* the command).
+ */
+function resolveCommandText(decodedId: string): string {
+  return commandTextsById.get(decodedId) ?? decodedId
+}
+
+/**
  * Record a proxy-side denial in the violation store so the model sees a
  * structured <sandbox_violations> block alongside the raw 403 / SOCKS
  * failure in stderr — parity with the macOS seatbelt log monitor and the
@@ -200,12 +241,15 @@ function recordProxyViolation(
   encodedCommand: string | undefined,
 ): void {
   // The proxy username is client-supplied inside the sandbox (only the
-  // password is authenticated), so the decoded command is untrusted bytes:
-  // strip control characters so a forged suffix can't inject newlines or
-  // escape sequences into whatever renders `command`.
+  // password is authenticated), so the decoded key is untrusted bytes. A
+  // known commandId resolves to the embedder's registered text; anything
+  // else is reported as-is, control characters collapsed.
   const command = encodedCommand
-    ? // eslint-disable-next-line no-control-regex -- stripping control chars is the point
-      decodeSandboxedCommand(encodedCommand).replace(/[\x00-\x1f\x7f]+/g, ' ')
+    ? (() => {
+        const decoded = decodeSandboxedCommand(encodedCommand)
+        const known = commandTextsById.get(decoded)
+        return known ?? sanitizeViolationText(decoded)
+      })()
     : undefined
   // Same suppression the seatbelt / seccomp monitors apply, so a
   // configured ignoreViolations pattern silences the event no matter
@@ -214,11 +258,7 @@ function recordProxyViolation(
     return
   }
   sandboxViolationStore.addViolation({
-    // One physical line inside the <sandbox_violations> block: an embedder-
-    // supplied reason (deniedDomainReasons / filterRequest) must not be able
-    // to break the framing with a newline or a stray closing tag.
-    // eslint-disable-next-line no-control-regex -- stripping control chars is the point
-    line: line.replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/[<>]/g, ''),
+    line,
     encodedCommand,
     command,
     timestamp: new Date(),
@@ -582,6 +622,7 @@ async function initialize(
     logMonitorShutdown = startMacOSSandboxLogMonitor(
       sandboxViolationStore.addViolation.bind(sandboxViolationStore),
       config.ignoreViolations,
+      resolveCommandText,
     )
     logForDebugging('Started macOS sandbox log monitor')
   }
@@ -598,6 +639,7 @@ async function initialize(
         ],
         denyWritePaths: config.filesystem.denyWrite,
         ignoreViolations: config.ignoreViolations,
+        resolveCommandText,
       },
     )
     // Don't block initialization on listen() — wrap-time checks
@@ -1412,17 +1454,24 @@ async function waitForNetworkInitialization(): Promise<boolean> {
  */
 export type WrapWithSandboxOptions = {
   /**
-   * Attribution key for this invocation. Violations observed while it runs
-   * (seatbelt log lines, seccomp events, proxy denies) are stored under this
-   * string, so it must equal what you later pass to
-   * `annotateStderrWithSandboxFailures` / `getViolationsForCommand`. Defaults
-   * to `command`. Set it when the string you execute is not the string you
-   * look up by — e.g. an embedder that wraps an assembled
-   * `source <snapshot> && eval '<cmd>'` but queries by the raw `<cmd>`;
-   * otherwise the lookup key never matches the stored one and no
-   * <sandbox_violations> block is ever produced.
+   * Opaque per-invocation correlation key. Violations observed while the
+   * wrapped command runs (seatbelt log lines, seccomp events, proxy denies)
+   * are stored under this key, so it must equal what you later pass to
+   * `annotateStderrWithSandboxFailures` / `getViolationsForCommand`.
+   * Defaults to `command`. Prefer a unique id (e.g. a tool-use id) over the
+   * command text: keys are compared on their first 100 characters, so two
+   * long commands sharing a prefix would otherwise cross-attribute, and a
+   * rerun of the same text would inherit the earlier run's events.
    */
-  commandLabel?: string
+  commandId?: string
+  /**
+   * The command this invocation *represents*, when that differs from the
+   * string being wrapped (e.g. you wrap an assembled
+   * `source <snapshot> && eval '<cmd>'` but the user-facing command is
+   * `<cmd>`). Used for `ignoreViolations` command-pattern matching and
+   * reported as the violation's `command`. Defaults to `command`.
+   */
+  commandText?: string
 }
 
 async function wrapWithSandbox(
@@ -1433,7 +1482,8 @@ async function wrapWithSandbox(
   options?: WrapWithSandboxOptions,
 ): Promise<string> {
   const platform = getPlatform()
-  const commandLabel = options?.commandLabel
+  const commandId = options?.commandId
+  registerCommandText(command, options)
 
   // filesystem.disabled bypasses ALL filesystem rule generation. Both
   // platform wrappers treat readConfig/writeConfig === undefined as "no
@@ -1565,7 +1615,7 @@ async function wrapWithSandbox(
       // macOS sandbox profile supports glob patterns directly, no ripgrep needed
       return wrapCommandWithSandboxMacOS({
         command,
-        commandLabel,
+        commandId,
         needsNetworkRestriction,
         // Only pass proxy ports if proxy is running (when there are domains to filter)
         httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
@@ -1593,7 +1643,7 @@ async function wrapWithSandbox(
     case 'linux':
       return wrapCommandWithSandboxLinux({
         command,
-        commandLabel,
+        commandId,
         needsNetworkRestriction,
         // Only pass socket paths if proxy is running (when there are domains to filter)
         httpSocketPath: needsNetworkProxy
@@ -1751,9 +1801,10 @@ async function wrapWithSandboxArgv(
     // The `denyReadPaths` half of the SESSION-level credentials
     // is already unioned into the stamp set at initialize() time
     // via `computeWindowsFsAccessSet`.
+    registerCommandText(command, options)
     return wrapCommandWithSandboxWindows({
       command,
-      commandLabel: options?.commandLabel,
+      commandId: options?.commandId,
       httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
       socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
       proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
