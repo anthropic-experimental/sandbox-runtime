@@ -51,6 +51,7 @@
   },
   "files": [
     "dist",
+    "examples",
     "vendor/seccomp",
     "vendor/srt-win",
     "README.md",
