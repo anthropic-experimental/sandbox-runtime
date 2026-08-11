@@ -89,7 +89,8 @@ if (-not $us.user.in_builtin_users)  { throw "install: sandbox user not in BUILT
 if (-not $us.user.in_sandbox_group)  { throw "install: sandbox user not in sandbox-runtime-users" }
 if (-not $us.user.hidden_from_logon) { throw "install: sandbox user not hidden from Winlogon" }
 if (-not $us.cred_present)           { throw "install: credential not present in state DB" }
-if ($us.marker_version -ne 1)        { throw "install: setup marker version expected 1, got $($us.marker_version)" }
+# Keep in sync with SETUP_VERSION (vendor/srt-win-src/src/install.rs).
+if ($us.marker_version -ne 2)        { throw "install: setup marker version expected 2, got $($us.marker_version)" }
 if ($us.marker_user_sid -ne $us.user.sid) {
   throw "install: marker SID '$($us.marker_user_sid)' != live SID '$($us.user.sid)'"
 }

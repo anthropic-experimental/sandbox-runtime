@@ -19,9 +19,12 @@ use crate::state_db::{self, SetupInfo};
 use crate::{dpapi, logon, runner, user};
 
 /// Bumped on schema-incompatible changes to the `sandbox_user`
-/// row. The broker compares this to the on-disk marker and
-/// refuses with a "re-run `srt-win install`" message on mismatch.
-pub const SETUP_VERSION: u32 = 1;
+/// row, or when `install` gains a step existing installs must pick
+/// up (v2: ambient write-deny stamps — `ambient.rs`). The broker
+/// compares this to the on-disk marker and refuses with a "re-run
+/// `srt-win install`" message on mismatch; `install` treats a stale
+/// marker as a partial install and completes the missing steps.
+pub const SETUP_VERSION: u32 = 2;
 
 /// DPAPI-encrypt `u.password` and write the credential + setup
 /// marker to the `sandbox_user` table. [`state_db::open_db`]
@@ -45,6 +48,32 @@ pub fn write_setup(u: &user::ProvisionedUser) -> Result<()> {
                 .unwrap_or(0),
         },
     )
+}
+
+/// Whether the install-time ambient write-deny step is complete on
+/// this machine: every CURRENT target
+/// ([`crate::ambient::ambient_deny_targets`]) is both recorded in
+/// the state DB and carrying its on-disk deny ACE
+/// ([`crate::acl::sandbox_deny_present`]). Both halves matter: an
+/// install that died mid-list falls through the install early-out
+/// and finishes the remainder (missing rows), and "re-run `srt-win
+/// install`" really is the repair for drift (an admin `icacls
+/// /reset`, or a stamp that failed best-effort). Targets that no
+/// longer canonicalize (dir vanished since the target list filtered
+/// on existence) are ignored; any error reads as incomplete, which
+/// at the call site just means the (idempotent) install steps run.
+pub fn ambient_complete(
+    conn: &rusqlite::Connection,
+    sandbox_sid: &str,
+    raw_targets: &[String],
+) -> bool {
+    raw_targets.iter().all(|raw| {
+        let Ok((canon, _)) = crate::path_id::canonicalize_path(raw) else {
+            return true;
+        };
+        state_db::ambient_deny_recorded(conn, &canon).unwrap_or(false)
+            && crate::acl::sandbox_deny_present(&canon, sandbox_sid).unwrap_or(false)
+    })
 }
 
 /// Read the install-time setup record (if any) without taking the
