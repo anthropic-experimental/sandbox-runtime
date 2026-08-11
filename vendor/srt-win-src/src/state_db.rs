@@ -539,7 +539,7 @@ pub fn read_setup_info(conn: &Connection) -> Result<Option<SetupInfo>> {
         .optional()
     {
         Ok(v) => Ok(v),
-        Err(e) if missing_sandbox_user_table(&e) => Ok(None),
+        Err(e) if missing_table(&e, "sandbox_user") => Ok(None),
         Err(e) => Err(anyhow!("SELECT sandbox_user: {e}")),
     }
 }
@@ -553,7 +553,7 @@ pub fn read_ca_cert(conn: &Connection) -> Result<Option<crate::cert_store::CertD
         .optional()
     {
         Ok(v) => Ok(v.flatten()),
-        Err(e) if missing_sandbox_user_table(&e) => Ok(None),
+        Err(e) if missing_table(&e, "sandbox_user") => Ok(None),
         Err(e) => Err(anyhow!("SELECT sandbox_user.ca_cert: {e}")),
     }
 }
@@ -576,16 +576,21 @@ pub fn set_ca_cert(conn: &Connection, der: &crate::cert_store::CertDer) -> Resul
 pub fn clear_setup_info(conn: &Connection) -> Result<()> {
     match conn.execute("DELETE FROM sandbox_user", []) {
         Ok(_) => Ok(()),
-        Err(e) if missing_sandbox_user_table(&e) => Ok(()),
+        Err(e) if missing_table(&e, "sandbox_user") => Ok(()),
         Err(e) => Err(anyhow!("clear_setup_info: {e}")),
     }
 }
 
-fn missing_sandbox_user_table(e: &rusqlite::Error) -> bool {
+/// Whether `e` is rusqlite's "no such table: `<name>`" — the
+/// additive-table tolerance for read-only connections to a pre-bump
+/// `state.db` ([`open_db_ro`] applies no schema). Read paths for
+/// additive tables (`sandbox_user`, `ambient_denies`) match this and
+/// report "nothing recorded" instead of erroring.
+fn missing_table(e: &rusqlite::Error, name: &str) -> bool {
     matches!(
         e,
         rusqlite::Error::SqliteFailure(_, Some(m))
-            if m.contains("no such table") && m.contains("sandbox_user")
+            if m.contains("no such table") && m.contains(name)
     )
 }
 
@@ -625,12 +630,21 @@ pub fn with_init_lock<R>(
     force_recover: bool,
     f: impl FnOnce(&mut Locked) -> Result<R>,
 ) -> Result<(R, RecoveryReport)> {
-    let _mutex = InitMutex::acquire()?;
-    let conn = open_db()?;
-    let report = crash_recovery(&conn, force_recover)?;
+    let (_mutex, conn, report) = locked_recovered(force_recover)?;
     let mut locked = Locked { conn, holder_pid };
     let out = f(&mut locked)?;
     Ok((out, report))
+}
+
+/// The shared critical-section preamble of [`with_init_lock`] and
+/// [`with_install_lock`]: acquire the init mutex, open the DB, run
+/// crash recovery. Keep the mutex guard alive for the whole
+/// critical section.
+fn locked_recovered(force_recover: bool) -> Result<(InitMutex, Connection, RecoveryReport)> {
+    let mutex = InitMutex::acquire()?;
+    let conn = open_db()?;
+    let report = crash_recovery(&conn, force_recover)?;
+    Ok((mutex, conn, report))
 }
 
 /// Run `f` under the init mutex with the DB open, WITHOUT the
@@ -642,10 +656,21 @@ pub fn with_init_lock<R>(
 /// runs first — same as [`with_init_lock`] — so an install-time
 /// recompose can't re-materialize a dead session's stale ACEs onto
 /// the ambient system dirs.
+/// `SeRestorePrivilege` is enabled up front — several ambient
+/// targets are TrustedInstaller-owned with no Administrators
+/// `WRITE_DAC`, and `SetNamedSecurityInfoW` uses the privilege
+/// silently when enabled; every ambient op needs it, so it lives at
+/// the lock boundary rather than per-operation.
 pub fn with_install_lock<R>(f: impl FnOnce(&Connection) -> Result<R>) -> Result<R> {
-    let _mutex = InitMutex::acquire()?;
-    let conn = open_db()?;
-    let _ = crash_recovery(&conn, false)?;
+    match crate::util::enable_privilege("SeRestorePrivilege") {
+        Ok(true) => {}
+        Ok(false) => eprintln!(
+            "srt-win: ambient deny: SeRestorePrivilege not held \
+             (non-elevated?) — TrustedInstaller-owned targets may fail"
+        ),
+        Err(e) => eprintln!("srt-win: ambient deny: enable SeRestorePrivilege: {e:#}"),
+    }
+    let (_mutex, conn, _) = locked_recovered(false)?;
     f(&conn)
 }
 
@@ -1125,52 +1150,29 @@ fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()>
     }
     // Install-time ambient write-deny (`ambient_denies`) folds into
     // every converge on the path, so session release/recovery cannot
-    // strip it. A session's wider ReadDeny wins while held (SbAce::max
-    // widening); the ambient WriteDeny floor returns when it releases.
+    // strip it. WriteDeny is the floor: a session's wider ReadDeny
+    // wins while its row is held, and the floor returns on release.
     if ambient_deny_recorded(conn, canon)? {
-        set.deny = Some(match set.deny {
-            Some(held) => match SbAce::Deny(held).max(SbAce::Deny(acl::DenyMask::WriteDeny)) {
-                SbAce::Deny(d) => d,
-                _ => unreachable!("max of two Deny is a Deny"),
-            },
-            None => acl::DenyMask::WriteDeny,
-        });
+        set.deny.get_or_insert(acl::DenyMask::WriteDeny);
     }
     acl::apply_sandbox_aces(canon, sandbox_sid, set)
         .with_context(|| format!("recompose '{canon}' ({set:?})"))
 }
 
-/// Whether the `ambient_denies` table exists. A read-only connection
-/// ([`open_db_ro`]) to a pre-v2 `state.db` never ran the additive
-/// schema, so every read path must tolerate the table's absence
-/// (absent table = nothing recorded) instead of surfacing "no such
-/// table" from the exact diagnostic commands the upgrade messages
-/// point at.
-fn ambient_table_exists(conn: &Connection) -> Result<bool> {
-    let n: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master \
-             WHERE type = 'table' AND name = 'ambient_denies'",
-            [],
-            |r| r.get(0),
-        )
-        .context("query sqlite_master for ambient_denies")?;
-    Ok(n > 0)
-}
-
 /// Whether `canon` is a recorded install-time ambient deny target.
-fn ambient_deny_recorded(conn: &Connection, canon: &str) -> Result<bool> {
-    if !ambient_table_exists(conn)? {
-        return Ok(false);
+/// `Ok(false)` on a pre-v2 DB with no `ambient_denies` table (the
+/// [`missing_table`] tolerance — matters only for [`open_db_ro`]
+/// callers; [`open_db`] applies the additive schema on every open).
+pub fn ambient_deny_recorded(conn: &Connection, canon: &str) -> Result<bool> {
+    match conn.query_row(
+        "SELECT COUNT(*) FROM ambient_denies WHERE canonical_path = ?1",
+        params![canon],
+        |r| r.get::<_, i64>(0),
+    ) {
+        Ok(n) => Ok(n > 0),
+        Err(e) if missing_table(&e, "ambient_denies") => Ok(false),
+        Err(e) => Err(anyhow!("SELECT ambient_denies: {e}")),
     }
-    let n: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM ambient_denies WHERE canonical_path = ?1",
-            params![canon],
-            |r| r.get(0),
-        )
-        .context("query ambient_denies")?;
-    Ok(n > 0)
 }
 
 /// Outcome of [`set_ambient_denies`].
@@ -1201,14 +1203,6 @@ pub fn set_ambient_denies(
     sandbox_sid: &str,
     raw_paths: &[String],
 ) -> Result<AmbientReport> {
-    match crate::util::enable_privilege("SeRestorePrivilege") {
-        Ok(true) => {}
-        Ok(false) => eprintln!(
-            "srt-win: ambient deny: SeRestorePrivilege not held \
-             (non-elevated?) — TrustedInstaller-owned targets may fail"
-        ),
-        Err(e) => eprintln!("srt-win: ambient deny: enable SeRestorePrivilege: {e:#}"),
-    }
     let mut report = AmbientReport::default();
     for raw in raw_paths {
         let canon = match path_id::canonicalize_path(raw) {
@@ -1247,22 +1241,15 @@ pub fn set_ambient_denies(
 /// holds its own deny/grant there). Per-path best-effort like
 /// [`set_ambient_denies`] — a lingering ACE after a failed removal
 /// references the (about-to-be-deleted) sandbox SID and denies
-/// nobody else. Returns the removed paths.
-pub fn clear_ambient_denies(conn: &Connection, sandbox_sid: &str) -> Result<Vec<String>> {
-    match crate::util::enable_privilege("SeRestorePrivilege") {
-        Ok(_) => {}
-        Err(e) => eprintln!("srt-win: ambient deny: enable SeRestorePrivilege: {e:#}"),
-    }
-    if !ambient_table_exists(conn)? {
-        return Ok(Vec::new());
-    }
+/// nobody else. Returns how many paths were removed.
+pub fn clear_ambient_denies(conn: &Connection, sandbox_sid: &str) -> Result<usize> {
     let paths: Vec<String> = query_vec(
         conn,
         "SELECT canonical_path FROM ambient_denies",
         [],
         |r| r.get(0),
     )?;
-    let mut removed = Vec::with_capacity(paths.len());
+    let mut removed = 0usize;
     for p in paths {
         // Delete the row FIRST so the recompose converges to the
         // session-held set (the fold-in would otherwise re-apply the
@@ -1276,7 +1263,7 @@ pub fn clear_ambient_denies(conn: &Connection, sandbox_sid: &str) -> Result<Vec<
         )
         .context("DELETE ambient_denies")?;
         match recompose_at(conn, &p, sandbox_sid) {
-            Ok(()) => removed.push(p),
+            Ok(()) => removed += 1,
             Err(e) => {
                 eprintln!("srt-win: warning: ambient deny removal '{p}': {e:#}");
                 conn.execute(
@@ -1291,43 +1278,23 @@ pub fn clear_ambient_denies(conn: &Connection, sandbox_sid: &str) -> Result<Vec<
 }
 
 /// Recorded ambient-deny paths, for `status`. Empty on a pre-v2 DB
-/// (see [`ambient_table_exists`]).
+/// (the [`missing_table`] tolerance).
 pub fn ambient_deny_paths(conn: &Connection) -> Result<Vec<String>> {
-    if !ambient_table_exists(conn)? {
-        return Ok(Vec::new());
-    }
-    query_vec(conn, "SELECT canonical_path FROM ambient_denies ORDER BY canonical_path", [], |r| {
-        r.get(0)
-    })
-}
-
-/// Whether every entry of `raw_targets` is recorded in
-/// `ambient_denies` AND its write-deny ACE is actually on disk — the
-/// install early-out's completeness check. Both halves matter: an
-/// install that died mid-list falls through and finishes the
-/// remainder (missing rows), and "re-run `srt-win install`" really
-/// is the repair for drift (an `icacls /reset` by an admin, or a
-/// stamp that failed best-effort) — recorded-but-absent ACEs also
-/// read as incomplete, so the re-run re-stamps instead of
-/// early-outing "no changes". Targets that no longer canonicalize
-/// (dir vanished since [`crate::ambient::ambient_deny_targets`]
-/// filtered on existence) are ignored.
-pub fn ambient_denies_complete(
-    conn: &Connection,
-    sandbox_sid: &str,
-    raw_targets: &[String],
-) -> Result<bool> {
-    for raw in raw_targets {
-        if let Ok((canon, _)) = path_id::canonicalize_path(raw) {
-            if !ambient_deny_recorded(conn, &canon)? {
-                return Ok(false);
-            }
-            if !acl::sandbox_deny_present(&canon, sandbox_sid).unwrap_or(false) {
-                return Ok(false);
-            }
+    match query_vec(
+        conn,
+        "SELECT canonical_path FROM ambient_denies ORDER BY canonical_path",
+        [],
+        |r| r.get(0),
+    ) {
+        Ok(v) => Ok(v),
+        Err(e)
+            if e.downcast_ref::<rusqlite::Error>()
+                .is_some_and(|e| missing_table(e, "ambient_denies")) =>
+        {
+            Ok(Vec::new())
         }
+        Err(e) => Err(e),
     }
-    Ok(true)
 }
 
 /// Sealed proof that [`Locked::apply_aces`] converged `canon` to

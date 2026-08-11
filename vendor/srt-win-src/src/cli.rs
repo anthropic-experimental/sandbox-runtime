@@ -565,11 +565,11 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
 /// is recorded (pre-v2 install, or no install).
 fn ambient_status_json() -> anyhow::Result<serde_json::Value> {
     use serde_json::json;
-    use srt_win::{acl, install, state_db};
+    use srt_win::{acl, state_db};
     let Some(conn) = state_db::open_db_ro()? else {
         return Ok(json!({ "paths": [] }));
     };
-    let sid = install::read_setup()
+    let sid = state_db::read_setup_info(&conn)
         .ok()
         .flatten()
         .map(|s| s.sandbox_user_sid);
@@ -727,6 +727,9 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // install whose tags lack a port_range (legacy) is
             // treated as "different" and requires --force.
             let existing = install::read_setup().ok().flatten();
+            // Shared by the early-out completeness check and the
+            // stamping step below (env reads + a stat per entry).
+            let ambient_targets = srt_win::ambient::ambient_deny_targets();
             let name_changed = existing.as_ref().is_some_and(|s| s.sandbox_user != name);
             if !force
                 && let Ok(st) = wfp::filter_status(&sl)
@@ -753,22 +756,22 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     );
                     std::process::exit(13);
                 }
-                // Same config — early-out only if COMPLETE. Ambient
-                // rows are part of completeness: an install that
-                // failed between the setup marker and the ambient
-                // stamps must fall through and finish them.
+                // Same config — early-out only if COMPLETE. The
+                // ambient half is part of completeness (an install
+                // that failed between the setup marker and the
+                // stamps must fall through and finish; a drifted
+                // ACE makes re-running install the repair), and is
+                // checked last: it reads a DACL per target, so it
+                // only runs once the cheap conjuncts pass.
                 let us = user::status(name)?;
                 let mv = existing.as_ref().map(|s| s.marker_version);
-                let ambient_ok = match (srt_win::state_db::open_db_ro(), &existing) {
-                    (Ok(Some(c)), Some(s)) => srt_win::state_db::ambient_denies_complete(
-                        &c,
-                        &s.sandbox_user_sid,
-                        &srt_win::ambient::ambient_deny_targets(),
-                    )
-                    .unwrap_or(false),
+                let ambient_ok = || match (srt_win::state_db::open_db_ro(), &existing) {
+                    (Ok(Some(c)), Some(s)) => {
+                        install::ambient_complete(&c, &s.sandbox_user_sid, &ambient_targets)
+                    }
                     _ => false,
                 };
-                if us.exists && us.in_sandbox_group && mv == Some(install::SETUP_VERSION) && ambient_ok {
+                if us.exists && us.in_sandbox_group && mv == Some(install::SETUP_VERSION) && ambient_ok() {
                     eprintln!(
                         "srt-win: already installed (sublayer={sl:?}, \
                          port_range={}-{}, sandbox_user='{name}', \
@@ -829,9 +832,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // the WFP step so a failure here leaves the install
             // visibly partial (filters absent) rather than
             // marker-complete with the stamps missing.
-            let targets = srt_win::ambient::ambient_deny_targets();
             match srt_win::state_db::with_install_lock(|conn| {
-                srt_win::state_db::set_ambient_denies(conn, &pu.sid, &targets)
+                srt_win::state_db::set_ambient_denies(conn, &pu.sid, &ambient_targets)
             }) {
                 Ok(r) if r.applied.is_empty() && !r.failed.is_empty() => {
                     // Every stamp failed — treat as a real install
@@ -934,9 +936,8 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     match srt_win::state_db::with_install_lock(|conn| {
                         srt_win::state_db::clear_ambient_denies(conn, &s.sandbox_user_sid)
                     }) {
-                        Ok(paths) if !paths.is_empty() => eprintln!(
-                            "srt-win: ambient write-deny removed from {} system path(s)",
-                            paths.len(),
+                        Ok(n) if n > 0 => eprintln!(
+                            "srt-win: ambient write-deny removed from {n} system path(s)",
                         ),
                         Ok(_) => {}
                         Err(e) => {

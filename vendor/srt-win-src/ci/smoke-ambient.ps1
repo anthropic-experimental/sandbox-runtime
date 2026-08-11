@@ -32,6 +32,25 @@ function Run { param([string[]] $argv)
   }
 }
 function J { param([string[]] $argv) Run $argv | ConvertFrom-Json }
+function Stdin { param([string[]] $argv, [string] $json)
+  $raw = $json | & $Exe @argv 2>&1 | Out-String
+  Write-Host -NoNewline $raw
+  if ($LASTEXITCODE -ne 0) {
+    throw "srt-win $($argv -join ' ') exited ${LASTEXITCODE}: $raw"
+  }
+}
+function RunCapture { param([string[]] $argv)
+  $raw = & $Exe @argv 2>&1 | Out-String
+  return [pscustomobject]@{ exit = $LASTEXITCODE; raw = $raw }
+}
+# A sandboxed write to $probe must fail AND leave no file behind.
+function Assert-WriteDenied { param([string] $msg)
+  & $Exe exec --quiet -- $cmd /c "echo p > `"$probe`"" 2>&1 | Out-Null
+  if ($LASTEXITCODE -eq 0 -or (Test-Path $probe)) {
+    Remove-Item $probe -Force -ea SilentlyContinue
+    throw $msg
+  }
+}
 
 $cmd = Join-Path $env:SystemRoot 'System32\cmd.exe'
 $env:SANDBOX_RUNTIME_WIN_DEBUG = '1'
@@ -43,10 +62,10 @@ try { Start-Service seclogon -ea Stop } catch {
 
 try {
   # ── AM1: install stamps the ambient list ─────────────────────────
-  $inst = & $Exe install --sublayer-guid $Sublayer --proxy-port-range $PortRange 2>&1 | Out-String
-  Write-Host -NoNewline $inst
-  if ($LASTEXITCODE -ne 0) { throw "install exited ${LASTEXITCODE}: $inst" }
-  if ($inst -notmatch 'ambient write-deny stamped on (\d+) system path') {
+  $inst = RunCapture @('install','--sublayer-guid',$Sublayer,'--proxy-port-range',$PortRange)
+  Write-Host -NoNewline $inst.raw
+  if ($inst.exit -ne 0) { throw "install exited $($inst.exit): $($inst.raw)" }
+  if ($inst.raw -notmatch 'ambient write-deny stamped on (\d+) system path') {
     throw 'AM1: install output missing the ambient-stamp line'
   }
   $us = J @('user','status')
@@ -65,55 +84,40 @@ try {
 
   # ── AM2: sandboxed write to %ProgramData% denied; read allowed ───
   $probe = Join-Path $env:ProgramData "srt-ambient-smoke-$([guid]::NewGuid().ToString('N')).txt"
-  & $Exe exec --quiet -- $cmd /c "echo p > `"$probe`"" 2>&1 | Out-Null
-  if ($LASTEXITCODE -eq 0 -or (Test-Path $probe)) {
-    Remove-Item $probe -Force -ea SilentlyContinue
-    throw 'AM2: sandboxed write into %ProgramData% succeeded (must be denied)'
-  }
+  Assert-WriteDenied 'AM2: sandboxed write into %ProgramData% succeeded (must be denied)'
   & $Exe exec --quiet -- $cmd /c "dir `"$env:ProgramData`" > nul" 2>&1 | Out-Null
   if ($LASTEXITCODE -ne 0) { throw 'AM2: sandboxed READ of %ProgramData% failed (deny must be write-only)' }
   Write-Host 'AM2 ok: %ProgramData% write denied, read allowed'
 
   # ── AM3: session stamp + restore preserves the ambient floor ─────
-  $pd = $env:ProgramData
-  (@{ denyRead = @(); denyWrite = @($pd) } | ConvertTo-Json) |
-    & $Exe acl stamp --holder-pid $PID --sandbox-user-sid $sbSid 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw 'AM3: session stamp on %ProgramData% failed' }
-  & $Exe acl restore --holder-pid $PID --sandbox-user-sid $sbSid --json 2>&1 | Out-Null
-  if ($LASTEXITCODE -ne 0) { throw 'AM3: session restore failed' }
-  & $Exe exec --quiet -- $cmd /c "echo p > `"$probe`"" 2>&1 | Out-Null
-  if ($LASTEXITCODE -eq 0 -or (Test-Path $probe)) {
-    Remove-Item $probe -Force -ea SilentlyContinue
-    throw 'AM3: ambient deny lost after session stamp+restore round-trip'
-  }
+  $json = @{ denyRead = @(); denyWrite = @($env:ProgramData) } | ConvertTo-Json
+  Stdin @('acl','stamp','--holder-pid',$PID,'--sandbox-user-sid',$sbSid) $json
+  Run @('acl','restore','--holder-pid',$PID,'--sandbox-user-sid',$sbSid,'--json')
+  Assert-WriteDenied 'AM3: ambient deny lost after session stamp+restore round-trip'
   Write-Host 'AM3 ok: ambient floor survives session stamp+restore'
 
   # ── AM4: --keep-user uninstall keeps the floor ───────────────────
   # Ambient stamps key on the ACCOUNT, not the sublayer: tearing down
   # one sublayer with --keep-user (what test suites do around a
   # possibly-shared machine) must not strip the floor.
-  $un = & $Exe uninstall --sublayer-guid $Sublayer --keep-user 2>&1 | Out-String
-  Write-Host -NoNewline $un
-  if ($LASTEXITCODE -ne 0) { throw "uninstall --keep-user exited ${LASTEXITCODE}: $un" }
-  if ($un -match 'ambient write-deny removed') {
+  $un = RunCapture @('uninstall','--sublayer-guid',$Sublayer,'--keep-user')
+  Write-Host -NoNewline $un.raw
+  if ($un.exit -ne 0) { throw "uninstall --keep-user exited $($un.exit): $($un.raw)" }
+  if ($un.raw -match 'ambient write-deny removed') {
     throw 'AM4: --keep-user uninstall removed the ambient stamps (must keep them)'
   }
   $st2 = J @('status','--sublayer-guid',$Sublayer)
   if ($st2.ambient.paths.Count -lt 3) {
     throw "AM4: only $($st2.ambient.paths.Count) ambient rows survive --keep-user uninstall"
   }
-  & $Exe exec --quiet -- $cmd /c "echo p > `"$probe`"" 2>&1 | Out-Null
-  if ($LASTEXITCODE -eq 0 -or (Test-Path $probe)) {
-    Remove-Item $probe -Force -ea SilentlyContinue
-    throw 'AM4: ambient deny lost after --keep-user uninstall'
-  }
+  Assert-WriteDenied 'AM4: ambient deny lost after --keep-user uninstall'
   Write-Host 'AM4 ok: --keep-user uninstall keeps the ambient floor'
 
   # ── AM5: full uninstall removes the stamps with the account ──────
-  $un2 = & $Exe uninstall --sublayer-guid $Sublayer 2>&1 | Out-String
-  Write-Host -NoNewline $un2
-  if ($LASTEXITCODE -ne 0) { throw "uninstall exited ${LASTEXITCODE}: $un2" }
-  if ($un2 -notmatch 'ambient write-deny removed') {
+  $un2 = RunCapture @('uninstall','--sublayer-guid',$Sublayer)
+  Write-Host -NoNewline $un2.raw
+  if ($un2.exit -ne 0) { throw "uninstall exited $($un2.exit): $($un2.raw)" }
+  if ($un2.raw -notmatch 'ambient write-deny removed') {
     throw 'AM5: full uninstall output missing the ambient-removal line'
   }
   $st3 = J @('status','--sublayer-guid',$Sublayer)

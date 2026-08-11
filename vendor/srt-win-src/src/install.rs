@@ -50,6 +50,32 @@ pub fn write_setup(u: &user::ProvisionedUser) -> Result<()> {
     )
 }
 
+/// Whether the install-time ambient write-deny step is complete on
+/// this machine: every CURRENT target
+/// ([`crate::ambient::ambient_deny_targets`]) is both recorded in
+/// the state DB and carrying its on-disk deny ACE
+/// ([`crate::acl::sandbox_deny_present`]). Both halves matter: an
+/// install that died mid-list falls through the install early-out
+/// and finishes the remainder (missing rows), and "re-run `srt-win
+/// install`" really is the repair for drift (an admin `icacls
+/// /reset`, or a stamp that failed best-effort). Targets that no
+/// longer canonicalize (dir vanished since the target list filtered
+/// on existence) are ignored; any error reads as incomplete, which
+/// at the call site just means the (idempotent) install steps run.
+pub fn ambient_complete(
+    conn: &rusqlite::Connection,
+    sandbox_sid: &str,
+    raw_targets: &[String],
+) -> bool {
+    raw_targets.iter().all(|raw| {
+        let Ok((canon, _)) = crate::path_id::canonicalize_path(raw) else {
+            return true;
+        };
+        state_db::ambient_deny_recorded(conn, &canon).unwrap_or(false)
+            && crate::acl::sandbox_deny_present(&canon, sandbox_sid).unwrap_or(false)
+    })
+}
+
 /// Read the install-time setup record (if any) without taking the
 /// init mutex. `Ok(None)` when no install has run (state DB
 /// absent or no marker row).
