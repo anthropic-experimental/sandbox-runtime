@@ -119,6 +119,17 @@ CREATE INDEX IF NOT EXISTS ace_holders_by_pid ON ace_holders (pid);
 CREATE TABLE IF NOT EXISTS placeholders (
   canonical_path TEXT PRIMARY KEY
 );
+-- Install-time ambient write-deny targets (`ambient.rs`): Windows'
+-- stock world-writable system dirs, stamped `(D;OICI;WriteDeny)` for
+-- the sandbox SID at `srt-win install` and removed at `uninstall`.
+-- NOT holder-refcounted: rows persist across sessions by design.
+-- Recorded here so `recompose_at` folds the deny into every
+-- converge — a session grant/stamp/release or crash recovery on the
+-- same path re-applies rather than strips it. Additive table — no
+-- schema-version bump.
+CREATE TABLE IF NOT EXISTS ambient_denies (
+  canonical_path TEXT PRIMARY KEY
+);
 -- Install-time setup record: the sandbox user's DPAPI-encrypted
 -- credential plus the setup marker. One row per provisioned
 -- sandbox user (currently exactly one). Additive table — no
@@ -622,6 +633,22 @@ pub fn with_init_lock<R>(
     Ok((out, report))
 }
 
+/// Run `f` under the init mutex with the DB open, WITHOUT the
+/// holder/broker machinery — for install/uninstall-time state that
+/// has no owning session ([`set_ambient_denies`] /
+/// [`clear_ambient_denies`]). The mutex serializes against
+/// concurrent `acl` ops so an ambient recompose can't interleave
+/// with a session's converge on the same path, and crash recovery
+/// runs first — same as [`with_init_lock`] — so an install-time
+/// recompose can't re-materialize a dead session's stale ACEs onto
+/// the ambient system dirs.
+pub fn with_install_lock<R>(f: impl FnOnce(&Connection) -> Result<R>) -> Result<R> {
+    let _mutex = InitMutex::acquire()?;
+    let conn = open_db()?;
+    let _ = crash_recovery(&conn, false)?;
+    f(&conn)
+}
+
 /// View inside `with_init_lock`. Owns the `Connection`; each method
 /// commits independently (rusqlite autocommits a lone `execute`).
 ///
@@ -1096,8 +1123,211 @@ fn recompose_at(conn: &Connection, canon: &str, sandbox_sid: &str) -> Result<()>
             SbAce::DenyDelete => set.deny_delete = true,
         }
     }
+    // Install-time ambient write-deny (`ambient_denies`) folds into
+    // every converge on the path, so session release/recovery cannot
+    // strip it. A session's wider ReadDeny wins while held (SbAce::max
+    // widening); the ambient WriteDeny floor returns when it releases.
+    if ambient_deny_recorded(conn, canon)? {
+        set.deny = Some(match set.deny {
+            Some(held) => match SbAce::Deny(held).max(SbAce::Deny(acl::DenyMask::WriteDeny)) {
+                SbAce::Deny(d) => d,
+                _ => unreachable!("max of two Deny is a Deny"),
+            },
+            None => acl::DenyMask::WriteDeny,
+        });
+    }
     acl::apply_sandbox_aces(canon, sandbox_sid, set)
         .with_context(|| format!("recompose '{canon}' ({set:?})"))
+}
+
+/// Whether the `ambient_denies` table exists. A read-only connection
+/// ([`open_db_ro`]) to a pre-v2 `state.db` never ran the additive
+/// schema, so every read path must tolerate the table's absence
+/// (absent table = nothing recorded) instead of surfacing "no such
+/// table" from the exact diagnostic commands the upgrade messages
+/// point at.
+fn ambient_table_exists(conn: &Connection) -> Result<bool> {
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master \
+             WHERE type = 'table' AND name = 'ambient_denies'",
+            [],
+            |r| r.get(0),
+        )
+        .context("query sqlite_master for ambient_denies")?;
+    Ok(n > 0)
+}
+
+/// Whether `canon` is a recorded install-time ambient deny target.
+fn ambient_deny_recorded(conn: &Connection, canon: &str) -> Result<bool> {
+    if !ambient_table_exists(conn)? {
+        return Ok(false);
+    }
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ambient_denies WHERE canonical_path = ?1",
+            params![canon],
+            |r| r.get(0),
+        )
+        .context("query ambient_denies")?;
+    Ok(n > 0)
+}
+
+/// Outcome of [`set_ambient_denies`].
+#[derive(Debug, Default)]
+pub struct AmbientReport {
+    /// Paths whose deny ACE is on disk (freshly stamped or
+    /// re-converged on re-install).
+    pub applied: Vec<String>,
+    /// Recorded paths whose stamp failed (odd system DACL even with
+    /// `SeRestorePrivilege`). The row stays: `status` shows
+    /// `present: false`, and any later recompose retries.
+    pub failed: Vec<String>,
+}
+
+/// Record + stamp the install-time ambient write-deny targets.
+/// Caller passes the RAW paths ([`crate::ambient::ambient_deny_targets`]);
+/// non-canonicalizable entries (racing deletion, permissions) are
+/// skipped with a warning line so a partial system list surfaces
+/// without failing the install. Several targets are
+/// TrustedInstaller-owned with no Administrators `WRITE_DAC`, so
+/// `SeRestorePrivilege` is enabled first (`SetNamedSecurityInfoW`
+/// uses it silently); per-path stamp failures are best-effort —
+/// warned, recorded, reported via `status` — rather than fatal.
+/// Runs OUTSIDE the holder machinery — ambient rows have no broker
+/// and survive crash recovery by design.
+pub fn set_ambient_denies(
+    conn: &Connection,
+    sandbox_sid: &str,
+    raw_paths: &[String],
+) -> Result<AmbientReport> {
+    match crate::util::enable_privilege("SeRestorePrivilege") {
+        Ok(true) => {}
+        Ok(false) => eprintln!(
+            "srt-win: ambient deny: SeRestorePrivilege not held \
+             (non-elevated?) — TrustedInstaller-owned targets may fail"
+        ),
+        Err(e) => eprintln!("srt-win: ambient deny: enable SeRestorePrivilege: {e:#}"),
+    }
+    let mut report = AmbientReport::default();
+    for raw in raw_paths {
+        let canon = match path_id::canonicalize_path(raw) {
+            Ok((c, _)) => c,
+            Err(e) => {
+                // Counted as FAILED (not silently skipped): a
+                // canonicalize failure on a dir the target list just
+                // saw exist is a real gap — it trips the caller's
+                // all-failed check, and re-running install retries it
+                // (no row is recorded, so the early-out's
+                // completeness check stays unsatisfied... for
+                // still-existing targets).
+                eprintln!("srt-win: warning: ambient deny target '{raw}': {e:#}");
+                report.failed.push(raw.clone());
+                continue;
+            }
+        };
+        conn.execute(
+            "INSERT OR IGNORE INTO ambient_denies (canonical_path) VALUES (?1)",
+            params![canon],
+        )
+        .context("INSERT ambient_denies")?;
+        match recompose_at(conn, &canon, sandbox_sid) {
+            Ok(()) => report.applied.push(canon),
+            Err(e) => {
+                eprintln!("srt-win: warning: ambient deny stamp '{canon}': {e:#}");
+                report.failed.push(canon);
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// Remove every recorded ambient deny: delete the rows, then
+/// re-converge each path (drops the ACE unless a live session still
+/// holds its own deny/grant there). Per-path best-effort like
+/// [`set_ambient_denies`] — a lingering ACE after a failed removal
+/// references the (about-to-be-deleted) sandbox SID and denies
+/// nobody else. Returns the removed paths.
+pub fn clear_ambient_denies(conn: &Connection, sandbox_sid: &str) -> Result<Vec<String>> {
+    match crate::util::enable_privilege("SeRestorePrivilege") {
+        Ok(_) => {}
+        Err(e) => eprintln!("srt-win: ambient deny: enable SeRestorePrivilege: {e:#}"),
+    }
+    if !ambient_table_exists(conn)? {
+        return Ok(Vec::new());
+    }
+    let paths: Vec<String> = query_vec(
+        conn,
+        "SELECT canonical_path FROM ambient_denies",
+        [],
+        |r| r.get(0),
+    )?;
+    let mut removed = Vec::with_capacity(paths.len());
+    for p in paths {
+        // Delete the row FIRST so the recompose converges to the
+        // session-held set (the fold-in would otherwise re-apply the
+        // ambient deny); on recompose failure RE-INSERT it, so the
+        // leftover ACE stays visible to `status` and retryable by a
+        // later uninstall/install instead of becoming an invisible
+        // orphan.
+        conn.execute(
+            "DELETE FROM ambient_denies WHERE canonical_path = ?1",
+            params![p],
+        )
+        .context("DELETE ambient_denies")?;
+        match recompose_at(conn, &p, sandbox_sid) {
+            Ok(()) => removed.push(p),
+            Err(e) => {
+                eprintln!("srt-win: warning: ambient deny removal '{p}': {e:#}");
+                conn.execute(
+                    "INSERT OR IGNORE INTO ambient_denies (canonical_path) VALUES (?1)",
+                    params![p],
+                )
+                .context("re-INSERT ambient_denies after failed removal")?;
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// Recorded ambient-deny paths, for `status`. Empty on a pre-v2 DB
+/// (see [`ambient_table_exists`]).
+pub fn ambient_deny_paths(conn: &Connection) -> Result<Vec<String>> {
+    if !ambient_table_exists(conn)? {
+        return Ok(Vec::new());
+    }
+    query_vec(conn, "SELECT canonical_path FROM ambient_denies ORDER BY canonical_path", [], |r| {
+        r.get(0)
+    })
+}
+
+/// Whether every entry of `raw_targets` is recorded in
+/// `ambient_denies` AND its write-deny ACE is actually on disk — the
+/// install early-out's completeness check. Both halves matter: an
+/// install that died mid-list falls through and finishes the
+/// remainder (missing rows), and "re-run `srt-win install`" really
+/// is the repair for drift (an `icacls /reset` by an admin, or a
+/// stamp that failed best-effort) — recorded-but-absent ACEs also
+/// read as incomplete, so the re-run re-stamps instead of
+/// early-outing "no changes". Targets that no longer canonicalize
+/// (dir vanished since [`crate::ambient::ambient_deny_targets`]
+/// filtered on existence) are ignored.
+pub fn ambient_denies_complete(
+    conn: &Connection,
+    sandbox_sid: &str,
+    raw_targets: &[String],
+) -> Result<bool> {
+    for raw in raw_targets {
+        if let Ok((canon, _)) = path_id::canonicalize_path(raw) {
+            if !ambient_deny_recorded(conn, &canon)? {
+                return Ok(false);
+            }
+            if !acl::sandbox_deny_present(&canon, sandbox_sid).unwrap_or(false) {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
 }
 
 /// Sealed proof that [`Locked::apply_aces`] converged `canon` to

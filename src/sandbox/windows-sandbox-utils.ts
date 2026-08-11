@@ -98,6 +98,8 @@ export type WindowsSandboxErrorCode =
   | 'install_user_failed'
   /** `srt-win install` exit 13 — different config under this sublayer. */
   | 'install_config_conflict'
+  /** `srt-win install` exit 17 — ambient write-deny stamping failed. */
+  | 'install_ambient_failed'
   /** `srt-win install` was killed by the spawn timeout (UAC left open). */
   | 'install_timeout'
   /** `srt-win install` failed with an unmapped exit code. */
@@ -1493,6 +1495,7 @@ function remapInstallTimeout(e: unknown): never {
 //   12 WFP install failed
 //   13 already installed with different config (use --force)
 //   14 sandbox-user provisioning failed
+//   17 ambient write-deny stamping failed
 //   1  other error (stderr has detail)
 // Throws on any failure code; the caller reads back state on 0/10.
 function throwOnInstallFailure(r: RunResult): void {
@@ -1519,6 +1522,13 @@ function throwOnInstallFailure(r: RunResult): void {
           `a different port range or sandbox-user name. Pass ` +
           `{force: true} to replace, or pick a different sublayerGuid. ` +
           `Output: ${out}`,
+      )
+    case 17:
+      throw new WindowsSandboxError(
+        'install_ambient_failed',
+        `srt-win install: ambient write-deny stamping failed (stock ` +
+          `world-writable system dirs could not be deny-stamped for the ` +
+          `sandbox user): ${out}`,
       )
     default:
       throw new WindowsSandboxError(

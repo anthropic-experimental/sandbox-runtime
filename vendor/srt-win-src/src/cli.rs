@@ -558,6 +558,32 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
     }))
 }
 
+/// Install-time ambient write-deny state: the recorded paths plus a
+/// per-path on-disk drift check (`present` = the explicit sandbox-SID
+/// deny ACE is still there; an admin `icacls /reset` clears it, and
+/// re-running `srt-win install` repairs it). Empty list when nothing
+/// is recorded (pre-v2 install, or no install).
+fn ambient_status_json() -> anyhow::Result<serde_json::Value> {
+    use serde_json::json;
+    use srt_win::{acl, install, state_db};
+    let Some(conn) = state_db::open_db_ro()? else {
+        return Ok(json!({ "paths": [] }));
+    };
+    let sid = install::read_setup()
+        .ok()
+        .flatten()
+        .map(|s| s.sandbox_user_sid);
+    let mut paths = Vec::new();
+    for p in state_db::ambient_deny_paths(&conn)? {
+        let present = match &sid {
+            Some(sid) => acl::sandbox_deny_present(&p, sid).unwrap_or(false),
+            None => false,
+        };
+        paths.push(json!({ "path": p, "present": present }));
+    }
+    Ok(json!({ "paths": paths }))
+}
+
 /// Read `path` and decode it as a single DER-encoded X.509
 /// certificate (PEM, base64, or raw DER input — see
 /// [`srt_win::cert_store::CertDer::from_pem_or_der`]). Used by
@@ -727,10 +753,22 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     );
                     std::process::exit(13);
                 }
-                // Same config — early-out only if COMPLETE.
+                // Same config — early-out only if COMPLETE. Ambient
+                // rows are part of completeness: an install that
+                // failed between the setup marker and the ambient
+                // stamps must fall through and finish them.
                 let us = user::status(name)?;
                 let mv = existing.as_ref().map(|s| s.marker_version);
-                if us.exists && us.in_sandbox_group && mv == Some(install::SETUP_VERSION) {
+                let ambient_ok = match (srt_win::state_db::open_db_ro(), &existing) {
+                    (Ok(Some(c)), Some(s)) => srt_win::state_db::ambient_denies_complete(
+                        &c,
+                        &s.sandbox_user_sid,
+                        &srt_win::ambient::ambient_deny_targets(),
+                    )
+                    .unwrap_or(false),
+                    _ => false,
+                };
+                if us.exists && us.in_sandbox_group && mv == Some(install::SETUP_VERSION) && ambient_ok {
                     eprintln!(
                         "srt-win: already installed (sublayer={sl:?}, \
                          port_range={}-{}, sandbox_user='{name}', \
@@ -783,6 +821,48 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(14);
                 }
             };
+            // Ambient write-deny stamps: Windows' stock world-
+            // writable system dirs (`ambient.rs`), stamped
+            // `(D;OICI;WriteDeny)` for the sandbox SID only and
+            // recorded in the state DB so session recomposes and
+            // crash recovery preserve them. Idempotent; runs before
+            // the WFP step so a failure here leaves the install
+            // visibly partial (filters absent) rather than
+            // marker-complete with the stamps missing.
+            let targets = srt_win::ambient::ambient_deny_targets();
+            match srt_win::state_db::with_install_lock(|conn| {
+                srt_win::state_db::set_ambient_denies(conn, &pu.sid, &targets)
+            }) {
+                Ok(r) if r.applied.is_empty() && !r.failed.is_empty() => {
+                    // Every stamp failed — treat as a real install
+                    // failure (per-path oddities are best-effort, a
+                    // clean sweep of failures is not).
+                    eprintln!(
+                        "srt-win: error: ambient write-deny stamps: all \
+                         {} target(s) failed (see warnings above)",
+                        r.failed.len(),
+                    );
+                    std::process::exit(17);
+                }
+                Ok(r) => eprintln!(
+                    "srt-win: ambient write-deny stamped on {} system \
+                     path(s){}",
+                    r.applied.len(),
+                    if r.failed.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " ({} failed — recorded; `srt-win status` \
+                             shows present:false)",
+                            r.failed.len(),
+                        )
+                    },
+                ),
+                Err(e) => {
+                    eprintln!("srt-win: error: ambient write-deny stamps: {e:#}");
+                    std::process::exit(17);
+                }
+            }
             if let Err(e) = wfp::install_filters(&sl, &pu.sid, range) {
                 eprintln!("srt-win: error: WFP install: {e:#}");
                 std::process::exit(12);
@@ -819,11 +899,22 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             }
             let sl = resolve_sublayer(&sublayer_guid)?;
             let n = wfp::uninstall_filters(&sl)?;
+            // Read setup up front: the ambient cleanup and the
+            // deprovision fallback both need the recorded name/SID
+            // before clear_setup wipes them.
+            let recorded = srt_win::install::read_setup().ok().flatten();
             let user_note = if keep_user {
-                "Sandbox user kept (--keep-user)."
+                // Ambient write-deny stamps key on the ACCOUNT, not
+                // the sublayer, and this uninstall may be tearing
+                // down one sublayer of several (the smoke/TS suites
+                // do exactly that) — so --keep-user keeps the
+                // account's ambient floor along with the account.
+                // The full (account-removing) branch below is what
+                // takes the stamps off.
+                "Sandbox user kept (--keep-user; ambient write-deny stamps kept with it)."
             } else {
-                use srt_win::{install, user};
-                // Read the recorded name (may not be the default),
+                use srt_win::user;
+                // Use the recorded name (may not be the default),
                 // then deprovision BEFORE clear_setup so a failed
                 // NetUserDel is retryable with the recorded name
                 // still intact. No marker (partial install that
@@ -832,13 +923,33 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 // SANDBOX_GROUP and any default-named account are
                 // still cleaned up; deprovision is idempotent on
                 // absent state.
-                let name = install::read_setup()
-                    .ok()
-                    .flatten()
-                    .map(|s| s.sandbox_user)
+                // Ambient write-deny stamps come off with the
+                // account they key on. Best-effort per path: an ACL
+                // failure on one system dir must not wedge the
+                // uninstall; a failed removal keeps its row so
+                // `status` surfaces it. Runs BEFORE deprovision so
+                // the SID's ACEs are removed while the account still
+                // resolves.
+                if let Some(s) = &recorded {
+                    match srt_win::state_db::with_install_lock(|conn| {
+                        srt_win::state_db::clear_ambient_denies(conn, &s.sandbox_user_sid)
+                    }) {
+                        Ok(paths) if !paths.is_empty() => eprintln!(
+                            "srt-win: ambient write-deny removed from {} system path(s)",
+                            paths.len(),
+                        ),
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("srt-win: warning: ambient write-deny cleanup: {e:#}")
+                        }
+                    }
+                }
+                let name = recorded
+                    .as_ref()
+                    .map(|s| s.sandbox_user.clone())
                     .unwrap_or_else(|| user::SANDBOX_USER.into());
                 user::deprovision(&name).context("deprovision sandbox user")?;
-                install::clear_setup().context("clear credential + setup marker")?;
+                srt_win::install::clear_setup().context("clear credential + setup marker")?;
                 "Sandbox user, credential, and setup marker removed."
             };
             // Migration: best-effort remove the legacy
@@ -856,6 +967,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 json!({
                     "user": user_status_json()?,
                     "wfp": wfp::filter_status(&sl)?,
+                    "ambient": ambient_status_json()?,
                 })
             );
         }

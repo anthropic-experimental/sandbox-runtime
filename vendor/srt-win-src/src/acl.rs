@@ -9,7 +9,10 @@
 //!   sandbox user (which has no inherent rights on real-user-owned
 //!   files) can reach the working tree;
 //! - `stamp` ⇒ `(D;OICI;mask;;;<sb-SID>)` on the target plus
-//!   `(D;OICI;FILE_DELETE_CHILD;;;<sb-SID>)` on the parent.
+//!   `(D;OICI;FILE_DELETE_CHILD;;;<sb-SID>)` on the parent;
+//! - install-time ambient write-denies (`ambient.rs`) reuse the
+//!   `stamp` deny shape, recorded in `ambient_denies` with no holder
+//!   so they persist across sessions until `uninstall`.
 //!
 //! Restore = walk the path's explicit ACEs, drop any whose trustee
 //! is `<sb-SID>`, write back preserving the DACL's protection state
@@ -44,7 +47,9 @@ use windows::Win32::Security::{
 use windows::Win32::Storage::FileSystem::{
     FILE_ALL_ACCESS, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
 };
-use windows::Win32::System::SystemServices::SECURITY_DESCRIPTOR_REVISION;
+use windows::Win32::System::SystemServices::{
+    ACCESS_DENIED_ACE_TYPE, SECURITY_DESCRIPTOR_REVISION,
+};
 
 use crate::sid::LocalPsid;
 use crate::util::{OwnedSd, pcwstr, win32_ok, wstr};
@@ -727,6 +732,33 @@ pub fn apply_sandbox_aces(canonical_path: &str, sandbox_sid: &str, set: SbAceSet
     let prot = if protected { Protection::Protected } else { Protection::Unprotected };
     write_file_dacl(canonical_path, new.as_ptr(), prot)
         .with_context(|| format!("recompose '{canonical_path}'"))
+}
+
+/// Whether `canonical_path` carries an EXPLICIT `(OI)(CI)` deny ACE
+/// for `sandbox_sid` covering at least the [`DenyMask::WriteDeny`]
+/// bits. Drift check for `srt-win status`'s ambient write-deny
+/// report and the install early-out's completeness check — a
+/// recorded install-time stamp whose on-disk ACE is gone (e.g. an
+/// `icacls /reset` by an admin) reads as absent, and an unrelated
+/// narrow deny on the same path (a `DenyDelete` placeholder, a
+/// parent-FDC ACE) must NOT count as the write-deny being intact.
+pub fn sandbox_deny_present(canonical_path: &str, sandbox_sid: &str) -> Result<bool> {
+    let sid = LocalPsid::from_string(sandbox_sid)
+        .with_context(|| format!("parse sandbox SID '{sandbox_sid}'"))?;
+    let sid_bytes = sid.as_bytes();
+    let want_mask = DenyMask::WriteDeny.bits();
+    let want_flags = OICI.0 as u8;
+    let (_sd, dacl) = read_file_dacl(canonical_path)?;
+    let denies = filter_aces(dacl, |hdr, body| {
+        // ACCESS_DENIED_ACE layout: header (4) then Mask (u32 LE).
+        let mask = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
+        u32::from(hdr.AceType) == ACCESS_DENIED_ACE_TYPE
+            && hdr.AceFlags & INHERITED_ACE == 0
+            && hdr.AceFlags & want_flags == want_flags
+            && mask & want_mask == want_mask
+            && ace_sid_is(body, sid_bytes)
+    })?;
+    Ok(!denies.0.is_empty())
 }
 
 /// `SECURITY_ATTRIBUTES` for the named init-mutex — real-user-only

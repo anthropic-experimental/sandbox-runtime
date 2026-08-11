@@ -1133,7 +1133,7 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
       expect(r.user.inBuiltinUsers).toBe(true)
       expect(r.user.inSandboxGroup).toBe(true)
       expect(r.user.credPresent).toBe(true)
-      expect(r.user.markerVersion).toBe(1)
+      expect(r.user.markerVersion).toBe(2)
       expect(r.wfp.userSid).toBe(r.user.sid)
       // Combined `srt-win status` returns the same objects the two
       // per-noun calls do (one spawn instead of two).

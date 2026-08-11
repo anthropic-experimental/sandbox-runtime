@@ -19,9 +19,12 @@ use crate::state_db::{self, SetupInfo};
 use crate::{dpapi, logon, runner, user};
 
 /// Bumped on schema-incompatible changes to the `sandbox_user`
-/// row. The broker compares this to the on-disk marker and
-/// refuses with a "re-run `srt-win install`" message on mismatch.
-pub const SETUP_VERSION: u32 = 1;
+/// row, or when `install` gains a step existing installs must pick
+/// up (v2: ambient write-deny stamps — `ambient.rs`). The broker
+/// compares this to the on-disk marker and refuses with a "re-run
+/// `srt-win install`" message on mismatch; `install` treats a stale
+/// marker as a partial install and completes the missing steps.
+pub const SETUP_VERSION: u32 = 2;
 
 /// DPAPI-encrypt `u.password` and write the credential + setup
 /// marker to the `sandbox_user` table. [`state_db::open_db`]
