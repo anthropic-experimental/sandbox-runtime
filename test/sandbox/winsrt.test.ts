@@ -12,13 +12,14 @@ import { spawn, spawnSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { isAbsolute, join } from 'node:path'
+import path, { isAbsolute, join } from 'node:path'
 import { createServer, type Server } from 'node:net'
 import type { AddressInfo } from 'node:net'
 import { isMacOS, isWindows } from '../helpers/platform.js'
@@ -630,6 +631,51 @@ describe('buildGitConfigEnv (pure, all platforms)', () => {
 // The srtWin handle points at the test runner's own executable so
 // resolveSrtWin's existence check passes on non-Windows hosts; the
 // spies intercept before any real process is spawned.
+
+describe('windowsStateDir resolution (pure, all platforms)', () => {
+  // Mirrors srt-win's state_db::state_dir(): the machine store
+  // %ProgramData%\sandbox-runtime when it exists (created by the
+  // elevated install), else the legacy per-user %LOCALAPPDATA% dir.
+  let savedProgramData: string | undefined
+  let savedLocalAppData: string | undefined
+  let tmp: string
+
+  beforeAll(() => {
+    savedProgramData = process.env.ProgramData
+    savedLocalAppData = process.env.LOCALAPPDATA
+    tmp = mkdtempSync(join(tmpdir(), 'srt-statedir-'))
+  })
+  afterAll(() => {
+    if (savedProgramData === undefined) delete process.env.ProgramData
+    else process.env.ProgramData = savedProgramData
+    if (savedLocalAppData === undefined) delete process.env.LOCALAPPDATA
+    else process.env.LOCALAPPDATA = savedLocalAppData
+    rmSync(tmp, { recursive: true, force: true })
+  })
+
+  test('prefers the machine store when %ProgramData%\\sandbox-runtime exists', () => {
+    const pd = join(tmp, 'pd-with-store')
+    mkdirSync(join(pd, 'sandbox-runtime'), { recursive: true })
+    process.env.ProgramData = pd
+    process.env.LOCALAPPDATA = join(tmp, 'lad')
+    expect(windowsStateDir()).toBe(path.win32.join(pd, 'sandbox-runtime'))
+  })
+
+  test('falls back to %LOCALAPPDATA% when no machine store exists', () => {
+    const pd = join(tmp, 'pd-empty')
+    mkdirSync(pd, { recursive: true })
+    process.env.ProgramData = pd
+    const lad = join(tmp, 'lad')
+    process.env.LOCALAPPDATA = lad
+    expect(windowsStateDir()).toBe(path.win32.join(lad, 'sandbox-runtime'))
+  })
+
+  test('throws when neither store is resolvable', () => {
+    delete process.env.ProgramData
+    delete process.env.LOCALAPPDATA
+    expect(() => windowsStateDir()).toThrow('LOCALAPPDATA')
+  })
+})
 
 describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
   const RAW_USER = JSON.stringify({
@@ -2446,14 +2492,15 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
 //
 // Separate describe from G: G's beforeAll pins the fixture CA
 // (explicit caCertPath); this group exercises the no-explicit-path
-// branch that generates-if-absent under
-// `%LOCALAPPDATA%\sandbox-runtime\ca\`.
+// branch that generates-if-absent under `windowsStateDir()/ca`
+// (machine store when provisioned, else the legacy per-user dir).
 // ────────────────────────────────────────────────────────────────────
 
 describe.if(isWindows)('Windows sandbox: persistent CA (P)', () => {
   // bun evaluates describe bodies even under `.if(false)` — guard the
   // top-level const so `windowsStateDir()` (throws without
-  // LOCALAPPDATA) doesn't run on macOS/Linux.
+  // LOCALAPPDATA when no machine store exists) doesn't run on
+  // macOS/Linux.
   const caDir = isWindows ? join(windowsStateDir(), 'ca') : ''
 
   beforeAll(async () => {

@@ -109,10 +109,12 @@ if ($pw -match '["\s\\`&|<>^]') {
 }
 
 # State-dir DACL: explicit DENY for sandbox-runtime-users. This is
-# the load-bearing gate on the credential file (machine-scope DPAPI
-# is not a confidentiality boundary — any local account can decrypt
-# a readable blob).
-$stateDir = Join-Path $env:LOCALAPPDATA 'sandbox-runtime'
+# the load-bearing gate on the credential (machine-scope DPAPI is
+# not a confidentiality boundary — any local account can decrypt a
+# readable blob). Post machine-store install this resolves to
+# %ProgramData%\sandbox-runtime (same resolution as the binary).
+$stateDir = Join-Path $env:ProgramData 'sandbox-runtime'
+if (-not (Test-Path $stateDir)) { $stateDir = Join-Path $env:LOCALAPPDATA 'sandbox-runtime' }
 $acl = Get-Acl $stateDir
 $deny = $acl.Access | Where-Object {
   $_.AccessControlType -eq 'Deny' -and

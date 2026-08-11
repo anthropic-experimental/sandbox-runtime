@@ -222,11 +222,20 @@ pub fn enable_privilege(name: &str) -> anyhow::Result<bool> {
     unsafe { LookupPrivilegeValueW(PCWSTR::null(), pcwstr(&w), &mut luid) }
         .with_context(|| format!("LookupPrivilegeValue('{name}')"))?;
     let mut tok = HANDLE::default();
-    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut tok) }
-        .context("OpenProcessToken(ADJUST_PRIVILEGES)")?;
+    unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut tok,
+        )
+    }
+    .context("OpenProcessToken(ADJUST_PRIVILEGES)")?;
     let tp = TOKEN_PRIVILEGES {
         PrivilegeCount: 1,
-        Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: SE_PRIVILEGE_ENABLED,
+        }],
     };
     let adjusted = unsafe { AdjustTokenPrivileges(tok, false, Some(&tp), 0, None, None) }
         .with_context(|| format!("AdjustTokenPrivileges('{name}')"));
@@ -234,7 +243,9 @@ pub fn enable_privilege(name: &str) -> anyhow::Result<bool> {
     // doesn't hold the privilege. Read it before CloseHandle can
     // clobber the thread's last-error.
     let assigned = unsafe { GetLastError() } != ERROR_NOT_ALL_ASSIGNED;
-    unsafe { let _ = CloseHandle(tok); }
+    unsafe {
+        let _ = CloseHandle(tok);
+    }
     adjusted?;
     Ok(assigned)
 }

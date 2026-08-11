@@ -2,9 +2,13 @@
 //! sandbox-user ACEs (grant ALLOW / stamp DENY) so the LAST broker
 //! to release a path can drop the ACE.
 //!
-//! Lives at `%LOCALAPPDATA%\sandbox-runtime\state.db` (rusqlite,
-//! WAL). The directory is ACL-stamped real-user-only `(OI)(CI)` on
-//! every open so the sandbox child cannot tamper with the refcount.
+//! Lives at `state_dir()/state.db` (rusqlite, WAL): the
+//! machine-wide `%ProgramData%\sandbox-runtime` once the elevated
+//! install has provisioned it (its DACL — Administrators-owned,
+//! Users modify, sandbox-group DENY — is install-managed), else the
+//! legacy per-user `%LOCALAPPDATA%\sandbox-runtime`, which is
+//! ACL-stamped real-user-only `(OI)(CI)` on every open. Either way
+//! the sandbox child cannot tamper with the refcount.
 //!
 //! ## Disk-is-truth invariant
 //!
@@ -37,9 +41,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{
+    CloseHandle, FILETIME, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 use windows::Win32::System::Threading::{
-    CreateMutexExW, GetCurrentProcess, GetProcessTimes, INFINITE, MUTEX_ALL_ACCESS, OpenProcess,
+    CreateMutexExW, GetCurrentProcess, GetProcessTimes, MUTEX_ALL_ACCESS, OpenProcess,
     PROCESS_QUERY_LIMITED_INFORMATION, ReleaseMutex, WaitForSingleObject,
 };
 
@@ -62,14 +68,14 @@ impl std::str::FromStr for HolderPid {
     }
 }
 
-/// `Local\` = per–Terminal-Services-session namespace. Brokers for
-/// the SAME user in DIFFERENT TS sessions share the state DB
-/// (`%LOCALAPPDATA%`) but NOT this mutex — they would not exclude
-/// each other. `Global\` would, but creating it requires
-/// `SeCreateGlobalPrivilege`, which an unelevated broker may lack.
-/// The cross-session same-user case is rare enough that we accept
-/// the limitation for v1; revisit if a real use case appears.
-const MUTEX_NAME: &str = r"Local\sandbox-runtime-acl-init";
+/// `Global\` = machine-wide namespace, so brokers for DIFFERENT
+/// users (and different Terminal-Services sessions) exclude each
+/// other — required now that the state store is machine-wide
+/// (`%ProgramData%\sandbox-runtime`). Named MUTEXES may be created
+/// in `Global\` without `SeCreateGlobalPrivilege` (that privilege
+/// gates file-mapping/section objects, not mutexes), so an
+/// unelevated broker can still create it first.
+const MUTEX_NAME: &str = r"Global\sandbox-runtime-acl-init";
 const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA_SQL: &str = r#"
@@ -174,9 +180,16 @@ impl Drop for InitMutex {
 }
 
 impl InitMutex {
-    /// Create-or-open and acquire the init mutex. The mutex carries
-    /// a real-user-only DACL so a sandbox child cannot open it (and
-    /// therefore cannot stall stamps by sitting on the lock).
+    /// Create-or-open and acquire the init mutex. The DACL allows
+    /// SYSTEM/Administrators/Users and DENIES the sandbox group, so
+    /// a sandbox child cannot OPEN an existing mutex to sit on the
+    /// lock. Residual (accepted, bounded below): the deny only
+    /// applies to a mutex WE created — a sandbox child that
+    /// pre-creates the Global name with its own permissive DACL can
+    /// hold it. The bounded wait converts that (and any other stuck
+    /// holder) from an invisible machine-wide hang into a loud
+    /// per-op error; it is a denial of service against the
+    /// sandbox's own ACL bookkeeping only, never an ACL bypass.
     fn acquire() -> Result<Self> {
         let sa = acl::build_init_mutex_sa().context("build init-mutex SECURITY_ATTRIBUTES")?;
         let name = wstr(MUTEX_NAME);
@@ -196,9 +209,26 @@ impl InitMutex {
         .with_context(|| format!("CreateMutexExW({MUTEX_NAME})"))?;
         // `sa` can drop now — the kernel object owns its SD.
 
-        let r = unsafe { WaitForSingleObject(h, INFINITE) };
+        // Bounded, not INFINITE: crash-recovery under this lock is
+        // sub-second and real contention is a handful of concurrent
+        // acl ops, so a minute means a wedged or hostile holder —
+        // fail the op loudly rather than hang every broker
+        // machine-wide.
+        const ACQUIRE_TIMEOUT_MS: u32 = 60_000;
+        let r = unsafe { WaitForSingleObject(h, ACQUIRE_TIMEOUT_MS) };
         match r {
             WAIT_OBJECT_0 => {}
+            WAIT_TIMEOUT => {
+                unsafe {
+                    let _ = CloseHandle(h);
+                }
+                bail!(
+                    "init mutex {MUTEX_NAME} not acquired within \
+                     {ACQUIRE_TIMEOUT_MS}ms — another process is \
+                     holding it (wedged broker, or a squatter on the \
+                     Global name)"
+                );
+            }
             WAIT_ABANDONED => {
                 // Previous holder died while owning the mutex. We
                 // now own it. Crash-recovery (which the caller will
@@ -224,10 +254,20 @@ impl InitMutex {
 }
 
 /// Open (creating if needed) the state DB at the default location.
-/// Stamps the parent directory real-user-only on EVERY open.
+/// On the LEGACY per-user store, stamps the parent directory
+/// real-user-only on EVERY open (below). On the MACHINE store the
+/// directory's DACL is owned by the elevated install
+/// (`install::provision_machine_store`) and is deliberately
+/// multi-user (BUILTIN\Users modify + sandbox-group DENY): a
+/// per-open real-user-only stamp would lock every other user's
+/// broker out — and an unelevated broker lacks `WRITE_DAC` on the
+/// install-owned directory anyway.
 pub fn open_db() -> Result<Connection> {
-    let dir = state_dir()?;
+    let (dir, kind) = state_dir_resolved()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("create_dir_all {}", dir.display()))?;
+    if kind == StoreKind::Machine {
+        return open_db_at(&dir.join("state.db"));
+    }
     // Stamp the directory `(OI)(CI)` real-user-only so the sandbox
     // child cannot tamper with state.db / -wal / -shm. Done on
     // EVERY open, not just first creation: defense-in-depth — the
@@ -594,29 +634,96 @@ fn missing_table(e: &rusqlite::Error, name: &str) -> bool {
     )
 }
 
-/// `%LOCALAPPDATA%\sandbox-runtime`. Errors if `LOCALAPPDATA` is
-/// unset, empty, or yields a non-absolute path — a relative state
-/// dir would put the broker-only-stamped DB in the CWD and break
-/// cross-broker refcounting/recovery.
-pub fn state_dir() -> Result<PathBuf> {
-    state_dir_from(std::env::var_os("LOCALAPPDATA"))
+/// Which store [`state_dir`] resolved to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreKind {
+    /// `%ProgramData%\sandbox-runtime` — machine-wide, shared by
+    /// every user of the machine. Created (and ACL'd) only by the
+    /// elevated install.
+    Machine,
+    /// `%LOCALAPPDATA%\sandbox-runtime` — the original per-user
+    /// store. Still resolved when no machine store exists, so
+    /// pre-migration installs keep working until the next elevated
+    /// install creates the machine store.
+    Legacy,
 }
 
-fn state_dir_from(local_app_data: Option<std::ffi::OsString>) -> Result<PathBuf> {
-    let base = local_app_data
+/// Machine-wide state dir: `%ProgramData%\sandbox-runtime`. Shared
+/// by all users so a fleet install running as SYSTEM provisions the
+/// same credential every user's broker reads, and one user's
+/// password rotation doesn't strand the others' stored copy.
+pub fn machine_state_dir() -> Result<PathBuf> {
+    state_dir_from_base(std::env::var_os("ProgramData"), "ProgramData")
+}
+
+/// Legacy per-user state dir: `%LOCALAPPDATA%\sandbox-runtime`.
+pub fn legacy_state_dir() -> Result<PathBuf> {
+    state_dir_from_base(std::env::var_os("LOCALAPPDATA"), "LOCALAPPDATA")
+}
+
+/// Resolve the state dir: the machine store when it exists, else
+/// the legacy per-user store. Existence — not install markers — is
+/// the switch, so every reader and writer (brokers, status, acl
+/// ops) flips to the shared store atomically the moment an elevated
+/// install creates it. A local user pre-creating the directory can
+/// redirect other users' ACE bookkeeping, but that is within the
+/// accepted local-tamper model (see `install::provision_machine_store`),
+/// and the credential never falls for it: `install::read_cred` on a
+/// machine store only reads the install-ACL'd `cred.dat`.
+pub fn state_dir() -> Result<PathBuf> {
+    Ok(state_dir_resolved()?.0)
+}
+
+/// [`state_dir`] plus which store it picked.
+pub fn state_dir_resolved() -> Result<(PathBuf, StoreKind)> {
+    let machine = machine_state_dir()?;
+    if machine.is_dir() {
+        return Ok((machine, StoreKind::Machine));
+    }
+    Ok((legacy_state_dir()?, StoreKind::Legacy))
+}
+
+/// Errors if `var` (`%LOCALAPPDATA%` / `%ProgramData%`) is unset,
+/// empty, or yields a non-absolute path — a relative state dir
+/// would put the ACL-protected DB in the CWD and break cross-broker
+/// refcounting/recovery.
+fn state_dir_from_base(base: Option<std::ffi::OsString>, var: &str) -> Result<PathBuf> {
+    let base = base
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("LOCALAPPDATA not set or empty"))?;
+        .ok_or_else(|| anyhow!("{var} not set or empty"))?;
     let dir = base.join("sandbox-runtime");
     if !dir.is_absolute() {
         bail!(
             "state-DB directory '{}' is not absolute \
-             (LOCALAPPDATA='{}'); refusing relative state path",
+             ({var}='{}'); refusing relative state path",
             dir.display(),
             base.display()
         );
     }
     Ok(dir)
+}
+
+/// One-time migration sweep for the elevated install: force-strip
+/// every ACE recorded in the CALLING USER's legacy per-user DB.
+/// Once the machine store exists, every broker resolves to it and
+/// the legacy DB's rows become unreachable — without this sweep,
+/// ACEs its sessions had stamped (working-tree grants for the
+/// sandbox SID) would linger on disk with no owner to release them.
+/// Only the installing user's legacy DB is reachable (other users'
+/// live under their own profiles at paths we don't enumerate);
+/// theirs are swept by their own next elevated install, and until
+/// then their leftover ACEs are bounded by the accepted local-model
+/// (grants for the confined sandbox SID on that user's own files).
+/// `Ok(None)` when there is no legacy DB. Takes the init mutex.
+pub fn recover_legacy_store() -> Result<Option<RecoveryReport>> {
+    let db = legacy_state_dir()?.join("state.db");
+    if !db.exists() {
+        return Ok(None);
+    }
+    let _mutex = InitMutex::acquire()?;
+    let conn = open_db_at(&db)?;
+    Ok(Some(crash_recovery(&conn, true)?))
 }
 
 /// Run `f` under the init mutex with the DB open. Crash recovery is
@@ -1243,12 +1350,10 @@ pub fn set_ambient_denies(
 /// references the (about-to-be-deleted) sandbox SID and denies
 /// nobody else. Returns how many paths were removed.
 pub fn clear_ambient_denies(conn: &Connection, sandbox_sid: &str) -> Result<usize> {
-    let paths: Vec<String> = query_vec(
-        conn,
-        "SELECT canonical_path FROM ambient_denies",
-        [],
-        |r| r.get(0),
-    )?;
+    let paths: Vec<String> =
+        query_vec(conn, "SELECT canonical_path FROM ambient_denies", [], |r| {
+            r.get(0)
+        })?;
     let mut removed = 0usize;
     for p in paths {
         // Delete the row FIRST so the recompose converges to the
@@ -1566,13 +1671,16 @@ mod tests {
         use std::ffi::OsString;
         // Unset or empty → error (var_os returns Some("") for a
         // present-but-empty var, which the old code accepted).
-        assert!(state_dir_from(None).is_err());
-        assert!(state_dir_from(Some(OsString::from(""))).is_err());
+        assert!(state_dir_from_base(None, "LOCALAPPDATA").is_err());
+        assert!(state_dir_from_base(Some(OsString::from("")), "LOCALAPPDATA").is_err());
         // Relative → error (would put the broker-only-stamped DB
         // in CWD).
-        assert!(state_dir_from(Some(OsString::from("rel"))).is_err());
+        assert!(state_dir_from_base(Some(OsString::from("rel")), "LOCALAPPDATA").is_err());
         // Absolute → ok.
-        let ok = state_dir_from(Some(OsString::from(r"C:\Users\u\AppData\Local")));
+        let ok = state_dir_from_base(
+            Some(OsString::from(r"C:\Users\u\AppData\Local")),
+            "LOCALAPPDATA",
+        );
         assert_eq!(
             ok.unwrap(),
             PathBuf::from(r"C:\Users\u\AppData\Local\sandbox-runtime")

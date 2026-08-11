@@ -23,7 +23,9 @@ param(
   # Must match test/sandbox/winsrt.test.ts.
   [string]$TsSublayer = '7c1f0e90-3a2b-4f5d-9e8c-1d2e3f4a5b6c',
 
-  [string]$AmbientSublayer = '9e4b2d7a-6c05-4f18-8a3d-2b9e7c1f5a0d'
+  [string]$AmbientSublayer = '9e4b2d7a-6c05-4f18-8a3d-2b9e7c1f5a0d',
+  # Must match smoke-machine-store.ps1.
+  [string]$MachineStoreSublayer = '4c7d9b21-3e58-4a06-9d17-8f2a6c40be93'
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -39,6 +41,7 @@ if (-not (Test-Path $Exe)) {
 & $Exe wfp uninstall --sublayer-guid $KillSublayer
 & $Exe wfp uninstall --sublayer-guid $TsSublayer
 & $Exe wfp uninstall --sublayer-guid $AmbientSublayer
+& $Exe wfp uninstall --sublayer-guid $MachineStoreSublayer
 # winsrt.test.ts installWindowsSandbox round-trip rows use these
 # sublayers; the test tears down via uninstallWindowsSandbox(). This
 # is belt-and-braces in case it crashed mid-row.
