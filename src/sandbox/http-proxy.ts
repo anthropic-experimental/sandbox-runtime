@@ -282,21 +282,35 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
     // 'end' only fires once the stream is being read: on a paused socket
     // (which a CONNECT socket is, between the header parse and the tunnel
     // handoff) a client FIN can sit unobserved for the whole decision.
-    // Capture decision-window data to put the socket into flowing mode —
-    // making EOF notification reliable across runtimes — and fold anything
-    // captured back into `head` at disarm time so early tunnel bytes (a
-    // client that pipelines its first payload behind the CONNECT) are
-    // never lost.
+    // On the opaque path, capture decision-window data to put the socket
+    // into flowing mode — making EOF notification reliable across
+    // runtimes — and fold anything captured back into `head` at disarm
+    // so early tunnel bytes (a client that pipelines its first payload
+    // behind the CONNECT) are never lost.
+    //
+    // Deliberately NOT armed on the mitmCA path: the ClientHello peek
+    // and the terminating relay manage this socket's flow themselves
+    // (pull-mode reads chosen specifically because pause()/resume()
+    // cycles corrupt CONNECT-upgraded sockets under Bun — see
+    // relayPaused), and injecting a flowing-mode phase ahead of them
+    // breaks the terminating path outright. There, EOF detection during
+    // the decision stays best-effort ('close' fires on full close — the
+    // incident case — and the peek's own reads surface 'end' once it
+    // runs); the write-time guards and the error-handler backstop cover
+    // the remainder.
+    //
     // Capture is bounded: the paused socket used to give free TCP
     // backpressure, and an untrusted client streaming at line rate for
     // the length of an interactive permission prompt must not balloon
-    // host memory. A legitimate pipelined first flight (a ClientHello,
-    // an SSH banner) is tiny; blowing the cap is abandonment-grade
-    // abuse and closes the connection.
+    // host memory. A legitimate pipelined first flight (an SSH banner)
+    // is tiny; blowing the cap is abandonment-grade abuse and closes
+    // the connection.
     const MAX_DECISION_CAPTURE_BYTES = 64 * 1024
     let decisionCaptureBytes = 0
+    let capturing = false
     const decisionData: Buffer[] = []
     const onDecisionData = (chunk: Buffer) => {
+      if (!capturing) return
       decisionCaptureBytes += chunk.length
       if (decisionCaptureBytes > MAX_DECISION_CAPTURE_BYTES) {
         logForDebugging(
@@ -308,7 +322,10 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       }
       decisionData.push(chunk)
     }
-    socket.on('data', onDecisionData)
+    if (!options.mitmCA) {
+      capturing = true
+      socket.on('data', onDecisionData)
+    }
     // EOF may already have been processed before this handler arms (a
     // client that sent CONNECT and FIN together), and an already-emitted
     // 'end' never re-fires — check the flag first.
@@ -317,17 +334,16 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
     } else {
       socket.once('end', onDecisionWindowEof)
     }
-    // Stop capturing and PAUSE, folding captured bytes into `head`. The
-    // pause matters: several consumers attach across an async gap (the
-    // ClientHello peek can short-circuit without attaching a listener,
-    // the upstream dial is awaited before pipe(), terminateAndForward
-    // attaches its reader turns later) and a flowing socket with no
-    // 'data' listener silently DROPS whatever arrives in that window.
-    // Paused, the bytes buffer in the socket for the eventual consumer
-    // (pipe() resumes; the peek resumes explicitly).
+    // Stop capturing, folding captured bytes into `head`. The listener
+    // deliberately STAYS attached as a discarding sink: 'data' events
+    // broadcast to every listener, so the real consumer (pipe()) still
+    // receives everything, while removing the last listener from a
+    // flowing stream would silently DROP bytes arriving before the
+    // consumer attaches (e.g. during the awaited upstream dial). No
+    // pause() — pause/resume cycles corrupt CONNECT-upgraded sockets
+    // under Bun (see relayPaused).
     const disarmDecisionCapture = () => {
-      socket.removeListener('data', onDecisionData)
-      socket.pause()
+      capturing = false
       if (decisionData.length) {
         head = Buffer.concat([head, ...decisionData])
         decisionData.length = 0
@@ -436,11 +452,6 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         // but not content-inspected (same as the SOCKS path).
         socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
         wrote200 = true
-        // The peek reads the socket itself — hand it any bytes the
-        // decision-window capture consumed and stop capturing (EOF
-        // detection stays armed: the peek's own reads keep the stream
-        // flowing, so 'end' still fires).
-        disarmDecisionCapture()
         const peeked = await peekForClientHello(socket, head)
         if (clientGone || socket.destroyed) {
           socket.destroy()
