@@ -103,6 +103,12 @@ export function peekForClientHello(
       socket.resume()
     }
     socket.on('data', onData)
+    // The caller may hand over an explicitly paused socket (the CONNECT
+    // handler's decision-window capture pauses at disarm) — and adding a
+    // 'data' listener does NOT resume an explicitly paused stream, so
+    // resume here or the peek waits forever. onData re-pauses
+    // synchronously per chunk, so nothing past the sniffed bytes flows.
+    socket.resume()
     socket.once('close', done)
   })
 }

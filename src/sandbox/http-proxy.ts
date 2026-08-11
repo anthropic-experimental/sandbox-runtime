@@ -233,6 +233,13 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
     // Attach error handler immediately to prevent unhandled errors
     socket.on('error', err => {
       logForDebugging(`Client socket error: ${err.message}`, { level: 'error' })
+      // A failed write (e.g. EPIPE to a dead peer) must also release
+      // the descriptor: logging alone leaves the fd open for the life
+      // of the process, and an open dead-peer fd is what the runtime's
+      // EPIPE retry loop spun on (idle-CPU busy-loop incident).
+      // destroy() is idempotent, so overlap with the close handlers
+      // below is harmless.
+      socket.destroy()
     })
 
     // Track client liveness so we can abort the upstream dial if they bail.
@@ -241,10 +248,133 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       clientGone = true
     })
 
+    // EOF during the decision window is treated as abandonment — a
+    // half-closed client cannot run any bidirectional protocol over the
+    // tunnel it is waiting for — so close our side immediately, the
+    // same close every healthy cycle performs at teardown. Without
+    // this, an EOF'd socket survives an arbitrarily long filter await
+    // half-open (the host decision may be a model-classifier call or
+    // an interactive permission prompt), and the verdict write lands on
+    // a dead descriptor. The armed window runs from here through the
+    // filter await, the ClientHello peek (MITM path), and the upstream
+    // dial; it is disarmed only at tunnel handoff, where established
+    // tunnels forward FIN through pipe() and keep half-open semantics —
+    // a FIN during the dial tears the connection down rather than
+    // half-opening it, which is the cleaner teardown for a client that
+    // is gone.
+    //
+    // Deliberate tradeoff: a hypothetical pipelined send-and-FIN
+    // CONNECT client (payload + FIN up front, then read the response
+    // across the half-open socket) is also destroyed here. Accepting
+    // that means nothing is written once EOF has been observed
+    // (checked again at write time via readableEnded). EOF
+    // notification is best-effort on a paused socket, so the layered
+    // backstop matters: a write that still hits a dead peer errors,
+    // and the error handler above destroys the socket, releasing the
+    // descriptor. On runtimes whose EPIPE handling spins on dead-peer
+    // writes (the incident's Bun builds, pre oven-sh/bun#37076) this
+    // narrows the exposure from every abandoned decision to only those
+    // whose EOF was never notified.
+    const onDecisionWindowEof = () => {
+      clientGone = true
+      socket.destroy()
+    }
+    // 'end' only fires once the stream is being read: on a paused socket
+    // (which a CONNECT socket is, between the header parse and the tunnel
+    // handoff) a client FIN can sit unobserved for the whole decision.
+    // Capture decision-window data to put the socket into flowing mode —
+    // making EOF notification reliable across runtimes — and fold anything
+    // captured back into `head` at disarm time so early tunnel bytes (a
+    // client that pipelines its first payload behind the CONNECT) are
+    // never lost.
+    // Capture is bounded: the paused socket used to give free TCP
+    // backpressure, and an untrusted client streaming at line rate for
+    // the length of an interactive permission prompt must not balloon
+    // host memory. A legitimate pipelined first flight (a ClientHello,
+    // an SSH banner) is tiny; blowing the cap is abandonment-grade
+    // abuse and closes the connection.
+    const MAX_DECISION_CAPTURE_BYTES = 64 * 1024
+    let decisionCaptureBytes = 0
+    const decisionData: Buffer[] = []
+    const onDecisionData = (chunk: Buffer) => {
+      decisionCaptureBytes += chunk.length
+      if (decisionCaptureBytes > MAX_DECISION_CAPTURE_BYTES) {
+        logForDebugging(
+          'CONNECT client exceeded pre-establishment capture cap; destroying',
+          { level: 'error' },
+        )
+        onDecisionWindowEof()
+        return
+      }
+      decisionData.push(chunk)
+    }
+    socket.on('data', onDecisionData)
+    // EOF may already have been processed before this handler arms (a
+    // client that sent CONNECT and FIN together), and an already-emitted
+    // 'end' never re-fires — check the flag first.
+    if (socket.readableEnded) {
+      onDecisionWindowEof()
+    } else {
+      socket.once('end', onDecisionWindowEof)
+    }
+    // Stop capturing and PAUSE, folding captured bytes into `head`. The
+    // pause matters: several consumers attach across an async gap (the
+    // ClientHello peek can short-circuit without attaching a listener,
+    // the upstream dial is awaited before pipe(), terminateAndForward
+    // attaches its reader turns later) and a flowing socket with no
+    // 'data' listener silently DROPS whatever arrives in that window.
+    // Paused, the bytes buffer in the socket for the eventual consumer
+    // (pipe() resumes; the peek resumes explicitly).
+    const disarmDecisionCapture = () => {
+      socket.removeListener('data', onDecisionData)
+      socket.pause()
+      if (decisionData.length) {
+        head = Buffer.concat([head, ...decisionData])
+        decisionData.length = 0
+      }
+    }
+    const disarmDecisionWindowEof = () => {
+      socket.removeListener('end', onDecisionWindowEof)
+      disarmDecisionCapture()
+    }
+    // Decision-phase status writes go through this guard: a verdict for
+    // a dead client is dropped, never written. The filter's work is not
+    // wasted — host-side allow/deny caches serve the client's retry.
+    const endWithStatus = (payload: string) => {
+      if (
+        clientGone ||
+        socket.destroyed ||
+        socket.readableEnded ||
+        !socket.writable
+      ) {
+        logForDebugging(
+          'CONNECT client gone before status write; dropping verdict and destroying socket',
+        )
+        socket.destroy()
+        return
+      }
+      // Disarm before writing: a FIN processed while this verdict is
+      // still queued (backpressured or slow client) would otherwise
+      // fire the armed 'end' handler and destroy() the unflushed write.
+      disarmDecisionWindowEof()
+      socket.end(payload)
+    }
+    // A client that sent CONNECT and FIN together (or closed before the
+    // handler ran) was destroyed at arm time: return before spending a
+    // decision — possibly an interactive permission prompt or a
+    // classifier call — on a connection that no longer exists.
+    if (clientGone || socket.destroyed) {
+      return
+    }
+
+    // Whether the MITM sniff path already wrote the 200 — hoisted so the
+    // catch below can see it: once the 200 is out, any HTTP status line
+    // would land inside what the client treats as tunnel payload.
+    let wrote200 = false
     try {
       const auth = checkAuth(req.headers['proxy-authorization'])
       if (!auth.ok) {
-        socket.end(
+        endWithStatus(
           'HTTP/1.1 407 Proxy Authentication Required\r\n' +
             'Proxy-Authenticate: Basic realm="srt"\r\n\r\n',
         )
@@ -255,7 +385,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         logForDebugging(`Invalid CONNECT request: ${req.url}`, {
           level: 'error',
         })
-        socket.end('HTTP/1.1 400 Bad Request\r\n\r\n')
+        endWithStatus('HTTP/1.1 400 Bad Request\r\n\r\n')
         return
       }
       const { hostname, port } = target
@@ -270,13 +400,19 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         logForDebugging(`Connection blocked to ${hostname}:${port}`, {
           level: 'error',
         })
-        socket.end(
+        endWithStatus(
           'HTTP/1.1 403 Forbidden\r\n' +
             'Content-Type: text/plain\r\n' +
             'X-Proxy-Error: blocked-by-allowlist\r\n' +
             '\r\n' +
             'Connection blocked by network allowlist',
         )
+        return
+      }
+      // The client may have died during the filter await (EOF destroy
+      // above, or full close): there is nothing left to establish.
+      if (clientGone || socket.destroyed) {
+        socket.destroy()
         return
       }
 
@@ -287,12 +423,10 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       //   > direct
       // (tlsTerminate and mitmProxy are mutually exclusive at the config
       // layer, so the first two never both apply.)
-      let wrote200 = false
       if (
         options.mitmCA &&
         (options.shouldTerminateTLS?.(hostname, port) ?? true)
       ) {
-        if (clientGone) return
         // We can only terminate TLS. CONNECT also carries non-TLS streams —
         // notably SSH on Linux, where the sandbox's own GIT_SSH_COMMAND
         // routes `ssh` through this proxy via `socat - PROXY:`. Send 200 so
@@ -302,9 +436,18 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         // but not content-inspected (same as the SOCKS path).
         socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
         wrote200 = true
+        // The peek reads the socket itself — hand it any bytes the
+        // decision-window capture consumed and stop capturing (EOF
+        // detection stays armed: the peek's own reads keep the stream
+        // flowing, so 'end' still fires).
+        disarmDecisionCapture()
         const peeked = await peekForClientHello(socket, head)
-        if (clientGone) return
+        if (clientGone || socket.destroyed) {
+          socket.destroy()
+          return
+        }
         if (peeked.isTLS) {
+          disarmDecisionWindowEof()
           terminateAndForward(
             options.mitmCA,
             options.filterRequest,
@@ -376,19 +519,27 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         // If we already sent 200 (mitmCA sniff path), an HTTP status line now
         // would land inside the tunnel as payload. Just close.
         if (wrote200) socket.destroy()
-        else socket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n')
+        else endWithStatus('HTTP/1.1 502 Bad Gateway\r\n\r\n')
         return
       }
 
-      if (clientGone) {
+      if (clientGone || socket.destroyed) {
         upstream.on('error', () => {}) // swallow post-resolve errors
         upstream.destroy()
+        socket.destroy()
         return
       }
 
       if (!wrote200) {
         socket.write('HTTP/1.1 200 Connection Established\r\n\r\n')
       }
+      disarmDecisionWindowEof()
+      // An established tunnel relays each TCP direction independently: a
+      // client that half-closes (FIN after its request bytes) must still
+      // receive the upstream's reply. Without this, runtimes that default
+      // http-server sockets to allowHalfOpen=false auto-close the client
+      // side on FIN and the reply is lost.
+      socket.allowHalfOpen = true
       // Forward any bytes the client sent in the same packet as the CONNECT
       // (Node delivers these as the `head` buffer, not via the socket stream),
       // plus anything the ClientHello sniff consumed when mitmCA is on.
@@ -406,7 +557,10 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       upstream.on('close', () => socket.destroy())
     } catch (err) {
       logForDebugging(`Error handling CONNECT: ${err}`, { level: 'error' })
-      socket.end('HTTP/1.1 500 Internal Server Error\r\n\r\n')
+      // Same rule as the 502 path: once the MITM sniff's 200 is out, a
+      // status line would corrupt the tunnel byte stream — just close.
+      if (wrote200) socket.destroy()
+      else endWithStatus('HTTP/1.1 500 Internal Server Error\r\n\r\n')
     }
   })
 
@@ -425,6 +579,11 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       logForDebugging(`Client response error: ${err.message}`, {
         level: 'error',
       })
+      // A failed response write (EPIPE to a dead peer) must release
+      // the descriptor — same rationale as the CONNECT handler's
+      // socket error handler. The res 'close' teardown listeners then
+      // handle the upstream leg.
+      res.socket?.destroy()
     })
     try {
       // Serve the empty CRL for Schannel's revocation check on MITM-minted
@@ -472,6 +631,15 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         logForDebugging(`HTTP request blocked to ${hostname}:${port}`, {
           level: 'error',
         })
+        // The client may have aborted during the filter await; a
+        // deny for a dead client is dropped, not written. Plain
+        // half-close (EOF after a complete request) is legal HTTP
+        // and still gets its verdict — only a destroyed socket is
+        // dead here.
+        if (req.socket.destroyed || res.destroyed) {
+          res.destroy()
+          return
+        }
         res.writeHead(403, {
           'Content-Type': 'text/plain',
           'X-Proxy-Error': 'blocked-by-allowlist',
