@@ -653,7 +653,7 @@ describe('windowsStateDir resolution (pure, all platforms)', () => {
     rmSync(tmp, { recursive: true, force: true })
   })
 
-  test('prefers the machine store when %ProgramData%\\sandbox-runtime exists', () => {
+  it('prefers the machine store when %ProgramData%\\sandbox-runtime exists', () => {
     const pd = join(tmp, 'pd-with-store')
     mkdirSync(join(pd, 'sandbox-runtime'), { recursive: true })
     process.env.ProgramData = pd
@@ -661,7 +661,7 @@ describe('windowsStateDir resolution (pure, all platforms)', () => {
     expect(windowsStateDir()).toBe(path.win32.join(pd, 'sandbox-runtime'))
   })
 
-  test('falls back to %LOCALAPPDATA% when no machine store exists', () => {
+  it('falls back to %LOCALAPPDATA% when no machine store exists', () => {
     const pd = join(tmp, 'pd-empty')
     mkdirSync(pd, { recursive: true })
     process.env.ProgramData = pd
@@ -670,7 +670,7 @@ describe('windowsStateDir resolution (pure, all platforms)', () => {
     expect(windowsStateDir()).toBe(path.win32.join(lad, 'sandbox-runtime'))
   })
 
-  test('throws when neither store is resolvable', () => {
+  it('throws when neither store is resolvable', () => {
     delete process.env.ProgramData
     delete process.env.LOCALAPPDATA
     expect(() => windowsStateDir()).toThrow('LOCALAPPDATA')

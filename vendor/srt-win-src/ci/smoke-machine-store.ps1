@@ -110,19 +110,35 @@ try {
   Run @('uninstall', '--sublayer-guid', $Sublayer)
   if (Test-Path $credFile) { throw 'MS3: cred.dat survived full uninstall' }
   $task = 'srt-win-ms3-system-install'
-  $tr = "`"$Exe`" install --sublayer-guid $Sublayer --proxy-port-range $PortRange --force"
-  schtasks /Create /F /RU SYSTEM /SC ONCE /ST 00:00 /TN $task /TR $tr | Out-Null
+  # A scheduled task starts in System32, so the exe path must be
+  # absolute; run through a wrapper .cmd that captures output, since
+  # a SYSTEM task's console is otherwise invisible.
+  $exeFull = (Resolve-Path $Exe).Path
+  $ms3Log  = 'C:\Windows\Temp\srt-ms3-system-install.log'
+  $runner  = 'C:\Windows\Temp\srt-ms3-system-install.cmd'
+  Remove-Item $ms3Log -ea SilentlyContinue
+  @(
+    '@echo off'
+    "`"$exeFull`" install --sublayer-guid $Sublayer --proxy-port-range $PortRange --force > `"$ms3Log`" 2>&1"
+  ) | Set-Content $runner -Encoding ascii
+  schtasks /Create /F /RU SYSTEM /SC ONCE /ST 00:00 /TN $task /TR "`"$runner`"" | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "MS3: schtasks /Create exited $LASTEXITCODE" }
   try {
     schtasks /Run /TN $task | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "MS3: schtasks /Run exited $LASTEXITCODE" }
     $deadline = (Get-Date).AddSeconds(120)
     while (-not (Test-Path $credFile)) {
-      if ((Get-Date) -gt $deadline) { throw 'MS3: SYSTEM install did not produce cred.dat in 120s' }
+      if ((Get-Date) -gt $deadline) {
+        $installOut = if (Test-Path $ms3Log) { Get-Content $ms3Log | Out-String } else { '<no log>' }
+        throw "MS3: SYSTEM install did not produce cred.dat in 120s. install output:`n$installOut"
+      }
       Start-Sleep -Seconds 2
     }
     # Give the SYSTEM install a moment to finish its WFP step too.
     Start-Sleep -Seconds 5
   } finally {
     schtasks /Delete /F /TN $task | Out-Null
+    Remove-Item $runner, $ms3Log -ea SilentlyContinue
   }
   $us = J @('user', 'status')   # interactive user's view
   if (-not $us.cred_present) { throw 'MS3: interactive user sees cred_present:false after SYSTEM install' }

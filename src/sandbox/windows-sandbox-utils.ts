@@ -1162,12 +1162,15 @@ function checkTrustCaResult(caCertPath: string, r: RunResult): void {
 export function windowsStateDir(): string {
   const programData = process.env.ProgramData
   if (programData) {
-    const machine = path.win32.join(programData, 'sandbox-runtime')
+    // Existence probe with the HOST-native join (identical to
+    // win32.join on Windows; keeps the pure cross-platform tests
+    // honest, where a backslashed path never resolves on POSIX).
     // statSync().isDirectory(), not existsSync: srt-win's resolution
     // keys on is_dir(), and a plain FILE squatted at this path must
     // not make the broker and the binary resolve different stores.
-    if (fs.statSync(machine, { throwIfNoEntry: false })?.isDirectory()) {
-      return machine
+    const probe = path.join(programData, 'sandbox-runtime')
+    if (fs.statSync(probe, { throwIfNoEntry: false })?.isDirectory()) {
+      return path.win32.join(programData, 'sandbox-runtime')
     }
   }
   const base = process.env.LOCALAPPDATA
