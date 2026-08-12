@@ -8,8 +8,12 @@
   that an install running as SYSTEM (the SCCM/Intune fleet shape)
   leaves a credential the INTERACTIVE user's broker can read and
   spawn with — the per-user-store bug this store exists to fix —
-  that a re-install rotates the shared credential in place, and
-  that a full uninstall removes the credential with the account.
+  that a re-install rotates the shared credential in place, that a
+  NON-ADMIN standard user's broker can read the credential, write
+  the shared state DB (acl grant/restore), and spawn (the
+  BUILTIN\Users ACEs, which the elevated outer script cannot
+  prove), and that a full uninstall removes the credential with
+  the account.
 
   Self-contained: installs under a fixed test-only sublayer GUID
   (distinct from the other smoke scripts); uninstalls in `finally`.
@@ -160,6 +164,68 @@ try {
     throw "MS4: read-cred after rotation failed (exit $LASTEXITCODE, len $($pw.Length))"
   }
   Write-Host 'MS4 ok: rotation refreshed the shared credential'
+
+  # ── MS6: a NON-ADMIN user's broker works against the shared store ─
+  # The outer script runs as an elevated Administrator, which would
+  # pass even if the BUILTIN\Users ACEs were wrong (the BA ACE grants
+  # full control) — so prove the Users leg with a real standard user:
+  # status reads the shared credential, an acl grant/restore
+  # round-trip WRITES the shared state.db (and takes the Global init
+  # mutex cross-user), and exec spawns a sandboxed child.
+  $u6 = 'srt-ms6-user'
+  $pw6 = 'Ms6!' + [guid]::NewGuid().ToString('N').Substring(0, 16)
+  net user $u6 $pw6 /add | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "MS6: net user add exited $LASTEXITCODE" }
+  try {
+    $cred6 = [pscredential]::new(
+      "$env:COMPUTERNAME\$u6",
+      (ConvertTo-SecureString $pw6 -AsPlainText -Force))
+    $pub = 'C:\Users\Public'
+    $o6 = Join-Path $pub 'srt-ms6-out.txt'
+    $e6 = Join-Path $pub 'srt-ms6-err.txt'
+    $i6 = Join-Path $pub 'srt-ms6-in.json'
+    function RunAsUser6 { param([string[]] $argv, [string] $stdin)
+      Remove-Item $o6, $e6 -ea SilentlyContinue
+      $sp = @{
+        FilePath = $exeFull; ArgumentList = $argv; Credential = $cred6
+        WorkingDirectory = $pub; NoNewWindow = $true; Wait = $true
+        PassThru = $true
+        RedirectStandardOutput = $o6; RedirectStandardError = $e6
+      }
+      if ($stdin) {
+        Set-Content -Path $i6 -Value $stdin -Encoding ascii
+        $sp.RedirectStandardInput = $i6
+      }
+      $p = Start-Process @sp
+      [pscustomobject]@{
+        exit = $p.ExitCode
+        out  = (Get-Content $o6 -Raw -ea SilentlyContinue)
+        err  = (Get-Content $e6 -Raw -ea SilentlyContinue)
+      }
+    }
+    $r = RunAsUser6 @('user', 'status')
+    if ($r.exit -ne 0) { throw "MS6: user status as standard user exited $($r.exit): $($r.err)" }
+    $st6 = $r.out | ConvertFrom-Json
+    if (-not $st6.cred_present) { throw 'MS6: standard user cannot see the shared credential' }
+    $probe6 = Join-Path $pub 'srt-ms6-probe'
+    New-Item -ItemType Directory -Force $probe6 | Out-Null
+    $r = RunAsUser6 @('acl', 'grant', '--holder-pid', $PID,
+                      '--sandbox-user-sid', $st6.marker_user_sid) `
+                    "{`"write`":[`"$($probe6 -replace '\\','\\')`"]}"
+    if ($r.exit -ne 0) { throw "MS6: acl grant as standard user exited $($r.exit): $($r.err)" }
+    $r = RunAsUser6 @('acl', 'restore', '--holder-pid', $PID,
+                      '--sandbox-user-sid', $st6.marker_user_sid)
+    if ($r.exit -ne 0) { throw "MS6: acl restore as standard user exited $($r.exit): $($r.err)" }
+    $r = RunAsUser6 @('exec', '--quiet', '--', $cmd, '/c', 'whoami')
+    if ($r.exit -ne 0) { throw "MS6: exec as standard user exited $($r.exit): $($r.err)" }
+    if ($r.out -notmatch 'srt-sandbox') {
+      throw "MS6: exec whoami expected the sandbox account, got: $($r.out)"
+    }
+    Write-Host 'MS6 ok: standard (non-admin) user reads the cred, writes the shared DB, and spawns'
+  } finally {
+    net user $u6 /delete | Out-Null
+    Remove-Item $o6, $e6, $i6, (Join-Path $pub 'srt-ms6-probe') -Recurse -Force -ea SilentlyContinue
+  }
 
   # ── MS5: full uninstall removes the credential with the account ──
   Run @('uninstall', '--sublayer-guid', $Sublayer)
