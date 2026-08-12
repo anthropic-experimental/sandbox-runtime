@@ -9,11 +9,12 @@
   leaves a credential the INTERACTIVE user's broker can read and
   spawn with — the per-user-store bug this store exists to fix —
   that a re-install rotates the shared credential in place, that a
-  NON-ADMIN standard user's broker can read the credential, write
-  the shared state DB (acl grant/restore), and spawn (the
-  BUILTIN\Users ACEs, which the elevated outer script cannot
-  prove), and that a full uninstall removes the credential with
-  the account.
+  NON-ADMIN standard user's broker can read the credential and
+  write the shared state DB (acl grant/restore — the BUILTIN\Users
+  ACEs, which the elevated outer script cannot prove) while its
+  exec refuses fail-closed inside a session it doesn't own (the
+  BNO-hardening gate), and that a full uninstall removes the
+  credential with the account.
 
   Self-contained: installs under a fixed test-only sublayer GUID
   (distinct from the other smoke scripts); uninstalls in `finally`.
@@ -225,12 +226,20 @@ try {
     $r = RunAsUser6 @('acl', 'restore', '--holder-pid', $PID,
                       '--sandbox-user-sid', $st6.marker_user_sid)
     if ($r.exit -ne 0) { throw "MS6: acl restore as standard user exited $($r.exit): $($r.err)" }
+    # exec from THIS shape must refuse, fail-closed: Start-Process
+    # -Credential runs the standard user INSIDE the admin's session,
+    # and the broker requires WRITE_DAC on the session's
+    # BaseNamedObjects to stamp BNO hardening before spawning — a
+    # session the user doesn't own is exactly where an unstampable
+    # child could squat named objects, so erroring is the invariant.
+    # (Real multi-user brokers run in their owner's own session,
+    # which grants WRITE_DAC; the same-session spawn is MS3.)
     $r = RunAsUser6 @('exec', '--quiet', '--', $cmd, '/c', 'whoami')
-    if ($r.exit -ne 0) { throw "MS6: exec as standard user exited $($r.exit): $($r.err)" }
-    if ($r.out -notmatch 'srt-sandbox') {
-      throw "MS6: exec whoami expected the sandbox account, got: $($r.out)"
+    if ($r.exit -eq 0) { throw 'MS6: exec inside a foreign session unexpectedly succeeded' }
+    if (($r.err + $r.out) -notmatch 'BaseNamedObjects|BNO') {
+      throw "MS6: exec refusal should name the session BNO gate; got: $($r.err)$($r.out)"
     }
-    Write-Host 'MS6 ok: standard (non-admin) user reads the cred, writes the shared DB, and spawns'
+    Write-Host 'MS6 ok: standard user reads the cred + writes the shared DB; foreign-session exec refuses closed'
   } finally {
     net user $u6 /delete | Out-Null
     Remove-Item $o6, $e6, $i6, (Join-Path $pub 'srt-ms6-probe') -Recurse -Force -ea SilentlyContinue
