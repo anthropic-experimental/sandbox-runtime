@@ -121,9 +121,12 @@ try {
   $ms3Log  = 'C:\Windows\Temp\srt-ms3-system-install.log'
   $runner  = 'C:\Windows\Temp\srt-ms3-system-install.cmd'
   Remove-Item $ms3Log -ea SilentlyContinue
+  $ms3Rc = 'C:\Windows\Temp\srt-ms3-system-install.rc'
+  Remove-Item $ms3Rc -ea SilentlyContinue
   @(
     '@echo off'
     "`"$exeFull`" install --sublayer-guid $Sublayer --proxy-port-range $PortRange --force > `"$ms3Log`" 2>&1"
+    "echo %errorlevel% > `"$ms3Rc`""
   ) | Set-Content $runner -Encoding ascii
   schtasks /Create /F /RU SYSTEM /SC ONCE /ST 00:00 /TN $task /TR "`"$runner`"" | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "MS3: schtasks /Create exited $LASTEXITCODE" }
@@ -138,11 +141,22 @@ try {
       }
       Start-Sleep -Seconds 2
     }
-    # Give the SYSTEM install a moment to finish its WFP step too.
-    Start-Sleep -Seconds 5
+    # cred.dat is written BEFORE the WFP step, so its appearance
+    # alone can mask a WFP-stage failure — wait for the wrapper's
+    # recorded exit code and assert the whole install succeeded.
+    $deadline = (Get-Date).AddSeconds(60)
+    while (-not (Test-Path $ms3Rc)) {
+      if ((Get-Date) -gt $deadline) { throw 'MS3: SYSTEM install exit code never recorded' }
+      Start-Sleep -Seconds 2
+    }
+    $rc = (Get-Content $ms3Rc -Raw).Trim()
+    if ($rc -ne '0') {
+      $installOut = if (Test-Path $ms3Log) { Get-Content $ms3Log | Out-String } else { '<no log>' }
+      throw "MS3: SYSTEM install exited ${rc}. install output:`n$installOut"
+    }
   } finally {
     schtasks /Delete /F /TN $task | Out-Null
-    Remove-Item $runner, $ms3Log -ea SilentlyContinue
+    Remove-Item $runner, $ms3Log, $ms3Rc -ea SilentlyContinue
   }
   $us = J @('user', 'status')   # interactive user's view
   if (-not $us.cred_present) { throw 'MS3: interactive user sees cred_present:false after SYSTEM install' }
@@ -154,15 +168,19 @@ try {
   Write-Host 'MS3 ok: SYSTEM install; interactive user reads cred and spawns'
 
   # ── MS4: re-install rotates the shared credential in place ───────
-  $before = [System.IO.File]::ReadAllBytes($credFile)
+  # Compare the DECRYPTED secret, not cred.dat bytes: DPAPI output
+  # embeds random salt, so ciphertext differs on every write even
+  # when the password was NOT rotated — the bytes comparison would
+  # be vacuously green.
+  $pwBefore = & $Exe user read-cred
+  if ($LASTEXITCODE -ne 0) { throw "MS4: read-cred before rotation exited $LASTEXITCODE" }
   Run @('install', '--sublayer-guid', $Sublayer, '--proxy-port-range', $PortRange, '--force')
-  $after = [System.IO.File]::ReadAllBytes($credFile)
-  if ([System.Convert]::ToBase64String($before) -eq [System.Convert]::ToBase64String($after)) {
-    throw 'MS4: cred.dat unchanged across rotating re-install'
+  $pwAfter = & $Exe user read-cred
+  if ($LASTEXITCODE -ne 0 -or $pwAfter.Length -ne 32) {
+    throw "MS4: read-cred after rotation failed (exit $LASTEXITCODE, len $($pwAfter.Length))"
   }
-  $pw = & $Exe user read-cred
-  if ($LASTEXITCODE -ne 0 -or $pw.Length -ne 32) {
-    throw "MS4: read-cred after rotation failed (exit $LASTEXITCODE, len $($pw.Length))"
+  if ($pwAfter -eq $pwBefore) {
+    throw 'MS4: password unchanged across rotating re-install'
   }
   Write-Host 'MS4 ok: rotation refreshed the shared credential'
 

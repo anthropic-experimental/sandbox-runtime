@@ -471,6 +471,109 @@ pub fn set_path_dacl_from_sddl(path: &str, sddl: &str, label: &str) -> Result<()
     write_file_dacl(path, dacl, Protection::Protected).context(label.to_owned())
 }
 
+/// Open `path` for security-descriptor writes with NO-FOLLOW
+/// semantics and REJECT reparse points. `%ProgramData%`'s default
+/// DACL lets standard users pre-create directories — including as
+/// NTFS mount points / junctions targeting an arbitrary directory —
+/// so an elevated install that take-owns and re-ACLs by NAME can be
+/// redirected into re-ACLing a victim tree. Opening with
+/// `FILE_FLAG_OPEN_REPARSE_POINT` pins the object itself (no
+/// traversal), the attribute check rejects a planted reparse point,
+/// and the returned HANDLE is what the security writes below
+/// operate on — validate-then-use on the same object, not a name.
+pub fn open_for_security_no_follow(path: &str) -> Result<crate::util::OwnedHandle> {
+    use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        GetFileInformationByHandle, OPEN_EXISTING,
+    };
+    let w = wstr(path);
+    let h = unsafe {
+        CreateFileW(
+            pcwstr(&w),
+            Mask::READ_CONTROL.bits() | Mask::WRITE_DAC.bits() | 0x0008_0000, // + WRITE_OWNER
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            None,
+        )
+    }
+    .with_context(|| format!("CreateFileW('{path}', no-follow)"))?;
+    if h == INVALID_HANDLE_VALUE {
+        bail!("CreateFileW('{path}'): INVALID_HANDLE_VALUE");
+    }
+    let owned = crate::util::OwnedHandle(h);
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(owned.0, &mut info) }
+        .with_context(|| format!("GetFileInformationByHandle('{path}')"))?;
+    if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        bail!(
+            "'{path}' is a reparse point (junction/symlink) — refusing \
+             to operate on a redirected store path; remove it and re-run"
+        );
+    }
+    Ok(owned)
+}
+
+/// Set OWNER = `BUILTIN\Administrators` on an open handle (see
+/// [`open_for_security_no_follow`] for why by-handle). Requires
+/// `SeTakeOwnershipPrivilege`/`SeRestorePrivilege` enabled unless
+/// the caller already owns the object.
+pub fn set_handle_owner_admins(h: &crate::util::OwnedHandle, label: &str) -> Result<()> {
+    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    let admins = crate::sid::LocalPsid::from_string(SID_BUILTIN_ADMINS)?;
+    let r = unsafe {
+        SetSecurityInfo(
+            h.0,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(admins.as_psid()),
+            None,
+            None,
+            None,
+        )
+    };
+    win32_ok(r, &format!("SetSecurityInfo(owner, {label})"))
+}
+
+/// Write a PROTECTED DACL parsed from `sddl` onto an open handle
+/// (see [`open_for_security_no_follow`] for why by-handle).
+pub fn set_handle_dacl_from_sddl(
+    h: &crate::util::OwnedHandle,
+    sddl: &str,
+    label: &str,
+) -> Result<()> {
+    use windows::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
+    use windows::Win32::Security::GetSecurityDescriptorDacl;
+    let sd = crate::util::OwnedSd::from_sddl(sddl)
+        .with_context(|| format!("{label}: build SD from SDDL"))?;
+    let mut present = windows::core::BOOL::from(false);
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut defaulted = windows::core::BOOL::from(false);
+    unsafe {
+        GetSecurityDescriptorDacl(sd.ptr, &mut present, &mut dacl, &mut defaulted)
+            .with_context(|| format!("{label}: GetSecurityDescriptorDacl"))?;
+    }
+    if !present.as_bool() || dacl.is_null() {
+        bail!("{label}: SDDL '{sddl}' yielded no DACL");
+    }
+    let r = unsafe {
+        SetSecurityInfo(
+            h.0,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(dacl),
+            None,
+        )
+    };
+    win32_ok(r, &format!("SetSecurityInfo(dacl, {label})"))
+}
+
 /// Set a path's OWNER to `BUILTIN\Administrators`. Used by the
 /// machine-store provisioning: `%ProgramData%`'s default DACL lets
 /// standard users pre-create directories, and the creator-owner of
@@ -771,11 +874,29 @@ pub fn sandbox_deny_present(canonical_path: &str, sandbox_sid: &str) -> Result<b
 /// create time.
 pub fn build_init_mutex_sa() -> Result<OwnedSa> {
     // Deny SID parsed first and kept alive across rebuild_acl (NewAce
-    // borrows the PSID buffer).
-    let deny = crate::sid::lookup_account_sid(crate::user::SANDBOX_GROUP)
-        .ok()
-        .map(|s| LocalPsid::from_string(&s))
-        .transpose()?;
+    // borrows the PSID buffer). The DENY is a SECURITY ACE — it must
+    // not be dropped silently: a mutex created without it grants
+    // BUILTIN\Users (which includes the sandbox account) GENERIC_ALL,
+    // and the DACL is fixed for the object's lifetime. So a lookup
+    // failure is only tolerated when SAM itself proves the group
+    // genuinely absent (install never ran → no sandbox account to
+    // exclude); a transient SAM/LSA failure fails the acquire loudly
+    // instead of minting a deny-less machine-wide mutex.
+    let deny = match crate::sid::lookup_account_sid(crate::user::SANDBOX_GROUP) {
+        Ok(s) => Some(LocalPsid::from_string(&s)?),
+        Err(e) => match crate::sid::sid_account_exists("S-1-5-32-545") {
+            // BUILTIN\Users always maps; if it does, SAM is up and
+            // the sandbox group is genuinely absent.
+            Ok(crate::sid::SidExistence::Mapped) => None,
+            _ => {
+                return Err(e).context(
+                    "resolve sandbox group for the init-mutex DENY \
+                     (transient SAM/LSA failure — refusing to create \
+                     the mutex without its security ACE)",
+                );
+            }
+        },
+    };
     let allows = [
         Allow(SID_BUILTIN_USERS, Mask::GENERIC_ALL, NO_INHERIT),
         Allow(SID_SYSTEM, Mask::GENERIC_ALL, NO_INHERIT),

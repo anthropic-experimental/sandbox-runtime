@@ -69,7 +69,25 @@ pub fn provision_machine_store(sandbox_group_sid: &str) -> Result<std::path::Pat
         anyhow::bail!("SeTakeOwnershipPrivilege not held — machine store requires elevation");
     }
     crate::util::enable_privilege("SeRestorePrivilege")?;
-    crate::acl::set_path_owner_admins(dir_str).context("take ownership of machine state dir")?;
+    // No-follow, by-handle: a squatter can also plant the path as a
+    // junction targeting a victim tree, turning a by-name take-own +
+    // re-ACL into an elevated arbitrary-directory primitive. A
+    // planted reparse point is removed (the junction itself, never
+    // its target) and the directory recreated; the handle the
+    // security writes use is the validated object itself.
+    let h = match crate::acl::open_for_security_no_follow(dir_str) {
+        Ok(h) => h,
+        Err(e) if format!("{e:#}").contains("reparse point") => {
+            std::fs::remove_dir(&dir)
+                .with_context(|| format!("remove planted reparse point {}", dir.display()))?;
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("recreate machine state dir {}", dir.display()))?;
+            crate::acl::open_for_security_no_follow(dir_str)?
+        }
+        Err(e) => return Err(e),
+    };
+    crate::acl::set_handle_owner_admins(&h, "machine state dir")
+        .context("take ownership of machine state dir")?;
     // 0x1301bf = FILE_GENERIC_READ|WRITE|EXECUTE + DELETE ("modify"
     // minus FILE_DELETE_CHILD): brokers create/replace state.db-wal
     // and ca\ files but cannot delete other users' files via
@@ -80,7 +98,26 @@ pub fn provision_machine_store(sandbox_group_sid: &str) -> Result<std::path::Pat
          (A;OICI;FA;;;BA)\
          (A;OICI;0x1301bf;;;BU)"
     );
-    crate::acl::set_path_dacl_from_sddl(dir_str, &sddl, "machine state dir")?;
+    crate::acl::set_handle_dacl_from_sddl(&h, &sddl, "machine state dir")?;
+    drop(h);
+    // A pre-existing state.db keeps its CREATOR OWNER's implicit
+    // WRITE_DAC no matter what DACL the directory propagates — a
+    // squatter who created it first (any unelevated srt-win command,
+    // or a direct create) could later re-ACL it to let the sandbox
+    // child tamper with the refcount. Heal ownership on every
+    // elevated install; the inherited DACL then governs.
+    for f in ["state.db", "state.db-wal", "state.db-shm"] {
+        let p = dir.join(f);
+        if !p.exists() {
+            continue;
+        }
+        if let Some(ps) = p.to_str()
+            && let Ok(fh) = crate::acl::open_for_security_no_follow(ps)
+            && let Err(e) = crate::acl::set_handle_owner_admins(&fh, f)
+        {
+            eprintln!("srt-win: warning: heal ownership of {f}: {e:#}");
+        }
+    }
     Ok(dir)
 }
 
@@ -105,7 +142,9 @@ pub fn write_setup(u: &user::ProvisionedUser) -> Result<()> {
     let cred_str = cred_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("cred path is not UTF-8"))?;
-    crate::acl::set_path_owner_admins(cred_str).context("take ownership of credential file")?;
+    let ch = crate::acl::open_for_security_no_follow(cred_str)?;
+    crate::acl::set_handle_owner_admins(&ch, "machine cred file")
+        .context("take ownership of credential file")?;
     let sddl = format!(
         "D:P(D;;FA;;;{})\
          (A;;FA;;;SY)\
@@ -113,7 +152,7 @@ pub fn write_setup(u: &user::ProvisionedUser) -> Result<()> {
          (A;;FR;;;BU)",
         u.group_sid
     );
-    crate::acl::set_path_dacl_from_sddl(cred_str, &sddl, "machine cred file")?;
+    crate::acl::set_handle_dacl_from_sddl(&ch, &sddl, "machine cred file")?;
     let conn = state_db::open_db().context("open state DB for setup write")?;
     state_db::write_setup_info(
         &conn,
@@ -160,10 +199,87 @@ pub fn ambient_complete(
 /// init mutex. `Ok(None)` when no install has run (state DB
 /// absent or no marker row).
 pub fn read_setup() -> Result<Option<SetupInfo>> {
-    match state_db::open_db_ro()? {
-        Some(c) => state_db::read_setup_info(&c),
-        None => Ok(None),
+    let info = match state_db::open_db_ro()? {
+        Some(c) => state_db::read_setup_info(&c)?,
+        None => None,
+    };
+    // The row lives in the Users-writable shared DB — its identity
+    // fields are UNTRUSTED input to everything downstream (the
+    // broker passes the SID to `acl grant`; elevated flows act on
+    // it). Cross-validate against SAM, which only admins can edit:
+    // the recorded name must resolve to the recorded SID, and the
+    // recorded group must be the real sandbox group. A row that
+    // fails reads as "not provisioned" (with a loud warning), so a
+    // tampered row can misdirect nothing — the repair is re-running
+    // the elevated install, which rewrites the row.
+    let Some(info) = info else { return Ok(None) };
+    match crate::sid::lookup_account_sid(&info.sandbox_user) {
+        Ok(sid) if sid == info.sandbox_user_sid => {}
+        Ok(sid) => {
+            eprintln!(
+                "srt-win: WARNING: state-DB identity row is stale or \
+                 tampered: '{}' resolves to {sid}, row records {} — \
+                 treating as not provisioned; re-run `srt-win install`",
+                info.sandbox_user, info.sandbox_user_sid,
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            eprintln!(
+                "srt-win: WARNING: cannot resolve recorded sandbox \
+                 user '{}' ({e:#}) — treating as not provisioned",
+                info.sandbox_user,
+            );
+            return Ok(None);
+        }
     }
+    match crate::sid::lookup_account_sid(user::SANDBOX_GROUP) {
+        Ok(gsid) if gsid == info.sandbox_group_sid => {}
+        Ok(gsid) => {
+            eprintln!(
+                "srt-win: WARNING: state-DB group row is stale or \
+                 tampered: '{}' resolves to {gsid}, row records {} — \
+                 treating as not provisioned; re-run `srt-win install`",
+                user::SANDBOX_GROUP,
+                info.sandbox_group_sid,
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            eprintln!(
+                "srt-win: WARNING: cannot resolve '{}' ({e:#}) — \
+                 treating as not provisioned",
+                user::SANDBOX_GROUP,
+            );
+            return Ok(None);
+        }
+    }
+    // The load-bearing check: name↔SID consistency alone would pass
+    // for ANY existing account (an attacker's own row about
+    // themselves is self-consistent). Sandbox-group MEMBERSHIP is
+    // what only the elevated install grants — an account outside it
+    // is not the sandbox user, whatever the row says.
+    match crate::sam::is_member_of(&info.sandbox_group_sid, &info.sandbox_user_sid) {
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!(
+                "srt-win: WARNING: state-DB row names account '{}' \
+                 which is NOT a member of {} — treating as not \
+                 provisioned; re-run `srt-win install`",
+                info.sandbox_user,
+                user::SANDBOX_GROUP,
+            );
+            return Ok(None);
+        }
+        Err(e) => {
+            eprintln!(
+                "srt-win: WARNING: sandbox-group membership check \
+                 failed ({e:#}) — treating as not provisioned",
+            );
+            return Ok(None);
+        }
+    }
+    Ok(Some(info))
 }
 
 /// Read the recorded MITM CA (DER), if `srt-win user trust-ca`
@@ -237,14 +353,19 @@ pub(crate) fn read_cred_blob() -> Result<Vec<u8>> {
     })
 }
 
-/// Whether [`CRED_FILE`] exists and is non-empty — the
-/// `cred_present` half of `srt-win user status`. Readable by every
-/// real user, which is the point of the shared store: a
-/// SYSTEM/fleet install must read as present from an ordinary
-/// user's session.
+/// Whether [`CRED_FILE`] exists AND decrypts — the `cred_present`
+/// half of `srt-win user status`, and the credential term of the
+/// install early-out. The DPAPI round-trip matters for the latter:
+/// the store directory lets any user create files, so a planted
+/// junk `cred.dat` must read as ABSENT — making plain re-install
+/// fall through and rewrite it — rather than blocking the repair
+/// behind `--force`. Readable by every real user, which is the
+/// point of the shared store: a SYSTEM/fleet install must read as
+/// present from an ordinary user's session.
 pub fn cred_present() -> bool {
-    state_db::state_dir()
-        .and_then(|d| Ok(std::fs::metadata(d.join(CRED_FILE))?.len() > 0))
+    read_cred_blob()
+        .and_then(|b| dpapi::unprotect(&b))
+        .map(|pw| !pw.is_empty())
         .unwrap_or(false)
 }
 

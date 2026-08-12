@@ -611,7 +611,9 @@ pub fn with_init_lock<R>(
     force_recover: bool,
     f: impl FnOnce(&mut Locked) -> Result<R>,
 ) -> Result<(R, RecoveryReport)> {
-    let (_mutex, conn, report) = locked_recovered(force_recover)?;
+    // Unelevated broker context: recovery applies disk ACEs (the
+    // caller's own token bounds what SetNamedSecurityInfoW can do).
+    let (_mutex, conn, report) = locked_recovered(force_recover, DiskAces::Apply)?;
     let mut locked = Locked { conn, holder_pid };
     let out = f(&mut locked)?;
     Ok((out, report))
@@ -621,10 +623,13 @@ pub fn with_init_lock<R>(
 /// [`with_install_lock`]: acquire the init mutex, open the DB, run
 /// crash recovery. Keep the mutex guard alive for the whole
 /// critical section.
-fn locked_recovered(force_recover: bool) -> Result<(InitMutex, Connection, RecoveryReport)> {
+fn locked_recovered(
+    force_recover: bool,
+    disk: DiskAces,
+) -> Result<(InitMutex, Connection, RecoveryReport)> {
     let mutex = InitMutex::acquire()?;
     let conn = open_db()?;
-    let report = crash_recovery(&conn, force_recover)?;
+    let report = crash_recovery(&conn, force_recover, disk)?;
     Ok((mutex, conn, report))
 }
 
@@ -651,7 +656,7 @@ pub fn with_install_lock<R>(f: impl FnOnce(&Connection) -> Result<R>) -> Result<
         ),
         Err(e) => eprintln!("srt-win: ambient deny: enable SeRestorePrivilege: {e:#}"),
     }
-    let (_mutex, conn, _) = locked_recovered(false)?;
+    let (_mutex, conn, _) = locked_recovered(false, DiskAces::Skip)?;
     f(&conn)
 }
 
@@ -1224,35 +1229,34 @@ pub fn set_ambient_denies(
 /// references the (about-to-be-deleted) sandbox SID and denies
 /// nobody else. Returns how many paths were removed.
 pub fn clear_ambient_denies(conn: &Connection, sandbox_sid: &str) -> Result<usize> {
-    let paths: Vec<String> =
-        query_vec(conn, "SELECT canonical_path FROM ambient_denies", [], |r| {
-            r.get(0)
-        })?;
+    // Paths come from the STATIC target list re-derived from the
+    // environment, NEVER from the rows: this runs elevated
+    // (uninstall), and the Users-writable rows are attacker-
+    // insertable — an elevated recompose of a row-named path would
+    // be a write-ACEs-on-arbitrary-paths primitive. The rows are
+    // deleted wholesale afterwards; a row for a path outside the
+    // current target list therefore ends without its path being
+    // touched (bounded: such a row was either attacker noise, or a
+    // target from an older environment whose leftover deny for the
+    // now-deleted account is inert).
     let mut removed = 0usize;
-    for p in paths {
-        // Delete the row FIRST so the recompose converges to the
-        // session-held set (the fold-in would otherwise re-apply the
-        // ambient deny); on recompose failure RE-INSERT it, so the
-        // leftover ACE stays visible to `status` and retryable by a
-        // later uninstall/install instead of becoming an invisible
-        // orphan.
-        conn.execute(
-            "DELETE FROM ambient_denies WHERE canonical_path = ?1",
-            params![p],
-        )
-        .context("DELETE ambient_denies")?;
-        match recompose_at(conn, &p, sandbox_sid) {
+    for raw in crate::ambient::ambient_deny_targets() {
+        let Ok((canon, _)) = crate::path_id::canonicalize_path(&raw) else {
+            continue;
+        };
+        // Converge the path to "no ACEs for the sandbox SID" —
+        // directly, not via recompose_at (which reads the same
+        // untrusted rows). Uninstall deletes the account, so any
+        // session grants/denies for it on these paths die with it.
+        match crate::acl::apply_sandbox_aces(&canon, sandbox_sid, crate::acl::SbAceSet::default()) {
             Ok(()) => removed += 1,
             Err(e) => {
-                eprintln!("srt-win: warning: ambient deny removal '{p}': {e:#}");
-                conn.execute(
-                    "INSERT OR IGNORE INTO ambient_denies (canonical_path) VALUES (?1)",
-                    params![p],
-                )
-                .context("re-INSERT ambient_denies after failed removal")?;
+                eprintln!("srt-win: warning: ambient deny removal '{canon}': {e:#}");
             }
         }
     }
+    conn.execute("DELETE FROM ambient_denies", [])
+        .context("DELETE ambient_denies")?;
     Ok(removed)
 }
 
@@ -1334,7 +1338,21 @@ impl AceRelease {
 /// delete) is committed independently, so a failure on path Y
 /// leaves path X's recompose+delete durable. `force` is reserved
 /// for a future "force-recompose ignoring file-id mismatch" mode.
-fn crash_recovery(conn: &Connection, force: bool) -> Result<RecoveryReport> {
+/// Whether crash recovery may WRITE DACLs while cleaning rows.
+/// `Skip` is for ELEVATED flows (install/uninstall): the rows are
+/// Users-writable and thus attacker-insertable, so an elevated
+/// process must never recompose row-named paths — an inserted row
+/// would turn recovery into an elevated write-ACE-on-arbitrary-path
+/// primitive. Rows are still pruned; the on-disk convergence is
+/// deferred to unelevated brokers (whose own token bounds the
+/// damage) via their next op or `acl recover`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DiskAces {
+    Apply,
+    Skip,
+}
+
+fn crash_recovery(conn: &Connection, force: bool, disk: DiskAces) -> Result<RecoveryReport> {
     let mut report = RecoveryReport::default();
 
     // 1. Find dead brokers.
@@ -1392,6 +1410,10 @@ fn crash_recovery(conn: &Connection, force: bool) -> Result<RecoveryReport> {
                 params![&canon, &kind],
             )
             .context("DELETE working_aces (orphan)")?;
+            if disk == DiskAces::Skip {
+                report.aces_revoked += 1;
+                continue;
+            }
             let want = FileId::from_bytes(&fid)?;
             match identity_gate(&canon, want) {
                 IdGate::Match => {
