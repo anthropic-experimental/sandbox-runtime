@@ -51,7 +51,6 @@ try {
   # ── MS1: elevated install provisions the machine store ───────────
   Run @('install', '--sublayer-guid', $Sublayer, '--proxy-port-range', $PortRange, '--force')
   $us = J @('user', 'status')
-  if ($us.store -ne 'machine')   { throw "MS1: store expected 'machine', got '$($us.store)'" }
   if (-not $us.cred_present)     { throw 'MS1: cred_present false after machine-store install' }
   if (-not (Test-Path $credFile)) { throw "MS1: $credFile missing" }
 
@@ -142,7 +141,6 @@ try {
   }
   $us = J @('user', 'status')   # interactive user's view
   if (-not $us.cred_present) { throw 'MS3: interactive user sees cred_present:false after SYSTEM install' }
-  if ($us.store -ne 'machine') { throw "MS3: store expected 'machine', got '$($us.store)'" }
   $pw = & $Exe user read-cred
   if ($LASTEXITCODE -ne 0) { throw "MS3: interactive read-cred exited $LASTEXITCODE" }
   if ($pw.Length -ne 32)   { throw "MS3: read-cred expected 32 chars, got $($pw.Length)" }

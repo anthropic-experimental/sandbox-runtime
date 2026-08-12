@@ -216,14 +216,6 @@ export interface WindowsSandboxUserStatus {
    * is not a confidentiality boundary).
    */
   credPresent: boolean
-  /**
-   * Which state store `srt-win` resolved: `'machine'`
-   * (`%ProgramData%\sandbox-runtime`, shared by all users — see
-   * {@link windowsStateDir}) or `'legacy'` (per-user
-   * `%LOCALAPPDATA%`). Absent on binaries predating the machine
-   * store.
-   */
-  store?: string
   /** Setup marker schema version, when the marker row exists. */
   markerVersion?: number
   /**
@@ -827,7 +819,6 @@ type RawUserStatus = {
     hidden_from_logon: boolean
   }
   cred_present: boolean
-  store?: string | null
   marker_version?: number | null
   real_user_sid: string
   ca_cert_thumb?: string | null
@@ -844,7 +835,6 @@ function mapUserStatus(raw: RawUserStatus): WindowsSandboxUserStatus {
     inSandboxGroup: raw.user.in_sandbox_group,
     hiddenFromLogon: raw.user.hidden_from_logon,
     credPresent: raw.cred_present,
-    ...(raw.store && { store: raw.store }),
     ...(typeof raw.marker_version === 'number' && {
       markerVersion: raw.marker_version,
     }),
@@ -1146,36 +1136,19 @@ function checkTrustCaResult(caCertPath: string, r: RunResult): void {
 }
 
 /**
- * The state directory, mirroring `srt-win`'s
- * `state_db::state_dir()` resolution exactly: the MACHINE store
- * `%ProgramData%\sandbox-runtime` when it exists (created and ACL'd
- * by the elevated `srt-win install`: Administrators own it,
- * BUILTIN\Users have modify, the sandbox group carries an explicit
- * `(OI)(CI)` DENY), else the LEGACY per-user
- * `%LOCALAPPDATA%\sandbox-runtime` (whose DACL `state_db::open_db()`
- * stamps `(OI)(CI)` real-user-only + sandbox-group DENY on every
- * open). The machine store is shared by every user of the machine so
- * a fleet install running as SYSTEM provisions the credential where
- * ordinary users' brokers resolve it, and one user's rotation
- * updates the copy the others read.
+ * The machine-wide state directory `%ProgramData%\sandbox-runtime`,
+ * mirroring `srt-win`'s `state_db::state_dir()` exactly. Shared by
+ * every user of the machine so a fleet install running as SYSTEM
+ * provisions the credential where ordinary users' brokers resolve
+ * it, and one user's rotation updates the copy the others read.
+ * Created and ACL'd by the elevated `srt-win install`:
+ * Administrators own it, BUILTIN\Users have modify, and the sandbox
+ * group carries an explicit `(OI)(CI)` DENY.
  */
 export function windowsStateDir(): string {
   const programData = process.env.ProgramData
-  if (programData) {
-    // Existence probe with the HOST-native join (identical to
-    // win32.join on Windows; keeps the pure cross-platform tests
-    // honest, where a backslashed path never resolves on POSIX).
-    // statSync().isDirectory(), not existsSync: srt-win's resolution
-    // keys on is_dir(), and a plain FILE squatted at this path must
-    // not make the broker and the binary resolve different stores.
-    const probe = path.join(programData, 'sandbox-runtime')
-    if (fs.statSync(probe, { throwIfNoEntry: false })?.isDirectory()) {
-      return path.win32.join(programData, 'sandbox-runtime')
-    }
-  }
-  const base = process.env.LOCALAPPDATA
-  if (!base) throw new Error('LOCALAPPDATA is not set')
-  return path.win32.join(base, 'sandbox-runtime')
+  if (!programData) throw new Error('ProgramData is not set')
+  return path.win32.join(programData, 'sandbox-runtime')
 }
 
 /** Result of {@link ensurePersistentWindowsCa}. */
@@ -1232,17 +1205,16 @@ export type WindowsPersistentCa = {
  *
  * **Key custody is broker-side.** The MITM proxy runs as the real
  * user, so the sandbox user never needs to read the key. The `ca/`
- * subdirectory inherits the state directory's `(OI)(CI)` DACL,
- * which carries an explicit `sandbox-runtime-users` DENY on both
- * stores (see {@link windowsStateDir}), so `ca.json`/`key.pem` are
- * unreadable from inside the sandbox with no per-file ACL work
- * here. On the machine store the key IS readable (and replaceable)
- * by other REAL local users — an accepted trade-off of the shared
- * store: the sandbox account is network-confined by SID-keyed WFP
- * filters regardless of who spawns it. The certificate reaches the
- * sandboxed child via the schannel registry write
- * ({@link windowsTrustCa}) and the trust-bundle env vars — never
- * via these files.
+ * subdirectory inherits the machine store's `(OI)(CI)` DACL, which
+ * carries an explicit `sandbox-runtime-users` DENY (see
+ * {@link windowsStateDir}), so `ca.json`/`key.pem` are unreadable
+ * from inside the sandbox with no per-file ACL work here. The key
+ * IS readable (and replaceable) by other REAL local users — an
+ * accepted trade-off of the shared store: the sandbox account is
+ * network-confined by SID-keyed WFP filters regardless of who
+ * spawns it. The certificate reaches the sandboxed child via the
+ * schannel registry write ({@link windowsTrustCa}) and the
+ * trust-bundle env vars — never via these files.
  *
  * `SandboxManager.initialize()` calls this on Windows when
  * `tlsTerminate` is enabled without an explicit

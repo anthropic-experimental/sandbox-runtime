@@ -1,8 +1,7 @@
 //! Thin DPAPI wrappers (`CryptProtectData` / `CryptUnprotectData`).
 //!
 //! Used to encrypt the sandbox user's password at rest in the
-//! state store (machine store: the `cred.dat` file; legacy
-//! per-user store: the `sandbox_user.cred` DB column).
+//! machine store's `cred.dat` file.
 //!
 //! ## SECURITY: machine-scope DPAPI is NOT a boundary
 //!

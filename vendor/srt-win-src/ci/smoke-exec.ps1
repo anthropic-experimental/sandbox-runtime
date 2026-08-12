@@ -257,9 +257,7 @@ try {
 }
 
 # ── R6: child cannot read state.db (sandbox-runtime-users DENY) ──
-$srtStateDir = Join-Path $env:ProgramData 'sandbox-runtime'
-if (-not (Test-Path $srtStateDir)) { $srtStateDir = Join-Path $env:LOCALAPPDATA 'sandbox-runtime' }
-$stateDb = Join-Path $srtStateDir 'state.db'
+$stateDb = Join-Path $env:ProgramData 'sandbox-runtime\state.db'
 if (-not (Test-Path $stateDb)) { throw "R6: $stateDb missing" }
 $r = RExec @('--', $cmd, '/c', "type `"$stateDb`"")
 if ($r.exit -eq 0) {

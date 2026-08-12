@@ -547,14 +547,10 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
     let ca = ca.as_ref();
     Ok(json!({
         "user": st,
-        // Machine store: the install-ACL'd cred.dat (a SYSTEM/fleet
-        // install must read as present from any user's session).
-        // Legacy store: the DB row's blob.
-        "cred_present": setup.as_ref().is_some_and(install::cred_present),
-        "store": match srt_win::state_db::state_dir_resolved() {
-            Ok((_, srt_win::state_db::StoreKind::Machine)) => "machine",
-            _ => "legacy",
-        },
+        // The install-ACL'd cred.dat in the machine store (a
+        // SYSTEM/fleet install must read as present from any
+        // user's session).
+        "cred_present": setup.is_some() && install::cred_present(),
         "marker_version": setup.as_ref().map(|s| s.marker_version),
         "marker_user_sid": setup.as_ref()
             .map(|s| s.sandbox_user_sid.as_str()),
@@ -778,19 +774,16 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     }
                     _ => false,
                 };
-                // Store kind is part of completeness: a healthy
-                // LEGACY install re-running `install` must fall
-                // through so the machine store gets provisioned and
-                // the legacy sweep runs — the documented migration
-                // point — instead of early-outing forever.
-                let machine_store_ok = matches!(
-                    srt_win::state_db::state_dir_resolved(),
-                    Ok((_, srt_win::state_db::StoreKind::Machine))
-                );
+                // The credential file is part of completeness: the
+                // marker lives in the Users-writable DB while
+                // cred.dat is a separate install-ACL'd file, so a
+                // deleted/tampered cred.dat with a healthy marker
+                // must fall through and be rewritten rather than
+                // early-outing on "already installed".
                 if us.exists
                     && us.in_sandbox_group
                     && mv == Some(install::SETUP_VERSION)
-                    && machine_store_ok
+                    && install::cred_present()
                     && ambient_ok()
                 {
                     eprintln!(
@@ -833,19 +826,11 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // marker records that name from a prior install.
             let we_own_it =
                 sandbox_user.is_none() || existing.as_ref().is_some_and(|s| s.sandbox_user == name);
-            // First provisioning of the machine store on this box?
-            // Captured BEFORE provision_machine_store creates it, to
-            // decide whether the legacy per-user store needs its
-            // one-time migration sweep below.
-            let first_migration = srt_win::state_db::machine_state_dir()
-                .map(|d| !d.is_dir())
-                .unwrap_or(false);
             let pu = match (|| -> anyhow::Result<srt_win::user::ProvisionedUser> {
                 let pu = user::provision(name, we_own_it).context("provision sandbox user")?;
-                // Machine store BEFORE write_setup: write_setup's
-                // store resolution must already see the machine dir
-                // so the credential lands in its install-ACL'd file,
-                // not a legacy DB row.
+                // Machine store BEFORE write_setup: the dir must
+                // exist with its install-owned ACLs before the
+                // credential file is written into it.
                 install::provision_machine_store(&pu.group_sid)
                     .context("provision machine state store")?;
                 install::write_setup(&pu)
@@ -858,25 +843,6 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     std::process::exit(14);
                 }
             };
-            // One-time legacy migration: with the machine store now
-            // resolving for every broker, strip the ACEs recorded in
-            // this user's abandoned per-user DB (best-effort — a
-            // failure leaves bounded sandbox-SID grants behind, not
-            // a broken install).
-            if first_migration {
-                match srt_win::state_db::recover_legacy_store() {
-                    Ok(Some(r)) => eprintln!(
-                        "srt-win: migrated legacy per-user state \
-                         (revoked {} stale ACE record(s))",
-                        r.aces_revoked,
-                    ),
-                    Ok(None) => {}
-                    Err(e) => eprintln!(
-                        "srt-win: WARNING: legacy per-user state sweep \
-                         failed: {e:#}"
-                    ),
-                }
-            }
             // Ambient write-deny stamps: Windows' stock world-
             // writable system dirs (`ambient.rs`), stamped
             // `(D;OICI;WriteDeny)` for the sandbox SID only and

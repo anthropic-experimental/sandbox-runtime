@@ -6,15 +6,12 @@
 //! [`crate::user::provision`]) and read by the non-elevated broker
 //! at `srt-win exec` / `srt-win user status` time.
 //!
-//! MACHINE store (`%ProgramData%\sandbox-runtime`, provisioned by
-//! [`provision_machine_store`]): the credential lives in its own
-//! [`CRED_FILE`] whose PROTECTED DACL (Users read-only,
-//! Administrators write, sandbox DENY) is stricter than the
-//! Users-writable store around it; marker + CA rows stay in
-//! `state.db`. LEGACY per-user store: everything in the
-//! `sandbox_user` row, gated by the directory stamp
-//! [`state_db::open_db`] rewrites on every open. The DPAPI blob is
-//! stored raw — no base64 layer.
+//! The store is the machine-wide `%ProgramData%\sandbox-runtime`
+//! (provisioned by [`provision_machine_store`]). The credential
+//! lives in its own [`CRED_FILE`] whose PROTECTED DACL (Users
+//! read-only, Administrators write, sandbox DENY) is stricter than
+//! the Users-writable store around it; marker + CA rows stay in
+//! `state.db`. The DPAPI blob is stored raw — no base64 layer.
 
 use anyhow::{Context, Result, anyhow};
 
@@ -59,13 +56,8 @@ pub const CRED_FILE: &str = "cred.dat";
 /// network-confined by SID-keyed WFP filters regardless of who
 /// spawns it and has no inherent rights on other users' files, and
 /// concurrently-interactive multi-user machines are rare.
-///
-/// Also migrates a legacy per-user CA (`%LOCALAPPDATA%\…\ca\`) into
-/// the machine store when the machine store has none, so an
-/// existing install's rotation to the shared store keeps its
-/// trusted CA instead of forcing a regenerate + re-trust.
 pub fn provision_machine_store(sandbox_group_sid: &str) -> Result<std::path::PathBuf> {
-    let dir = state_db::machine_state_dir()?;
+    let dir = state_db::state_dir()?;
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create machine state dir {}", dir.display()))?;
     let dir_str = dir
@@ -89,73 +81,43 @@ pub fn provision_machine_store(sandbox_group_sid: &str) -> Result<std::path::Pat
          (A;OICI;0x1301bf;;;BU)"
     );
     crate::acl::set_path_dacl_from_sddl(dir_str, &sddl, "machine state dir")?;
-
-    let machine_ca = dir.join("ca");
-    if !machine_ca.join("ca.json").exists()
-        && let Ok(legacy) = state_db::legacy_state_dir()
-    {
-        let legacy_ca = legacy.join("ca");
-        if legacy_ca.join("ca.json").exists() {
-            let _ = std::fs::create_dir_all(&machine_ca);
-            for f in ["ca.json", "cert.pem", "key.pem"] {
-                // Best-effort: a partial copy self-heals — the
-                // broker's generate-if-absent treats a missing or
-                // unparsable ca.json as absent.
-                let _ = std::fs::copy(legacy_ca.join(f), machine_ca.join(f));
-            }
-        }
-    }
     Ok(dir)
 }
 
-/// DPAPI-encrypt `u.password` and record the setup marker.
-///
-/// MACHINE store: the blob is written to [`CRED_FILE`] with its own
+/// DPAPI-encrypt `u.password` into [`CRED_FILE`] — with its own
 /// stricter PROTECTED DACL (Users read-only, Administrators write,
-/// sandbox DENY) and the DB row carries an empty `cred` column —
-/// the file DACL is the only gate on the credential, since
-/// machine-scope DPAPI lets any local account decrypt a readable
-/// blob. LEGACY store (no machine store yet — e.g. tests):
-/// unchanged, the blob lives in the `sandbox_user` row and the
-/// per-user directory stamp gates it.
+/// sandbox DENY): the file DACL is the only gate on the credential,
+/// since machine-scope DPAPI lets any local account decrypt a
+/// readable blob — and record the setup marker in `state.db`.
 pub fn write_setup(u: &user::ProvisionedUser) -> Result<()> {
-    let (dir, kind) = state_db::state_dir_resolved()?;
+    let dir = state_db::state_dir()?;
     let blob = dpapi::protect_machine(u.password.as_bytes())?;
-    let cred_in_db = match kind {
-        state_db::StoreKind::Machine => {
-            let cred_path = dir.join(CRED_FILE);
-            // The parent grants Users create, so a squatter may have
-            // pre-created this path — and a file's CREATOR OWNER
-            // keeps WRITE_DAC through ownership no matter what DACL
-            // we write. Delete-and-recreate (best-effort), then take
-            // ownership explicitly (the install enabled
-            // SeTakeOwnership/SeRestore in provision_machine_store)
-            // so the protective DACL below is actually final.
-            let _ = std::fs::remove_file(&cred_path);
-            std::fs::write(&cred_path, &blob)
-                .with_context(|| format!("write {}", cred_path.display()))?;
-            let cred_str = cred_path
-                .to_str()
-                .ok_or_else(|| anyhow::anyhow!("cred path is not UTF-8"))?;
-            crate::acl::set_path_owner_admins(cred_str)
-                .context("take ownership of credential file")?;
-            let sddl = format!(
-                "D:P(D;;FA;;;{})\
-                 (A;;FA;;;SY)\
-                 (A;;FA;;;BA)\
-                 (A;;FR;;;BU)",
-                u.group_sid
-            );
-            crate::acl::set_path_dacl_from_sddl(cred_str, &sddl, "machine cred file")?;
-            Vec::new()
-        }
-        state_db::StoreKind::Legacy => blob,
-    };
+    let cred_path = dir.join(CRED_FILE);
+    // The parent grants Users create, so a squatter may have
+    // pre-created this path — and a file's CREATOR OWNER keeps
+    // WRITE_DAC through ownership no matter what DACL we write.
+    // Delete-and-recreate (best-effort), then take ownership
+    // explicitly (the install enabled SeTakeOwnership/SeRestore in
+    // provision_machine_store) so the protective DACL below is
+    // actually final.
+    let _ = std::fs::remove_file(&cred_path);
+    std::fs::write(&cred_path, &blob).with_context(|| format!("write {}", cred_path.display()))?;
+    let cred_str = cred_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("cred path is not UTF-8"))?;
+    crate::acl::set_path_owner_admins(cred_str).context("take ownership of credential file")?;
+    let sddl = format!(
+        "D:P(D;;FA;;;{})\
+         (A;;FA;;;SY)\
+         (A;;FA;;;BA)\
+         (A;;FR;;;BU)",
+        u.group_sid
+    );
+    crate::acl::set_path_dacl_from_sddl(cred_str, &sddl, "machine cred file")?;
     let conn = state_db::open_db().context("open state DB for setup write")?;
     state_db::write_setup_info(
         &conn,
         &SetupInfo {
-            cred: cred_in_db,
             marker_version: SETUP_VERSION,
             sandbox_user: u.username.clone(),
             sandbox_user_sid: u.sid.clone(),
@@ -233,13 +195,13 @@ impl Drop for SandboxCred {
 }
 
 /// Decrypt and return the sandbox user's credential. Fails if the
-/// caller cannot read `state.db` — by design, the sandbox user is
-/// DENY'd on the directory and so cannot call this to learn its own
-/// password.
+/// caller cannot read [`CRED_FILE`] — by design, the sandbox user
+/// is DENY'd on it (and on the store directory) and so cannot call
+/// this to learn its own password.
 pub fn read_cred() -> Result<SandboxCred> {
     let info = read_setup()?.ok_or_else(|| {
         anyhow!(
-            "no sandbox-user credential in state DB — run \
+            "no sandbox-user setup record in the state store — run \
              `srt-win install`"
         )
     })?;
@@ -251,7 +213,7 @@ pub fn read_cred() -> Result<SandboxCred> {
             SETUP_VERSION,
         ));
     }
-    let blob = read_cred_blob(&info)?;
+    let blob = read_cred_blob()?;
     let pw = String::from_utf8(dpapi::unprotect(&blob)?).context("password is not UTF-8")?;
     Ok(SandboxCred {
         user: info.sandbox_user,
@@ -259,43 +221,31 @@ pub fn read_cred() -> Result<SandboxCred> {
     })
 }
 
-/// The DPAPI blob for the current store. MACHINE store: only
-/// [`CRED_FILE`] — never the DB column, whose Users-writable row
-/// must not be able to smuggle a substitute credential past the
-/// install-ACL'd file; a missing/unreadable file means the install
-/// is incomplete (or was tampered with) and the repair is the same
-/// re-run either way. LEGACY store: the `sandbox_user.cred` column,
-/// as always.
-pub(crate) fn read_cred_blob(info: &SetupInfo) -> Result<Vec<u8>> {
-    let (dir, kind) = state_db::state_dir_resolved()?;
-    match kind {
-        state_db::StoreKind::Machine => {
-            let p = dir.join(CRED_FILE);
-            std::fs::read(&p).with_context(|| {
-                format!(
-                    "read credential file {} — run `srt-win install` \
-                     (elevated) to (re)provision it",
-                    p.display()
-                )
-            })
-        }
-        state_db::StoreKind::Legacy => Ok(info.cred.clone()),
-    }
+/// The DPAPI blob — only [`CRED_FILE`], never a DB column: the
+/// Users-writable `state.db` must not be able to smuggle a
+/// substitute credential past the install-ACL'd file. A
+/// missing/unreadable file means the install is incomplete (or was
+/// tampered with) and the repair is the same re-run either way.
+pub(crate) fn read_cred_blob() -> Result<Vec<u8>> {
+    let p = state_db::state_dir()?.join(CRED_FILE);
+    std::fs::read(&p).with_context(|| {
+        format!(
+            "read credential file {} — run `srt-win install` \
+             (elevated) to (re)provision it",
+            p.display()
+        )
+    })
 }
 
-/// Whether a credential is present for the current store — the
-/// `cred_present` half of `srt-win user status`. Machine store:
-/// [`CRED_FILE`] exists and is non-empty (readable by every real
-/// user, which is the point of the shared store — a SYSTEM/fleet
-/// install must read as present from an ordinary user's session).
-/// Legacy store: non-empty DB column.
-pub fn cred_present(info: &SetupInfo) -> bool {
-    match state_db::state_dir_resolved() {
-        Ok((dir, state_db::StoreKind::Machine)) => std::fs::metadata(dir.join(CRED_FILE))
-            .map(|m| m.len() > 0)
-            .unwrap_or(false),
-        _ => !info.cred.is_empty(),
-    }
+/// Whether [`CRED_FILE`] exists and is non-empty — the
+/// `cred_present` half of `srt-win user status`. Readable by every
+/// real user, which is the point of the shared store: a
+/// SYSTEM/fleet install must read as present from an ordinary
+/// user's session.
+pub fn cred_present() -> bool {
+    state_db::state_dir()
+        .and_then(|d| Ok(std::fs::metadata(d.join(CRED_FILE))?.len() > 0))
+        .unwrap_or(false)
 }
 
 /// Write `der` into the **sandbox user's** `CurrentUser\Root` via a
@@ -332,18 +282,16 @@ pub fn trust_ca(der: &crate::cert_store::CertDer, cred: &SandboxCred, sb_sid: &s
 /// [`write_setup`] this doesn't re-stamp the directory: uninstall
 /// deletes rows, it doesn't need to assert the DACL.
 pub fn clear_setup() -> Result<()> {
-    let (dir, kind) = state_db::state_dir_resolved()?;
-    if kind == state_db::StoreKind::Machine {
-        // The credential file goes with the setup rows: uninstall
-        // deletes the account, so a surviving blob would be a
-        // credential for a nonexistent user at best and a stale one
-        // for a recreated user at worst.
-        let cred = dir.join(CRED_FILE);
-        if let Err(e) = std::fs::remove_file(&cred)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            eprintln!("srt-win: warning: could not remove {}: {e}", cred.display());
-        }
+    let dir = state_db::state_dir()?;
+    // The credential file goes with the setup rows: uninstall
+    // deletes the account, so a surviving blob would be a
+    // credential for a nonexistent user at best and a stale one
+    // for a recreated user at worst.
+    let cred = dir.join(CRED_FILE);
+    if let Err(e) = std::fs::remove_file(&cred)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("srt-win: warning: could not remove {}: {e}", cred.display());
     }
     let path = dir.join("state.db");
     if !path.try_exists().unwrap_or(true) {

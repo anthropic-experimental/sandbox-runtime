@@ -21,10 +21,10 @@
 //! [`apply_sandbox_aces`] ([`SbAceSet`]): converge the path to
 //! exactly the wanted ALLOW + DENY for `<sb-SID>`, idempotently.
 //!
-//! The PROTECTED broker-only allow-list in [`stamp_dir_inheriting`]
-//! / [`build_init_mutex_sa`] is the ONE remaining `PROTECTED`
-//! consumer — it protects the state-DB directory and the named
-//! init-mutex from the sandbox child, not user files.
+//! The PROTECTED allow-lists in [`set_path_dacl_from_sddl`]'s
+//! callers / [`build_init_mutex_sa`] are the ONE remaining
+//! `PROTECTED` consumer — they protect the machine state store and
+//! the named init-mutex from the sandbox child, not user files.
 //!
 //! Globs are **rejected**. Directory targets get `(OI)(CI)` ACEs
 //! so the additive grant/deny inherits to the whole subtree.
@@ -449,44 +449,6 @@ pub(crate) fn ace_sid_is(body: &[u8], sid_bytes: &[u8]) -> bool {
     body.get(ACE_FIXED..ACE_FIXED + sid_bytes.len()) == Some(sid_bytes)
 }
 
-/// Apply the broker-only DACL to a directory with `(OI)(CI)`
-/// inheritance, optionally **prefixed** by a `(D;OICI;FA;;;
-/// <deny_sid>)` ACE. Used by `state_db.rs` to protect the LEGACY
-/// per-user `%LOCALAPPDATA%\sandbox-runtime\` (the machine store's
-/// DACL is written by `install::provision_machine_store` instead).
-///
-/// `deny_sid` is the [`crate::user::SANDBOX_GROUP`] SID when the
-/// sandbox user has been provisioned: the credential file in this
-/// directory is encrypted with **machine-scope** DPAPI, which any
-/// local account can decrypt — so the sandbox account MUST NOT be
-/// able to read it. The real-user `PROTECTED` allow set already
-/// excludes the sandbox user, but the explicit DENY makes that
-/// intent visible in `Get-Acl` and survives any future widening of
-/// the allow set.
-///
-/// Built via SDDL because [`build_allow_dacl`] only emits ALLOW
-/// ACEs, and adding a generic DENY row to the [`Allow`] table
-/// would invite misuse.
-pub fn stamp_dir_inheriting(canonical_path: &str, deny_sid: Option<&str>) -> Result<()> {
-    let deny = deny_sid
-        .map(|s| format!("(D;OICI;FA;;;{s})"))
-        .unwrap_or_default();
-    // Trustee = the **real user** (the broker matches; the
-    // `srt-sandbox` child does not). SY/BA = FILE_ALL `(OI)(CI)`;
-    // OWNER_RIGHTS = READ_CONTROL `(OI)(CI)`. SDDL's `FA` =
-    // `FILE_ALL_ACCESS`; `RC` = `READ_CONTROL`; `S-1-3-4` =
-    // OWNER_RIGHTS. Canonical ACE order = DENY before ALLOW.
-    let user_sid = crate::sid::current_user_sid()?;
-    let sddl = format!(
-        "D:P{deny}\
-         (A;OICI;FA;;;{user_sid})\
-         (A;OICI;FA;;;SY)\
-         (A;OICI;FA;;;BA)\
-         (A;OICI;RC;;;S-1-3-4)"
-    );
-    set_path_dacl_from_sddl(canonical_path, &sddl, "state-db dir")
-}
-
 /// SDDL → SD → DACL pointer → `SetNamedSecurityInfoW(PROTECTED)`.
 /// One-shot helper for the few call sites that need a DENY ACE
 /// (which the [`BuiltAcl`] machinery deliberately doesn't expose).
@@ -802,9 +764,9 @@ pub fn sandbox_deny_present(canonical_path: &str, sandbox_sid: &str) -> Result<b
 /// an explicit DENY so a sandbox child cannot stall stamps by
 /// sitting on the lock. The DENY is built via SDDL because
 /// [`build_allow_dacl`] deliberately emits only ALLOW ACEs; when
-/// the sandbox group does not resolve (install never ran — the
-/// legacy-store case on a fresh machine) the allow-only set is
-/// used, matching `state_db::open_db`'s deny-skip fallback.
+/// the sandbox group does not resolve (install never ran on this
+/// machine) the allow-only set is used — there is no sandbox
+/// account to exclude yet.
 /// `GENERIC_ALL` (`GA`) resolves via the mutex's generic mapping at
 /// create time.
 pub fn build_init_mutex_sa() -> Result<OwnedSa> {

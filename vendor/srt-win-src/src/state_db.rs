@@ -2,13 +2,12 @@
 //! sandbox-user ACEs (grant ALLOW / stamp DENY) so the LAST broker
 //! to release a path can drop the ACE.
 //!
-//! Lives at `state_dir()/state.db` (rusqlite, WAL): the
-//! machine-wide `%ProgramData%\sandbox-runtime` once the elevated
-//! install has provisioned it (its DACL — Administrators-owned,
-//! Users modify, sandbox-group DENY — is install-managed), else the
-//! legacy per-user `%LOCALAPPDATA%\sandbox-runtime`, which is
-//! ACL-stamped real-user-only `(OI)(CI)` on every open. Either way
-//! the sandbox child cannot tamper with the refcount.
+//! Lives at `state_dir()/state.db` (rusqlite, WAL) in the
+//! machine-wide `%ProgramData%\sandbox-runtime` store, whose DACL —
+//! Administrators-owned, Users modify, sandbox-group DENY — is
+//! managed by the elevated install
+//! (`install::provision_machine_store`), so the sandbox child
+//! cannot tamper with the refcount.
 //!
 //! ## Disk-is-truth invariant
 //!
@@ -76,7 +75,7 @@ impl std::str::FromStr for HolderPid {
 /// gates file-mapping/section objects, not mutexes), so an
 /// unelevated broker can still create it first.
 const MUTEX_NAME: &str = r"Global\sandbox-runtime-acl-init";
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS brokers (
@@ -136,15 +135,14 @@ CREATE TABLE IF NOT EXISTS placeholders (
 CREATE TABLE IF NOT EXISTS ambient_denies (
   canonical_path TEXT PRIMARY KEY
 );
--- Install-time setup record: the sandbox user's DPAPI-encrypted
--- credential plus the setup marker. One row per provisioned
--- sandbox user (currently exactly one). Additive table — no
--- schema-version bump.
+-- Install-time setup record: the setup marker + identity SIDs.
+-- The credential itself lives in the install-ACL'd cred.dat file,
+-- NEVER here — this table is writable by every real user's broker.
+-- One row per provisioned sandbox user (currently exactly one).
 CREATE TABLE IF NOT EXISTS sandbox_user (
   username        TEXT    PRIMARY KEY,
   user_sid        TEXT    NOT NULL,
   group_sid       TEXT    NOT NULL,
-  cred            BLOB    NOT NULL,
   marker_version  INTEGER NOT NULL,
   created_at_unix INTEGER NOT NULL,
   -- DER-encoded MITM CA certificate (`srt-win user trust-ca`).
@@ -253,80 +251,18 @@ impl InitMutex {
     }
 }
 
-/// Open (creating if needed) the state DB at the default location.
-/// On the LEGACY per-user store, stamps the parent directory
-/// real-user-only on EVERY open (below). On the MACHINE store the
-/// directory's DACL is owned by the elevated install
+/// Open (creating if needed) the state DB at the machine store.
+/// The directory's DACL is owned by the elevated install
 /// (`install::provision_machine_store`) and is deliberately
-/// multi-user (BUILTIN\Users modify + sandbox-group DENY): a
-/// per-open real-user-only stamp would lock every other user's
-/// broker out — and an unelevated broker lacks `WRITE_DAC` on the
-/// install-owned directory anyway.
+/// multi-user (BUILTIN\Users modify + sandbox-group DENY) — no
+/// per-open stamping here: an unelevated broker lacks `WRITE_DAC`
+/// on the install-owned directory, and a real-user-only stamp
+/// would lock every other user's broker out. A pre-install
+/// create_dir_all inherits ProgramData's defaults; the next
+/// elevated install takes ownership and rewrites the DACL.
 pub fn open_db() -> Result<Connection> {
-    let (dir, kind) = state_dir_resolved()?;
+    let dir = state_dir()?;
     std::fs::create_dir_all(&dir).with_context(|| format!("create_dir_all {}", dir.display()))?;
-    if kind == StoreKind::Machine {
-        return open_db_at(&dir.join("state.db"));
-    }
-    // Stamp the directory `(OI)(CI)` real-user-only so the sandbox
-    // child cannot tamper with state.db / -wal / -shm. Done on
-    // EVERY open, not just first creation: defense-in-depth — the
-    // child runs as a different user, but a working-tree grant
-    // could otherwise expose this directory if it lives under a
-    // granted root. `SetNamedSecurityInfoW` is
-    // idempotent, so re-stamping an already-correct dir is a no-op.
-    // Best-effort: if it fails we proceed (the `%LOCALAPPDATA%`
-    // default DACL already excludes the separate `srt-sandbox`
-    // user; the explicit stamp + sandbox-users DENY below is
-    // belt-and-braces against a working-tree ALLOW grant covering
-    // this directory) and warn so the test harness can assert. We
-    // own this directory, so a user-applied custom DACL on it is
-    // NOT preserved — it is rewritten on every open by design.
-    let dir_str = dir.to_str().ok_or_else(|| {
-        anyhow!(
-            "state-DB directory path '{}' is not representable as \
-             UTF-8 (contains unpaired surrogates); not supported",
-            dir.display()
-        )
-    })?;
-    // Include the sandbox-users DENY when the install has
-    // provisioned that group. The credential file in this
-    // directory is machine-scope DPAPI — readable-by-sandbox =
-    // decryptable-by-sandbox — so the DENY is load-bearing once
-    // the separate-user runner exists. The lookup distinguishes
-    // "group genuinely absent" (install never run / older install
-    // → DENY skipped, broker-only allow set still excludes the
-    // sandbox user) from a transient SAM/LSA failure — the latter
-    // is surfaced rather than silently dropping a security ACE.
-    let deny_sid = match crate::sid::lookup_account_sid(crate::user::SANDBOX_GROUP) {
-        Ok(s) => Some(s),
-        Err(e) => {
-            match crate::sid::sid_account_exists("S-1-5-32-545") {
-                // BUILTIN\Users always maps; if it does, SAM is up
-                // and the sandbox group is genuinely absent.
-                Ok(crate::sid::SidExistence::Mapped) => None,
-                _ => {
-                    eprintln!(
-                        "srt-win: WARNING: cannot resolve \
-                         '{}' to add the state-dir DENY ACE \
-                         ({e:#}); the broker-only allow set \
-                         still excludes the sandbox user, but \
-                         the explicit DENY is omitted for this \
-                         stamp",
-                        crate::user::SANDBOX_GROUP,
-                    );
-                    None
-                }
-            }
-        }
-    };
-    if let Err(e) = acl::stamp_dir_inheriting(dir_str, deny_sid.as_deref()) {
-        eprintln!(
-            "srt-win: WARNING: failed to stamp state-DB dir {} \
-             broker-only: {e:#}",
-            dir.display()
-        );
-    }
     open_db_at(&dir.join("state.db"))
 }
 
@@ -411,10 +347,11 @@ pub(crate) fn open_db_at(path: &std::path::Path) -> Result<Connection> {
     // state.db.v<old>.<ts>.bak alongside `path`, and a fresh DB is
     // created at the expected schema. `acl recover` sweeps orphaned
     // ACEs by trustee SID without the old rows. The `sandbox_user`
-    // row (cred + ca_cert) is in the renamed-away DB → the hint
-    // says re-run install + trust-ca. The .bak inherits the
-    // PROTECTED broker-only DACL from the state dir (stamped by
-    // [`open_db`]); no per-file stamp needed. Chokepoint here so
+    // row (marker + ca_cert) is in the renamed-away DB → the hint
+    // says re-run install + trust-ca. The .bak inherits the machine
+    // store's install-managed DACL (Users modify, sandbox-group
+    // DENY); no per-file stamp needed — it holds no credential.
+    // Chokepoint here so
     // direct callers (`clear_setup`, `trust_ca`) don't silently
     // bump `user_version` on a stale DB.
     if path.exists() {
@@ -494,9 +431,10 @@ pub(crate) fn open_db_at(path: &std::path::Path) -> Result<Connection> {
 }
 
 /// One row of the `sandbox_user` table — the install-time setup
-/// record: the sandbox user's DPAPI-encrypted credential plus the
-/// setup marker. Written by `srt-win install`, read by the
-/// non-elevated broker. The `ca_cert` column is read/written
+/// record: the setup marker plus identity SIDs (the credential
+/// lives in `install::CRED_FILE`, never in this Users-writable
+/// DB). Written by `srt-win install`, read by the non-elevated
+/// broker. The `ca_cert` column is read/written
 /// separately ([`read_ca_cert`] / [`set_ca_cert`]) so this struct
 /// carries exactly what [`write_setup_info`] owns.
 #[derive(Debug, Clone)]
@@ -504,8 +442,6 @@ pub struct SetupInfo {
     pub sandbox_user: String,
     pub sandbox_user_sid: String,
     pub sandbox_group_sid: String,
-    /// DPAPI ciphertext of the sandbox user's password.
-    pub cred: Vec<u8>,
     pub marker_version: u32,
     pub created_at_unix: u64,
 }
@@ -532,20 +468,18 @@ pub fn write_setup_info(conn: &Connection, info: &SetupInfo) -> Result<()> {
     .context("DELETE stale sandbox_user row")?;
     conn.execute(
         "INSERT INTO sandbox_user \
-           (username, user_sid, group_sid, cred, marker_version, \
+           (username, user_sid, group_sid, marker_version, \
             created_at_unix) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
          ON CONFLICT(username) DO UPDATE SET \
            user_sid        = excluded.user_sid, \
            group_sid       = excluded.group_sid, \
-           cred            = excluded.cred, \
            marker_version  = excluded.marker_version, \
            created_at_unix = excluded.created_at_unix",
         params![
             info.sandbox_user,
             info.sandbox_user_sid,
             info.sandbox_group_sid,
-            info.cred,
             info.marker_version,
             info.created_at_unix as i64,
         ],
@@ -561,7 +495,7 @@ pub fn write_setup_info(conn: &Connection, info: &SetupInfo) -> Result<()> {
 pub fn read_setup_info(conn: &Connection) -> Result<Option<SetupInfo>> {
     match conn
         .query_row(
-            "SELECT username, user_sid, group_sid, cred, \
+            "SELECT username, user_sid, group_sid, \
                     marker_version, created_at_unix \
              FROM sandbox_user LIMIT 1",
             [],
@@ -570,9 +504,8 @@ pub fn read_setup_info(conn: &Connection) -> Result<Option<SetupInfo>> {
                     sandbox_user: r.get(0)?,
                     sandbox_user_sid: r.get(1)?,
                     sandbox_group_sid: r.get(2)?,
-                    cred: r.get(3)?,
-                    marker_version: r.get(4)?,
-                    created_at_unix: r.get::<_, i64>(5)? as u64,
+                    marker_version: r.get(3)?,
+                    created_at_unix: r.get::<_, i64>(4)? as u64,
                 })
             },
         )
@@ -634,56 +567,19 @@ fn missing_table(e: &rusqlite::Error, name: &str) -> bool {
     )
 }
 
-/// Which store [`state_dir`] resolved to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StoreKind {
-    /// `%ProgramData%\sandbox-runtime` — machine-wide, shared by
-    /// every user of the machine. Created (and ACL'd) only by the
-    /// elevated install.
-    Machine,
-    /// `%LOCALAPPDATA%\sandbox-runtime` — the original per-user
-    /// store. Still resolved when no machine store exists, so
-    /// pre-migration installs keep working until the next elevated
-    /// install creates the machine store.
-    Legacy,
-}
-
-/// Machine-wide state dir: `%ProgramData%\sandbox-runtime`. Shared
-/// by all users so a fleet install running as SYSTEM provisions the
-/// same credential every user's broker reads, and one user's
-/// password rotation doesn't strand the others' stored copy.
-pub fn machine_state_dir() -> Result<PathBuf> {
+/// The machine-wide state dir: `%ProgramData%\sandbox-runtime`,
+/// shared by all users of the machine, so a fleet install running
+/// as SYSTEM provisions the same credential every user's broker
+/// reads and one user's password rotation doesn't strand the
+/// others' stored copy. Created (and ACL'd) by the elevated
+/// install (`install::provision_machine_store`); a pre-created
+/// directory is healed there by taking ownership and rewriting the
+/// DACL.
+pub fn state_dir() -> Result<PathBuf> {
     state_dir_from_base(std::env::var_os("ProgramData"), "ProgramData")
 }
 
-/// Legacy per-user state dir: `%LOCALAPPDATA%\sandbox-runtime`.
-pub fn legacy_state_dir() -> Result<PathBuf> {
-    state_dir_from_base(std::env::var_os("LOCALAPPDATA"), "LOCALAPPDATA")
-}
-
-/// Resolve the state dir: the machine store when it exists, else
-/// the legacy per-user store. Existence — not install markers — is
-/// the switch, so every reader and writer (brokers, status, acl
-/// ops) flips to the shared store atomically the moment an elevated
-/// install creates it. A local user pre-creating the directory can
-/// redirect other users' ACE bookkeeping, but that is within the
-/// accepted local-tamper model (see `install::provision_machine_store`),
-/// and the credential never falls for it: `install::read_cred` on a
-/// machine store only reads the install-ACL'd `cred.dat`.
-pub fn state_dir() -> Result<PathBuf> {
-    Ok(state_dir_resolved()?.0)
-}
-
-/// [`state_dir`] plus which store it picked.
-pub fn state_dir_resolved() -> Result<(PathBuf, StoreKind)> {
-    let machine = machine_state_dir()?;
-    if machine.is_dir() {
-        return Ok((machine, StoreKind::Machine));
-    }
-    Ok((legacy_state_dir()?, StoreKind::Legacy))
-}
-
-/// Errors if `var` (`%LOCALAPPDATA%` / `%ProgramData%`) is unset,
+/// Errors if `var` (`%ProgramData%`) is unset,
 /// empty, or yields a non-absolute path — a relative state dir
 /// would put the ACL-protected DB in the CWD and break cross-broker
 /// refcounting/recovery.
@@ -702,28 +598,6 @@ fn state_dir_from_base(base: Option<std::ffi::OsString>, var: &str) -> Result<Pa
         );
     }
     Ok(dir)
-}
-
-/// One-time migration sweep for the elevated install: force-strip
-/// every ACE recorded in the CALLING USER's legacy per-user DB.
-/// Once the machine store exists, every broker resolves to it and
-/// the legacy DB's rows become unreachable — without this sweep,
-/// ACEs its sessions had stamped (working-tree grants for the
-/// sandbox SID) would linger on disk with no owner to release them.
-/// Only the installing user's legacy DB is reachable (other users'
-/// live under their own profiles at paths we don't enumerate);
-/// theirs are swept by their own next elevated install, and until
-/// then their leftover ACEs are bounded by the accepted local-model
-/// (grants for the confined sandbox SID on that user's own files).
-/// `Ok(None)` when there is no legacy DB. Takes the init mutex.
-pub fn recover_legacy_store() -> Result<Option<RecoveryReport>> {
-    let db = legacy_state_dir()?.join("state.db");
-    if !db.exists() {
-        return Ok(None);
-    }
-    let _mutex = InitMutex::acquire()?;
-    let conn = open_db_at(&db)?;
-    Ok(Some(crash_recovery(&conn, true)?))
 }
 
 /// Run `f` under the init mutex with the DB open. Crash recovery is
@@ -1671,15 +1545,15 @@ mod tests {
         use std::ffi::OsString;
         // Unset or empty → error (var_os returns Some("") for a
         // present-but-empty var, which the old code accepted).
-        assert!(state_dir_from_base(None, "LOCALAPPDATA").is_err());
-        assert!(state_dir_from_base(Some(OsString::from("")), "LOCALAPPDATA").is_err());
+        assert!(state_dir_from_base(None, "ProgramData").is_err());
+        assert!(state_dir_from_base(Some(OsString::from("")), "ProgramData").is_err());
         // Relative → error (would put the broker-only-stamped DB
         // in CWD).
-        assert!(state_dir_from_base(Some(OsString::from("rel")), "LOCALAPPDATA").is_err());
+        assert!(state_dir_from_base(Some(OsString::from("rel")), "ProgramData").is_err());
         // Absolute → ok.
         let ok = state_dir_from_base(
             Some(OsString::from(r"C:\Users\u\AppData\Local")),
-            "LOCALAPPDATA",
+            "ProgramData",
         );
         assert_eq!(
             ok.unwrap(),

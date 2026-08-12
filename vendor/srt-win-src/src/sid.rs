@@ -75,55 +75,6 @@ pub fn psid_to_string(sid: PSID) -> Result<String> {
     Ok(s)
 }
 
-/// Outcome of a SID → account reverse lookup.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SidExistence {
-    /// `LookupAccountSidW` resolved the SID to an account.
-    Mapped,
-    /// `LookupAccountSidW` returned `ERROR_NONE_MAPPED` — well-formed
-    /// SID with no corresponding account. Treat as "absent".
-    Unmapped,
-    /// Lookup failed for a transient reason (e.g. domain controller
-    /// unreachable). Caller should fall through to other checks
-    /// rather than report absent.
-    Unknown,
-}
-
-/// Reverse-lookup: does any account correspond to `sid_str`?
-/// SAM/LSA liveness probe when resolving the sandbox group for the
-/// state-dir DENY ACE.
-pub fn sid_account_exists(sid_str: &str) -> Result<SidExistence> {
-    use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_NONE_MAPPED, GetLastError};
-    let psid = LocalPsid::from_string(sid_str)?;
-    unsafe {
-        let mut cch_name: u32 = 0;
-        let mut cch_dom: u32 = 0;
-        let mut use_: SID_NAME_USE = SID_NAME_USE::default();
-        // Sizing call — we only care about the error code.
-        let r = LookupAccountSidW(
-            windows::core::PCWSTR::null(),
-            psid.as_psid(),
-            None,
-            &mut cch_name,
-            None,
-            &mut cch_dom,
-            &mut use_,
-        );
-        if r.is_ok() {
-            // Shouldn't happen with zero-length buffers, but treat as
-            // mapped if it does.
-            return Ok(SidExistence::Mapped);
-        }
-        match GetLastError() {
-            ERROR_INSUFFICIENT_BUFFER => Ok(SidExistence::Mapped),
-            ERROR_NONE_MAPPED => Ok(SidExistence::Unmapped),
-            // RPC_S_SERVER_UNAVAILABLE, ERROR_TRUSTED_RELATIONSHIP_FAILURE,
-            // etc. — don't claim absence on a transient lookup failure.
-            _ => Ok(SidExistence::Unknown),
-        }
-    }
-}
-
 /// Resolve an account name (local or domain) to a string SID via
 /// `LookupAccountNameW` with a NULL system name (local SAM first,
 /// then domain). Errors if the name is not found.
@@ -247,28 +198,6 @@ mod tests {
     fn lookup_missing_account_errors() {
         let r = lookup_account_sid("no-such-group-srt-win-test");
         assert!(r.is_err());
-    }
-
-    #[test]
-    fn sid_account_exists_for_well_known() {
-        assert_eq!(
-            sid_account_exists("S-1-5-32-545").unwrap(),
-            SidExistence::Mapped
-        );
-    }
-
-    #[test]
-    fn sid_account_exists_unmapped_for_bogus() {
-        // Well-formed but maps to nothing on any machine.
-        assert_eq!(
-            sid_account_exists("S-1-5-21-1-2-3-9999999").unwrap(),
-            SidExistence::Unmapped
-        );
-    }
-
-    #[test]
-    fn sid_account_exists_errors_on_malformed() {
-        assert!(sid_account_exists("not-a-sid").is_err());
     }
 
     #[test]

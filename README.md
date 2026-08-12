@@ -521,7 +521,7 @@ Run once per machine (self-elevates; one UAC prompt):
 npx @anthropic-ai/sandbox-runtime windows-install
 ```
 
-This provisions the `srt-sandbox` local user account (with a random password stored DPAPI-encrypted under `%LOCALAPPDATA%\sandbox-runtime\state.db`), the `sandbox-runtime-users` local group, and installs a machine-wide WFP filter set keyed on the `srt-sandbox` SID. It is **idempotent** — re-running it rotates the sandbox account's password and reconciles the filter set.
+This provisions the `srt-sandbox` local user account (with a random password stored DPAPI-encrypted in `%ProgramData%\sandbox-runtime\cred.dat` — a machine-wide store shared by every user of the machine, so fleet installs running as SYSTEM work and one user's rotation updates the copy the others read), the `sandbox-runtime-users` local group, and installs a machine-wide WFP filter set keyed on the `srt-sandbox` SID. It is **idempotent** — re-running it rotates the sandbox account's password and reconciles the filter set.
 
 **No logout is required.** The WFP filters key on the dedicated sandbox account's SID, so your own network, services, and every other principal on the machine are unaffected.
 
@@ -580,7 +580,7 @@ The cross-platform `filesystem` and `network` blocks apply as described above. W
 npx @anthropic-ai/sandbox-runtime windows-uninstall
 ```
 
-Removes the WFP filter set, the `srt-sandbox` account and its profile, the `sandbox-runtime-users` group, and clears the credential/setup marker from `state.db` (one UAC prompt). `%LOCALAPPDATA%\sandbox-runtime\state.db` itself is left in place (it is ACL-stamped broker-only); delete the directory manually for a full sweep.
+Removes the WFP filter set, the `srt-sandbox` account and its profile, the `sandbox-runtime-users` group, and clears the credential (`cred.dat`) and setup marker (one UAC prompt). `%ProgramData%\sandbox-runtime\state.db` itself is left in place; delete the directory manually for a full sweep.
 
 ## Development
 
