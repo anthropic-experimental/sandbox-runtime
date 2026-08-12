@@ -209,8 +209,15 @@ try {
     if ($r.exit -ne 0) { throw "MS6: user status as standard user exited $($r.exit): $($r.err)" }
     $st6 = $r.out | ConvertFrom-Json
     if (-not $st6.cred_present) { throw 'MS6: standard user cannot see the shared credential' }
+    # The grant target must be created BY the standard user: writing
+    # an ACE needs WRITE_DAC, which they hold via CREATOR OWNER on
+    # their own files (the real broker shape — a user grants on their
+    # own working tree), not on directories some admin created.
     $probe6 = Join-Path $pub 'srt-ms6-probe'
-    New-Item -ItemType Directory -Force $probe6 | Out-Null
+    Remove-Item $probe6 -Recurse -Force -ea SilentlyContinue
+    $mk = Start-Process -FilePath $cmd -ArgumentList @('/c', "mkdir `"$probe6`"") `
+            -Credential $cred6 -WorkingDirectory $pub -NoNewWindow -Wait -PassThru
+    if ($mk.ExitCode -ne 0) { throw "MS6: mkdir as standard user exited $($mk.ExitCode)" }
     $r = RunAsUser6 @('acl', 'grant', '--holder-pid', $PID,
                       '--sandbox-user-sid', $st6.marker_user_sid) `
                     "{`"write`":[`"$($probe6 -replace '\\','\\')`"]}"
