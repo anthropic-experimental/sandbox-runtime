@@ -174,7 +174,9 @@ try {
   # mutex cross-user), and exec spawns a sandboxed child.
   $u6 = 'srt-ms6-user'
   $pw6 = 'Ms6!' + [guid]::NewGuid().ToString('N').Substring(0, 16)
-  net user $u6 $pw6 /add | Out-Null
+  # /y: net.exe interactively prompts Y/N for passwords longer than
+  # 14 chars, which hangs (exit -1) with no stdin in CI.
+  net user $u6 $pw6 /add /y | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "MS6: net user add exited $LASTEXITCODE" }
   try {
     $cred6 = [pscredential]::new(
