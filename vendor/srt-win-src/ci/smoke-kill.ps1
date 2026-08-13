@@ -106,8 +106,15 @@ function Start-Tree {
   $bpid = $p.Id
   # Poll until the leaf (`PING.EXE`) is present — a depth count
   # alone can be inflated by conhost.exe before the leaf spawns.
-  for ($i = 0; $i -lt 40; $i++) {
+  # 30s, not 10s: the leaf is two hops away (broker → seclogon
+  # logon → cmd → ping), and the first CreateProcessWithLogonW on a
+  # cold runner can take well over 10s building the sandbox user's
+  # profile — the recurring x86-64 "leaf never appeared" flake.
+  for ($i = 0; $i -lt 120; $i++) {
     Start-Sleep -Milliseconds 250
+    if ($p.HasExited) {
+      throw "Start-Tree: broker exited early with code $($p.ExitCode) before the leaf spawned (broker=$bpid)"
+    }
     $t = @(Get-TreePids $bpid)
     if (($t | Where-Object { $_.Name -match '^PING\.EXE$' })) {
       $pids = @($t | Select-Object -Expand ProcessId)
@@ -116,8 +123,10 @@ function Start-Tree {
       return [pscustomobject]@{ broker = $bpid; proc = $p; pids = $pids }
     }
   }
+  $t = @(Get-TreePids $bpid)
+  $names = ($t | ForEach-Object { "$($_.ProcessId)=$($_.Name)" }) -join ','
   try { $p.Kill($true) } catch { }
-  throw "Start-Tree: PING.EXE leaf never appeared (broker=$bpid)"
+  throw "Start-Tree: PING.EXE leaf never appeared in 30s (broker=$bpid, partial tree=[$names])"
 }
 
 try {
