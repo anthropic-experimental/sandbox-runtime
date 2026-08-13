@@ -3,6 +3,7 @@ import { createServer } from '@pondwader/socks5-server'
 import { logForDebugging } from '../utils/debug.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import {
+  canonicalizeHost,
   connectViaParentProxy,
   dialDirect,
   isValidHost,
@@ -141,7 +142,10 @@ export function createSocksProxyServer(
   // HTTP proxy when one is configured. The default handler does a straight
   // net.connect() which fails when direct egress is blocked.
   socksServer.setConnectionHandler((conn, sendStatus) => {
-    const host = conn.destAddress
+    // The ruleset validator above allowed this destination on its
+    // canonical spelling; dial (and make the parent-proxy decision on)
+    // that same spelling, as the HTTP proxy does, rather than the client's.
+    const host = canonicalizeHost(conn.destAddress) ?? conn.destAddress
     const port = conn.destPort
 
     // Track client liveness so we can abort the upstream dial if they bail.

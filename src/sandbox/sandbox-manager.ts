@@ -371,11 +371,6 @@ async function filterNetworkRequest(
 }
 
 /**
- * Get the MITM proxy socket path for a given host, if configured.
- * Returns the socket path if the host matches any MITM domain pattern,
- * otherwise returns undefined.
- */
-/**
  * Build the header-mutation callback that substitutes sentinel→real for
  * masked credentials. Returns undefined when no `credentials` block is
  * configured — wiring the seam at all is unnecessary then.
@@ -427,15 +422,31 @@ function buildSigv4Planner(): PlanSigv4 | undefined {
     )(method, requestTarget, headers, destHost)
 }
 
+/**
+ * Get the MITM proxy socket path for a given host, if configured.
+ * Returns the socket path if the host matches any MITM domain pattern,
+ * otherwise returns undefined.
+ *
+ * Matches the canonicalized hostname, like the allow/deny filter
+ * (filterNetworkRequest) and the tlsTerminate exclusion below. This site
+ * fails OPEN on a miss — a host that matches no MITM pattern is dialed
+ * directly — so it must accept exactly the set of spellings the allowlist
+ * accepts: otherwise `api.example.com.` (trailing-dot FQDN, same name to
+ * DNS) passes the allowlist as `api.example.com` but misses every MITM
+ * pattern and skips the MITM proxy entirely. The proxies already hand this
+ * hook the canonical spelling; canonicalizing again here is defence in
+ * depth for any other caller.
+ */
 function getMitmSocketPath(host: string): string | undefined {
   if (!config?.network.mitmProxy) {
     return undefined
   }
 
   const { socketPath, domains } = config.network.mitmProxy
+  const canonicalHost = canonicalizeHost(host) ?? host
 
   for (const pattern of domains) {
-    if (matchesDomainPattern(host, pattern)) {
+    if (matchesDomainPattern(canonicalHost, pattern)) {
       logForDebugging(`Host ${host} matches MITM pattern ${pattern}`)
       return socketPath
     }
