@@ -615,7 +615,7 @@ async function initialize(
   // On Windows with tlsTerminate and no explicit caCertPath/caKeyPath,
   // defer CA creation until the Windows block below has resolved
   // srt-win and fetched user status — the persistent CA is
-  // generated-if-absent under %LOCALAPPDATA%\sandbox-runtime\ca\ and
+  // generated-if-absent under windowsStateDir()/ca and
   // trusted in the sandbox user's Root store, then loaded here.
   // Explicit paths (or non-Windows) go straight to createMitmCA.
   const tlsTerminate = runtimeConfig.network.tlsTerminate

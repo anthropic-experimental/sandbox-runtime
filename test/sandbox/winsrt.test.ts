@@ -631,6 +631,31 @@ describe('buildGitConfigEnv (pure, all platforms)', () => {
 // resolveSrtWin's existence check passes on non-Windows hosts; the
 // spies intercept before any real process is spawned.
 
+describe('windowsStateDir (pure, all platforms)', () => {
+  // Mirrors srt-win's state_db::state_dir(): the machine-wide
+  // %ProgramData%\sandbox-runtime, a pure env-derived path (no fs
+  // probing — the elevated install creates it).
+  let savedProgramData: string | undefined
+
+  beforeAll(() => {
+    savedProgramData = process.env.ProgramData
+  })
+  afterAll(() => {
+    if (savedProgramData === undefined) delete process.env.ProgramData
+    else process.env.ProgramData = savedProgramData
+  })
+
+  it('joins %ProgramData%\\sandbox-runtime', () => {
+    process.env.ProgramData = 'C:\\ProgramData'
+    expect(windowsStateDir()).toBe('C:\\ProgramData\\sandbox-runtime')
+  })
+
+  it('throws when ProgramData is unset', () => {
+    delete process.env.ProgramData
+    expect(() => windowsStateDir()).toThrow('ProgramData')
+  })
+})
+
 describe('windows-sandbox-utils async twins (pure, all platforms)', () => {
   const RAW_USER = JSON.stringify({
     user: {
@@ -2446,14 +2471,13 @@ describe.if(isWindows)('Windows sandbox: tlsTerminate (G)', () => {
 //
 // Separate describe from G: G's beforeAll pins the fixture CA
 // (explicit caCertPath); this group exercises the no-explicit-path
-// branch that generates-if-absent under
-// `%LOCALAPPDATA%\sandbox-runtime\ca\`.
+// branch that generates-if-absent under `windowsStateDir()/ca`.
 // ────────────────────────────────────────────────────────────────────
 
 describe.if(isWindows)('Windows sandbox: persistent CA (P)', () => {
   // bun evaluates describe bodies even under `.if(false)` — guard the
   // top-level const so `windowsStateDir()` (throws without
-  // LOCALAPPDATA) doesn't run on macOS/Linux.
+  // ProgramData) doesn't run on macOS/Linux.
   const caDir = isWindows ? join(windowsStateDir(), 'ca') : ''
 
   beforeAll(async () => {
@@ -2506,7 +2530,7 @@ describe.if(isWindows)('Windows sandbox: persistent CA (P)', () => {
       expect(existsSync(a.keyPath)).toBe(true)
       // Second call: same PEMs, same thumb, no regenerate. `trusted`
       // is false — the first call's trust step recorded this thumb
-      // in state.db, so the reconcile finds it already installed.
+      // in install.db, so the reconcile finds it already installed.
       const b = await ensurePersistentWindowsCa({
         dir,
         status: getWindowsSandboxUserStatus({ srtWin }),
