@@ -259,10 +259,12 @@ try {
     # KEY_READ|KEY_SET_VALUE and deliberately NOT KEY_WRITE (whose
     # CREATE_SUB_KEY bit is withheld), so tools that open with
     # KEY_WRITE (reg.exe add, the old product bug) are denied while
-    # the product's set-value open succeeds.
+    # the product's set-value open succeeds. ReadWriteSubTree only
+    # sets .NET's managed writable flag; the explicit rights arg
+    # still governs the actual open.
     $caProbe = 'try { ' +
       '$k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(''SOFTWARE\sandbox-runtime\Ca'', ' +
-      '[Microsoft.Win32.RegistryKeyPermissionCheck]::Default, ' +
+      '[Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, ' +
       '[System.Security.AccessControl.RegistryRights]::SetValue); ' +
       '$k.SetValue(''Ms6Probe'',''x''); Write-Output SETVALUE-OK } catch { Write-Output (''failed: '' + $_.Exception.Message) }'
     $r = RunAsUser6 @('user', 'status')  # keep env plumbing warm
