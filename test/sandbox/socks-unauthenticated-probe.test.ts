@@ -1,6 +1,6 @@
 import { connect, createServer as createTcpServer } from 'node:net'
 import { once } from 'node:events'
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 import { afterEach, describe, expect, it } from 'bun:test'
 import { createSocksProxyServer } from '../../src/sandbox/socks-proxy.js'
 import { SandboxManager } from '../../src/index.js'
@@ -117,6 +117,52 @@ describe('SOCKS unauthenticated probe', () => {
     // Reply status 0x02 = connection not allowed by ruleset.
     expect(out[3]).toBe(0x02)
     expect(out.toString('latin1')).not.toContain('SSH-2.0-')
+  })
+
+  // The ProxyCommand helper used by the ssh tests below must outlive the
+  // proxy's close: the proxy sends banner + DISCONNECT and closes at once,
+  // while ssh only reads the DISCONNECT after it has written its own
+  // KEXINIT into the helper's stdin. A helper that exits on socket close
+  // races that write; when ssh loses (a busy CI runner), it dies with
+  // "Broken pipe" and never prints the reason. Reproduced here without
+  // ssh: play ssh's part with a deliberately late write, and require the
+  // helper to still be running when it lands (the parent-side write itself
+  // reports nothing useful once the child is gone), then to exit as soon as
+  // its stdin is closed — not on a fallback timer.
+  it('ProxyCommand helper stays alive until its stdin closes, even after the proxy hangs up', async () => {
+    const port = await startServer({ deniedReason: 'late-write reason' })
+    const child = spawn(
+      process.execPath,
+      [
+        `${import.meta.dir}/../helpers/socks-noauth-pipe.ts`,
+        String(port),
+        'denied.test',
+        '22',
+      ],
+      { stdio: ['pipe', 'pipe', 'inherit'] },
+    )
+    let exitCode: number | null | undefined
+    const exited = once(child, 'exit').then(([code]) => {
+      exitCode = code as number | null
+    })
+    child.stdin.on('error', () => {})
+    const stdout: Buffer[] = []
+    const firstData = once(child.stdout, 'data')
+    child.stdout.on('data', d => stdout.push(d))
+    await firstData
+    // By now the proxy has closed the socket; give the helper ample time to
+    // (wrongly) exit on that.
+    await new Promise(r => setTimeout(r, 200))
+    expect(exitCode).toBeUndefined()
+    child.stdin.write('SSH-2.0-client\r\n')
+    const stdinClosedAt = Date.now()
+    child.stdin.end()
+    await exited
+    expect(exitCode).toBe(0)
+    expect(Date.now() - stdinClosedAt).toBeLessThan(1000)
+    expect(Buffer.concat(stdout).toString('latin1')).toContain(
+      'late-write reason',
+    )
   })
 
   it('a client offering username/password still gets the authenticated flow', async () => {

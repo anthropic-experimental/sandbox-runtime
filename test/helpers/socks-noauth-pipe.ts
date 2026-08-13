@@ -47,5 +47,24 @@ sock.on('data', chunk => {
     process.stdin.pipe(sock)
   }
 })
-sock.on('close', () => process.exit(0))
+/**
+ * The proxy refuses by writing banner + DISCONNECT and closing straight
+ * away, but ssh only reads that DISCONNECT after it has written its own
+ * identification/KEXINIT into our stdin. Exiting as soon as the socket
+ * closes therefore races ssh's write: when ssh loses (busy CI runner) it
+ * gets EPIPE and dies with "Broken pipe" instead of reporting the reason.
+ * So on socket close, signal EOF to ssh once everything forwarded has been
+ * flushed, then keep draining stdin and exit only when ssh closes it — with
+ * a fallback timer so a client that never closes cannot wedge the test.
+ */
+sock.on('close', () => {
+  process.stdout.end()
+  process.stdin.unpipe(sock)
+  process.stdin.on('end', () => process.exit(0))
+  process.stdin.on('close', () => process.exit(0))
+  process.stdin.on('error', () => process.exit(0))
+  process.stdin.resume()
+  setTimeout(() => process.exit(0), 5000).unref()
+})
+process.stdout.on('error', () => process.exit(0))
 sock.on('error', () => process.exit(1))
