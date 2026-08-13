@@ -256,17 +256,54 @@ try {
   $outRange.Stop()
 }
 
-# ── R6: child cannot read state.db (sandbox-runtime-users DENY) ──
-$stateDb = Join-Path $env:LOCALAPPDATA 'sandbox-runtime\state.db'
-if (-not (Test-Path $stateDb)) { throw "R6: $stateDb missing" }
-$r = RExec @('--', $cmd, '/c', "type `"$stateDb`"")
-if ($r.exit -eq 0) {
-  throw "R6: child READ state.db (DENY ACE not in effect?). raw: $($r.raw)"
+# ── R5d: IPv6 loopback out-of-range blocked ──────────────────────
+# The WFP fence must cover the v6 layers too: a v4-only filter set
+# would leave [::1] as a silent hole to every local service. Real
+# listener on [::1], child connect must be denied (an
+# AccessDenied/timeout, never a successful connect).
+$v6l = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::IPv6Loopback, 49998)
+$v6l.Start()
+try {
+  $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
+    "try { `$c = New-Object Net.Sockets.TcpClient([Net.Sockets.AddressFamily]::InterNetworkV6); " +
+    "`$c.Connect('::1', 49998); Write-Output CONNECTED } catch { Write-Output blocked }")
+  if ($r.out -match 'CONNECTED') {
+    throw "R5d: sandboxed connect to [::1]:49998 succeeded — v6 fence hole. raw: $($r.raw)"
+  }
+  Write-Host 'R5d ok: IPv6 loopback out-of-range blocked'
+} finally {
+  $v6l.Stop()
 }
-if ($r.raw -notmatch '(?i)access is denied') {
+
+# ── R5e: loopback ALIAS (127.0.0.2) out-of-range blocked ─────────
+# 127.0.0.0/8 is all loopback; a filter keyed on 127.0.0.1 alone
+# would leave every other alias open. No listener needed — the
+# discriminating signal is AccessDenied (WFP) vs ConnectionRefused
+# (no filter, nothing listening).
+$r = RExec @('--', $pwsh, '-NoProfile', '-Command',
+  "try { `$c = New-Object Net.Sockets.TcpClient; `$c.Connect('127.0.0.2', 49998); Write-Output CONNECTED } " +
+  "catch { Write-Output ('code=' + `$_.Exception.InnerException.SocketErrorCode) }")
+if ($r.out -match 'CONNECTED') {
+  throw "R5e: sandboxed connect to 127.0.0.2 succeeded. raw: $($r.raw)"
+}
+if ($r.out -notmatch 'AccessDenied') {
+  throw "R5e: expected AccessDenied (WFP block), got: $($r.raw)"
+}
+Write-Host 'R5e ok: loopback alias 127.0.0.2 blocked by the fence'
+
+# ── R6: child cannot read the credential key (sandbox DENY) ──────
+# The Cred subkey's DACL is the load-bearing gate: machine-scope
+# DPAPI means readable = decryptable, and a child that learned its
+# own password could CreateProcessWithLogonW itself a fresh logon
+# session outside the job/desktop confinement.
+$r = RExec @('--', $cmd, '/c', 'reg query HKLM\SOFTWARE\sandbox-runtime\Cred /v Blob')
+if ($r.exit -eq 0) {
+  throw "R6: child READ the Cred registry key (DENY not in effect?). raw: $($r.raw)"
+}
+if ($r.raw -notmatch '(?i)access is denied|denied') {
   throw "R6: expected Access is denied. raw: $($r.raw)"
 }
-Write-Host 'R6 ok: child cannot read state.db (cred file gate holds)'
+Write-Host 'R6 ok: child cannot read the Cred registry key'
 
 # ── R7: cmd.exe /c passthrough — user-quoted payload survives ───
 # build_cmdline wraps the post-/c content in ONE outer "…" pair
