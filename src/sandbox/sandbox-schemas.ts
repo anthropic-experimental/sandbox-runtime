@@ -9,7 +9,11 @@
  * - `{denyOnly: [...paths]}` = deny reads from these paths, allow all others
  * - `{denyOnly: [...paths], allowWithinDeny: [...paths]}` = deny reads from
  *   denyOnly paths, but re-allow reads within allowWithinDeny paths.
- *   allowWithinDeny takes precedence over denyOnly (most-specific rule wins).
+ *   Most-specific entry wins: an allowWithinDeny path re-opens the denied
+ *   region it sits inside, while a denyOnly entry that is itself more
+ *   specific than the allow it lands in — a literal nested under an
+ *   allowed directory, or a glob such as `**\/.env` matching files inside
+ *   one — stays denied.
  *
  * This is maximally permissive by default - only explicitly denied paths are blocked.
  */

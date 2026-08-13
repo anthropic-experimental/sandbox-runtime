@@ -116,7 +116,7 @@ Both filesystem and network isolation are required for effective sandboxing. Wit
 
 **Filesystem Isolation** enforces read and write restrictions:
 
-- **Read** (deny-then-allow pattern): By default, read access is allowed everywhere. You can deny broad regions (e.g., `/Users`) and then re-allow specific paths within them (e.g., `.`). `allowRead` takes precedence over `denyRead` — the opposite of write, where `denyWrite` takes precedence over `allowWrite`.
+- **Read** (deny-then-allow pattern): By default, read access is allowed everywhere. You can deny broad regions (e.g., `/Users`) and then re-allow specific paths within them (e.g., `.`). `allowRead` takes precedence over `denyRead` — the opposite of write, where `denyWrite` takes precedence over `allowWrite`. A `denyRead` entry that is more specific than the `allowRead` region it falls inside (e.g. `denyRead: ["**/.env"]` or `["./secrets"]` with `allowRead: ["."]`) still stays denied.
 - **Write** (allow-only pattern): By default, write access is denied everywhere. You must explicitly allow paths (e.g., `.`, `/tmp`). An empty allow list means no write access.
 
 **Network Isolation** (allow-only pattern): By default, all network access is denied. You must explicitly allow domains. An empty allowedDomains list means no network access. Network traffic is routed through proxy servers running on the host:
