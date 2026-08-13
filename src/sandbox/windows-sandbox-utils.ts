@@ -209,11 +209,11 @@ export interface WindowsSandboxUserStatus {
   inSandboxGroup: boolean
   hiddenFromLogon: boolean
   /**
-   * The credential row is present in `state.db` and readable by
-   * THIS process. False when not yet written, or when called from
-   * inside the sandbox (the state-DB directory carries an explicit
-   * DENY for `sandbox-runtime-users` — machine-scope DPAPI alone
-   * is not a confidentiality boundary).
+   * The credential blob (`HKLM\SOFTWARE\sandbox-runtime\Cred`) is
+   * present, decryptable, and readable by THIS process. False when
+   * not yet written, or when called from inside the sandbox (the
+   * Cred key carries an explicit DENY for `sandbox-runtime-users` —
+   * machine-scope DPAPI alone is not a confidentiality boundary).
    */
   credPresent: boolean
   /** Setup marker schema version, when the marker row exists. */
@@ -1060,7 +1060,7 @@ export async function getWindowsSandboxUserStatusAsync(
  * Read back the persistent MITM CA the sandbox was installed with
  * (via `srt-win user trust-ca` / {@link windowsTrustCa}).
  * Returns `null` when no CA was installed. The PEM is what `srt-win
- * user status` reconstructs from the DER stored in `state.db`.
+ * user status` reconstructs from the DER recorded in the registry.
  *
  * On Windows, `tlsTerminate` requires this CA to be present in the
  * sandbox user's `CurrentUser\Root` (schannel-level trust is an
@@ -1083,7 +1083,7 @@ export function getWindowsSandboxCaCert(
 
 /**
  * Install (or replace) the MITM CA in the **sandbox user's**
- * `CurrentUser\Root` and record it in `state.db` (so
+ * `CurrentUser\Root` and record it in the registry (so
  * {@link getWindowsSandboxCaCert} surfaces its thumbprint + PEM).
  * Thin wrapper around `srt-win user trust-ca <path>`. Does NOT
  * require elevation. Persistent until {@link uninstallWindowsSandbox}
@@ -1136,17 +1136,21 @@ function checkTrustCaResult(caCertPath: string, r: RunResult): void {
 }
 
 /**
- * `%LOCALAPPDATA%\sandbox-runtime` — the same directory `srt-win`'s
- * `state_db::state_dir()` uses. Its DACL is stamped `(OI)(CI)`
- * real-user-only + explicit `sandbox-runtime-users` DENY on every
- * `state_db::open_db()` (i.e. at `srt-win install` and every `acl`
- * op), so anything created underneath it inherits broker-only
- * custody.
+ * The machine-wide state directory `%ProgramData%\sandbox-runtime`,
+ * mirroring `srt-win`'s `state_db::machine_store_dir()` exactly.
+ * Since the registry move it hosts only the managed CA key material
+ * (`ca\`), which must stay on the filesystem because the broker's
+ * unelevated generate-if-absent self-heal rewrites it; the
+ * credential, marker, and CA record live in
+ * `HKLM\SOFTWARE\sandbox-runtime`. Created and ACL'd by the
+ * elevated `srt-win install`: Administrators own it, BUILTIN\Users
+ * have modify, and the sandbox group carries an explicit
+ * `(OI)(CI)` DENY.
  */
 export function windowsStateDir(): string {
-  const base = process.env.LOCALAPPDATA
-  if (!base) throw new Error('LOCALAPPDATA is not set')
-  return path.win32.join(base, 'sandbox-runtime')
+  const programData = process.env.ProgramData
+  if (!programData) throw new Error('ProgramData is not set')
+  return path.win32.join(programData, 'sandbox-runtime')
 }
 
 /** Result of {@link ensurePersistentWindowsCa}. */
@@ -1186,10 +1190,13 @@ export type WindowsPersistentCa = {
 
 /**
  * Generate-if-absent a persistent MITM CA under
- * `%LOCALAPPDATA%\sandbox-runtime\ca\` and ensure it is trusted in
+ * `{windowsStateDir()}\ca\` and ensure it is trusted in
  * the sandbox user's `CurrentUser\Root`. Idempotent and unelevated:
  * a second call with a valid on-disk pair returns it with
- * `generated: false`.
+ * `generated: false`. On the machine store the `ca\` subdir is
+ * user-writable by design (BUILTIN\Users modify, inherited from the
+ * install-ACL'd store), so this self-heal keeps working without
+ * admin rights for every user of the machine.
  *
  * **Storage.** The pair lives in a single `ca.json = {certPem,
  * keyPem}` written atomically (tmp+rename) and re-read after every
@@ -1200,13 +1207,16 @@ export type WindowsPersistentCa = {
  *
  * **Key custody is broker-side.** The MITM proxy runs as the real
  * user, so the sandbox user never needs to read the key. The `ca/`
- * subdirectory inherits the state-DB directory's `(OI)(CI)`
- * real-user-only DACL + `sandbox-runtime-users` DENY (see
+ * subdirectory inherits the machine store's `(OI)(CI)` DACL, which
+ * carries an explicit `sandbox-runtime-users` DENY (see
  * {@link windowsStateDir}), so `ca.json`/`key.pem` are unreadable
- * from inside the sandbox with no per-file ACL work here. The
- * certificate reaches the sandboxed child via the schannel registry
- * write ({@link windowsTrustCa}) and the trust-bundle env vars —
- * never via these files.
+ * from inside the sandbox with no per-file ACL work here. The key
+ * IS readable (and replaceable) by other REAL local users — an
+ * accepted trade-off of the shared store: the sandbox account is
+ * network-confined by SID-keyed WFP filters regardless of who
+ * spawns it. The certificate reaches the sandboxed child via the
+ * schannel registry write ({@link windowsTrustCa}) and the
+ * trust-bundle env vars — never via these files.
  *
  * `SandboxManager.initialize()` calls this on Windows when
  * `tlsTerminate` is enabled without an explicit

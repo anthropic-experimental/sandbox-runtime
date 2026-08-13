@@ -171,10 +171,10 @@ enum Cmd {
     },
     /// Add/remove explicit ACEs for the sandbox user on file paths
     /// so the sandboxed child can (`grant`) or cannot (`stamp`)
-    /// read/write them. State is persisted in
-    /// `%LOCALAPPDATA%\sandbox-runtime\state.db` so concurrent
-    /// brokers refcount and a crash mid-session is recoverable by
-    /// the next `acl` op.
+    /// read/write them. State is persisted in the shared state
+    /// per-user session DB so concurrent brokers refcount
+    /// and a crash mid-session is recoverable by the next `acl`
+    /// op.
     Acl {
         #[command(subcommand)]
         sub: AclCmd,
@@ -547,7 +547,9 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
     let ca = ca.as_ref();
     Ok(json!({
         "user": st,
-        "cred_present": setup.is_some(),
+        // The HKLM Cred\Blob value (a SYSTEM/fleet install must
+        // read as present from any user's session).
+        "cred_present": setup.is_some() && install::cred_present(),
         "marker_version": setup.as_ref().map(|s| s.marker_version),
         "marker_user_sid": setup.as_ref()
             .map(|s| s.sandbox_user_sid.as_str()),
@@ -558,23 +560,21 @@ fn user_status_json() -> anyhow::Result<serde_json::Value> {
     }))
 }
 
-/// Install-time ambient write-deny state: the recorded paths plus a
-/// per-path on-disk drift check (`present` = the explicit sandbox-SID
-/// deny ACE is still there; an admin `icacls /reset` clears it, and
-/// re-running `srt-win install` repairs it). Empty list when nothing
-/// is recorded (pre-v2 install, or no install).
+/// Install-time ambient write-deny state: the recorded paths (HKLM
+/// `AmbientDenies` — admin-written, trustworthy) plus whether each
+/// deny ACE is on disk (an admin `icacls /reset` clears it;
+/// re-running `srt-win install` repairs). Empty when no install.
 fn ambient_status_json() -> anyhow::Result<serde_json::Value> {
     use serde_json::json;
-    use srt_win::{acl, state_db};
-    let Some(conn) = state_db::open_db_ro()? else {
-        return Ok(json!({ "paths": [] }));
-    };
-    let sid = state_db::read_setup_info(&conn)
+    use srt_win::{acl, install};
+    // Degrade like user_status_json: a registry read error (beyond
+    // not-found) must not abort the whole status document.
+    let sid = install::read_setup()
         .ok()
         .flatten()
         .map(|s| s.sandbox_user_sid);
     let mut paths = Vec::new();
-    for p in state_db::ambient_deny_paths(&conn)? {
+    for p in install::ambient_recorded_paths()? {
         let present = match &sid {
             Some(sid) => acl::sandbox_deny_present(&p, sid).unwrap_or(false),
             None => false,
@@ -765,13 +765,20 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 // only runs once the cheap conjuncts pass.
                 let us = user::status(name)?;
                 let mv = existing.as_ref().map(|s| s.marker_version);
-                let ambient_ok = || match (srt_win::state_db::open_db_ro(), &existing) {
-                    (Ok(Some(c)), Some(s)) => {
-                        install::ambient_complete(&c, &s.sandbox_user_sid, &ambient_targets)
-                    }
-                    _ => false,
+                let ambient_ok = || match &existing {
+                    Some(s) => install::ambient_complete(&s.sandbox_user_sid, &ambient_targets),
+                    None => false,
                 };
-                if us.exists && us.in_sandbox_group && mv == Some(install::SETUP_VERSION) && ambient_ok() {
+                // The credential is part of completeness: a
+                // missing/undecryptable Cred\Blob with a healthy
+                // marker must fall through and be rewritten rather
+                // than early-outing on "already installed".
+                if us.exists
+                    && us.in_sandbox_group
+                    && mv == Some(install::SETUP_VERSION)
+                    && install::cred_present()
+                    && ambient_ok()
+                {
                     eprintln!(
                         "srt-win: already installed (sublayer={sl:?}, \
                          port_range={}-{}, sandbox_user='{name}', \
@@ -814,6 +821,11 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 sandbox_user.is_none() || existing.as_ref().is_some_and(|s| s.sandbox_user == name);
             let pu = match (|| -> anyhow::Result<srt_win::user::ProvisionedUser> {
                 let pu = user::provision(name, we_own_it).context("provision sandbox user")?;
+                // Machine store BEFORE write_setup: the dir must
+                // exist with its install-owned ACLs before the
+                // credential file is written into it.
+                install::provision_machine_store(&pu.group_sid)
+                    .context("provision machine state store")?;
                 install::write_setup(&pu)
                     .context("write sandbox credential + setup marker to state DB")?;
                 Ok(pu)
@@ -832,9 +844,7 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
             // the WFP step so a failure here leaves the install
             // visibly partial (filters absent) rather than
             // marker-complete with the stamps missing.
-            match srt_win::state_db::with_install_lock(|conn| {
-                srt_win::state_db::set_ambient_denies(conn, &pu.sid, &ambient_targets)
-            }) {
+            match install::set_ambient_denies(&pu.sid, &ambient_targets) {
                 Ok(r) if r.applied.is_empty() && !r.failed.is_empty() => {
                     // Every stamp failed — treat as a real install
                     // failure (per-path oddities are best-effort, a
@@ -933,12 +943,10 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                 // the SID's ACEs are removed while the account still
                 // resolves.
                 if let Some(s) = &recorded {
-                    match srt_win::state_db::with_install_lock(|conn| {
-                        srt_win::state_db::clear_ambient_denies(conn, &s.sandbox_user_sid)
-                    }) {
-                        Ok(n) if n > 0 => eprintln!(
-                            "srt-win: ambient write-deny removed from {n} system path(s)",
-                        ),
+                    match srt_win::install::clear_ambient_denies(&s.sandbox_user_sid) {
+                        Ok(n) if n > 0 => {
+                            eprintln!("srt-win: ambient write-deny removed from {n} system path(s)",)
+                        }
                         Ok(_) => {}
                         Err(e) => {
                             eprintln!("srt-win: warning: ambient write-deny cleanup: {e:#}")
