@@ -4,7 +4,7 @@ import type { Server } from 'node:http'
 import { Agent, createServer } from 'node:http'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
-import { connect } from 'node:net'
+import { connect, isIP } from 'node:net'
 import { URL } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
 import { encodedCommandFromProxyUser } from './sandbox-utils.js'
@@ -25,6 +25,7 @@ import {
 import type { PlanSigv4 } from './credential-aws-pairs.js'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import {
+  canonicalizeHost,
   connectViaParentProxy,
   dialDirect,
   openConnectTunnel,
@@ -40,6 +41,12 @@ export interface HttpProxyServerOptions {
    * Host-allowlist decision. `encodedCommand` is the per-command suffix
    * parsed from the Proxy-Authorization username (`srt.<encodedCommand>`),
    * so the manager can attribute a denial to the invocation that made it.
+   *
+   * Receives the host exactly as the client spelled it (so denials and
+   * permission prompts show what the process asked for); the manager's
+   * filter canonicalizes internally. Every other hook below, and the
+   * upstream leg itself, get the {@link canonicalizeHost} spelling of an
+   * allowed host — see the note at the CONNECT handler's routing step.
    */
   filter(
     port: number,
@@ -52,6 +59,10 @@ export interface HttpProxyServerOptions {
    * Optional function to get the MITM proxy socket path for a given host.
    * If returns a socket path, the request will be routed through that MITM proxy.
    * If returns undefined, the request will be handled directly.
+   *
+   * Called with the canonical host; the CONNECT authority / absolute URI
+   * forwarded to the MITM socket carries the same canonical spelling, so
+   * the proxy behind the socket never has to re-derive it.
    */
   getMitmSocketPath?(host: string): string | undefined
 
@@ -404,16 +415,16 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         endWithStatus('HTTP/1.1 400 Bad Request\r\n\r\n')
         return
       }
-      const { hostname, port } = target
+      const { hostname: requestedHost, port } = target
 
       const allowed = await options.filter(
         port,
-        hostname,
+        requestedHost,
         socket,
         auth.encodedCommand,
       )
       if (!allowed) {
-        logForDebugging(`Connection blocked to ${hostname}:${port}`, {
+        logForDebugging(`Connection blocked to ${requestedHost}:${port}`, {
           level: 'error',
         })
         endWithStatus(
@@ -431,6 +442,19 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         socket.destroy()
         return
       }
+
+      // From here on, use the spelling the allowlist actually evaluated.
+      // The filter canonicalizes before matching (so `Api.Example.com.`,
+      // `127.1`, `0x7f.0.0.1` are allowed iff their canonical forms are),
+      // and every decision below — TLS-termination exemption, MITM
+      // routing, parent-proxy bypass, credential injection, the leaf cert
+      // and upstream SNI, the authority we put on the wire — must key off
+      // that same spelling. Routing off the raw one let a trailing-dot
+      // FQDN pass the allowlist as `api.example.com`, miss every MITM
+      // pattern, and dial out directly. Same fallback as the filter for
+      // the (already-validated, so practically unreachable) case where
+      // canonicalization fails, so the two layers can never disagree.
+      const hostname = canonicalizeHost(requestedHost) ?? requestedHost
 
       // Decide upstream route:
       //   in-process TLS termination
@@ -625,7 +649,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         return
       }
       const url = new URL(req.url!)
-      const hostname = stripBrackets(url.hostname)
+      const requestedHost = stripBrackets(url.hostname)
       const port = url.port
         ? parseInt(url.port, 10)
         : url.protocol === 'https:'
@@ -634,12 +658,12 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
 
       const allowed = await options.filter(
         port,
-        hostname,
+        requestedHost,
         req.socket,
         auth.encodedCommand,
       )
       if (!allowed) {
-        logForDebugging(`HTTP request blocked to ${hostname}:${port}`, {
+        logForDebugging(`HTTP request blocked to ${requestedHost}:${port}`, {
           level: 'error',
         })
         // The client may have aborted during the filter await; a
@@ -663,7 +687,22 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // rather than dialing an upstream nobody will read from.
       if (req.socket.destroyed) return
 
-      const fwdHeaders = { ...stripHopByHop(req.headers), host: url.host }
+      // Same rule as the CONNECT handler: everything after the allow
+      // decision keys off the canonical spelling. The URL parser has
+      // already lowercased and IPv4-normalized `url.hostname`; what it
+      // leaves behind is the trailing dot, which is exactly the spelling
+      // that used to reach getMitmSocketPath / the upstream unchanged.
+      const hostname = canonicalizeHost(requestedHost) ?? requestedHost
+      // The authority we forward (request-target and Host header) is
+      // rebuilt from the canonical host so the MITM / parent proxy sees the
+      // host we allowlist-checked, not the client's spelling of it. `url.port`
+      // is '' when the scheme default was given or implied, matching the
+      // `url.host` form this replaces.
+      const authority =
+        (isIP(hostname) === 6 ? `[${hostname}]` : hostname) +
+        (url.port ? `:${url.port}` : '')
+
+      const fwdHeaders = { ...stripHopByHop(req.headers), host: authority }
       options.mutateHeadersPlaintext?.(fwdHeaders, hostname)
       // Body-substitution counterpart of mutateHeadersPlaintext (opt-in via
       // the same config gate). May delete content-length from fwdHeaders.
@@ -689,7 +728,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // forwarding the client's raw req.url. This ensures the upstream proxy
       // sees exactly the host we allowlist-checked, closing URL-parser
       // differential bypasses.
-      const absUrl = `${url.protocol}//${url.host}${url.pathname}${url.search}`
+      const absUrl = `${url.protocol}//${authority}${url.pathname}${url.search}`
 
       // Per-request filter applies to plain HTTP too — otherwise a sandboxed
       // client could bypass it by using http:// where the upstream serves it.

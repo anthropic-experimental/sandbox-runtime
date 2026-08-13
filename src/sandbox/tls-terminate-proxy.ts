@@ -138,6 +138,13 @@ function relayPullMode(src: Duplex, dst: Duplex): void {
 }
 
 export type TerminateTarget = {
+  /**
+   * Canonical (see canonicalizeHost) CONNECT target: what the allowlist
+   * evaluated. Used verbatim for the minted leaf, the filterRequest URL,
+   * the credential hooks' destHost, and the upstream host/SNI, so all of
+   * them agree with the policy decision regardless of how the client
+   * spelled the name.
+   */
   hostname: string
   port: number
   /**
