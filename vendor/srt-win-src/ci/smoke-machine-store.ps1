@@ -254,14 +254,29 @@ try {
                     "{`"write`":[`"$($probe6 -replace '\\','\\')`"]}"
     if ($r.exit -ne 0) { throw "MS6: acl grant as standard user exited $($r.exit): $($r.err)" }
     # The Ca record must be WRITABLE by a standard user (unelevated
-    # trust-ca records the DER there) — a KEY_WRITE-vs-KEY_SET_VALUE
-    # access-mask regression passes every DACL assertion and only
-    # shows up on an actual unelevated write.
-    $r = RunAsUser6 @('user', 'status')
-    $rw = Start-Process -FilePath "$env:SystemRoot\System32\reg.exe" -ArgumentList @('add','HKLM\SOFTWARE\sandbox-runtime\Ca','/v','Ms6Probe','/d','x','/f') `
-            -Credential $cred6 -WorkingDirectory $pub -NoNewWindow -Wait -PassThru -LoadUserProfile
-    if ($rw.ExitCode -ne 0) { throw "MS6: standard user cannot write the Ca record (exit $($rw.ExitCode))" }
+    # trust-ca records the DER there). Probe with an open requesting
+    # exactly RegistryRights::SetValue — the DACL grants Users
+    # KEY_READ|KEY_SET_VALUE and deliberately NOT KEY_WRITE (whose
+    # CREATE_SUB_KEY bit is withheld), so tools that open with
+    # KEY_WRITE (reg.exe add, the old product bug) are denied while
+    # the product's set-value open succeeds.
+    $caProbe = 'try { ' +
+      '$k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(''SOFTWARE\sandbox-runtime\Ca'', ' +
+      '[Microsoft.Win32.RegistryKeyPermissionCheck]::Default, ' +
+      '[System.Security.AccessControl.RegistryRights]::SetValue); ' +
+      '$k.SetValue(''Ms6Probe'',''x''); Write-Output SETVALUE-OK } catch { Write-Output (''failed: '' + $_.Exception.Message) }'
+    $r = RunAsUser6 @('user', 'status')  # keep env plumbing warm
+    $o7 = Join-Path $pub 'srt-ms6-ca.txt'
+    Remove-Item $o7 -ea SilentlyContinue
+    $pp = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+            -ArgumentList @('-NoProfile','-Command', $caProbe) -Credential $cred6 -WorkingDirectory $pub `
+            -NoNewWindow -Wait -PassThru -LoadUserProfile -RedirectStandardOutput $o7
+    $caOut = Get-Content $o7 -Raw -ea SilentlyContinue
+    if ($caOut -notmatch 'SETVALUE-OK') {
+      throw "MS6: standard user cannot set-value the Ca record: $caOut"
+    }
     Remove-ItemProperty 'HKLM:\SOFTWARE\sandbox-runtime\Ca' -Name Ms6Probe -ea SilentlyContinue
+    Remove-Item $o7 -ea SilentlyContinue
     # revoke, not restore: grants are released by `acl revoke`
     # (restore releases deny stamps) — and assert the ALLOW ACE is
     # actually gone rather than trusting the exit code.
