@@ -51,6 +51,17 @@ pub fn scrub_wstr(buf: &mut [u16]) {
     }
 }
 
+/// Encode `s` as a COUNTED (not NUL-terminated) UTF-16 buffer plus
+/// its length in BYTES — the shape `UNICODE_STRING` /
+/// `LSA_UNICODE_STRING` want in `Length`/`MaximumLength`. Callers
+/// build their (structurally identical, module-distinct) struct from
+/// the pair; the buffer must outlive it.
+pub fn counted_utf16(s: &str) -> (Vec<u16>, u16) {
+    let buf: Vec<u16> = s.encode_utf16().collect();
+    let bytes = (buf.len() * 2) as u16;
+    (buf, bytes)
+}
+
 /// Borrow a `Vec<u16>` from `wstr` as a `PCWSTR`.
 pub fn pcwstr(buf: &[u16]) -> PCWSTR {
     PCWSTR(buf.as_ptr())

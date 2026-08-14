@@ -565,15 +565,15 @@ where
     }
     // One owned buffer per right: growth of LOGON_DENIALS can never
     // invalidate an earlier entry's Buffer pointer.
-    let bufs: Vec<Vec<u16>> = LOGON_DENIALS
+    let bufs: Vec<(Vec<u16>, u16)> = LOGON_DENIALS
         .iter()
-        .map(|r| r.encode_utf16().collect())
+        .map(|r| crate::util::counted_utf16(r))
         .collect();
     let rights: Vec<LSA_UNICODE_STRING> = bufs
         .iter()
-        .map(|b| LSA_UNICODE_STRING {
-            Length: (b.len() * 2) as u16,
-            MaximumLength: (b.len() * 2) as u16,
+        .map(|(b, bytes)| LSA_UNICODE_STRING {
+            Length: *bytes,
+            MaximumLength: *bytes,
             Buffer: windows::core::PWSTR(b.as_ptr() as *mut u16),
         })
         .collect();
