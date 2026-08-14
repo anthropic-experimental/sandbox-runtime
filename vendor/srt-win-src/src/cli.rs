@@ -779,13 +779,28 @@ fn run(cli: Cli, args: &[OsString]) -> anyhow::Result<()> {
                     && install::cred_present()
                     && ambient_ok()
                 {
-                    eprintln!(
-                        "srt-win: already installed (sublayer={sl:?}, \
+                    // Re-assert the logon-type denials BEFORE the
+                    // early-out: they must reach installs from
+                    // binaries that predate them, and a domain GPO
+                    // refresh can strip local LSA user-right
+                    // assignments between runs. Idempotent and
+                    // cheap; a failure falls through to the full
+                    // (also idempotent) install steps.
+                    if let Some(gsid) = us.group_sid.as_deref() {
+                        if let Err(e) = user::apply_logon_denials(gsid) {
+                            eprintln!(
+                                "srt-win: warning: re-asserting logon denials: {e:#} — completing full install",
+                            );
+                        } else {
+                            eprintln!(
+                                "srt-win: already installed (sublayer={sl:?}, \
                          port_range={}-{}, sandbox_user='{name}', \
                          filters={}); no changes",
-                        range.0, range.1, st.filters,
-                    );
-                    return Ok(());
+                                range.0, range.1, st.filters,
+                            );
+                            return Ok(());
+                        }
+                    }
                 }
                 eprintln!(
                     "srt-win: partial install detected \

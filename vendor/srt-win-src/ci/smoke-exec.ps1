@@ -291,6 +291,31 @@ if ($r.out -notmatch 'AccessDenied') {
 }
 Write-Host 'R5e ok: loopback alias 127.0.0.2 blocked by the fence'
 
+# ── R5f: non-interactive logon types refused for the sandbox account ─
+# The SMB redirector dials from kernel mode as SYSTEM, so the
+# SID-keyed WFP fence never sees its connects; the fix denies the
+# sandbox group every logon type except interactive. LOOPBACK SMB is
+# exempt by NTLM loopback-session reuse (no new logon occurs), so the
+# CI-provable check is LogonUser itself: type NETWORK/BATCH/SERVICE
+# must refuse with 1385 (what any remote server's LSA runs at SMB
+# session setup), INTERACTIVE must stay granted (the
+# CreateProcessWithLogonW launch depends on it).
+$pwPlain = (& $Exe user read-cred).Trim()
+if ($LASTEXITCODE -ne 0 -or -not $pwPlain) { throw 'R5f: read-cred failed' }
+$lsig = '[DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)] public static extern bool LogonUserW(string u, string d, string p, uint type, uint prov, out IntPtr tok);'
+$lt = Add-Type -MemberDefinition $lsig -Name R5fLogon -Namespace Srt -PassThru
+$sbUser = ((& $Exe user status | ConvertFrom-Json).user.name)
+foreach ($probe in @(@{n='NETWORK'; t=3; want=$false}, @{n='BATCH'; t=4; want=$false}, @{n='SERVICE'; t=5; want=$false}, @{n='INTERACTIVE'; t=2; want=$true})) {
+  $tok = [IntPtr]::Zero
+  $ok = [Srt.R5fLogon]::LogonUserW($sbUser, '.', $pwPlain, [uint32]$probe.t, 0, [ref]$tok)
+  $gle = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+  if ($probe.want -and -not $ok) { throw "R5f: $($probe.n) logon REFUSED (gle=$gle) - launch path broken" }
+  if (-not $probe.want -and $ok) { throw "R5f: $($probe.n) logon GRANTED - logon-type denial not in effect" }
+  if (-not $probe.want -and $gle -ne 1385) { Write-Host "R5f note: $($probe.n) refused with gle=$gle (expected 1385; still refused)" }
+}
+$pwPlain = $null
+Write-Host 'R5f ok: network/batch/service logons refused (1385), interactive granted'
+
 # ── R6: child cannot read the credential key (sandbox DENY) ──────
 # The Cred subkey's DACL is the load-bearing gate: machine-scope
 # DPAPI means readable = decryptable, and a child that learned its
