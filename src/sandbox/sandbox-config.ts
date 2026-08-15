@@ -13,6 +13,7 @@ import {
   splitDomainPatternPort,
   stripDomainPatternPort,
 } from './domain-pattern.js'
+import { envNameComparisonKey } from './sandbox-utils.js'
 
 /**
  * Host-only pattern check (e.g., "example.com", "*.npmjs.org"). Rejects
@@ -1309,6 +1310,10 @@ export const SandboxRuntimeConfigSchema = z
     // re-signer needs the fake value to BE the sentinel (exact-match
     // trigger on the access key id in the credential scope) and the real
     // value to be the entire secret. extract/decode entries violate both.
+    // Names are compared under the platform's env semantics
+    // (envNameComparisonKey): on Windows env-var names are
+    // case-insensitive, so a pair slot and an envVars entry that differ
+    // only in case reference the same variable there.
     const seenPairVars = new Set<string>()
     for (const [idx, pair] of (creds.awsPairs ?? []).entries()) {
       const vars: Array<[string, string]> = [
@@ -1320,7 +1325,7 @@ export const SandboxRuntimeConfigSchema = z
       }
       for (const [field, name] of vars) {
         const path = ['credentials', 'awsPairs', idx, field]
-        if (seenPairVars.has(name)) {
+        if (seenPairVars.has(envNameComparisonKey(name))) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
             path,
@@ -1330,8 +1335,10 @@ export const SandboxRuntimeConfigSchema = z
           })
           continue
         }
-        seenPairVars.add(name)
-        const entry = (creds.envVars ?? []).find(v => v.name === name)
+        seenPairVars.add(envNameComparisonKey(name))
+        const entry = (creds.envVars ?? []).find(
+          v => envNameComparisonKey(v.name) === envNameComparisonKey(name),
+        )
         if (entry === undefined || entry.mode !== 'mask') {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
