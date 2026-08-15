@@ -292,14 +292,28 @@ async function main(): Promise<void> {
           // we keep the existing shell-string path.
           let child
           if (process.platform === 'win32') {
-            // env carries the proxy vars the sandboxed child must inherit.
-            const { argv, env } =
+            // env is the broker (srt-win exec) process's spawn env;
+            // the sandboxed child sees the --env overlay baked into
+            // argv plus, when stdinPayload is set, the secret env
+            // frame written to the broker's stdin (--env-stdin) —
+            // that frame carries the proxy auth token, which must
+            // never ride a command line.
+            const { argv, env, stdinPayload } =
               await SandboxManager.wrapWithSandboxArgv(command)
             child = spawn(argv[0], argv.slice(1), {
               shell: false,
-              stdio: 'inherit',
+              stdio: [stdinPayload ? 'pipe' : 'inherit', 'inherit', 'inherit'],
               env,
             })
+            if (stdinPayload) {
+              // EPIPE no-op: if srt-win exits before reading (spawn
+              // failure, unknown-flag error from an older binary),
+              // an unhandled stream 'error' would crash the CLI and
+              // mask the child's real diagnostic.
+              child.stdin?.on('error', () => {})
+              child.stdin?.write(stdinPayload)
+              child.stdin?.end()
+            }
           } else {
             const sandboxedCommand =
               await SandboxManager.wrapWithSandbox(command)
