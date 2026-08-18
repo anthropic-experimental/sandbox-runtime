@@ -23,6 +23,7 @@ export default [
             'eslint.config.js',
             'test/utils/which-node-test.mjs',
             'vendor/build-common.ts',
+            'vendor/credmask/build.ts',
             'vendor/seccomp/build.ts',
             'vendor/srt-win/build.ts',
           ],

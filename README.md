@@ -608,6 +608,10 @@ npm run format
 
 The BPF filter and `apply-seccomp` loader are compiled from C source in `vendor/seccomp-src/` via `npm run build:seccomp` (Linux only; needs `gcc` and `libseccomp-dev`). CI runs it before tests on each Linux arch, and the release workflow builds both arches and bundles them into the published package.
 
+### Building the macOS Credential-Mask Interposer
+
+`libcredmask.dylib` — the DYLD interposer that lets masked credential files read as sentinels on macOS (see "Credential File Masking on macOS" below) — is compiled from C source in `vendor/credmask-src/` via `npm run build:credmask` (macOS only; needs `clang` from the Xcode Command Line Tools). The default build produces a universal (arm64 + x86_64) dylib at `vendor/credmask/libcredmask.dylib`; `--native` builds host-arch only (the macOS CI test legs use this to compile it from source before the integration tests). Like the seccomp binaries, the artifact is never committed: the release workflow builds it on a macOS runner and bundles it into the published package. In a source checkout without the dylib, file masking on macOS falls back to deny (see below).
+
 ## Implementation Details
 
 ### Network Isolation Architecture
@@ -767,6 +771,29 @@ mitmproxy -s custom_filter.py --listen-port 8888
 Note: Custom proxy configuration is not yet supported in the new configuration format. This feature will be added in a future release.
 
 **Important security consideration:** Even with domain allowlists, exfiltration vectors may exist. For example, allowing `github.com` lets a process push to any repository. With a custom MITM proxy and proper certificate setup, you can inspect and filter specific API calls to prevent this.
+
+### Credential File Masking on macOS (DYLD Interposer)
+
+On Linux, a `credentials.files` entry with `mode: "mask"` bind-mounts a fake (sentinel-content) file over the real path, so the sandboxed process transparently reads the sentinel and the proxy swaps it back to the real value at allowed hosts. macOS Seatbelt has no bind-mount equivalent — SBPL can only deny — so srt uses a two-layer design:
+
+- **Security boundary (SBPL)**: the real path always gets a `(deny file-read*)` rule. This is the only layer that protects the credential.
+- **Compatibility shim (DYLD interposer)**: when `vendor/credmask/libcredmask.dylib` is present, the wrapped command exports `DYLD_INSERT_LIBRARIES` and a `CREDMASK_MAP` (realPath→fakePath pairs), and the interposer redirects cooperative processes' `open`/`openat`/`fopen`/`freopen`/`stat`/`lstat`/`fstatat`/`access`/`faccessat`/`realpath` calls on masked paths to the sentinel fake.
+
+Anything that bypasses the shim falls through to the SBPL deny and gets EPERM — **fail-closed for the credential in every case**:
+
+| Reader | Behavior |
+| --- | --- |
+| Non-SIP binaries using libc path calls (compiled tools, homebrew binaries, node, python, …) | Reads return the sentinel (masking works) |
+| SIP-protected binaries (`/bin/cat`, `/usr/bin/grep`, shell builtins of `/bin/bash`/`/bin/zsh`, …) | dyld strips `DYLD_*` at load → SBPL deny → EPERM |
+| Static syscalls / raw `syscall(2)` / hooks not in the list above | SBPL deny → EPERM |
+| Paths reaching the file through a symlinked directory (no exact match) | SBPL deny → EPERM |
+| Dylib missing (source checkout without `npm run build:credmask`) | Whole mask degrades to deny, same as `mode: "deny"` |
+| Malformed/absent `CREDMASK_MAP` | Interposer is a pure passthrough; SBPL deny still applies |
+
+Two macOS-specific details worth knowing:
+
+- `DYLD_INSERT_LIBRARIES` cannot ride the normal `env VAR=…` prefix: macOS purges `DYLD_*` from the environment when loading a SIP-protected binary, and both `/usr/bin/sandbox-exec` and the system shells are SIP-protected. srt instead `export`s the variables *inside* the wrapped `<shell> -c` string — a runtime export in the already-loaded shell survives into the non-SIP children it spawns.
+- The sentinel fakes live in a host-owned temp dir which the profile explicitly allows for reading and **denies for writing** (mirroring the Linux invariant that the fake store is never writable from inside the sandbox).
 
 ### Security Limitations
 

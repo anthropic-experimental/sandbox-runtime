@@ -16,11 +16,25 @@ import {
 } from './sandbox-utils.js'
 import { shouldIgnoreViolation } from './sandbox-violation-store.js'
 
+import {
+  CREDMASK_MAP_ENV,
+  encodeCredmaskMap,
+  getCredmaskDylibPath,
+} from './credmask-interposer.js'
+
 import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
 } from './sandbox-schemas.js'
 import type { IgnoreViolationsConfig } from './sandbox-config.js'
+
+/** Profile inputs for the credential-mask DYLD interposer (macOS). */
+interface CredmaskProfileConfig {
+  /** Resolved path of libcredmask.dylib (must be readable by dyld). */
+  dylibPath: string
+  /** Directories holding the sentinel fakes (MaskedFileStore dirs). */
+  storeDirs: string[]
+}
 
 export interface MacOSSandboxParams {
   command: string
@@ -51,11 +65,25 @@ export interface MacOSSandboxParams {
   /** Environment variables to set for the sandboxed child (env NAME=VALUE) */
   setEnvVars?: Record<string, string>
   /**
-   * Whole-file credential masks. SBPL cannot redirect reads, so on macOS
-   * these degrade to read-deny on realPath until the DYLD interposer
-   * lands. fakePath is unused here.
+   * Whole-file credential masks. SBPL cannot redirect reads, so realPath
+   * is always read-denied (the security boundary). When
+   * libcredmask.dylib is available, the DYLD interposer additionally
+   * redirects cooperative processes' reads of realPath to fakePath so
+   * they see the sentinel instead of EPERM; without the dylib the mask
+   * degrades to deny.
    */
   maskedFileBinds?: Array<{ realPath: string; fakePath: string }>
+  /**
+   * MaskedFileStore temp dir holding the fakes; read-allowed (and
+   * write-denied) in the profile when the interposer is active. Falls
+   * back to the fakePaths' parent dirs when omitted.
+   */
+  maskedFileStoreDir?: string
+  /**
+   * Explicit libcredmask.dylib path override (tests / native builds).
+   * Default resolution mirrors the apply-seccomp binary lookup.
+   */
+  credmaskDylibPath?: string
   ignoreViolations?: IgnoreViolationsConfig | undefined
   allowPty?: boolean
   allowGitConfig?: boolean
@@ -649,6 +677,7 @@ function generateSandboxProfile({
   allowGitConfig = false,
   enableWeakerNetworkIsolation = false,
   allowAppleEvents = false,
+  credmask,
   logTag,
 }: {
   readConfig: FsReadRestrictionConfig | undefined
@@ -664,6 +693,7 @@ function generateSandboxProfile({
   allowGitConfig?: boolean
   enableWeakerNetworkIsolation?: boolean
   allowAppleEvents?: boolean
+  credmask?: CredmaskProfileConfig
   logTag: string
 }): string {
   const profile: string[] = [
@@ -976,6 +1006,30 @@ function generateSandboxProfile({
     profile.push(')')
   }
 
+  // Credential-mask interposer support. Emitted last so these rules win
+  // (Seatbelt is last-match-wins): the sentinel fakes and the dylib must
+  // be readable even under broad read denies, and the fake store must be
+  // immutable even when writeConfig allows its parent (mirrors the
+  // Linux invariant that the MaskedFileStore dir is never writable from
+  // inside the sandbox — a writable fake could be swapped for content
+  // the proxy would still substitute).
+  if (credmask) {
+    profile.push('')
+    profile.push('; Credential-mask interposer: sentinel fakes + dylib')
+    for (const dir of credmask.storeDirs) {
+      const normalizedDir = normalizePathForSandbox(dir)
+      profile.push(`(allow file-read* (subpath ${escapePath(normalizedDir)}))`)
+      profile.push(
+        `(deny file-write*`,
+        `  (subpath ${escapePath(normalizedDir)})`,
+        `  (with message "${logTag}"))`,
+      )
+    }
+    profile.push(
+      `(allow file-read* (literal ${escapePath(normalizePathForSandbox(credmask.dylibPath))}))`,
+    )
+  }
+
   return profile.join('\n')
 }
 
@@ -1009,6 +1063,8 @@ export function wrapCommandWithSandboxMacOS(
     unsetEnvVars,
     setEnvVars,
     maskedFileBinds,
+    maskedFileStoreDir,
+    credmaskDylibPath,
     allowPty,
     allowGitConfig = false,
     gitSafeDirectories,
@@ -1017,23 +1073,69 @@ export function wrapCommandWithSandboxMacOS(
     binShell,
   } = params
 
-  // SBPL cannot redirect a read to different bytes, so whole-file masking
-  // degrades to read-deny on macOS: the sandboxed process gets EPERM
-  // instead of the sentinel. The DYLD interposer (a later step) lifts
-  // this. Folding the masked paths into denyOnly here means the existing
-  // generateReadRules() emits the (deny file-read* …) rule unchanged.
+  // SBPL cannot redirect a read to different bytes, so the masked real
+  // paths are ALWAYS folded into denyOnly — the (deny file-read* …) rule
+  // is the security boundary regardless of what happens below. When the
+  // credmask interposer dylib is available, cooperative (non-SIP)
+  // processes additionally get the Linux masking behaviour: reads of the
+  // real path are redirected to the sentinel fake instead of failing
+  // with EPERM. Anything that bypasses the interposer still hits the
+  // deny (fail-closed).
   let readConfig = readConfigIn
+  let credmask: CredmaskProfileConfig | undefined
+  let innerCommand = command
   if (maskedFileBinds && maskedFileBinds.length > 0) {
-    logForDebugging(
-      '[Sandbox macOS] file mask degrades to deny on macOS until the ' +
-        'interposer lands',
-    )
     readConfig = {
       denyOnly: [
         ...(readConfigIn?.denyOnly ?? []),
         ...maskedFileBinds.map(b => b.realPath),
       ],
       allowWithinDeny: readConfigIn?.allowWithinDeny,
+    }
+
+    const dylibPath = getCredmaskDylibPath(credmaskDylibPath)
+    const credmaskMap =
+      dylibPath !== null ? encodeCredmaskMap(maskedFileBinds) : ''
+    if (dylibPath !== null && credmaskMap !== '') {
+      credmask = {
+        dylibPath,
+        storeDirs: [
+          ...new Set(
+            maskedFileStoreDir !== undefined
+              ? [maskedFileStoreDir]
+              : maskedFileBinds.map(b => path.dirname(b.fakePath)),
+          ),
+        ],
+      }
+      // The DYLD vars must be exported INSIDE the `<shell> -c` string:
+      // macOS purges DYLD_* from the environment when it loads a
+      // SIP-protected binary, and both /usr/bin/sandbox-exec and the
+      // system shells are SIP-protected — a plain `env DYLD_…=…` prefix
+      // would never reach the user's command. A runtime `export` in the
+      // (already-loaded) shell survives into the non-SIP children it
+      // spawns.
+      const assignments = quote([
+        `DYLD_INSERT_LIBRARIES=${dylibPath}`,
+        `${CREDMASK_MAP_ENV}=${credmaskMap}`,
+      ])
+      innerCommand = `export ${assignments}; ${command}`
+      logForDebugging(
+        `[Sandbox macOS] credential-mask interposer active for ` +
+          `${maskedFileBinds.length} file(s)`,
+      )
+    } else if (dylibPath === null) {
+      logForDebugging(
+        '[Sandbox macOS] file mask degrades to deny: libcredmask.dylib ' +
+          'not found — build vendor/credmask (npm run build:credmask) ' +
+          'to enable masked reads',
+      )
+    } else {
+      // Dylib present but no bind was encodable (separator bytes in a
+      // path) — encodeCredmaskMap already logged each skipped entry.
+      logForDebugging(
+        '[Sandbox macOS] file mask degrades to deny: no encodable ' +
+          'masked-file binds',
+      )
     }
   }
 
@@ -1078,6 +1180,7 @@ export function wrapCommandWithSandboxMacOS(
     allowGitConfig,
     enableWeakerNetworkIsolation,
     allowAppleEvents,
+    credmask,
     logTag,
   })
 
@@ -1157,7 +1260,7 @@ export function wrapCommandWithSandboxMacOS(
     profile,
     shell,
     '-c',
-    command,
+    innerCommand,
   ])
 
   logForDebugging(

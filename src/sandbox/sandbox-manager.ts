@@ -1658,6 +1658,7 @@ async function wrapWithSandbox(
         unsetEnvVars: credentialRestrictions.unsetEnvVars,
         setEnvVars: credentialRestrictions.setEnvVars,
         maskedFileBinds: credentialRestrictions.maskedFileBinds,
+        maskedFileStoreDir: credentialRestrictions.maskedFileStoreDir,
         allowUnixSockets: getAllowUnixSockets(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         allowLocalBinding: getAllowLocalBinding(),
