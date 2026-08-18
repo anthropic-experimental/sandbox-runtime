@@ -53,8 +53,9 @@ jobs:
         with:
           bun-version: 1.3.14
 
-      # test/sandbox/java-proxy-agent.test.ts drives the embedded JVM proxy
-      # agent in a real JVM; it self-skips without a JDK, so pin one here.
+      # The JVM proxy agent (vendor/java-proxy-agent) is built from source
+      # here, like the seccomp helper; test/sandbox/java-proxy-agent.test.ts
+      # then drives it in a real JVM and self-skips when jar or JDK is absent.
       - name: Setup Java (macOS/Linux)
         if: matrix.os != 'windows'
         uses: actions/setup-java@v4
@@ -178,6 +179,10 @@ jobs:
       - name: Build seccomp binaries (Linux)
         if: matrix.os == 'linux'
         run: npm run build:seccomp
+
+      - name: Build JVM proxy agent (macOS/Linux)
+        if: matrix.os != 'windows'
+        run: npm run build:java-agent
 
       - name: Build project
         if: matrix.os != 'windows'

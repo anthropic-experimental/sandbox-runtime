@@ -105,10 +105,7 @@ import type { ChildProcess } from 'node:child_process'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import { EOL } from 'node:os'
 import { dirname } from 'node:path'
-import {
-  disposeJavaProxyAgentJar,
-  materializeJavaProxyAgentJar,
-} from './java-proxy-agent.js'
+import { getJavaProxyAgentJarPath } from './java-proxy-agent.js'
 
 interface HostNetworkManagerContext {
   httpProxyPort: number
@@ -132,8 +129,9 @@ let linuxMonitor: LinuxViolationMonitor | undefined
 let parentProxy: ResolvedParentProxy | undefined
 let mitmCA: MitmCA | undefined
 /**
- * On-disk copy of the JVM proxy agent jar for this session (see
- * java-proxy-agent.ts); set while a proxy is advertised to the sandbox.
+ * Resolved path of the JVM proxy agent jar (see java-proxy-agent.ts); set
+ * while a proxy is advertised to the sandbox, undefined if the jar is not
+ * shipped/found (JVMs then just aren't proxy-aware, as before).
  */
 let javaAgentJarPath: string | undefined
 // Per-session proxy auth token. Generated at proxy start, exported only into
@@ -898,10 +896,9 @@ async function initialize(
       const httpProxyPort = config.network.httpProxyPort ?? muxPort!
       const socksProxyPort = config.network.socksProxyPort ?? muxPort!
       // JVMs read neither HTTPS_PROXY nor its credential; the agent bridges
-      // both. Written once here, advertised via JAVA_TOOL_OPTIONS per command.
-      if (!javaAgentJarPath) {
-        javaAgentJarPath = materializeJavaProxyAgentJar()
-      }
+      // both. Resolved once here, advertised via JAVA_TOOL_OPTIONS per command.
+      javaAgentJarPath =
+        getJavaProxyAgentJarPath(config.javaAgentJarPath) ?? undefined
       // Leaves are minted lazily per-CONNECT (after this point), so setting
       // the CDP URL now means every leaf carries it. See MitmCA.crlUrl.
       // Windows-only: on Linux the child runs under bwrap --unshare-net and
@@ -2175,10 +2172,6 @@ async function reset(): Promise<void> {
 
   if (mitmCA) {
     closePromises.push(disposeMitmCA(mitmCA))
-  }
-
-  if (javaAgentJarPath) {
-    closePromises.push(disposeJavaProxyAgentJar(javaAgentJarPath))
   }
 
   if (muxProxyServer) {

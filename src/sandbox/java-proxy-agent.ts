@@ -10,47 +10,69 @@
  * the token and get a 407.
  *
  * The fix is a tiny `-javaagent` (source in vendor/java-proxy-agent-src,
- * embedded as base64 by vendor/java-proxy-agent/build.ts) that, at JVM
- * start-up, translates the proxy env vars into system properties and
- * installs an Authenticator for the proxy endpoint. This module writes that
- * jar to a temp dir once per session and builds the JAVA_TOOL_OPTIONS value
- * that points every JVM in the sandbox at it. The env var carries only the
- * jar path — the credential stays in HTTPS_PROXY, which the agent reads
- * itself — so the JVM's "Picked up JAVA_TOOL_OPTIONS: …" stderr line
- * leaks nothing.
+ * built into vendor/java-proxy-agent/srt-proxy-agent.jar by the release
+ * workflow) that, at JVM start-up, translates the proxy env vars into
+ * system properties and installs an Authenticator for the proxy endpoint.
+ * This module locates that jar — same lookup shape as the apply-seccomp
+ * binary — and builds the JAVA_TOOL_OPTIONS value that points every JVM in
+ * the sandbox at it. The env var carries only the jar path; the credential
+ * stays in HTTPS_PROXY, which the agent reads itself, so the JVM's "Picked
+ * up JAVA_TOOL_OPTIONS: …" stderr line leaks nothing.
  */
-import { mkdtempSync, writeFileSync } from 'node:fs'
-import { rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
-import { JAVA_PROXY_AGENT_JAR_BASE64 } from './java-proxy-agent-jar.js'
+import { getGlobalNpmPaths } from './generate-seccomp-filter.js'
 
 export const JAVA_PROXY_AGENT_JAR_NAME = 'srt-proxy-agent.jar'
 
+const jarPathCache = new Map<string, string | null>()
+
 /**
- * Write the embedded agent jar to a fresh temp directory and return its
- * path. Mode 0644 so the sandboxed child (same uid) can read it; the dir
- * is srt-owned and removed by {@link disposeJavaProxyAgentJar}.
+ * Locate srt-proxy-agent.jar. Order:
+ * 0. explicit path (config `javaAgentJarPath`) — used if it exists,
+ * 1. vendor/java-proxy-agent/ next to this module (bundled),
+ * 2. ../../vendor/java-proxy-agent/ (package root — normal npm install),
+ * 3. ../vendor/java-proxy-agent/ (dist/vendor — some bundlers),
+ * 4. a global npm install of the package (native builds without vendor/).
+ * Returns null when nothing is found; callers then leave JAVA_TOOL_OPTIONS
+ * alone (JVMs are simply not proxy-aware, as before) rather than failing.
  */
-export function materializeJavaProxyAgentJar(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'srt-java-'))
-  const jarPath = join(dir, JAVA_PROXY_AGENT_JAR_NAME)
-  writeFileSync(jarPath, Buffer.from(JAVA_PROXY_AGENT_JAR_BASE64, 'base64'), {
-    mode: 0o644,
-  })
-  return jarPath
+export function getJavaProxyAgentJarPath(explicitPath?: string): string | null {
+  const key = explicitPath ?? ''
+  const cached = jarPathCache.get(key)
+  if (cached !== undefined) return cached
+  const found = findJar(explicitPath)
+  jarPathCache.set(key, found)
+  return found
 }
 
-export async function disposeJavaProxyAgentJar(jarPath: string): Promise<void> {
-  try {
-    await rm(dirname(jarPath), { recursive: true, force: true })
-  } catch (err) {
+function findJar(explicitPath?: string): string | null {
+  if (explicitPath) {
+    if (existsSync(explicitPath)) return explicitPath
     logForDebugging(
-      `[java-proxy-agent] cleanup failed: ${(err as Error).message}`,
+      `[java-proxy-agent] javaAgentJarPath not found: ${explicitPath}`,
       { level: 'warn' },
     )
   }
+  const baseDir = dirname(fileURLToPath(import.meta.url))
+  const rel = join('vendor', 'java-proxy-agent', JAVA_PROXY_AGENT_JAR_NAME)
+  const candidates = [
+    join(baseDir, rel),
+    join(baseDir, '..', '..', rel),
+    join(baseDir, '..', rel),
+    ...getGlobalNpmPaths().map(base => join(base, rel)),
+  ]
+  for (const p of candidates) {
+    if (existsSync(p)) return p
+  }
+  logForDebugging(
+    `[java-proxy-agent] ${JAVA_PROXY_AGENT_JAR_NAME} not found; JVMs in the ` +
+      `sandbox will not be pointed at the proxy (run \`npm run build:java-agent\`)`,
+    { level: 'warn' },
+  )
+  return null
 }
 
 /**

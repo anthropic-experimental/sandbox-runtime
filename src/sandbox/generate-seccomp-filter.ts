@@ -15,7 +15,7 @@ let cachedGlobalNpmPaths: string[] | null = null
  * Get paths to check for globally installed @anthropic-ai/sandbox-runtime package.
  * This is used as a fallback when the binaries aren't bundled (e.g., native builds).
  */
-function getGlobalNpmPaths(): string[] {
+export function getGlobalNpmPaths(): string[] {
   if (cachedGlobalNpmPaths) return cachedGlobalNpmPaths
 
   const paths: string[] = []

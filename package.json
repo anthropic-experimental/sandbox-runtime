@@ -54,6 +54,7 @@
     "dist",
     "vendor/seccomp",
     "vendor/srt-win",
+    "vendor/java-proxy-agent",
     "README.md",
     "LICENSE"
   ],

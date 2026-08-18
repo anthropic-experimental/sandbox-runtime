@@ -1,19 +1,14 @@
 import { describe, it, expect, afterAll } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { join } from 'node:path'
 import {
   buildJavaToolOptions,
-  disposeJavaProxyAgentJar,
-  materializeJavaProxyAgentJar,
+  getJavaProxyAgentJarPath,
   JAVA_PROXY_AGENT_JAR_NAME,
 } from '../../src/sandbox/java-proxy-agent.js'
-import {
-  JAVA_PROXY_AGENT_JAR_BASE64,
-  JAVA_PROXY_AGENT_JAR_BYTES,
-} from '../../src/sandbox/java-proxy-agent-jar.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
@@ -66,26 +61,36 @@ describe('buildJavaToolOptions', () => {
   })
 })
 
-describe('embedded agent jar', () => {
-  it('is a zip whose manifest names the agent class', () => {
-    const jar = Buffer.from(JAVA_PROXY_AGENT_JAR_BASE64, 'base64')
-    expect(jar.length).toBe(JAVA_PROXY_AGENT_JAR_BYTES)
-    expect(jar.subarray(0, 4)).toEqual(Buffer.from([0x50, 0x4b, 0x03, 0x04]))
-    // STORED entries, so the manifest text is visible in the clear.
-    const text = jar.toString('latin1')
-    expect(text).toContain('Premain-Class: com.anthropic.srt.ProxyAgent')
-    expect(text).toContain('com/anthropic/srt/ProxyAgent.class')
+// The jar is a build artifact (vendor/java-proxy-agent/srt-proxy-agent.jar,
+// `npm run build:java-agent`, needs a JDK) and is not in git; CI builds it
+// before `bun test`. Suites that need it on disk self-skip otherwise.
+const jarPath = getJavaProxyAgentJarPath()
+
+describe('getJavaProxyAgentJarPath', () => {
+  it('prefers an existing explicit path', () => {
+    const explicit = join(
+      import.meta.dir,
+      '..',
+      'fixtures',
+      'java-proxy-agent',
+      'ProxyProbe.java',
+    )
+    expect(getJavaProxyAgentJarPath(explicit)).toBe(explicit)
   })
 
-  it('materializes to a world-readable file and disposes cleanly', async () => {
-    const path = materializeJavaProxyAgentJar()
-    try {
-      expect(path.endsWith(JAVA_PROXY_AGENT_JAR_NAME)).toBe(true)
-      expect(readFileSync(path).length).toBe(JAVA_PROXY_AGENT_JAR_BYTES)
-    } finally {
-      await disposeJavaProxyAgentJar(path)
-    }
-    expect(existsSync(path)).toBe(false)
+  it('falls back past a missing explicit path', () => {
+    // Either the vendor jar (when built) or null — never the bogus path.
+    const r = getJavaProxyAgentJarPath('/nonexistent/srt-proxy-agent.jar')
+    expect(r).toBe(jarPath)
+  })
+
+  it.if(jarPath !== null)('finds the built jar under vendor/', () => {
+    expect(
+      jarPath!.endsWith(
+        join('vendor', 'java-proxy-agent', JAVA_PROXY_AGENT_JAR_NAME),
+      ),
+    ).toBe(true)
+    expect(existsSync(jarPath!)).toBe(true)
   })
 })
 
@@ -131,7 +136,7 @@ describe.if(isMacOS)('macOS wrapper', () => {
   })
 })
 
-describe.if(isLinux || isMacOS)('sandboxed child', () => {
+describe.if((isLinux || isMacOS) && jarPath !== null)('sandboxed child', () => {
   afterAll(async () => {
     await SandboxManager.reset()
   })
@@ -152,9 +157,7 @@ describe.if(isLinux || isMacOS)('sandboxed child', () => {
       timeout: 15000,
     })
     expect(result.status).toBe(0)
-    expect(result.stdout).toMatch(
-      /^JTO=-javaagent:\S*srt-java-[^/]+\/srt-proxy-agent\.jar( |$)/m,
-    )
+    expect(result.stdout).toContain(`JTO=-javaagent:${jarPath}`)
     expect(result.stdout).toContain('READABLE')
     // The credential rides in HTTPS_PROXY, never in JAVA_TOOL_OPTIONS.
     expect(result.stdout).toMatch(/^HP=http:\/\/srt[^:]*:[0-9a-f]{32}@/m)
@@ -193,160 +196,158 @@ const PROBE = join(
   'ProxyProbe.java',
 )
 
-describe.if(java !== undefined)('agent inside a JVM', () => {
-  const jarPath = materializeJavaProxyAgentJar()
-  afterAll(async () => {
-    await disposeJavaProxyAgentJar(jarPath)
-  })
-
-  const proxyEnv = (proxyPort: number) => ({
-    ...process.env,
-    JAVA_TOOL_OPTIONS: `-javaagent:${jarPath}`,
-    // Same shape generateProxyEnvVars emits: percent-encoded username
-    // (base64 command suffix), hex token.
-    HTTPS_PROXY: `http://srt.YWJj%2Bx%3D%3D:deadbeef@localhost:${proxyPort}`,
-    HTTP_PROXY: `http://srt.YWJj%2Bx%3D%3D:deadbeef@localhost:${proxyPort}`,
-    NO_PROXY:
-      'localhost,127.0.0.1,::1,169.254.0.0/16,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16',
-  })
-
-  // spawnAsync, not spawnSync: the proxy tests below talk to an in-process
-  // server, and spawnSync would block the loop it runs on (see helpers).
-  function runProbe(args: string[], env: NodeJS.ProcessEnv) {
-    return spawnAsync(java!, [PROBE, ...args], { env, timeout: 60000 })
-  }
-
-  it('translates the proxy env vars into system properties + Authenticator', async () => {
-    const r = await runProbe(['props', 'localhost', '3128'], proxyEnv(3128))
-    expect(r.status).toBe(0)
-    expect(r.stderr).toContain('Picked up JAVA_TOOL_OPTIONS')
-    expect(r.stdout).toContain('https.proxyHost=localhost')
-    expect(r.stdout).toContain('https.proxyPort=3128')
-    expect(r.stdout).toContain('http.proxyHost=localhost')
-    expect(r.stdout).toContain('jdk.http.auth.tunneling.disabledSchemes=\n')
-    // Percent-decoded username, raw token; both requestor overloads answer;
-    // any other endpoint gets nothing.
-    expect(r.stdout).toContain('auth.proxy=srt.YWJj+x==:deadbeef')
-    expect(r.stdout).toContain('auth.server=srt.YWJj+x==')
-    expect(r.stdout).toContain('auth.other=null')
-    // NO_PROXY → nonProxyHosts: proxy for the world, direct for loopback and
-    // private ranges (172.16/12 expands to 172.16.* … 172.31.*).
-    expect(r.stdout).toMatch(/http\.nonProxyHosts=.*172\.31\.\*/)
-    expect(r.stdout).toMatch(/select\.https=\[HTTP @ localhost.*:3128\]/)
-    expect(r.stdout).toContain('select.localhost=[DIRECT]')
-    expect(r.stdout).toContain('select.private=[DIRECT]')
-  })
-
-  it('leaves explicitly set proxy properties alone', async () => {
-    const env = proxyEnv(3128)
-    env.JAVA_TOOL_OPTIONS = `-Dhttps.proxyHost=other -Dhttps.proxyPort=9 ${env.JAVA_TOOL_OPTIONS}`
-    const r = await runProbe(['props', 'localhost', '3128'], env)
-    expect(r.status).toBe(0)
-    expect(r.stdout).toContain('https.proxyHost=other')
-    expect(r.stdout).toContain('https.proxyPort=9')
-  })
-
-  it('does nothing without proxy env vars', async () => {
-    const env: NodeJS.ProcessEnv = {
+describe.if(java !== undefined && jarPath !== null)(
+  'agent inside a JVM',
+  () => {
+    const proxyEnv = (proxyPort: number) => ({
       ...process.env,
       JAVA_TOOL_OPTIONS: `-javaagent:${jarPath}`,
-    }
-    for (const k of [
-      'HTTPS_PROXY',
-      'https_proxy',
-      'HTTP_PROXY',
-      'http_proxy',
-      'NO_PROXY',
-      'no_proxy',
-    ]) {
-      delete env[k]
-    }
-    const r = await runProbe(['props', 'localhost', '3128'], env)
-    expect(r.status).toBe(0)
-    expect(r.stdout).toContain('https.proxyHost=null')
-    expect(r.stdout).toContain('auth.proxy=null')
-    expect(r.stdout).toContain('select.https=[DIRECT]')
-  })
+      // Same shape generateProxyEnvVars emits: percent-encoded username
+      // (base64 command suffix), hex token.
+      HTTPS_PROXY: `http://srt.YWJj%2Bx%3D%3D:deadbeef@localhost:${proxyPort}`,
+      HTTP_PROXY: `http://srt.YWJj%2Bx%3D%3D:deadbeef@localhost:${proxyPort}`,
+      NO_PROXY:
+        'localhost,127.0.0.1,::1,169.254.0.0/16,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16',
+    })
 
-  describe('against a challenging proxy', () => {
-    let proxy: Server | undefined
-    let proxyPort = 0
-    const seen: Array<{ method: string; url: string; auth?: string }> = []
+    // spawnAsync, not spawnSync: the proxy tests below talk to an in-process
+    // server, and spawnSync would block the loop it runs on (see helpers).
+    function runProbe(args: string[], env: NodeJS.ProcessEnv) {
+      return spawnAsync(java!, [PROBE, ...args], { env, timeout: 60000 })
+    }
 
-    async function startProxy() {
-      proxy = createServer((req, res) => {
-        seen.push({
-          method: req.method!,
-          url: req.url!,
-          auth: req.headers['proxy-authorization'],
+    it('translates the proxy env vars into system properties + Authenticator', async () => {
+      const r = await runProbe(['props', 'localhost', '3128'], proxyEnv(3128))
+      expect(r.status).toBe(0)
+      expect(r.stderr).toContain('Picked up JAVA_TOOL_OPTIONS')
+      expect(r.stdout).toContain('https.proxyHost=localhost')
+      expect(r.stdout).toContain('https.proxyPort=3128')
+      expect(r.stdout).toContain('http.proxyHost=localhost')
+      expect(r.stdout).toContain('jdk.http.auth.tunneling.disabledSchemes=\n')
+      // Percent-decoded username, raw token; both requestor overloads answer;
+      // any other endpoint gets nothing.
+      expect(r.stdout).toContain('auth.proxy=srt.YWJj+x==:deadbeef')
+      expect(r.stdout).toContain('auth.server=srt.YWJj+x==')
+      expect(r.stdout).toContain('auth.other=null')
+      // NO_PROXY → nonProxyHosts: proxy for the world, direct for loopback and
+      // private ranges (172.16/12 expands to 172.16.* … 172.31.*).
+      expect(r.stdout).toMatch(/http\.nonProxyHosts=.*172\.31\.\*/)
+      expect(r.stdout).toMatch(/select\.https=\[HTTP @ localhost.*:3128\]/)
+      expect(r.stdout).toContain('select.localhost=[DIRECT]')
+      expect(r.stdout).toContain('select.private=[DIRECT]')
+    })
+
+    it('leaves explicitly set proxy properties alone', async () => {
+      const env = proxyEnv(3128)
+      env.JAVA_TOOL_OPTIONS = `-Dhttps.proxyHost=other -Dhttps.proxyPort=9 ${env.JAVA_TOOL_OPTIONS}`
+      const r = await runProbe(['props', 'localhost', '3128'], env)
+      expect(r.status).toBe(0)
+      expect(r.stdout).toContain('https.proxyHost=other')
+      expect(r.stdout).toContain('https.proxyPort=9')
+    })
+
+    it('does nothing without proxy env vars', async () => {
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        JAVA_TOOL_OPTIONS: `-javaagent:${jarPath}`,
+      }
+      for (const k of [
+        'HTTPS_PROXY',
+        'https_proxy',
+        'HTTP_PROXY',
+        'http_proxy',
+        'NO_PROXY',
+        'no_proxy',
+      ]) {
+        delete env[k]
+      }
+      const r = await runProbe(['props', 'localhost', '3128'], env)
+      expect(r.status).toBe(0)
+      expect(r.stdout).toContain('https.proxyHost=null')
+      expect(r.stdout).toContain('auth.proxy=null')
+      expect(r.stdout).toContain('select.https=[DIRECT]')
+    })
+
+    describe('against a challenging proxy', () => {
+      let proxy: Server | undefined
+      let proxyPort = 0
+      const seen: Array<{ method: string; url: string; auth?: string }> = []
+
+      async function startProxy() {
+        proxy = createServer((req, res) => {
+          seen.push({
+            method: req.method!,
+            url: req.url!,
+            auth: req.headers['proxy-authorization'],
+          })
+          if (!req.headers['proxy-authorization']) {
+            res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="srt"' })
+            res.end()
+            return
+          }
+          res.writeHead(200, { 'Content-Length': '2' })
+          res.end('ok')
         })
-        if (!req.headers['proxy-authorization']) {
-          res.writeHead(407, { 'Proxy-Authenticate': 'Basic realm="srt"' })
-          res.end()
-          return
-        }
-        res.writeHead(200, { 'Content-Length': '2' })
-        res.end('ok')
-      })
-      proxy.on('connect', (req, sock) => {
-        seen.push({
-          method: 'CONNECT',
-          url: req.url!,
-          auth: req.headers['proxy-authorization'],
+        proxy.on('connect', (req, sock) => {
+          seen.push({
+            method: 'CONNECT',
+            url: req.url!,
+            auth: req.headers['proxy-authorization'],
+          })
+          if (!req.headers['proxy-authorization']) {
+            sock.end(
+              'HTTP/1.1 407 Proxy Authentication Required\r\n' +
+                'Proxy-Authenticate: Basic realm="srt"\r\n' +
+                'Content-Length: 0\r\n\r\n',
+            )
+            return
+          }
+          // Accept the tunnel, then hang up: the JVM's TLS handshake fails,
+          // which is fine — the assertion is on the CONNECT it sent.
+          sock.end('HTTP/1.1 200 OK\r\n\r\n')
         })
-        if (!req.headers['proxy-authorization']) {
-          sock.end(
-            'HTTP/1.1 407 Proxy Authentication Required\r\n' +
-              'Proxy-Authenticate: Basic realm="srt"\r\n' +
-              'Content-Length: 0\r\n\r\n',
+        proxyPort = await new Promise<number>((resolve, reject) => {
+          proxy!.on('error', reject)
+          proxy!.listen(0, '127.0.0.1', () =>
+            resolve((proxy!.address() as AddressInfo).port),
           )
-          return
-        }
-        // Accept the tunnel, then hang up: the JVM's TLS handshake fails,
-        // which is fine — the assertion is on the CONNECT it sent.
-        sock.end('HTTP/1.1 200 OK\r\n\r\n')
+        })
+      }
+
+      afterAll(async () => {
+        if (proxy) await new Promise<void>(r => proxy!.close(() => r()))
       })
-      proxyPort = await new Promise<number>((resolve, reject) => {
-        proxy!.on('error', reject)
-        proxy!.listen(0, '127.0.0.1', () =>
-          resolve((proxy!.address() as AddressInfo).port),
+
+      const expectedAuth =
+        'Basic ' + Buffer.from('srt.YWJj+x==:deadbeef').toString('base64')
+
+      it('answers a 407 on a plain-HTTP request with the credential', async () => {
+        await startProxy()
+        seen.length = 0
+        const r = await runProbe(
+          ['connect', 'http://example.invalid/'],
+          proxyEnv(proxyPort),
         )
+        expect(r.status).toBe(0)
+        expect(r.stdout).toContain('code=200')
+        expect(seen.map(s => s.method)).toEqual(['GET', 'GET'])
+        expect(seen[0].auth).toBeUndefined()
+        expect(seen[1].auth).toBe(expectedAuth)
       })
-    }
 
-    afterAll(async () => {
-      if (proxy) await new Promise<void>(r => proxy!.close(() => r()))
+      it('answers a 407 on CONNECT with Basic (tunneling scheme re-enabled)', async () => {
+        seen.length = 0
+        const r = await runProbe(
+          ['connect', 'https://example.invalid/'],
+          proxyEnv(proxyPort),
+        )
+        expect(r.status).toBe(0)
+        const connects = seen.filter(s => s.method === 'CONNECT')
+        expect(connects.length).toBeGreaterThanOrEqual(2)
+        expect(connects[0].url).toBe('example.invalid:443')
+        expect(connects[0].auth).toBeUndefined()
+        expect(connects[1].auth).toBe(expectedAuth)
+      })
     })
-
-    const expectedAuth =
-      'Basic ' + Buffer.from('srt.YWJj+x==:deadbeef').toString('base64')
-
-    it('answers a 407 on a plain-HTTP request with the credential', async () => {
-      await startProxy()
-      seen.length = 0
-      const r = await runProbe(
-        ['connect', 'http://example.invalid/'],
-        proxyEnv(proxyPort),
-      )
-      expect(r.status).toBe(0)
-      expect(r.stdout).toContain('code=200')
-      expect(seen.map(s => s.method)).toEqual(['GET', 'GET'])
-      expect(seen[0].auth).toBeUndefined()
-      expect(seen[1].auth).toBe(expectedAuth)
-    })
-
-    it('answers a 407 on CONNECT with Basic (tunneling scheme re-enabled)', async () => {
-      seen.length = 0
-      const r = await runProbe(
-        ['connect', 'https://example.invalid/'],
-        proxyEnv(proxyPort),
-      )
-      expect(r.status).toBe(0)
-      const connects = seen.filter(s => s.method === 'CONNECT')
-      expect(connects.length).toBeGreaterThanOrEqual(2)
-      expect(connects[0].url).toBe('example.invalid:443')
-      expect(connects[0].auth).toBeUndefined()
-      expect(connects[1].auth).toBe(expectedAuth)
-    })
-  })
-})
+  },
+)
