@@ -3,6 +3,7 @@ import { spawn } from 'child_process'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
+import { buildJavaToolOptions } from './java-proxy-agent.js'
 import {
   normalizePathForSandbox,
   generateProxyEnvVars,
@@ -40,6 +41,8 @@ export interface MacOSSandboxParams {
   proxyAuthToken?: string
   /** Path to the TLS-termination CA cert; injected as trust env vars. */
   caCertPath?: string
+  /** Path to the JVM proxy agent jar; injected via JAVA_TOOL_OPTIONS. */
+  javaAgentJarPath?: string
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
@@ -1000,6 +1003,7 @@ export function wrapCommandWithSandboxMacOS(
     socksProxyPort,
     proxyAuthToken,
     caCertPath,
+    javaAgentJarPath,
     allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,
@@ -1091,23 +1095,37 @@ export function wrapCommandWithSandboxMacOS(
     encodeSandboxedCommand(attributionCommand),
   )
 
-  // Seatbelt's (remote ip "localhost:*") filter — used for the
-  // allowLocalBinding outbound rule above — matches 127.0.0.1 and ::1 but not
-  // the IPv4-mapped IPv6 form ::ffff:127.0.0.1. Modern Java defaults to
-  // AF_INET6 dual-stack sockets, so a Java client connecting to 127.0.0.1
-  // reaches the kernel as ::ffff:127.0.0.1 and is denied. Forcing the IPv4
-  // stack makes Java open AF_INET sockets so loopback connect matches the
-  // Seatbelt filter. The flag is appended after any inherited
-  // JAVA_TOOL_OPTIONS unless that var is on the credential-deny list, in
-  // which case the inherited value is dropped so the deny holds.
-  if (allowLocalBinding && needsNetworkRestriction) {
-    const flag = '-Djava.net.preferIPv4Stack=true'
-    const denied = (unsetEnvVars ?? []).includes('JAVA_TOOL_OPTIONS')
-    const inherited = denied ? '' : (process.env.JAVA_TOOL_OPTIONS ?? '')
-    const value = inherited.includes(flag)
-      ? inherited
-      : [inherited, flag].filter(Boolean).join(' ')
-    proxyEnvArgs.push(`JAVA_TOOL_OPTIONS=${value}`)
+  // JAVA_TOOL_OPTIONS carries two things for JVMs in the sandbox:
+  //
+  // - The proxy agent jar (see java-proxy-agent.ts): JVMs ignore the proxy
+  //   env vars above, so the agent translates them into system properties
+  //   plus an Authenticator for the proxy credential at JVM start.
+  // - -Djava.net.preferIPv4Stack=true whenever the profile lets the child
+  //   reach loopback at all (the proxy ports, or allowLocalBinding's
+  //   localhost:*): Seatbelt's (remote ip "localhost:N") filter matches
+  //   127.0.0.1 and ::1 but not the IPv4-mapped IPv6 form ::ffff:127.0.0.1.
+  //   Modern Java defaults to AF_INET6 dual-stack sockets, so a Java client
+  //   connecting to 127.0.0.1 reaches the kernel as ::ffff:127.0.0.1 and is
+  //   denied ("Operation not permitted") — including its connect to the
+  //   proxy the agent just pointed it at. Forcing the IPv4 stack makes Java
+  //   open AF_INET sockets so loopback connect matches the filter.
+  //
+  // Both are composed with any inherited JAVA_TOOL_OPTIONS unless that var
+  // is on the credential-deny list, in which case the inherited value is
+  // dropped so the deny holds.
+  const loopbackReachable =
+    needsNetworkRestriction &&
+    (allowLocalBinding ||
+      httpProxyPort !== undefined ||
+      socksProxyPort !== undefined)
+  const javaToolOptions = buildJavaToolOptions({
+    agentJarPath: javaAgentJarPath,
+    flags: loopbackReachable ? ['-Djava.net.preferIPv4Stack=true'] : [],
+    unsetEnvVars,
+    inherited: process.env.JAVA_TOOL_OPTIONS,
+  })
+  if (javaToolOptions !== undefined) {
+    proxyEnvArgs.push(`JAVA_TOOL_OPTIONS=${javaToolOptions}`)
   }
 
   // safe.directory (dubious-ownership) — `buildPosixGitSafeDirEnv`

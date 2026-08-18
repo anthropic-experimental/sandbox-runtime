@@ -1123,6 +1123,14 @@ export const SandboxRuntimeConfigSchema = z
         'Linux only: absolute path to the socat binary. ' +
           'When set, this path is used directly instead of resolving "socat" via PATH.',
       ),
+    javaAgentJarPath: binaryPathSchema
+      .optional()
+      .describe(
+        'macOS/Linux: absolute path to srt-proxy-agent.jar, the JVM agent ' +
+          'injected via JAVA_TOOL_OPTIONS so Java tools honor the proxy. ' +
+          'When set, used instead of looking under vendor/java-proxy-agent/. ' +
+          'For consumers that bundle sandbox-runtime and ship the jar separately.',
+      ),
     windows: WindowsConfigSchema.optional().describe(
       'Windows-specific settings (WFP sublayer, proxy port range).',
     ),

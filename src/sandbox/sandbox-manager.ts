@@ -105,6 +105,7 @@ import type { ChildProcess } from 'node:child_process'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import { EOL } from 'node:os'
 import { dirname } from 'node:path'
+import { getJavaProxyAgentJarPath } from './java-proxy-agent.js'
 
 interface HostNetworkManagerContext {
   httpProxyPort: number
@@ -127,6 +128,12 @@ let logMonitorShutdown: (() => void) | undefined
 let linuxMonitor: LinuxViolationMonitor | undefined
 let parentProxy: ResolvedParentProxy | undefined
 let mitmCA: MitmCA | undefined
+/**
+ * Resolved path of the JVM proxy agent jar (see java-proxy-agent.ts); set
+ * while a proxy is advertised to the sandbox, undefined if the jar is not
+ * shipped/found (JVMs then just aren't proxy-aware, as before).
+ */
+let javaAgentJarPath: string | undefined
 // Per-session proxy auth token. Generated at proxy start, exported only into
 // the sandbox child env, checked on every CONNECT/request — so a host process
 // dialing 127.0.0.1:<proxyPort> can't reach the filter callback.
@@ -888,6 +895,10 @@ async function initialize(
         : undefined
       const httpProxyPort = config.network.httpProxyPort ?? muxPort!
       const socksProxyPort = config.network.socksProxyPort ?? muxPort!
+      // JVMs read neither HTTPS_PROXY nor its credential; the agent bridges
+      // both. Resolved once here, advertised via JAVA_TOOL_OPTIONS per command.
+      javaAgentJarPath =
+        getJavaProxyAgentJarPath(config.javaAgentJarPath) ?? undefined
       // Leaves are minted lazily per-CONNECT (after this point), so setting
       // the CDP URL now means every leaf carries it. See MitmCA.crlUrl.
       // Windows-only: on Linux the child runs under bwrap --unshare-net and
@@ -1606,6 +1617,10 @@ async function wrapWithSandbox(
     if (mitmCA) {
       expandedAllowRead.push(mitmCA.certPath, mitmCA.trustBundlePath)
     }
+    // Likewise the JVM proxy agent jar JAVA_TOOL_OPTIONS points at.
+    if (javaAgentJarPath) {
+      expandedAllowRead.push(javaAgentJarPath)
+    }
     readConfig = {
       denyOnly: expandedDenyRead,
       allowWithinDeny: expandedAllowRead,
@@ -1653,6 +1668,7 @@ async function wrapWithSandbox(
         socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
         proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
         caCertPath: mitmCA?.trustBundlePath,
+        javaAgentJarPath: needsNetworkProxy ? javaAgentJarPath : undefined,
         readConfig,
         writeConfig,
         unsetEnvVars: credentialRestrictions.unsetEnvVars,
@@ -1691,6 +1707,7 @@ async function wrapWithSandbox(
           : undefined,
         proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
         caCertPath: mitmCA?.trustBundlePath,
+        javaAgentJarPath: needsNetworkProxy ? javaAgentJarPath : undefined,
         readConfig,
         writeConfig,
         unsetEnvVars: credentialRestrictions.unsetEnvVars,
@@ -2192,6 +2209,7 @@ async function reset(): Promise<void> {
   initializationPromise = undefined
   parentProxy = undefined
   mitmCA = undefined
+  javaAgentJarPath = undefined
   sentinelRegistry.clear()
   awsPairRegistry.clear()
   maskedFileStore.dispose()
