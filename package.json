@@ -15,6 +15,7 @@
     "build": "tsc",
     "build:seccomp": "bun vendor/seccomp/build.ts",
     "build:srt-win": "bun vendor/srt-win/build.ts",
+    "build:java-agent": "bun vendor/java-proxy-agent/build.ts",
     "clean": "rm -rf dist",
     "test": "bun test",
     "typecheck": "tsc --noEmit",

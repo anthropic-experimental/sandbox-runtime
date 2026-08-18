@@ -8,6 +8,7 @@ import type { ChildProcess } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { ripGrep } from '../utils/ripgrep.js'
+import { buildJavaToolOptions } from './java-proxy-agent.js'
 import {
   generateProxyEnvVars,
   buildPosixGitSafeDirEnv,
@@ -48,6 +49,8 @@ export interface LinuxSandboxParams {
   proxyAuthToken?: string
   /** Path to the TLS-termination CA cert; injected as trust env vars. */
   caCertPath?: string
+  /** Path to the JVM proxy agent jar; injected via JAVA_TOOL_OPTIONS. */
+  javaAgentJarPath?: string
   readConfig?: FsReadRestrictionConfig
   writeConfig?: FsWriteRestrictionConfig
   /** Environment variable names to unset inside the sandbox (bwrap --unsetenv) */
@@ -1693,6 +1696,7 @@ export async function wrapCommandWithSandboxLinux(
     socksProxyPort,
     proxyAuthToken,
     caCertPath,
+    javaAgentJarPath,
     readConfig,
     writeConfig,
     unsetEnvVars,
@@ -1881,6 +1885,19 @@ export async function wrapCommandWithSandboxLinux(
             return ['--setenv', key, value]
           }),
         )
+
+        // JVMs ignore the proxy env vars above; the agent jar translates
+        // them into system properties + an Authenticator at JVM start
+        // (see java-proxy-agent.ts). Composed against the inherited value
+        // so a caller's own JAVA_TOOL_OPTIONS survives.
+        const javaToolOptions = buildJavaToolOptions({
+          agentJarPath: javaAgentJarPath,
+          unsetEnvVars,
+          inherited: process.env.JAVA_TOOL_OPTIONS,
+        })
+        if (javaToolOptions !== undefined) {
+          bwrapArgs.push('--setenv', 'JAVA_TOOL_OPTIONS', javaToolOptions)
+        }
 
         // Add host proxy port environment variables for debugging/transparency
         // These show which host ports the Unix socket bridges connect to

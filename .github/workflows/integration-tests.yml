@@ -53,6 +53,15 @@ jobs:
         with:
           bun-version: 1.3.14
 
+      # test/sandbox/java-proxy-agent.test.ts drives the embedded JVM proxy
+      # agent in a real JVM; it self-skips without a JDK, so pin one here.
+      - name: Setup Java (macOS/Linux)
+        if: matrix.os != 'windows'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
       # ─── Windows: srt-win helper binary ─────────────────────────────
       # GitHub-hosted Windows runners run as a member of Administrators
       # with UAC disabled, so NetLocalGroup* and Fwpm* calls succeed
