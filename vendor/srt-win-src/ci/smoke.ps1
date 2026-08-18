@@ -121,6 +121,33 @@ $deny = $acl.Access | Where-Object {
 if (-not $deny) {
   throw "install: state-dir DACL has no DENY for sandbox-runtime-users; got:`n$($acl.Access | Out-String)"
 }
+# Logon-type denials: the sandbox group must carry the four LSA
+# deny rights (everything except interactive, which the
+# CreateProcessWithLogonW launch needs). secedit is the only stock
+# read path for user-right assignments.
+$grpSid = $us.user.group_sid
+if (-not $grpSid) { throw 'install: user status carries no group_sid' }
+$seceditOut = Join-Path $env:TEMP 'srt-secedit.inf'
+Remove-Item $seceditOut -ea SilentlyContinue  # never read a stale export
+secedit /export /cfg $seceditOut /areas USER_RIGHTS | Out-Null
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $seceditOut)) {
+  throw "install: secedit /export failed (exit $LASTEXITCODE)"
+}
+$rights = Get-Content $seceditOut -Raw
+foreach ($r in @('SeDenyNetworkLogonRight','SeDenyBatchLogonRight','SeDenyServiceLogonRight','SeDenyRemoteInteractiveLogonRight')) {
+  $line = ($rights -split "`n" | Where-Object { $_ -match "^$r" })
+  # secedit exports resolvable trustees by NAME, unresolvable as *SID.
+  if (-not $line -or ($line -notmatch 'sandbox-runtime-users' -and $line -notmatch [regex]::Escape($grpSid))) {
+    throw "install: $r does not include the sandbox group ($grpSid); got: $line"
+  }
+}
+$interactive = ($rights -split "`n" | Where-Object { $_ -match '^SeDenyInteractiveLogonRight' })
+if ($interactive -match 'sandbox-runtime-users' -or $interactive -match [regex]::Escape($grpSid)) {
+  throw "install: SeDenyInteractiveLogonRight includes the sandbox group - the launch path would be broken"
+}
+Remove-Item $seceditOut -ea SilentlyContinue
+Write-Host 'install ok: logon-type denials stamped on the sandbox group (interactive untouched)'
+
 # Registry store: base key present with marker + identity; Cred
 # subkey deny for the sandbox group and no BU write; Ca subkey BU
 # KEY_SET_VALUE (unelevated trust-ca) but sandbox-group DENY.
