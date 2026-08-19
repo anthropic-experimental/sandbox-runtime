@@ -51,6 +51,13 @@ export interface LinuxSandboxParams {
   caCertPath?: string
   /** Path to the JVM proxy agent jar; injected via JAVA_TOOL_OPTIONS. */
   javaAgentJarPath?: string
+  /**
+   * gh front door: host unix socket bound into the sandbox, and the
+   * GH_CONFIG_DIR shim pointing gh at it (see gh-config-shim.ts). Both or
+   * neither.
+   */
+  ghSocketPath?: string
+  ghConfigDir?: string
   readConfig?: FsReadRestrictionConfig
   writeConfig?: FsWriteRestrictionConfig
   /** Environment variable names to unset inside the sandbox (bwrap --unsetenv) */
@@ -1697,6 +1704,8 @@ export async function wrapCommandWithSandboxLinux(
     proxyAuthToken,
     caCertPath,
     javaAgentJarPath,
+    ghSocketPath,
+    ghConfigDir,
     readConfig,
     writeConfig,
     unsetEnvVars,
@@ -1897,6 +1906,19 @@ export async function wrapCommandWithSandboxLinux(
         })
         if (javaToolOptions !== undefined) {
           bwrapArgs.push('--setenv', 'JAVA_TOOL_OPTIONS', javaToolOptions)
+        }
+
+        // gh front door (host-header-proxy.ts): a unix socket is
+        // filesystem-addressed, so unlike the TCP proxy it needs no socat
+        // bridge into the network namespace — bind the file and point gh's
+        // config at it.
+        if (
+          ghSocketPath !== undefined &&
+          ghConfigDir !== undefined &&
+          fs.existsSync(ghSocketPath)
+        ) {
+          bwrapArgs.push('--bind', ghSocketPath, ghSocketPath)
+          bwrapArgs.push('--setenv', 'GH_CONFIG_DIR', ghConfigDir)
         }
 
         // Add host proxy port environment variables for debugging/transparency

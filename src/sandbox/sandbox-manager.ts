@@ -2,6 +2,8 @@ import { createHttpProxyServer } from './http-proxy.js'
 import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
 import { createMuxProxyServer, type MuxProxyServer } from './mux-proxy.js'
+import { createHostHeaderProxyServer } from './host-header-proxy.js'
+import { prepareGhConfigDir, removeGhConfigDir } from './gh-config-shim.js'
 import { listenInRange } from './listen-in-range.js'
 import { SentinelRegistry } from './credential-sentinel.js'
 import {
@@ -103,8 +105,8 @@ import {
 } from './domain-pattern.js'
 import type { ChildProcess } from 'node:child_process'
 import type { ResolvedParentProxy } from './parent-proxy.js'
-import { EOL } from 'node:os'
-import { dirname } from 'node:path'
+import { EOL, tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 import { getJavaProxyAgentJarPath } from './java-proxy-agent.js'
 
 interface HostNetworkManagerContext {
@@ -134,6 +136,15 @@ let mitmCA: MitmCA | undefined
  * shipped/found (JVMs then just aren't proxy-aware, as before).
  */
 let javaAgentJarPath: string | undefined
+/**
+ * gh front door (see host-header-proxy.ts / gh-config-shim.ts): a unix
+ * socket speaking plaintext HTTP into the TLS-terminated pipeline, and the
+ * GH_CONFIG_DIR shim that points the sandboxed gh at it. Both set only
+ * while TLS termination is on and this process owns the proxy.
+ */
+let ghSocketServer: ReturnType<typeof createHostHeaderProxyServer> | undefined
+let ghSocketPath: string | undefined
+let ghConfigDir: string | undefined
 // Per-session proxy auth token. Generated at proxy start, exported only into
 // the sandbox child env, checked on every CONNECT/request — so a host process
 // dialing 127.0.0.1:<proxyPort> can't reach the filter callback.
@@ -595,6 +606,78 @@ async function startMuxProxyServer(
   return muxPort
 }
 
+/**
+ * Start the gh unix-socket front door. Go binaries on macOS ignore every
+ * CA-bundle env var (crypto/x509 uses the keychain there, and the sandbox
+ * blocks trustd), so under TLS termination `gh` cannot verify the
+ * proxy-minted leaf. gh's `http_unix_socket` setting makes it send plain
+ * HTTP over a unix socket instead — no client-side TLS at all — and this
+ * listener feeds those requests into the same allowlist + filterRequest +
+ * credential pipeline as a terminated CONNECT, with a cert-verified
+ * upstream leg. See host-header-proxy.ts.
+ *
+ * Best effort: any failure leaves ghSocketPath/ghConfigDir unset and gh
+ * keeps today's behaviour.
+ */
+async function startGhSocketServer(
+  sandboxAskCallback: SandboxAskCallback | undefined,
+): Promise<void> {
+  const sockPath = join(
+    tmpdir(),
+    `srt-gh-${process.pid}-${randomBytes(4).toString('hex')}.sock`,
+  )
+  const server = createHostHeaderProxyServer({
+    filter: (port, host) =>
+      filterNetworkRequest(port, host, sandboxAskCallback, undefined),
+    filterRequest: config?.network.filterRequest,
+    onFilterRequestDenied: ({ method, url, reason }) => {
+      recordProxyViolation(
+        `deny http-request ${method} ${redactUrlForViolation(url)} (${reason})`,
+        undefined,
+      )
+    },
+    mutateHeaders: buildCredentialInjector(),
+    getBodySubstitutions: buildBodyCredentialInjector(),
+    planSigv4: buildSigv4Planner(),
+  })
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(sockPath, () => {
+        server.removeListener('error', reject)
+        // Post-listen errors must not escape as uncaughtException.
+        server.on('error', err => {
+          logForDebugging(`gh socket server error: ${err.message}`, {
+            level: 'error',
+          })
+        })
+        resolve()
+      })
+    })
+    // The socket file is the credential: there is no Proxy-Authorization
+    // on this path, so nothing but this uid may connect.
+    fs.chmodSync(sockPath, 0o600)
+  } catch (err) {
+    logForDebugging(
+      `gh socket: listen on ${sockPath} failed: ${(err as Error).message}`,
+      { level: 'error' },
+    )
+    server.close()
+    return
+  }
+  server.unref()
+  const dir = prepareGhConfigDir(sockPath)
+  if (dir === undefined) {
+    server.close()
+    fs.rmSync(sockPath, { force: true })
+    return
+  }
+  ghSocketServer = server
+  ghSocketPath = sockPath
+  ghConfigDir = dir
+  logForDebugging(`gh socket listening on ${sockPath} (GH_CONFIG_DIR=${dir})`)
+}
+
 // ============================================================================
 // Public Module Functions (will be exported via namespace)
 // ============================================================================
@@ -899,6 +982,18 @@ async function initialize(
       // both. Resolved once here, advertised via JAVA_TOOL_OPTIONS per command.
       javaAgentJarPath =
         getJavaProxyAgentJarPath(config.javaAgentJarPath) ?? undefined
+      // gh cannot trust the MITM CA on macOS (Go uses the keychain there);
+      // give it a plaintext unix-socket path into the terminated pipeline
+      // instead. Only with in-process termination and our own proxy — an
+      // external proxy must keep seeing gh's traffic on its own port — and
+      // only where the child can reach a host unix socket (not Windows).
+      if (
+        mitmCA &&
+        muxPort !== undefined &&
+        (getPlatform() === 'macos' || getPlatform() === 'linux')
+      ) {
+        await startGhSocketServer(sandboxAskCallback)
+      }
       // Leaves are minted lazily per-CONNECT (after this point), so setting
       // the CDP URL now means every leaf carries it. See MitmCA.crlUrl.
       // Windows-only: on Linux the child runs under bwrap --unshare-net and
@@ -1669,6 +1764,8 @@ async function wrapWithSandbox(
         proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
         caCertPath: mitmCA?.trustBundlePath,
         javaAgentJarPath: needsNetworkProxy ? javaAgentJarPath : undefined,
+        ghSocketPath: needsNetworkProxy ? ghSocketPath : undefined,
+        ghConfigDir: needsNetworkProxy ? ghConfigDir : undefined,
         readConfig,
         writeConfig,
         unsetEnvVars: credentialRestrictions.unsetEnvVars,
@@ -1708,6 +1805,8 @@ async function wrapWithSandbox(
         proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
         caCertPath: mitmCA?.trustBundlePath,
         javaAgentJarPath: needsNetworkProxy ? javaAgentJarPath : undefined,
+        ghSocketPath: needsNetworkProxy ? ghSocketPath : undefined,
+        ghConfigDir: needsNetworkProxy ? ghConfigDir : undefined,
         readConfig,
         writeConfig,
         unsetEnvVars: credentialRestrictions.unsetEnvVars,
@@ -2188,6 +2287,16 @@ async function reset(): Promise<void> {
     closePromises.push(forceCloseHttpServer(httpProxyServer))
   }
 
+  if (ghSocketServer) {
+    closePromises.push(forceCloseHttpServer(ghSocketServer))
+  }
+  if (ghSocketPath) {
+    fs.rmSync(ghSocketPath, { force: true })
+  }
+  if (ghConfigDir) {
+    removeGhConfigDir(ghConfigDir)
+  }
+
   if (socksProxyServer) {
     const socksClose = socksProxyServer.close().catch((error: Error) => {
       logForDebugging(`Error closing SOCKS proxy server: ${error.message}`, {
@@ -2210,6 +2319,9 @@ async function reset(): Promise<void> {
   parentProxy = undefined
   mitmCA = undefined
   javaAgentJarPath = undefined
+  ghSocketServer = undefined
+  ghSocketPath = undefined
+  ghConfigDir = undefined
   sentinelRegistry.clear()
   awsPairRegistry.clear()
   maskedFileStore.dispose()

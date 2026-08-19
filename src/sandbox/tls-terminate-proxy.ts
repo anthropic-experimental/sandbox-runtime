@@ -308,7 +308,19 @@ function destroyAfterDenial(req: IncomingMessage, res: ServerResponse): void {
   res.once('close', () => req.destroy())
 }
 
-function forwardUpstreamGuarded(
+/**
+ * Forward one already-allowlisted request to `target` over a fresh,
+ * cert-verified upstream TLS connection, running the per-request pipeline
+ * (filterRequest, credential header/body substitution, SigV4 re-signing)
+ * on the way. Exported so the host-header unix-socket listener
+ * (host-header-proxy.ts) shares the exact pipeline of the terminated path:
+ * its clients speak plaintext to srt and the upstream leg is real TLS, the
+ * same shape as a decrypted CONNECT tunnel.
+ *
+ * Precondition: the caller has validated `target` against the domain
+ * allowlist; this function does not re-check it.
+ */
+export function forwardUpstreamGuarded(
   ...args: Parameters<typeof forwardUpstream>
 ): void {
   // Fire-and-forget from the request handler: a rejection (e.g. a

@@ -43,6 +43,13 @@ export interface MacOSSandboxParams {
   caCertPath?: string
   /** Path to the JVM proxy agent jar; injected via JAVA_TOOL_OPTIONS. */
   javaAgentJarPath?: string
+  /**
+   * gh front door: unix socket the child may connect to, and the
+   * GH_CONFIG_DIR shim pointing gh at it (see gh-config-shim.ts). Both or
+   * neither.
+   */
+  ghSocketPath?: string
+  ghConfigDir?: string
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
@@ -644,6 +651,7 @@ function generateSandboxProfile({
   httpProxyPort,
   socksProxyPort,
   needsNetworkRestriction,
+  ghSocketPath,
   allowUnixSockets,
   allowAllUnixSockets,
   allowLocalBinding,
@@ -659,6 +667,7 @@ function generateSandboxProfile({
   httpProxyPort?: number
   socksProxyPort?: number
   needsNetworkRestriction: boolean
+  ghSocketPath?: string
   allowUnixSockets?: string[]
   allowAllUnixSockets?: boolean
   allowLocalBinding?: boolean
@@ -905,6 +914,16 @@ function generateSandboxProfile({
     }
     // If both allowAllUnixSockets and allowUnixSockets are false/undefined/empty, Unix sockets are blocked by default
 
+    // The gh front door (host-header-proxy.ts): connect-only, to this one
+    // path. system-socket is needed even when the user allowed no other
+    // unix sockets (socket() has no path to match).
+    if (ghSocketPath !== undefined) {
+      profile.push('(allow system-socket (socket-domain AF_UNIX))')
+      profile.push(
+        `(allow network-outbound (remote unix-socket (path-literal ${escapePath(normalizePathForSandbox(ghSocketPath))})))`,
+      )
+    }
+
     // Allow localhost TCP operations for the HTTP proxy
     if (httpProxyPort !== undefined) {
       profile.push(
@@ -1004,6 +1023,8 @@ export function wrapCommandWithSandboxMacOS(
     proxyAuthToken,
     caCertPath,
     javaAgentJarPath,
+    ghSocketPath,
+    ghConfigDir,
     allowUnixSockets,
     allowAllUnixSockets,
     allowLocalBinding,
@@ -1073,6 +1094,7 @@ export function wrapCommandWithSandboxMacOS(
     writeConfig,
     httpProxyPort,
     socksProxyPort,
+    ghSocketPath,
     needsNetworkRestriction,
     allowUnixSockets,
     allowAllUnixSockets,
@@ -1126,6 +1148,12 @@ export function wrapCommandWithSandboxMacOS(
   })
   if (javaToolOptions !== undefined) {
     proxyEnvArgs.push(`JAVA_TOOL_OPTIONS=${javaToolOptions}`)
+  }
+
+  // gh: config-file-only `http_unix_socket` lives in this shim dir (see
+  // gh-config-shim.ts). Only meaningful alongside the socket rule above.
+  if (ghConfigDir !== undefined && ghSocketPath !== undefined) {
+    proxyEnvArgs.push(`GH_CONFIG_DIR=${ghConfigDir}`)
   }
 
   // safe.directory (dubious-ownership) — `buildPosixGitSafeDirEnv`
