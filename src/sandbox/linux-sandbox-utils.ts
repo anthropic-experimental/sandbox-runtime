@@ -817,6 +817,56 @@ function buildSandboxCommand(
   }
 }
 
+/** Prefix that a strict descendant of `dir` starts with ('/' for the root). */
+function pathSep(dir: string): string {
+  return dir === '/' ? '/' : dir + '/'
+}
+
+/** True when an fs error means the path is absent, as opposed to
+ * unreadable (EACCES), looping (ELOOP) or otherwise unverifiable. */
+function isAbsenceError(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code
+  return code === 'ENOENT' || code === 'ENOTDIR'
+}
+
+/**
+ * Directories to pin with a self --bind: every ancestor of a deny dest or
+ * mask seed up to (and excluding) the outermost covering allowed write root,
+ * shallow-first. Filesystem and policy probes are injected so the walk is
+ * testable without bwrap.
+ */
+export function computeAncestorPins(
+  seeds: Iterable<string>,
+  probes: {
+    isWithinAllowedWrite: (dir: string) => boolean
+    isAllowedWriteRoot: (dir: string) => boolean
+    isExcluded: (dir: string) => boolean
+    containsReadDenyTmpfs: (dir: string) => boolean
+    isAbsent: (dir: string) => boolean
+  },
+): string[] {
+  const pins = new Set<string>()
+  // Verdicts are seed-independent: a visited ancestor's chain is done.
+  const visited = new Set<string>()
+  for (const seed of seeds) {
+    let dir = path.dirname(seed)
+    while (dir !== '/' && probes.isWithinAllowedWrite(dir)) {
+      if (visited.has(dir)) break
+      visited.add(dir)
+      if (
+        !probes.isAllowedWriteRoot(dir) &&
+        !probes.isExcluded(dir) &&
+        !probes.containsReadDenyTmpfs(dir) &&
+        !probes.isAbsent(dir)
+      ) {
+        pins.add(dir)
+      }
+      dir = path.dirname(dir)
+    }
+  }
+  return [...pins].sort((a, b) => a.split('/').length - b.split('/').length)
+}
+
 /**
  * bwrap cannot create a file bind mount point over a destination that is
  * itself a symlink — `--ro-bind /dev/null <symlink>` fails with "Can't create
@@ -830,18 +880,6 @@ function buildSandboxCommand(
  * carve-outs expressed against the symlink path (e.g. /bin on usr-merged
  * systems).
  */
-/** Prefix that a strict descendant of `dir` starts with ('/' for the root). */
-function pathSep(dir: string): string {
-  return dir === '/' ? '/' : dir + '/'
-}
-
-/** True when an fs error means the path is absent, as opposed to
- * unreadable (EACCES), looping (ELOOP) or otherwise unverifiable. */
-function isAbsenceError(err: unknown): boolean {
-  const code = (err as NodeJS.ErrnoException | undefined)?.code
-  return code === 'ENOENT' || code === 'ENOTDIR'
-}
-
 function resolveSymlinkDenyDest(normalizedPath: string): string {
   try {
     if (fs.lstatSync(normalizedPath).isSymbolicLink()) {
@@ -1636,25 +1674,16 @@ async function generateFilesystemArgs(
         return isAbsenceError(err)
       }
     }
-    const ancestorPinDirs = new Set<string>()
-    // Verdicts are dest-independent: a visited ancestor's chain is done.
-    const visitedAncestors = new Set<string>()
-    for (const dest of [...denyWriteDests, ...maskPinSeeds]) {
-      let ancestorDir = path.dirname(dest)
-      while (ancestorDir !== '/' && isWithinAnyAllowedWritePath(ancestorDir)) {
-        if (visitedAncestors.has(ancestorDir)) break
-        visitedAncestors.add(ancestorDir)
-        if (
-          !isAllowedWriteRoot(ancestorDir) &&
-          !excludedFromPinning(ancestorDir) &&
-          !containsProspectiveReadDenyTmpfs(ancestorDir) &&
-          !ancestorIsAbsent(ancestorDir)
-        ) {
-          ancestorPinDirs.add(ancestorDir)
-        }
-        ancestorDir = path.dirname(ancestorDir)
-      }
-    }
+    const ancestorPinDirs = computeAncestorPins(
+      [...denyWriteDests, ...maskPinSeeds],
+      {
+        isWithinAllowedWrite: isWithinAnyAllowedWritePath,
+        isAllowedWriteRoot,
+        isExcluded: excludedFromPinning,
+        containsReadDenyTmpfs: containsProspectiveReadDenyTmpfs,
+        isAbsent: ancestorIsAbsent,
+      },
+    )
     // bwrap re-resolves the pin path at mount time, so re-verify that no
     // component is a symlink (narrows, does not close, the check→mount race).
     // A symlink component drops the pin; an lstat error other than absence
@@ -1669,8 +1698,8 @@ async function generateFilesystemArgs(
           if (!isAbsenceError(err)) {
             const code = (err as NodeJS.ErrnoException | undefined)?.code
             throw new Error(
-              `Sandbox ancestor-pin verification failed: cannot lstat ${prefix} (${code ?? String(err)}). ` +
-                'Refusing to build a mount plan with unverifiable pin components.',
+              `Sandbox cannot verify ${prefix} (${code ?? String(err)}), which lies between an allowed write path and a protected path. ` +
+                'Fix its permissions or remove the covering path from allowWrite.',
             )
           }
           verdict = null
@@ -1701,9 +1730,7 @@ async function generateFilesystemArgs(
       return true
     }
     const ancestorPinArgs: string[] = []
-    for (const pinDir of [...ancestorPinDirs].sort(
-      (a, b) => a.split('/').length - b.split('/').length,
-    )) {
+    for (const pinDir of ancestorPinDirs) {
       if (pinComponentsAreSymlinkFree(pinDir)) {
         ancestorPinArgs.push('--bind', pinDir, pinDir)
       }

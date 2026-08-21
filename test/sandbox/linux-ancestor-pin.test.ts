@@ -604,23 +604,55 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     },
   )
 
+  it('does not pin above a nested repo deeper than the mandatory-deny scan depth', async () => {
+    // a/b/c/.git/config sits at depth 4; the default scan depth of 3 never
+    // finds it, so there is no deny bind there and nothing to pin. Raising
+    // the depth finds it and pins the whole chain.
+    mkTree(PROJECT, {
+      a: { b: { c: { '.git': { hooks: {}, config: '[core]\n' } } } },
+    })
+    const cDir = join(PROJECT, 'a', 'b', 'c')
+    const gitDir = join(cDir, '.git')
+
+    const shallow = await wrap()
+    expect(shallow).not.toContain(`--ro-bind ${gitDir}/config`)
+    expect(shallow).not.toContain(`--bind ${gitDir} ${gitDir}`)
+    expect(shallow).not.toContain(`--bind ${cDir} ${cDir}`)
+
+    process.chdir(PROJECT)
+    const deep = await wrapCommandWithSandboxLinux({
+      command: 'true',
+      needsNetworkRestriction: false,
+      allowAllUnixSockets: true,
+      mandatoryDenySearchDepth: 4,
+      writeConfig: { allowOnly: [PROJECT], denyWithinAllow: [] },
+    })
+    expect(deep).toContain(`--ro-bind ${gitDir}/config ${gitDir}/config`)
+    for (const dir of [
+      join(PROJECT, 'a'),
+      join(PROJECT, 'a', 'b'),
+      cDir,
+      gitDir,
+    ]) {
+      expect(deep).toContain(`--bind ${dir} ${dir}`)
+    }
+  })
+
   it.if(BWRAP_CAN_NAMESPACE && Bun.which('git') !== null)(
     'lets git and cross-directory renames work in a nested repo whose ancestors are pinned',
     async () => {
-      // packages/app is a nested repo: packages and packages/app/.git are
-      // pinned (packages/app/.git/config and hooks are mandatory denies
-      // found by the depth scan; packages/app itself is the .git's parent).
+      // app is a nested repo at depth 1: app/.git/config and hooks are
+      // mandatory denies found by the depth scan, so app and app/.git are
+      // pinned.
       mkTree(PROJECT, {
-        packages: {
-          app: {
-            'index.js': 'console.log(1)\n',
-            node_modules: {
-              '.staging': { 'left-pad-abc': { 'index.js': 'x' } },
-            },
+        app: {
+          'index.js': 'console.log(1)\n',
+          node_modules: {
+            '.staging': { 'left-pad-abc': { 'index.js': 'x' } },
           },
         },
       })
-      const appDir = join(PROJECT, 'packages', 'app')
+      const appDir = join(PROJECT, 'app')
       const gitInit = spawnSync(
         'git',
         ['-c', 'init.defaultBranch=main', 'init', '-q', appDir],
@@ -629,9 +661,6 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       expect(gitInit.status).toBe(0)
 
       const command = await wrap({})
-      expect(command).toContain(
-        `--bind ${join(PROJECT, 'packages')} ${join(PROJECT, 'packages')}`,
-      )
       expect(command).toContain(`--bind ${appDir} ${appDir}`)
       expect(command).toContain(
         `--bind ${join(appDir, '.git')} ${join(appDir, '.git')}`,
@@ -653,18 +682,18 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
 
       // The npm-style staging rename (node_modules/.staging/x -> node_modules/
       // x) does not cross a pin: neither directory is a mountpoint, both
-      // live in the packages/app vfsmount.
+      // live in the app vfsmount.
       const staged = join(appDir, 'node_modules', '.staging', 'left-pad-abc')
       const final = join(appDir, 'node_modules', 'left-pad')
       const npmLike = await wrap(
         {},
-        `${process.execPath} -e "require('fs').renameSync(${JSON.stringify(staged)}, ${JSON.stringify(final)})" && echo RENAME_OK`,
+        `${process.execPath} -e "require('fs').renameSync('${staged}', '${final}')" && echo RENAME_OK`,
       )
       const npmResult = run(npmLike)
       expect(npmResult.stdout).toContain('RENAME_OK')
       expect(existsSync(join(final, 'index.js'))).toBe(true)
 
-      // A rename that straddles a pin boundary (packages/app -> packages,
+      // A rename that straddles a pin boundary (app -> PROJECT,
       // i.e. out of the app vfsmount into its parent's) fails EXDEV from
       // fs.rename; mv detects EXDEV and falls back to copy + unlink.
       const straddle = await wrap(
@@ -674,7 +703,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       const straddleResult = run(straddle)
       expect(straddleResult.stdout).toContain('CODE=EXDEV')
       expect(straddleResult.stdout).toContain('MV_OK')
-      expect(existsSync(join(PROJECT, 'packages', 'moved.js'))).toBe(true)
+      expect(existsSync(join(PROJECT, 'moved.js'))).toBe(true)
       expect(existsSync(join(appDir, 'index.js'))).toBe(false)
     },
   )
