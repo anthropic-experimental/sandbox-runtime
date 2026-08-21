@@ -1302,10 +1302,15 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
     ],
     { mode: 'deny' },
   )
-  // Existing paths only, depth-bounded like the Linux ripgrep scan.
+  // Existing paths only, depth-bounded and skipping node_modules like
+  // the Linux ripgrep scan.
   const mandatoryDenyWrite = expand(
     windowsGetMandatoryDenyPatterns(process.cwd(), getAllowGitConfig()),
-    { mode: 'deny', maxDepth: getMandatoryDenySearchDepth() },
+    {
+      mode: 'deny',
+      maxDepth: getMandatoryDenySearchDepth(),
+      skipDirNames: ['node_modules'],
+    },
   )
   const denyWrite = [
     ...new Set([

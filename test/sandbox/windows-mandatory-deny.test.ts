@@ -67,6 +67,15 @@ describe('expandGlobPattern maxDepth', () => {
     ).toEqual([join(base, 'node_modules', 'x', 'y', '.bashrc')])
   })
 
+  it('does not descend into skipDirNames', () => {
+    expect(
+      expandGlobPattern(join(base, '**', '.bashrc'), {
+        maxDepth: 4,
+        skipDirNames: ['node_modules'],
+      }),
+    ).toEqual([])
+  })
+
   it('matches directories too (hooks is a directory target)', () => {
     const r = expandGlobPattern(join(base, '**', '.git', 'hooks'), {
       maxDepth: 3,

@@ -877,6 +877,8 @@ export interface ExpandGlobOptions {
    * Default: unbounded.
    */
   maxDepth?: number
+  /** Directory names not descended into (e.g. `node_modules`). */
+  skipDirNames?: readonly string[]
 }
 
 /**
@@ -948,7 +950,11 @@ export function expandGlobPattern(
           if (regex.test(toFwd(fullPath))) {
             results.push(fullPath)
           }
-          if (entry.isDirectory() && depth < opts.maxDepth) {
+          if (
+            entry.isDirectory() &&
+            depth < opts.maxDepth &&
+            !opts.skipDirNames?.includes(entry.name)
+          ) {
             stack.push({ dir: fullPath, depth: depth + 1 })
           }
         }

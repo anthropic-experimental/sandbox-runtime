@@ -1718,7 +1718,11 @@ export function windowsGetMandatoryDenyPatterns(
  */
 export function expandWindowsFsPaths(
   patterns: readonly string[],
-  opts?: { mode?: 'grant' | 'deny'; maxDepth?: number },
+  opts?: {
+    mode?: 'grant' | 'deny'
+    maxDepth?: number
+    skipDirNames?: readonly string[]
+  },
 ): string[] {
   const out = new Set<string>()
   for (const raw of patterns) {
@@ -1734,6 +1738,7 @@ export function expandWindowsFsPaths(
       ? expandGlobPattern(norm, {
           caseInsensitive: true,
           maxDepth: opts?.maxDepth,
+          skipDirNames: opts?.skipDirNames,
         })
       : [norm]
     for (const c of candidates) {

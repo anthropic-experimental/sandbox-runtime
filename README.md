@@ -680,11 +680,13 @@ $ srt 'echo "bad" > .git/hooks/pre-commit'
 
 On macOS the directories that hold these paths (`.git`, `.vscode`, `.idea`, `.claude`) are also pinned at any depth, so a sandboxed command cannot create, rename, or delete them — for example `mv decoy packages/app/.git` or `git init` in a subdirectory fails, while writes inside an existing nested `.git` still work.
 
-| Platform | Covers | Paths created after the command starts |
+| Platform | Covers | Paths created after the scan |
 | --- | --- | --- |
 | macOS | Pattern rules, any depth | Blocked |
-| Linux | Existing paths, up to `mandatoryDenySearchDepth` | Not blocked |
-| Windows | Existing paths, up to `mandatoryDenySearchDepth` | Not blocked |
+| Linux | Direct writes to existing paths, up to `mandatoryDenySearchDepth` | Not blocked |
+| Windows | Direct writes to existing paths, up to `mandatoryDenySearchDepth` | Not blocked |
+
+A nested repository whose `.git` sits `L` directories below the project is within the scan when `mandatoryDenySearchDepth >= L + 2`. `node_modules` is never scanned.
 
 **Search depth (Linux/Windows):** the project directory is scanned for these paths at startup, 3 levels deep by default. Configure with `mandatoryDenySearchDepth`:
 
