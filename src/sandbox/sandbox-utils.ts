@@ -871,14 +871,6 @@ export interface ExpandGlobOptions {
    * don't need it).
    */
   caseInsensitive?: boolean
-  /**
-   * Descend at most this many directory levels below the pattern's
-   * static base directory (`1` = the base directory's own entries).
-   * Default: unbounded.
-   */
-  maxDepth?: number
-  /** Directory names not descended into (e.g. `node_modules`). */
-  skipDirNames?: readonly string[]
 }
 
 /**
@@ -933,35 +925,6 @@ export function expandGlobPattern(
   // List all entries recursively under the base directory
   const results: string[] = []
   try {
-    if (opts.maxDepth !== undefined) {
-      const stack: Array<{ dir: string; depth: number }> = [
-        { dir: baseDir, depth: 1 },
-      ]
-      while (stack.length > 0) {
-        const { dir, depth } = stack.pop()!
-        let entries: fs.Dirent[]
-        try {
-          entries = fs.readdirSync(dir, { withFileTypes: true })
-        } catch {
-          continue
-        }
-        for (const entry of entries) {
-          const fullPath = path.join(dir, entry.name)
-          if (regex.test(toFwd(fullPath))) {
-            results.push(fullPath)
-          }
-          if (
-            entry.isDirectory() &&
-            depth < opts.maxDepth &&
-            !opts.skipDirNames?.includes(entry.name)
-          ) {
-            stack.push({ dir: fullPath, depth: depth + 1 })
-          }
-        }
-      }
-      return results
-    }
-
     const entries = fs.readdirSync(baseDir, {
       recursive: true,
       withFileTypes: true,

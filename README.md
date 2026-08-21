@@ -684,11 +684,10 @@ On macOS the directories that hold these paths (`.git`, `.vscode`, `.idea`, `.cl
 | --- | --- | --- |
 | macOS | Pattern rules, any depth | Blocked |
 | Linux | Direct writes to existing paths, up to `mandatoryDenySearchDepth` | Not blocked |
-| Windows | Direct writes to existing paths, up to `mandatoryDenySearchDepth` | Not blocked |
 
 A nested repository whose `.git` sits `L` directories below the project is within the scan when `mandatoryDenySearchDepth >= L + 2`. `node_modules` is never scanned.
 
-**Search depth (Linux/Windows):** the project directory is scanned for these paths at startup, 3 levels deep by default. Configure with `mandatoryDenySearchDepth`:
+**Search depth (Linux):** the project directory is scanned for these paths with `ripgrep`, 3 levels deep by default. Configure with `mandatoryDenySearchDepth`:
 
 ```json
 {

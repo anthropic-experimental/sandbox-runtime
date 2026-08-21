@@ -13,8 +13,6 @@ import {
   containsGlobCharsWin,
   expandGlobPattern,
   isUncPath,
-  DANGEROUS_FILES,
-  getDangerousDirectories,
 } from './sandbox-utils.js'
 // Re-export so existing tests (glob-expand.test.ts) and any
 // out-of-tree caller keep their import path. `buildGitConfigEnv` is
@@ -1663,31 +1661,6 @@ export function uninstallWindowsSandbox(
 }
 
 /**
- * Mandatory write-deny globs rooted at `cwd` — the same set
- * macGetMandatoryDenyPatterns() / linuxGetMandatoryDenyPaths() use.
- * Globs so that {@link expandWindowsFsPaths} stamps existing paths
- * only; a literal `mode: 'deny'` entry would materialize placeholder
- * files in the project.
- */
-export function windowsGetMandatoryDenyPatterns(
-  cwd: string,
-  allowGitConfig: boolean,
-): string[] {
-  const out: string[] = []
-  for (const fileName of DANGEROUS_FILES) {
-    out.push(path.join(cwd, '**', fileName))
-  }
-  for (const dirName of getDangerousDirectories()) {
-    out.push(path.join(cwd, '**', dirName))
-  }
-  out.push(path.join(cwd, '**', '.git', 'hooks'))
-  if (!allowGitConfig) {
-    out.push(path.join(cwd, '**', '.git', 'config'))
-  }
-  return out
-}
-
-/**
  * Resolve any Windows filesystem-config path list — `allowRead`/
  * `allowWrite` grants and `denyRead`/`denyWrite` stamps — to
  * concrete paths via the single platform-aware
@@ -1718,11 +1691,7 @@ export function windowsGetMandatoryDenyPatterns(
  */
 export function expandWindowsFsPaths(
   patterns: readonly string[],
-  opts?: {
-    mode?: 'grant' | 'deny'
-    maxDepth?: number
-    skipDirNames?: readonly string[]
-  },
+  opts?: { mode?: 'grant' | 'deny' },
 ): string[] {
   const out = new Set<string>()
   for (const raw of patterns) {
@@ -1735,11 +1704,7 @@ export function expandWindowsFsPaths(
       continue
     }
     const candidates = isGlob
-      ? expandGlobPattern(norm, {
-          caseInsensitive: true,
-          maxDepth: opts?.maxDepth,
-          skipDirNames: opts?.skipDirNames,
-        })
+      ? expandGlobPattern(norm, { caseInsensitive: true })
       : [norm]
     for (const c of candidates) {
       const st = fs.statSync(c, { throwIfNoEntry: false })
