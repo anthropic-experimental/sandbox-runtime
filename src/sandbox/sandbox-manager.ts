@@ -61,6 +61,7 @@ import {
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
   expandWindowsFsPaths,
+  windowsGetMandatoryDenyPatterns,
   stampWindowsAcl,
   restoreWindowsAcl,
   grantWindowsAcl,
@@ -1301,7 +1302,17 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
     ],
     { mode: 'deny' },
   )
-  const denyWrite = expand(fs?.denyWrite ?? [], { mode: 'deny' })
+  // Existing paths only, depth-bounded like the Linux ripgrep scan.
+  const mandatoryDenyWrite = expand(
+    windowsGetMandatoryDenyPatterns(process.cwd(), getAllowGitConfig()),
+    { mode: 'deny', maxDepth: getMandatoryDenySearchDepth() },
+  )
+  const denyWrite = [
+    ...new Set([
+      ...expand(fs?.denyWrite ?? [], { mode: 'deny' }),
+      ...mandatoryDenyWrite,
+    ]),
+  ]
   return {
     // `allowRead` also serves as `allowWithinDeny`: a file under a
     // denied dir gets an explicit ALLOW ACE for the sandbox user,
@@ -1331,6 +1342,8 @@ function rawWindowsFsInputs(c: SandboxRuntimeConfig) {
     allowRead: [...(c.filesystem.allowRead ?? [])],
     allowWrite: [...c.filesystem.allowWrite],
     credFiles: getCredentialDenyReadPaths(c.credentials),
+    allowGitConfig: c.filesystem.allowGitConfig ?? false,
+    mandatoryDenySearchDepth: c.mandatoryDenySearchDepth,
   }
 }
 
@@ -1350,7 +1363,9 @@ function sameRawWindowsFsInputs(
     setEq(a.denyWrite, b.denyWrite) &&
     setEq(a.allowRead, b.allowRead) &&
     setEq(a.allowWrite, b.allowWrite) &&
-    setEq(a.credFiles, b.credFiles)
+    setEq(a.credFiles, b.credFiles) &&
+    a.allowGitConfig === b.allowGitConfig &&
+    a.mandatoryDenySearchDepth === b.mandatoryDenySearchDepth
   )
 }
 
