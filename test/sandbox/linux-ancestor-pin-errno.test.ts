@@ -130,7 +130,7 @@ describe.if(isLinux)(
       )
       // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
       await expect(wrap(proj)).rejects.toThrow(
-        /cannot lstat .*Refusing to build a mount plan/s,
+        /cannot verify .*Fix its permissions/s,
       )
       expect(lstatHits).toBeGreaterThan(0)
     })
