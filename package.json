@@ -84,5 +84,9 @@
       "eslint --fix --cache --cache-location=node_modules/.cache/.eslintcache",
       "prettier --write"
     ]
+  },
+  "overrides": {
+    "brace-expansion@1": "^1.1.18",
+    "brace-expansion@2": "^2.1.4"
   }
 }
