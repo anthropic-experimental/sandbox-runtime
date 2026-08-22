@@ -13,7 +13,11 @@ import {
   createServer as createHttpsServer,
   request as httpsRequest,
 } from 'node:https'
-import type { IncomingMessage, ServerResponse } from 'node:http'
+import type {
+  IncomingHttpHeaders,
+  IncomingMessage,
+  ServerResponse,
+} from 'node:http'
 import { connect, isIP } from 'node:net'
 import { unlink } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -135,6 +139,39 @@ function relayPullMode(src: Duplex, dst: Duplex): void {
   }
   pump()
   src.once('end', () => dst.end())
+}
+
+/**
+ * Convert Unicode response-header values into the Latin-1 byte strings
+ * accepted by Node's `ServerResponse.writeHead`.
+ *
+ * Bun's HTTPS client can decode a raw UTF-8 header value into Unicode before
+ * it reaches this proxy. Forwarding that value verbatim makes Node throw
+ * `ERR_INVALID_CHAR` from the asynchronous upstream-response callback,
+ * which escapes the request promise and can terminate the host process. The
+ * proxy should preserve the upstream bytes where possible: encode only code
+ * points outside Latin-1 back to their UTF-8 bytes represented as a Latin-1
+ * string. Values already in the accepted byte range are unchanged.
+ */
+function sanitizeResponseHeaderValue(value: string): string {
+  return value.replace(/[\u0100-\u{10ffff}]/gu, character =>
+    Buffer.from(character, 'utf8').toString('latin1'),
+  )
+}
+
+export function sanitizeResponseHeaders(
+  headers: IncomingHttpHeaders,
+): IncomingHttpHeaders {
+  return Object.fromEntries(
+    Object.entries(headers).map(([name, value]) => [
+      name,
+      Array.isArray(value)
+        ? value.map(sanitizeResponseHeaderValue)
+        : value === undefined
+          ? undefined
+          : sanitizeResponseHeaderValue(value),
+    ]),
+  )
 }
 
 export type TerminateTarget = {
@@ -550,7 +587,10 @@ async function forwardUpstream(
         )
         res.destroy()
       })
-      res.writeHead(upRes.statusCode ?? 502, stripHopByHop(upRes.headers))
+      res.writeHead(
+        upRes.statusCode ?? 502,
+        sanitizeResponseHeaders(stripHopByHop(upRes.headers)),
+      )
       upRes.pipe(res)
     },
   )

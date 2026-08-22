@@ -1,5 +1,7 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
 import { createServer as createHttpsServer } from 'node:https'
+import { createServer as createHttpServer } from 'node:http'
+import { createServer as createTlsServer } from 'node:tls'
 import type { Server, AddressInfo } from 'node:net'
 import type { TLSSocket } from 'node:tls'
 import { spawn } from 'node:child_process'
@@ -10,12 +12,45 @@ import forge from 'node-forge'
 import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
 import { createMitmCA, disposeMitmCA } from '../../src/sandbox/mitm-ca.js'
 import { mintLeafCert } from '../../src/sandbox/mitm-leaf.js'
+import { sanitizeResponseHeaders } from '../../src/sandbox/tls-terminate-proxy.js'
 
 // Committed test-only CA — see test/fixtures/tls-terminate/README.md.
 const FIXTURE_DIR = join(import.meta.dir, '..', 'fixtures', 'tls-terminate')
 const CA_CERT = join(FIXTURE_DIR, 'ca.crt')
 const CA_KEY = join(FIXTURE_DIR, 'ca.key')
 const CA_PEM = readFileSync(CA_CERT, 'utf8')
+
+describe('tls-terminate-proxy: response header sanitization', () => {
+  test('preserves non-Latin-1 header bytes without crashing writeHead', async () => {
+    const filename = '中文名.pdf'
+    const headers = sanitizeResponseHeaders({
+      'content-disposition': `attachment; filename="${filename}"`,
+      'set-cookie': ['one=1', 'two=2'],
+    })
+    const encodedFilename = Buffer.from(filename, 'utf8').toString('latin1')
+
+    expect(headers['content-disposition']).toBe(
+      `attachment; filename="${encodedFilename}"`,
+    )
+    expect(headers['set-cookie']).toEqual(['one=1', 'two=2'])
+
+    const server = createHttpServer((_req, res) => {
+      expect(() => res.writeHead(200, headers)).not.toThrow()
+      res.end('ok')
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    const address = server.address()
+    if (!address || typeof address === 'string') throw new Error('no port')
+    try {
+      // eslint-disable-next-line eslint-plugin-n/no-unsupported-features/node-builtins -- bun:test runtime has stable fetch
+      const response = await fetch(`http://127.0.0.1:${address.port}`)
+      expect(response.status).toBe(200)
+      expect(await response.text()).toBe('ok')
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    }
+  })
+})
 
 // Drive the proxy with curl so we exercise a real CONNECT-through-proxy
 // client. (Bun's https.request ignores createConnection, so an in-process
@@ -105,6 +140,50 @@ describe('tls-terminate-proxy: end-to-end through createHttpProxyServer', () => 
     expect(r.exit).toBe(0)
     expect(r.status).toBe(200)
     expect(JSON.parse(r.body).path).toBe('/ping')
+  })
+
+  test('forwards UTF-8 response header bytes without crashing the proxy', async () => {
+    const upCert = mintLeafCert(ca, '127.0.0.1')
+    const leafOnly = upCert.certPem.match(
+      /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----\r?\n?/,
+    )![0]
+    const rawUpstream = createTlsServer(
+      { cert: leafOnly, key: upCert.keyPem },
+      socket => {
+        socket.once('data', () => {
+          socket.end(
+            Buffer.concat([
+              Buffer.from(
+                'HTTP/1.1 200 OK\r\nContent-Disposition: attachment; filename="',
+              ),
+              Buffer.from('中文名.pdf', 'utf8'),
+              Buffer.from(
+                '"\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok',
+              ),
+            ]),
+          )
+        })
+      },
+    )
+    await new Promise<void>(resolve =>
+      rawUpstream.listen(0, '127.0.0.1', resolve),
+    )
+    const address = rawUpstream.address()
+    if (!address || typeof address === 'string') throw new Error('no port')
+    try {
+      const r = await curlViaProxy(
+        proxyPort,
+        `https://127.0.0.1:${address.port}/utf8-header`,
+      )
+      expect(r.exit).toBe(0)
+      expect(r.status).toBe(200)
+      expect(r.headers['content-disposition']).toBe(
+        'attachment; filename="中文名.pdf"',
+      )
+      expect(r.body).toBe('ok')
+    } finally {
+      await new Promise<void>(resolve => rawUpstream.close(() => resolve()))
+    }
   })
 
   test('serves the empty CRL at GET /srt.crl (Schannel revocation)', async () => {
