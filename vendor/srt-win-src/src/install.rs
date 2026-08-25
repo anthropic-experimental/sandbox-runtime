@@ -354,9 +354,7 @@ impl Drop for SandboxCred {
     fn drop(&mut self) {
         // SAFETY: writing zeros into the String's bytes keeps it
         // valid UTF-8.
-        for b in unsafe { self.pw.as_mut_vec() } {
-            *b = 0;
-        }
+        unsafe { self.pw.as_mut_vec() }.fill(0);
     }
 }
 
