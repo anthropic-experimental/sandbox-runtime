@@ -927,7 +927,9 @@ async function generateFilesystemArgs(
   // path whose deepest existing ancestor lies within one of these is already
   // uncreatable, and must not get a /dev/null stub: bwrap would have to
   // creat() the mount point inside that read-only mount and abort ("Can't
-  // create file at <path>: Read-only file system"). The spellings matter
+  // create file at <path>: Read-only file system"). An EXISTING deny path
+  // strictly beneath one is likewise already unwritable and its own
+  // --ro-bind <p> <p> is skipped as redundant. The spellings matter
   // because the emission filter and the denyRead re-application compare raw
   // spellings as well as the resolved dest, so the stub-skip guard tests a
   // covering directory in its canonical form AND every recorded spelling.
@@ -1423,6 +1425,32 @@ async function generateFilesystemArgs(
       const isWithinAllowedPath = isWithinAnyAllowedWritePath(normalizedPath)
 
       if (isWithinAllowedPath) {
+        // The existing-path twin of the stub skip above: a path STRICTLY
+        // beneath a directory that another deny re-binds read-only is
+        // already unwritable there, so its own --ro-bind <p> <p> is a
+        // redundant mount (one per mandatory-deny file under a write-denied
+        // checkout adds up). Same evidence, same vetoes: the covering
+        // directory comes from the order-independent pre-pass and must pass
+        // coveringDirIsUnsafe, which also guarantees its bind survives the
+        // emission filter. Equality is deliberately excluded — a deny that
+        // IS an allowWrite root (cwd both allowed and denied) is the covering
+        // bind itself. A dest reached through a symlinked spelling keeps its
+        // bind: the tmpfs/mask re-application passes below key off emitted
+        // raw spellings, and the covering directory's bind does not carry
+        // this one's.
+        const coveringReadOnlyDenyDirs = readOnlyDenyDirs.filter(denyDir =>
+          normalizedPath.startsWith(denyDir + '/'),
+        )
+        if (
+          rawPath === normalizedPath &&
+          coveringReadOnlyDenyDirs.length > 0 &&
+          !coveringReadOnlyDenyDirs.some(coveringDirIsUnsafe)
+        ) {
+          logForDebugging(
+            `[Sandbox Linux] Skipping deny path already under read-only denied directory: ${normalizedPath}`,
+          )
+          continue
+        }
         denyWriteArgs.push('--ro-bind', normalizedPath, normalizedPath)
         denyWriteRawDests.set(normalizedPath, rawPath)
       } else {
