@@ -42,6 +42,7 @@ import type {
 import {
   wrapCommandWithSandboxLinux,
   wrapCommandWithSandboxLinuxArgv,
+  expandReadDenyGlobLinux,
   initializeLinuxNetworkBridge,
   type LinuxNetworkBridgeContext,
   type LinuxSandboxParams,
@@ -1183,22 +1184,8 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     ),
   )
 
-  const denyPaths: string[] = []
-  for (const p of rawDenyRead) {
-    const stripped = removeTrailingGlobSuffix(p)
-    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-      // Expand glob to concrete paths on Linux (bubblewrap doesn't support globs)
-      const expanded = expandGlobPattern(p)
-      logForDebugging(
-        `[Sandbox] Expanded glob pattern "${p}" to ${expanded.length} paths on Linux`,
-      )
-      denyPaths.push(...expanded)
-    } else {
-      denyPaths.push(stripped)
-    }
-  }
-
-  // Process allowRead paths (re-allow within denied regions)
+  // Process allowRead paths (re-allow within denied regions). Resolved
+  // before denyRead: the Linux glob expansion below collapses against them.
   const allowPaths: string[] = []
   for (const p of config.filesystem.allowRead ?? []) {
     const stripped = removeTrailingGlobSuffix(p)
@@ -1210,6 +1197,22 @@ function getFsReadConfig(): FsReadRestrictionConfig {
       allowPaths.push(...expanded)
     } else {
       allowPaths.push(stripped)
+    }
+  }
+
+  const denyPaths: string[] = []
+  let reExposedPaths: string[] | undefined
+  for (const p of rawDenyRead) {
+    const stripped = removeTrailingGlobSuffix(p)
+    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
+      // Expand glob to concrete paths on Linux (bubblewrap doesn't support
+      // globs), collapsed to the fewest mounts that deny the same set.
+      if (reExposedPaths === undefined) {
+        reExposedPaths = [...allowPaths, ...getFsWriteConfig().allowOnly]
+      }
+      denyPaths.push(...expandReadDenyGlobLinux(p, reExposedPaths))
+    } else {
+      denyPaths.push(stripped)
     }
   }
 
@@ -1606,15 +1609,9 @@ async function preparePosixSandboxParams(
       customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
       credentialRestrictions,
     )
-    const expandedDenyRead: string[] = []
-    for (const p of rawDenyRead) {
-      const stripped = removeTrailingGlobSuffix(p)
-      if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-        expandedDenyRead.push(...expandGlobPattern(p))
-      } else {
-        expandedDenyRead.push(stripped)
-      }
-    }
+    // allowRead is resolved first: on Linux a denyRead glob's expansion is
+    // collapsed against the paths that re-expose contents under a denied
+    // directory (allowRead + allowWrite), so both must be final here.
     const rawAllowRead =
       customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? []
     const expandedAllowRead: string[] = []
@@ -1635,6 +1632,16 @@ async function preparePosixSandboxParams(
     // Likewise the JVM proxy agent jar JAVA_TOOL_OPTIONS points at.
     if (javaAgentJarPath) {
       expandedAllowRead.push(javaAgentJarPath)
+    }
+    const reExposedPaths = [...expandedAllowRead, ...writeConfig.allowOnly]
+    const expandedDenyRead: string[] = []
+    for (const p of rawDenyRead) {
+      const stripped = removeTrailingGlobSuffix(p)
+      if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
+        expandedDenyRead.push(...expandReadDenyGlobLinux(p, reExposedPaths))
+      } else {
+        expandedDenyRead.push(stripped)
+      }
     }
     readConfig = {
       denyOnly: expandedDenyRead,

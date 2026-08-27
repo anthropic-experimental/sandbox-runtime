@@ -48,6 +48,7 @@ export {
   type BwrapArgvSummary,
   type BwrapArgvTerm,
   describeBwrapArgv,
+  READ_DENY_GLOB_MOUNT_WARN_THRESHOLD,
 } from './sandbox/linux-sandbox-utils.js'
 
 // Windows install/status API

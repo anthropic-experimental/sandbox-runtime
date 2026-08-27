@@ -16,6 +16,8 @@ import {
   normalizeCaseForComparison,
   isSymlinkOutsideBoundary,
   encodeSandboxedCommand,
+  expandGlobPattern,
+  removeTrailingGlobSuffix,
   DANGEROUS_FILES,
   getDangerousDirectories,
 } from './sandbox-utils.js'
@@ -839,6 +841,131 @@ function resolveSymlinkDenyDest(normalizedPath: string): string {
     // Dangling symlink or vanished path — keep the original.
   }
   return normalizedPath
+}
+
+/**
+ * A single read-deny glob that still needs more than this many mounts after
+ * {@link collapseReadDenyMounts} is reported at warn level. Every mount is
+ * three bwrap argv words, so a broad pattern over a large tree (`**\/*.log`
+ * in a monorepo) is what pushes the invocation towards the kernel's argument
+ * limits. The expansion is never truncated — that would silently un-deny
+ * paths — only surfaced.
+ */
+export const READ_DENY_GLOB_MOUNT_WARN_THRESHOLD = 256
+
+/**
+ * Reduce one read-deny glob's expansion to the mounts that actually change
+ * what the sandbox can read.
+ *
+ * The denyRead loop in generateFilesystemArgs mounts a `--tmpfs` over every
+ * matched directory and `--ro-bind /dev/null` over every matched file. A
+ * tmpfs already hides the directory's whole subtree, so a match strictly
+ * beneath another matched directory adds a mount without denying anything
+ * new — unless something between the two re-exposes host contents: the loop
+ * re-binds allowRead paths (`--ro-bind`) and allowed write paths (`--bind`)
+ * that sit at or under a tmpfs (see pushReadDenyDirMounts), and a match under
+ * such a re-bind is readable again without its own mount.
+ *
+ * So: walk matches shallow-first and drop a match only when some kept proper
+ * ancestor covers it AND no re-exposing path lies at-or-under that ancestor
+ * and at-or-above the match. A kept ancestor with descendants among the
+ * matches is necessarily a directory (readdir found entries beneath it), so
+ * it gets a tmpfs. All inputs are absolute, normalized, slash-free-suffix
+ * spellings — the same strings the loop later compares by prefix.
+ */
+export function collapseReadDenyMounts(
+  matches: readonly string[],
+  reExposedPaths: readonly string[],
+): string[] {
+  const isAtOrUnder = (candidate: string, dir: string): boolean =>
+    candidate === dir || candidate.startsWith(dir === '/' ? '/' : dir + '/')
+  const depth = (p: string): number => p.split('/').length
+  const sorted = [...new Set(matches)].sort(
+    (a, b) => depth(a) - depth(b) || (a < b ? -1 : a > b ? 1 : 0),
+  )
+
+  const kept: string[] = []
+  const keptSet = new Set<string>()
+  for (const candidate of sorted) {
+    let covered = false
+    // Proper ancestors only (slash > 0 skips both the candidate itself and
+    // the root, which expandGlobPattern never yields).
+    for (
+      let slash = candidate.lastIndexOf('/');
+      slash > 0;
+      slash = candidate.lastIndexOf('/', slash - 1)
+    ) {
+      const ancestor = candidate.slice(0, slash)
+      if (!keptSet.has(ancestor)) continue
+      const reExposedBetween = reExposedPaths.some(
+        reExposed =>
+          isAtOrUnder(reExposed, ancestor) && isAtOrUnder(candidate, reExposed),
+      )
+      if (!reExposedBetween) {
+        covered = true
+        break
+      }
+    }
+    if (!covered) {
+      kept.push(candidate)
+      keptSet.add(candidate)
+    }
+  }
+  return kept
+}
+
+/**
+ * Expand a read-deny glob into the concrete paths bwrap should mount over,
+ * collapsing redundant descendants (see {@link collapseReadDenyMounts}).
+ *
+ * For a pattern with a trailing `/**` the directories matched by its
+ * directory form (the pattern without that suffix) are added to the
+ * candidate set first: `**\/build/**` on its own matches only the entries
+ * beneath each `build/`, never `build/` itself, so nothing would collapse.
+ * Only real directories are taken from the directory form (lstat, so a
+ * symlink named `build` is not newly denied and a file named `build` keeps
+ * today's semantics); every path the full pattern matches sits under one of
+ * them, so the result is a tmpfs per `build/` directory instead of a mount
+ * per file inside it.
+ *
+ * `reExposedPaths` are the caller's allowRead and allowWrite entries (any
+ * spelling normalizePathForSandbox accepts); they keep a descendant's own
+ * mount wherever the denyRead loop would re-bind host contents between it
+ * and its covering directory.
+ */
+export function expandReadDenyGlobLinux(
+  globPattern: string,
+  reExposedPaths: readonly string[],
+): string[] {
+  const matches = expandGlobPattern(globPattern)
+  const directoryForm = removeTrailingGlobSuffix(globPattern)
+  if (directoryForm !== globPattern) {
+    for (const dir of expandGlobPattern(directoryForm)) {
+      try {
+        if (fs.lstatSync(dir).isDirectory()) matches.push(dir)
+      } catch {
+        // Vanished between readdir and here — nothing to mount over.
+      }
+    }
+  }
+
+  const normalizedReExposed = reExposedPaths.map(
+    p => normalizePathForSandbox(p).replace(/\/+$/, '') || '/',
+  )
+  const mounts = collapseReadDenyMounts(matches, normalizedReExposed)
+
+  logForDebugging(
+    `[Sandbox Linux] Expanded denyRead glob "${globPattern}": ${matches.length} matches -> ${mounts.length} mounts`,
+  )
+  if (mounts.length > READ_DENY_GLOB_MOUNT_WARN_THRESHOLD) {
+    logForDebugging(
+      `[Sandbox Linux] denyRead glob "${globPattern}" still needs ${mounts.length} mounts after collapsing ` +
+        `(threshold ${READ_DENY_GLOB_MOUNT_WARN_THRESHOLD}); each is a separate bwrap bind and a very ` +
+        `large set can exceed the kernel argument-size limits. Prefer denying the enclosing directories.`,
+      { level: 'warn' },
+    )
+  }
+  return mounts
 }
 
 /**
