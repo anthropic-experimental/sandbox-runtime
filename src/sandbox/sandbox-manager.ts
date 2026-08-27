@@ -41,8 +41,10 @@ import type {
 } from './sandbox-schemas.js'
 import {
   wrapCommandWithSandboxLinux,
+  wrapCommandWithSandboxLinuxArgv,
   initializeLinuxNetworkBridge,
   type LinuxNetworkBridgeContext,
+  type LinuxSandboxParams,
   checkLinuxDependencies,
   type SandboxDependencyCheck,
   cleanupBwrapMountPoints,
@@ -50,6 +52,7 @@ import {
 import {
   wrapCommandWithSandboxMacOS,
   startMacOSSandboxLogMonitor,
+  type MacOSSandboxParams,
 } from './macos-sandbox-utils.js'
 import {
   startLinuxSandboxViolationMonitor,
@@ -1516,13 +1519,25 @@ export type WrapWithSandboxOptions = {
   commandText?: string
 }
 
-async function wrapWithSandbox(
+/**
+ * Platform wrapper inputs derived from the effective config. macOS and Linux
+ * share every derivation step (filesystem policy, credential restrictions,
+ * network flags) and differ only in which wrapper consumes the result, so
+ * {@link wrapWithSandbox} (shell string) and {@link wrapWithSandboxArgv}
+ * (spawn vector) both go through {@link preparePosixSandboxParams} and pick
+ * the output form afterwards.
+ */
+type PosixSandboxParams =
+  | { platform: 'macos'; params: MacOSSandboxParams }
+  | { platform: 'linux'; params: LinuxSandboxParams }
+
+async function preparePosixSandboxParams(
   command: string,
-  binShell?: string,
-  customConfig?: Partial<SandboxRuntimeConfig>,
-  abortSignal?: AbortSignal,
-  options?: WrapWithSandboxOptions,
-): Promise<string> {
+  binShell: string | undefined,
+  customConfig: Partial<SandboxRuntimeConfig> | undefined,
+  abortSignal: AbortSignal | undefined,
+  options: WrapWithSandboxOptions | undefined,
+): Promise<PosixSandboxParams> {
   const platform = getPlatform()
   const commandId = options?.commandId
   registerCommandText(command, options)
@@ -1659,80 +1674,87 @@ async function wrapWithSandbox(
   switch (platform) {
     case 'macos':
       // macOS sandbox profile supports glob patterns directly, no ripgrep needed
-      return wrapCommandWithSandboxMacOS({
-        command,
-        commandId,
-        needsNetworkRestriction,
-        // Only pass proxy ports if proxy is running (when there are domains to filter)
-        httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
-        socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
-        proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
-        caCertPath: mitmCA?.trustBundlePath,
-        javaAgentJarPath: needsNetworkProxy ? javaAgentJarPath : undefined,
-        readConfig,
-        writeConfig,
-        unsetEnvVars: credentialRestrictions.unsetEnvVars,
-        setEnvVars: credentialRestrictions.setEnvVars,
-        maskedFileBinds: credentialRestrictions.maskedFileBinds,
-        allowUnixSockets: getAllowUnixSockets(),
-        allowAllUnixSockets: getAllowAllUnixSockets(),
-        allowLocalBinding: getAllowLocalBinding(),
-        allowMachLookup: getAllowMachLookup(),
-        ignoreViolations: getIgnoreViolations(),
-        allowPty,
-        allowGitConfig: getAllowGitConfig(),
-        gitSafeDirectories,
-        enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
-        allowAppleEvents: getAllowAppleEvents(),
-        binShell,
-      })
+      return {
+        platform,
+        params: {
+          command,
+          commandId,
+          needsNetworkRestriction,
+          // Only pass proxy ports if proxy is running (when there are domains to filter)
+          httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
+          socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
+          proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
+          caCertPath: mitmCA?.trustBundlePath,
+          javaAgentJarPath: needsNetworkProxy ? javaAgentJarPath : undefined,
+          readConfig,
+          writeConfig,
+          unsetEnvVars: credentialRestrictions.unsetEnvVars,
+          setEnvVars: credentialRestrictions.setEnvVars,
+          maskedFileBinds: credentialRestrictions.maskedFileBinds,
+          allowUnixSockets: getAllowUnixSockets(),
+          allowAllUnixSockets: getAllowAllUnixSockets(),
+          allowLocalBinding: getAllowLocalBinding(),
+          allowMachLookup: getAllowMachLookup(),
+          ignoreViolations: getIgnoreViolations(),
+          allowPty,
+          allowGitConfig: getAllowGitConfig(),
+          gitSafeDirectories,
+          enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
+          allowAppleEvents: getAllowAppleEvents(),
+          binShell,
+        },
+      }
 
     case 'linux':
-      return wrapCommandWithSandboxLinux({
-        command,
-        commandId,
-        needsNetworkRestriction,
-        // Only pass socket paths if proxy is running (when there are domains to filter)
-        httpSocketPath: needsNetworkProxy
-          ? getLinuxHttpSocketPath()
-          : undefined,
-        socksSocketPath: needsNetworkProxy
-          ? getLinuxSocksSocketPath()
-          : undefined,
-        httpProxyPort: needsNetworkProxy
-          ? managerContext?.httpProxyPort
-          : undefined,
-        socksProxyPort: needsNetworkProxy
-          ? managerContext?.socksProxyPort
-          : undefined,
-        proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
-        caCertPath: mitmCA?.trustBundlePath,
-        javaAgentJarPath: needsNetworkProxy ? javaAgentJarPath : undefined,
-        readConfig,
-        writeConfig,
-        unsetEnvVars: credentialRestrictions.unsetEnvVars,
-        setEnvVars: credentialRestrictions.setEnvVars,
-        maskedFileBinds: credentialRestrictions.maskedFileBinds,
-        maskedFileStoreDir: credentialRestrictions.maskedFileStoreDir,
-        enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
-        allowAllUnixSockets: getAllowAllUnixSockets(),
-        binShell,
-        ripgrepConfig: getRipgrepConfig(),
-        mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
-        allowGitConfig: getAllowGitConfig(),
-        gitSafeDirectories,
-        seccompConfig: getSeccompConfig(),
-        bwrapPath: config?.bwrapPath,
-        socatPath: config?.socatPath,
-        observeSocketPath: linuxMonitor?.observeSocketPath,
-        abortSignal,
-      })
+      return {
+        platform,
+        params: {
+          command,
+          commandId,
+          needsNetworkRestriction,
+          // Only pass socket paths if proxy is running (when there are domains to filter)
+          httpSocketPath: needsNetworkProxy
+            ? getLinuxHttpSocketPath()
+            : undefined,
+          socksSocketPath: needsNetworkProxy
+            ? getLinuxSocksSocketPath()
+            : undefined,
+          httpProxyPort: needsNetworkProxy
+            ? managerContext?.httpProxyPort
+            : undefined,
+          socksProxyPort: needsNetworkProxy
+            ? managerContext?.socksProxyPort
+            : undefined,
+          proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
+          caCertPath: mitmCA?.trustBundlePath,
+          javaAgentJarPath: needsNetworkProxy ? javaAgentJarPath : undefined,
+          readConfig,
+          writeConfig,
+          unsetEnvVars: credentialRestrictions.unsetEnvVars,
+          setEnvVars: credentialRestrictions.setEnvVars,
+          maskedFileBinds: credentialRestrictions.maskedFileBinds,
+          maskedFileStoreDir: credentialRestrictions.maskedFileStoreDir,
+          enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
+          allowAllUnixSockets: getAllowAllUnixSockets(),
+          binShell,
+          ripgrepConfig: getRipgrepConfig(),
+          mandatoryDenySearchDepth: getMandatoryDenySearchDepth(),
+          allowGitConfig: getAllowGitConfig(),
+          gitSafeDirectories,
+          seccompConfig: getSeccompConfig(),
+          bwrapPath: config?.bwrapPath,
+          socatPath: config?.socatPath,
+          observeSocketPath: linuxMonitor?.observeSocketPath,
+          abortSignal,
+        },
+      }
 
     case 'windows':
       // Windows wraps to an argv array, not a shell string. Forcing
       // callers through wrapWithSandboxArgv() means they spawn with
       // {shell:false}, which is the security boundary that keeps the
-      // user's command bytes off the HOST shell.
+      // user's command bytes off the HOST shell. (wrapWithSandboxArgv
+      // handles Windows itself and never reaches here.)
       throw new Error(
         'wrapWithSandbox() returns a shell string and is not supported ' +
           'on Windows. Use SandboxManager.wrapWithSandboxArgv() and ' +
@@ -1747,6 +1769,28 @@ async function wrapWithSandbox(
   }
 }
 
+async function wrapWithSandbox(
+  command: string,
+  binShell?: string,
+  customConfig?: Partial<SandboxRuntimeConfig>,
+  abortSignal?: AbortSignal,
+  options?: WrapWithSandboxOptions,
+): Promise<string> {
+  const prepared = await preparePosixSandboxParams(
+    command,
+    binShell,
+    customConfig,
+    abortSignal,
+    options,
+  )
+  switch (prepared.platform) {
+    case 'macos':
+      return wrapCommandWithSandboxMacOS(prepared.params)
+    case 'linux':
+      return wrapCommandWithSandboxLinux(prepared.params)
+  }
+}
+
 /**
  * Wrap `command` for the sandbox and return a spawn descriptor:
  * `{ argv, env }`, suitable for
@@ -1756,10 +1800,15 @@ async function wrapWithSandbox(
  * {@link wrapWithSandbox}); `env` is the broker process's spawn env
  * — the sandboxed child gets a fresh `srt-sandbox` profile env with
  * only the `--env` overlay baked into `argv` (see
- * {@link wrapCommandWithSandboxWindows}). On
- * macOS/Linux `argv` is `[binShell, '-c', <wrapWithSandbox result>]`
- * (proxy env is baked into that command) and `env` is the unchanged
- * `process.env`, so callers can spawn uniformly across platforms.
+ * {@link wrapCommandWithSandboxWindows}). On Linux `argv` is the
+ * bwrap invocation itself (`['bwrap', ...options, '--', shell, '-c',
+ * innerScript]`, proxy env baked in as `--setenv`), so no single
+ * element carries the whole mount profile and only `innerScript` is
+ * subject to the kernel's 128 KiB per-argument limit; when the
+ * effective config needs no sandbox it is `[binShell, '-c', command]`.
+ * On macOS `argv` is `[binShell, '-c', <wrapWithSandbox result>]`.
+ * On both, `env` is the unchanged `process.env`, so callers can spawn
+ * uniformly across platforms.
  *
  * @param cwd the working directory the caller will spawn the result
  *   with. On Windows the child's cwd is whatever the caller passes
@@ -1878,15 +1927,13 @@ async function wrapWithSandboxArgv(
     })
   }
 
-  // macOS/Linux: delegate to the existing string wrapper, then put
-  // the result behind `<shell> -c` so the caller's argv-spawn works.
   if (typeof binShell === 'object') {
     throw new Error(
       'binShell object form is Windows-only; pass a shell path string ' +
         'on macOS/Linux',
     )
   }
-  const wrapped = await wrapWithSandbox(
+  const prepared = await preparePosixSandboxParams(
     command,
     binShell,
     customConfig,
@@ -1894,7 +1941,25 @@ async function wrapWithSandboxArgv(
     options,
   )
   const shell = binShell ?? '/bin/bash'
-  return { argv: [shell, '-c', wrapped], env: process.env }
+  switch (prepared.platform) {
+    case 'linux': {
+      // The real bwrap vector: spawning it with {shell:false} keeps the
+      // mount profile spread across many small argv elements instead of
+      // one `sh -c <everything>` string, so only the inner script counts
+      // against the kernel's 128 KiB per-argument cap. `null` means the
+      // params called for no sandbox — run the command under the shell
+      // exactly as the string form would have.
+      const argv = await wrapCommandWithSandboxLinuxArgv(prepared.params)
+      return { argv: argv ?? [shell, '-c', command], env: process.env }
+    }
+    case 'macos': {
+      // sandbox-exec -p takes the whole profile inline as one argument, so
+      // a real argv would not shrink the largest element; keep delegating
+      // to the string wrapper behind `<shell> -c`.
+      const wrapped = wrapCommandWithSandboxMacOS(prepared.params)
+      return { argv: [shell, '-c', wrapped], env: process.env }
+    }
+  }
 }
 
 /**

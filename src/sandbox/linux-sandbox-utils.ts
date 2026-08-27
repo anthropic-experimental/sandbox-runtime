@@ -1682,10 +1682,21 @@ async function generateFilesystemArgs(
  * - To use sandboxing without Unix socket blocking on unsupported architectures,
  *   set allowAllUnixSockets: true in your configuration
  * Dependencies are checked by checkLinuxDependencies() before enabling the sandbox.
+ *
+ * RETURN SHAPE:
+ * The bwrap invocation as an argv vector — `[bwrap, ...options, '--', shell,
+ * '-c', innerScript]` — for `spawn(argv[0], argv.slice(1), {shell: false})`,
+ * or `null` when the params call for no sandboxing at all (the caller runs
+ * `command` as-is). Spawning the vector directly matters on Linux: the kernel
+ * caps every single argv element at MAX_ARG_STRLEN (128 KiB) independently of
+ * the ~2 MiB ARG_MAX total, and the shell-string form
+ * ({@link wrapCommandWithSandboxLinux}) puts the entire mount profile into ONE
+ * element of the caller's `sh -c <string>`. As a vector, only `innerScript`
+ * (the user command plus fixed plumbing) is subject to the per-element cap.
  */
-export async function wrapCommandWithSandboxLinux(
+export async function wrapCommandWithSandboxLinuxArgv(
   params: LinuxSandboxParams,
-): Promise<string> {
+): Promise<string[] | null> {
   const {
     command,
     commandId,
@@ -1737,7 +1748,7 @@ export async function wrapCommandWithSandboxLinux(
     !hasEnvRestrictions &&
     !hasGitConfig
   ) {
-    return command
+    return null
   }
 
   // Mark this sandbox invocation as active. cleanupBwrapMountPoints() will
@@ -2001,7 +2012,7 @@ export async function wrapCommandWithSandboxLinux(
       bwrapArgs.push(command)
     }
 
-    const wrappedCommand = quote([bwrapPath ?? 'bwrap', ...bwrapArgs])
+    const argv = [bwrapPath ?? 'bwrap', ...bwrapArgs]
 
     const restrictions = []
     if (needsNetworkRestriction) restrictions.push('network')
@@ -2014,7 +2025,7 @@ export async function wrapCommandWithSandboxLinux(
       `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,
     )
 
-    return wrappedCommand
+    return argv
   } catch (error) {
     // Undo the activeSandboxCount increment — the caller won't call
     // cleanupBwrapMountPoints() for a wrap that threw.
@@ -2023,4 +2034,149 @@ export async function wrapCommandWithSandboxLinux(
     }
     throw error
   }
+}
+
+/**
+ * Shell-string form of {@link wrapCommandWithSandboxLinuxArgv}: the same
+ * bwrap invocation rendered through {@link quote} for `sh -c`, or `command`
+ * unchanged when no sandboxing is needed. Identical side effects (mount-point
+ * bookkeeping, active-sandbox count). Prefer the argv form when the caller
+ * can spawn without a shell — see RETURN SHAPE on the argv function for why.
+ */
+export async function wrapCommandWithSandboxLinux(
+  params: LinuxSandboxParams,
+): Promise<string> {
+  const argv = await wrapCommandWithSandboxLinuxArgv(params)
+  return argv === null ? params.command : quote(argv)
+}
+
+/** Mount/env categories {@link describeBwrapArgv} breaks a bwrap argv into. */
+export type BwrapArgvTerm =
+  | 'roBindSelf'
+  | 'roBindDevNull'
+  | 'roBindOther'
+  | 'bind'
+  | 'tmpfs'
+  | 'setenv'
+  | 'other'
+
+/** Size breakdown of a bwrap argv; see {@link describeBwrapArgv}. */
+export interface BwrapArgvSummary {
+  /** Bytes execve() charges for the whole vector: UTF-8 length + 1 (the
+   *  terminating NUL) per element. */
+  totalBytes: number
+  /** The largest single element, same accounting. This is the number to
+   *  compare against Linux's per-argument MAX_ARG_STRLEN (128 KiB). */
+  largestArgBytes: number
+  /** The inner shell script — the final element after `--` — same
+   *  accounting; 0 when the vector has no `--` trailer. */
+  innerCommandBytes: number
+  /** Occurrences per term. A mount/env option and its operands count once;
+   *  under `other`, every remaining element (argv[0], bare flags, `--dev
+   *  /dev`, the `--` trailer words) counts individually. */
+  counts: Record<BwrapArgvTerm, number>
+  /** Bytes per term, same accounting as totalBytes; the terms partition the
+   *  vector, so these sum to totalBytes. */
+  bytes: Record<BwrapArgvTerm, number>
+}
+
+/** Operand counts for the bwrap options this module emits (plus close
+ *  relatives). Unknown `--options` are treated as bare flags. */
+const BWRAP_OPTION_ARITY: Readonly<Record<string, number>> = {
+  '--ro-bind': 2,
+  '--bind': 2,
+  '--dev-bind': 2,
+  '--ro-bind-try': 2,
+  '--bind-try': 2,
+  '--dev-bind-try': 2,
+  '--symlink': 2,
+  '--setenv': 2,
+  '--tmpfs': 1,
+  '--unsetenv': 1,
+  '--dev': 1,
+  '--proc': 1,
+  '--dir': 1,
+  '--chdir': 1,
+  '--cap-add': 1,
+  '--cap-drop': 1,
+  '--remount-ro': 1,
+}
+
+/**
+ * Break a bwrap argv (as returned by {@link wrapCommandWithSandboxLinuxArgv})
+ * down by mount/env term, with execve()-style byte accounting, so an embedder
+ * that hits E2BIG — or wants to warn before it does — can say which part of
+ * the profile is responsible. Pure; never touches the filesystem.
+ */
+export function describeBwrapArgv(argv: readonly string[]): BwrapArgvSummary {
+  const argBytes = (s: string): number => Buffer.byteLength(s, 'utf8') + 1
+  const counts: Record<BwrapArgvTerm, number> = {
+    roBindSelf: 0,
+    roBindDevNull: 0,
+    roBindOther: 0,
+    bind: 0,
+    tmpfs: 0,
+    setenv: 0,
+    other: 0,
+  }
+  const bytes: Record<BwrapArgvTerm, number> = { ...counts }
+  let totalBytes = 0
+  let largestArgBytes = 0
+  for (const arg of argv) {
+    const n = argBytes(arg)
+    totalBytes += n
+    if (n > largestArgBytes) largestArgBytes = n
+  }
+
+  const account = (term: BwrapArgvTerm, from: number, to: number): void => {
+    counts[term]++
+    for (let k = from; k < to; k++) {
+      bytes[term] += argBytes(argv[k]!)
+    }
+  }
+
+  let innerCommandBytes = 0
+  let i = 0
+  if (argv.length > 0) {
+    account('other', 0, 1) // the bwrap executable itself
+    i = 1
+  }
+  while (i < argv.length) {
+    const option = argv[i]!
+    if (option === '--') {
+      // Trailer: shell, '-c', inner script. Each word is its own `other`.
+      for (let k = i; k < argv.length; k++) account('other', k, k + 1)
+      if (argv.length - 1 > i) {
+        innerCommandBytes = argBytes(argv[argv.length - 1]!)
+      }
+      break
+    }
+    const arity = BWRAP_OPTION_ARITY[option] ?? 0
+    const end = Math.min(i + 1 + arity, argv.length)
+    let term: BwrapArgvTerm = 'other'
+    if (option === '--ro-bind') {
+      const src = argv[i + 1]
+      const dest = argv[i + 2]
+      term =
+        src === '/dev/null'
+          ? 'roBindDevNull'
+          : src === dest
+            ? 'roBindSelf'
+            : 'roBindOther'
+    } else if (option === '--bind') {
+      term = 'bind'
+    } else if (option === '--tmpfs') {
+      term = 'tmpfs'
+    } else if (option === '--setenv') {
+      term = 'setenv'
+    }
+    if (term === 'other') {
+      for (let k = i; k < end; k++) account('other', k, k + 1)
+    } else {
+      account(term, i, end)
+    }
+    i = end
+  }
+
+  return { totalBytes, largestArgBytes, innerCommandBytes, counts, bytes }
 }
