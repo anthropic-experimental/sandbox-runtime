@@ -215,7 +215,7 @@ child.on('exit', async code => {
 })
 ```
 
-**Spawning without a shell (`wrapWithSandboxArgv`).** `SandboxManager.wrapWithSandboxArgv(command)` returns `{ argv, env }` for `spawn(argv[0], argv.slice(1), { shell: false, env })`. On Linux `argv` is the `bwrap` invocation itself, one element per option word, so a large mount profile is not squeezed into a single `sh -c` argument (Linux rejects any single argument over 128 KiB with `E2BIG`); `describeBwrapArgv(argv)` breaks such a vector down by mount type and byte size for diagnostics. On Windows this is the only supported form; on macOS it is `[shell, '-c', <wrapWithSandbox result>]`.
+**Spawning without a shell (`wrapWithSandboxArgv`).** `SandboxManager.wrapWithSandboxArgv(command)` returns `{ argv, env }` for `spawn(argv[0], argv.slice(1), { shell: false, env })`. On Linux `argv` is the `bwrap` invocation itself, one element per option word, so a large mount profile is not squeezed into a single `sh -c` argument (Linux rejects any single argument over `MAX_ARG_STRLEN`, 128 KiB on 4 KiB-page kernels, with `E2BIG`); `describeBwrapArgv(argv)` breaks such a vector down by mount type and byte size for diagnostics; when the effective config needs no sandbox at all, `argv` is `[shell, '-c', command]`, `shell` being `binShell` or its `/bin/bash` default. On Windows this is the only supported form; on macOS it is `[shell, '-c', <wrapWithSandbox result>]`.
 
 **Violation attribution (`commandId` / `commandText`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key, and `annotateStderrWithSandboxFailures(key, stderr)` / `getViolationsForCommand(key)` look them up by that same key. By default the key is the wrapped string itself. Pass an opaque per-invocation `commandId` (e.g. a tool-use id) to key by that instead — recommended: keys compare on their first 100 characters, so long commands sharing a prefix would otherwise cross-attribute, and a rerun of the same text would inherit the earlier run's events. If the string you *execute* is not the command the invocation *represents* (e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'`), also pass `commandText: '<cmd>'`: it is what `ignoreViolations` command patterns match against and what each violation reports as its `command`.
 
@@ -374,10 +374,16 @@ Examples:
 
 **Path Syntax (Linux):**
 
-**Linux currently does not support glob matching.** Use literal paths only:
+bubblewrap binds concrete paths, so glob support is narrower than on macOS:
+
+- `allowWrite` / `denyWrite` take literal paths only; a glob pattern there is skipped.
+- `denyRead` / `allowRead` accept the same glob syntax as macOS, expanded to the matching entries when the command is wrapped (a file that appears later is not covered). A `denyRead` pattern ending in `/**` becomes one mount per matched directory rather than one per file beneath it.
+
+Examples:
 
 - `"allowWrite": ["src/"]` - Allow write to `src/` directory
 - `"denyRead": ["/home/user/.ssh"]` - Deny read to SSH directory
+- `"denyRead": ["**/build/**"]` - Deny read to every `build/` directory under the current directory
 - `"denyRead": ["/home"], "allowRead": ["."]` - Deny read to all of `/home`, but re-allow the current directory
 
 **All platforms:**

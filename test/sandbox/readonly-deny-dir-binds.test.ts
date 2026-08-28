@@ -16,16 +16,10 @@ import {
 import { isLinux } from '../helpers/platform.js'
 
 /**
- * Companion to readonly-deny-dir-stubs.test.ts for EXISTING deny targets.
- *
- * When denyWithinAllow re-binds a directory read-only (--ro-bind <dir>
- * <dir>), every existing deny path strictly beneath it — typically the
- * mandatory-deny files of a write-protected checkout (.git/hooks,
- * .git/config, .mcp.json, …) — is already unwritable, yet each used to get
- * its own --ro-bind <p> <p>. Those redundant mounts are now skipped under the
- * same evidence and vetoes as the absent-path stub skip; a deny that equals
- * an allowOnly root, or one with no covering read-only directory, is still
- * bound.
+ * A deny path strictly beneath a directory that denyWithinAllow re-binds
+ * read-only gets no --ro-bind of its own, under the same evidence and vetoes
+ * as the absent-path stub skip (readonly-deny-dir-stubs.test.ts); a deny
+ * equal to an allowOnly root, or with no covering directory, is still bound.
  */
 describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
   let BASE: string
@@ -70,7 +64,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     haystack.split(needle).length - 1
 
   it('binds the denied allow-root once and skips the existing file beneath it', async () => {
-    // allowOnly=[cwd], denyWithinAllow=[cwd, cwd/sub/file]: the directory
+    // allowOnly=[proj], denyWithinAllow=[proj, proj/sub/file]: the directory
     // deny equals the allow root and must still be emitted; the file is a
     // strict descendant of that read-only bind and needs nothing.
     const command = await wrap([PROJ, FILE], [PROJ])

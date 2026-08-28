@@ -42,7 +42,6 @@ import type {
 import {
   wrapCommandWithSandboxLinux,
   wrapCommandWithSandboxLinuxArgv,
-  expandReadDenyGlobLinux,
   initializeLinuxNetworkBridge,
   type LinuxNetworkBridgeContext,
   type LinuxSandboxParams,
@@ -50,6 +49,7 @@ import {
   type SandboxDependencyCheck,
   cleanupBwrapMountPoints,
 } from './linux-sandbox-utils.js'
+import { expandReadDenyGlobLinux } from './read-deny-glob.js'
 import {
   wrapCommandWithSandboxMacOS,
   startMacOSSandboxLogMonitor,
@@ -1169,6 +1169,28 @@ function unionDenyReadPaths(
   return [...new Set([...denyRead, ...credentialRestrictions.denyReadPaths])]
 }
 
+/**
+ * Strip a trailing `/**` from each read-path entry and, on Linux, expand
+ * any remaining glob with `expandGlob` (bubblewrap takes concrete paths
+ * only); other platforms match globs natively and keep the stripped
+ * spelling.
+ */
+function resolveReadPathEntries(
+  paths: readonly string[],
+  expandGlob: (pattern: string) => string[],
+): string[] {
+  const out: string[] = []
+  for (const p of paths) {
+    const stripped = removeTrailingGlobSuffix(p)
+    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
+      out.push(...expandGlob(p))
+    } else {
+      out.push(stripped)
+    }
+  }
+  return out
+}
+
 function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config || config.filesystem.disabled) {
     return { denyOnly: [], allowWithinDeny: [] }
@@ -1186,35 +1208,25 @@ function getFsReadConfig(): FsReadRestrictionConfig {
 
   // Process allowRead paths (re-allow within denied regions). Resolved
   // before denyRead: the Linux glob expansion below collapses against them.
-  const allowPaths: string[] = []
-  for (const p of config.filesystem.allowRead ?? []) {
-    const stripped = removeTrailingGlobSuffix(p)
-    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
+  const allowPaths = resolveReadPathEntries(
+    config.filesystem.allowRead ?? [],
+    p => {
       const expanded = expandGlobPattern(p)
       logForDebugging(
         `[Sandbox] Expanded allowRead glob pattern "${p}" to ${expanded.length} paths on Linux`,
       )
-      allowPaths.push(...expanded)
-    } else {
-      allowPaths.push(stripped)
-    }
-  }
+      return expanded
+    },
+  )
 
-  const denyPaths: string[] = []
-  let reExposedPaths: string[] | undefined
-  for (const p of rawDenyRead) {
-    const stripped = removeTrailingGlobSuffix(p)
-    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-      // Expand glob to concrete paths on Linux (bubblewrap doesn't support
-      // globs), collapsed to the fewest mounts that deny the same set.
-      if (reExposedPaths === undefined) {
-        reExposedPaths = [...allowPaths, ...getFsWriteConfig().allowOnly]
-      }
-      denyPaths.push(...expandReadDenyGlobLinux(p, reExposedPaths))
-    } else {
-      denyPaths.push(stripped)
-    }
-  }
+  // On Linux a denyRead glob's expansion is collapsed to fewer mounts that
+  // deny the same set, keeping a mount wherever an allowRead/allowWrite
+  // re-bind would otherwise re-expose it, so the result is only sound
+  // alongside THIS write config.
+  const reExposedPaths = [...allowPaths, ...getFsWriteConfig().allowOnly]
+  const denyPaths = resolveReadPathEntries(rawDenyRead, p =>
+    expandReadDenyGlobLinux(p, reExposedPaths),
+  )
 
   return {
     denyOnly: denyPaths,
@@ -1522,14 +1534,8 @@ export type WrapWithSandboxOptions = {
   commandText?: string
 }
 
-/**
- * Platform wrapper inputs derived from the effective config. macOS and Linux
- * share every derivation step (filesystem policy, credential restrictions,
- * network flags) and differ only in which wrapper consumes the result, so
- * {@link wrapWithSandbox} (shell string) and {@link wrapWithSandboxArgv}
- * (spawn vector) both go through {@link preparePosixSandboxParams} and pick
- * the output form afterwards.
- */
+/** Wrapper inputs derived once by {@link preparePosixSandboxParams} for both
+ *  output forms (shell string, argv). */
 type PosixSandboxParams =
   | { platform: 'macos'; params: MacOSSandboxParams }
   | { platform: 'linux'; params: LinuxSandboxParams }
@@ -1612,17 +1618,10 @@ async function preparePosixSandboxParams(
     // allowRead is resolved first: on Linux a denyRead glob's expansion is
     // collapsed against the paths that re-expose contents under a denied
     // directory (allowRead + allowWrite), so both must be final here.
-    const rawAllowRead =
-      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? []
-    const expandedAllowRead: string[] = []
-    for (const p of rawAllowRead) {
-      const stripped = removeTrailingGlobSuffix(p)
-      if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-        expandedAllowRead.push(...expandGlobPattern(p))
-      } else {
-        expandedAllowRead.push(stripped)
-      }
-    }
+    const expandedAllowRead = resolveReadPathEntries(
+      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? [],
+      p => expandGlobPattern(p),
+    )
     // The TLS-termination CA cert and the trust bundle the env vars point at
     // (NODE_EXTRA_CA_CERTS etc.) must be readable by the child, even if their
     // paths fall under a user-configured denyRead.
@@ -1634,15 +1633,9 @@ async function preparePosixSandboxParams(
       expandedAllowRead.push(javaAgentJarPath)
     }
     const reExposedPaths = [...expandedAllowRead, ...writeConfig.allowOnly]
-    const expandedDenyRead: string[] = []
-    for (const p of rawDenyRead) {
-      const stripped = removeTrailingGlobSuffix(p)
-      if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-        expandedDenyRead.push(...expandReadDenyGlobLinux(p, reExposedPaths))
-      } else {
-        expandedDenyRead.push(stripped)
-      }
-    }
+    const expandedDenyRead = resolveReadPathEntries(rawDenyRead, p =>
+      expandReadDenyGlobLinux(p, reExposedPaths),
+    )
     readConfig = {
       denyOnly: expandedDenyRead,
       allowWithinDeny: expandedAllowRead,
@@ -1809,10 +1802,9 @@ async function wrapWithSandbox(
  * only the `--env` overlay baked into `argv` (see
  * {@link wrapCommandWithSandboxWindows}). On Linux `argv` is the
  * bwrap invocation itself (`['bwrap', ...options, '--', shell, '-c',
- * innerScript]`, proxy env baked in as `--setenv`), so no single
- * element carries the whole mount profile and only `innerScript` is
- * subject to the kernel's 128 KiB per-argument limit; when the
- * effective config needs no sandbox it is `[binShell, '-c', command]`.
+ * innerScript]`, proxy env baked in as `--setenv`; RETURN SHAPE on
+ * {@link wrapCommandWithSandboxLinuxArgv} says why), or `[binShell,
+ * '-c', command]` when the effective config needs no sandbox.
  * On macOS `argv` is `[binShell, '-c', <wrapWithSandbox result>]`.
  * On both, `env` is the unchanged `process.env`, so callers can spawn
  * uniformly across platforms.
@@ -1950,19 +1942,13 @@ async function wrapWithSandboxArgv(
   const shell = binShell ?? '/bin/bash'
   switch (prepared.platform) {
     case 'linux': {
-      // The real bwrap vector: spawning it with {shell:false} keeps the
-      // mount profile spread across many small argv elements instead of
-      // one `sh -c <everything>` string, so only the inner script counts
-      // against the kernel's 128 KiB per-argument cap. `null` means the
-      // params called for no sandbox — run the command under the shell
-      // exactly as the string form would have.
       const argv = await wrapCommandWithSandboxLinuxArgv(prepared.params)
       return { argv: argv ?? [shell, '-c', command], env: process.env }
     }
     case 'macos': {
-      // sandbox-exec -p takes the whole profile inline as one argument, so
-      // a real argv would not shrink the largest element; keep delegating
-      // to the string wrapper behind `<shell> -c`.
+      // Darwin has no per-element argv cap (only the ~1 MiB ARG_MAX total,
+      // env included), so the shell-string form carries no E2BIG hazard of
+      // its own there; keep delegating to it behind `<shell> -c`.
       const wrapped = wrapCommandWithSandboxMacOS(prepared.params)
       return { argv: [shell, '-c', wrapped], env: process.env }
     }

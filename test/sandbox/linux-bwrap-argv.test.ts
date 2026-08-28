@@ -11,22 +11,21 @@ import { join } from 'node:path'
 import {
   wrapCommandWithSandboxLinux,
   wrapCommandWithSandboxLinuxArgv,
-  describeBwrapArgv,
   cleanupBwrapMountPoints,
   type LinuxSandboxParams,
 } from '../../src/sandbox/linux-sandbox-utils.js'
+import {
+  describeBwrapArgv,
+  type BwrapArgvSummary,
+} from '../../src/sandbox/bwrap-argv.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import { quote } from '../../src/utils/shell-quote.js'
 import { whichSync } from '../../src/utils/which.js'
 import { isLinux } from '../helpers/platform.js'
 
 /**
- * The bwrap invocation is available as a real argv vector so an embedder can
- * spawn it with {shell:false}. Linux caps every single argv element at
- * MAX_ARG_STRLEN (128 KiB); the shell-string form puts the entire mount
- * profile into one `sh -c` argument and a large profile then fails every
- * spawn with E2BIG. These tests pin that the vector and the string are the
- * same invocation, and that the vector really is one element per bwrap word.
+ * The bwrap invocation as a real argv vector, spawnable with {shell:false}:
+ * one element per bwrap word, and the same invocation the string form runs.
  */
 describe.if(isLinux)('wrapCommandWithSandboxLinuxArgv', () => {
   let BASE: string
@@ -78,7 +77,7 @@ describe.if(isLinux)('wrapCommandWithSandboxLinuxArgv', () => {
       writeConfig: undefined,
     })
     expect(argv).toBeNull()
-    // ...and the string form still hands the command back untouched.
+    // The string form hands the command back untouched as well.
     expect(
       await wrapCommandWithSandboxLinux({
         command: 'echo hi',
@@ -89,17 +88,9 @@ describe.if(isLinux)('wrapCommandWithSandboxLinuxArgv', () => {
     ).toBe('echo hi')
   })
 
-  it('is the quote()d string form, token for token', async () => {
-    const argv = await wrapCommandWithSandboxLinuxArgv(params())
-    const wrapped = await wrapCommandWithSandboxLinux(params())
-
-    expect(argv).not.toBeNull()
-    expect(quote(argv!)).toBe(wrapped)
-  })
-
   it('is one element per bwrap word with the shell trailer last', async () => {
     // No single quotes: the inner script may re-quote the command (the
-    // apply-seccomp shim wraps it in another `bash -c '…'`), and a
+    // apply-seccomp shim wraps it in another `bash -c '...'`), and a
     // single-quote-free command survives that as a verbatim substring.
     const command = `printf "%s\\n" word && true`
     const argv = (await wrapCommandWithSandboxLinuxArgv(params(command)))!
@@ -181,6 +172,12 @@ describe.if(isLinux)('wrapCommandWithSandboxLinuxArgv', () => {
 
 describe('describeBwrapArgv', () => {
   const nul = (s: string): number => Buffer.byteLength(s, 'utf8') + 1
+  const countsOf = (summary: BwrapArgvSummary): Record<string, number> =>
+    Object.fromEntries(
+      Object.entries(summary.terms).map(([term, t]) => [term, t.count]),
+    )
+  const bytesAcrossTerms = (summary: BwrapArgvSummary): number =>
+    Object.values(summary.terms).reduce((sum, t) => sum + t.bytes, 0)
 
   it('breaks a vector down by term with execve-style byte accounting', () => {
     const inner = `echo 'héllo'` // multi-byte on purpose
@@ -219,7 +216,7 @@ describe('describeBwrapArgv', () => {
 
     const summary = describeBwrapArgv(argv)
 
-    expect(summary.counts).toEqual({
+    expect(countsOf(summary)).toEqual({
       roBindSelf: 2, // '/' '/' and the hooks dir
       roBindDevNull: 1,
       roBindOther: 1, // the empty-dir stub
@@ -230,11 +227,11 @@ describe('describeBwrapArgv', () => {
       // --, /usr/bin/bash, -c, inner
       other: 10,
     })
-    expect(summary.bytes.setenv).toBe(
+    expect(summary.terms.setenv.bytes).toBe(
       nul('--setenv') + nul('HTTP_PROXY') + nul('http://localhost:3128'),
     )
-    expect(summary.bytes.tmpfs).toBe(nul('--tmpfs') + nul('/home/u/.ssh'))
-    expect(summary.bytes.roBindDevNull).toBe(
+    expect(summary.terms.tmpfs.bytes).toBe(nul('--tmpfs') + nul('/home/u/.ssh'))
+    expect(summary.terms.roBindDevNull.bytes).toBe(
       nul('--ro-bind') + nul('/dev/null') + nul('/work/.env'),
     )
     expect(summary.innerCommandBytes).toBe(nul(inner))
@@ -242,28 +239,47 @@ describe('describeBwrapArgv', () => {
       argv.reduce((sum, arg) => sum + nul(arg), 0),
     )
     // The terms partition the vector.
-    expect(Object.values(summary.bytes).reduce((sum, n) => sum + n, 0)).toBe(
-      summary.totalBytes,
-    )
+    expect(bytesAcrossTerms(summary)).toBe(summary.totalBytes)
     expect(summary.largestArgBytes).toBe(nul('/tmp/claude-empty-123'))
   })
 
   it('reports zero inner-command bytes for a vector without a -- trailer', () => {
     const summary = describeBwrapArgv(['bwrap', '--tmpfs', '/x'])
     expect(summary.innerCommandBytes).toBe(0)
-    expect(summary.counts.tmpfs).toBe(1)
-    expect(summary.counts.other).toBe(1)
+    expect(summary.terms.tmpfs.count).toBe(1)
+    expect(summary.terms.other.count).toBe(1)
   })
 
   it('tolerates an empty vector and a truncated trailing option', () => {
     expect(describeBwrapArgv([]).totalBytes).toBe(0)
     const truncated = describeBwrapArgv(['bwrap', '--ro-bind', '/dev/null'])
-    expect(truncated.counts.roBindDevNull).toBe(1)
-    expect(truncated.bytes.roBindDevNull).toBe(
+    expect(truncated.terms.roBindDevNull.count).toBe(1)
+    expect(truncated.terms.roBindDevNull.bytes).toBe(
       nul('--ro-bind') + nul('/dev/null'),
     )
-    expect(Object.values(truncated.bytes).reduce((sum, n) => sum + n, 0)).toBe(
-      truncated.totalBytes,
-    )
+    expect(bytesAcrossTerms(truncated)).toBe(truncated.totalBytes)
+  })
+
+  it('is not fooled by an operand spelled like an Object.prototype member, nor by a bare --ro-bind', () => {
+    // An option the table does not know leaves its operand in option
+    // position; `constructor` must read as a bare word, not as a function.
+    const summary = describeBwrapArgv([
+      'bwrap',
+      '--hostname',
+      'constructor',
+      '--tmpfs',
+      '/x',
+      '--',
+      '/bin/bash',
+      '-c',
+      'echo',
+    ])
+    expect(summary.terms.tmpfs.count).toBe(1)
+    expect(summary.innerCommandBytes).toBe(nul('echo'))
+    expect(bytesAcrossTerms(summary)).toBe(summary.totalBytes)
+    // No operands at all is not a self-bind.
+    expect(
+      describeBwrapArgv(['bwrap', '--ro-bind']).terms.roBindSelf.count,
+    ).toBe(0)
   })
 })

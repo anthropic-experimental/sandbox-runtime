@@ -16,8 +16,6 @@ import {
   normalizeCaseForComparison,
   isSymlinkOutsideBoundary,
   encodeSandboxedCommand,
-  expandGlobPattern,
-  removeTrailingGlobSuffix,
   DANGEROUS_FILES,
   getDangerousDirectories,
 } from './sandbox-utils.js'
@@ -844,131 +842,6 @@ function resolveSymlinkDenyDest(normalizedPath: string): string {
 }
 
 /**
- * A single read-deny glob that still needs more than this many mounts after
- * {@link collapseReadDenyMounts} is reported at warn level. Every mount is
- * three bwrap argv words, so a broad pattern over a large tree (`**\/*.log`
- * in a monorepo) is what pushes the invocation towards the kernel's argument
- * limits. The expansion is never truncated — that would silently un-deny
- * paths — only surfaced.
- */
-export const READ_DENY_GLOB_MOUNT_WARN_THRESHOLD = 256
-
-/**
- * Reduce one read-deny glob's expansion to the mounts that actually change
- * what the sandbox can read.
- *
- * The denyRead loop in generateFilesystemArgs mounts a `--tmpfs` over every
- * matched directory and `--ro-bind /dev/null` over every matched file. A
- * tmpfs already hides the directory's whole subtree, so a match strictly
- * beneath another matched directory adds a mount without denying anything
- * new — unless something between the two re-exposes host contents: the loop
- * re-binds allowRead paths (`--ro-bind`) and allowed write paths (`--bind`)
- * that sit at or under a tmpfs (see pushReadDenyDirMounts), and a match under
- * such a re-bind is readable again without its own mount.
- *
- * So: walk matches shallow-first and drop a match only when some kept proper
- * ancestor covers it AND no re-exposing path lies at-or-under that ancestor
- * and at-or-above the match. A kept ancestor with descendants among the
- * matches is necessarily a directory (readdir found entries beneath it), so
- * it gets a tmpfs. All inputs are absolute, normalized, slash-free-suffix
- * spellings — the same strings the loop later compares by prefix.
- */
-export function collapseReadDenyMounts(
-  matches: readonly string[],
-  reExposedPaths: readonly string[],
-): string[] {
-  const isAtOrUnder = (candidate: string, dir: string): boolean =>
-    candidate === dir || candidate.startsWith(dir === '/' ? '/' : dir + '/')
-  const depth = (p: string): number => p.split('/').length
-  const sorted = [...new Set(matches)].sort(
-    (a, b) => depth(a) - depth(b) || (a < b ? -1 : a > b ? 1 : 0),
-  )
-
-  const kept: string[] = []
-  const keptSet = new Set<string>()
-  for (const candidate of sorted) {
-    let covered = false
-    // Proper ancestors only (slash > 0 skips both the candidate itself and
-    // the root, which expandGlobPattern never yields).
-    for (
-      let slash = candidate.lastIndexOf('/');
-      slash > 0;
-      slash = candidate.lastIndexOf('/', slash - 1)
-    ) {
-      const ancestor = candidate.slice(0, slash)
-      if (!keptSet.has(ancestor)) continue
-      const reExposedBetween = reExposedPaths.some(
-        reExposed =>
-          isAtOrUnder(reExposed, ancestor) && isAtOrUnder(candidate, reExposed),
-      )
-      if (!reExposedBetween) {
-        covered = true
-        break
-      }
-    }
-    if (!covered) {
-      kept.push(candidate)
-      keptSet.add(candidate)
-    }
-  }
-  return kept
-}
-
-/**
- * Expand a read-deny glob into the concrete paths bwrap should mount over,
- * collapsing redundant descendants (see {@link collapseReadDenyMounts}).
- *
- * For a pattern with a trailing `/**` the directories matched by its
- * directory form (the pattern without that suffix) are added to the
- * candidate set first: `**\/build/**` on its own matches only the entries
- * beneath each `build/`, never `build/` itself, so nothing would collapse.
- * Only real directories are taken from the directory form (lstat, so a
- * symlink named `build` is not newly denied and a file named `build` keeps
- * today's semantics); every path the full pattern matches sits under one of
- * them, so the result is a tmpfs per `build/` directory instead of a mount
- * per file inside it.
- *
- * `reExposedPaths` are the caller's allowRead and allowWrite entries (any
- * spelling normalizePathForSandbox accepts); they keep a descendant's own
- * mount wherever the denyRead loop would re-bind host contents between it
- * and its covering directory.
- */
-export function expandReadDenyGlobLinux(
-  globPattern: string,
-  reExposedPaths: readonly string[],
-): string[] {
-  const matches = expandGlobPattern(globPattern)
-  const directoryForm = removeTrailingGlobSuffix(globPattern)
-  if (directoryForm !== globPattern) {
-    for (const dir of expandGlobPattern(directoryForm)) {
-      try {
-        if (fs.lstatSync(dir).isDirectory()) matches.push(dir)
-      } catch {
-        // Vanished between readdir and here — nothing to mount over.
-      }
-    }
-  }
-
-  const normalizedReExposed = reExposedPaths.map(
-    p => normalizePathForSandbox(p).replace(/\/+$/, '') || '/',
-  )
-  const mounts = collapseReadDenyMounts(matches, normalizedReExposed)
-
-  logForDebugging(
-    `[Sandbox Linux] Expanded denyRead glob "${globPattern}": ${matches.length} matches -> ${mounts.length} mounts`,
-  )
-  if (mounts.length > READ_DENY_GLOB_MOUNT_WARN_THRESHOLD) {
-    logForDebugging(
-      `[Sandbox Linux] denyRead glob "${globPattern}" still needs ${mounts.length} mounts after collapsing ` +
-        `(threshold ${READ_DENY_GLOB_MOUNT_WARN_THRESHOLD}); each is a separate bwrap bind and a very ` +
-        `large set can exceed the kernel argument-size limits. Prefer denying the enclosing directories.`,
-      { level: 'warn' },
-    )
-  }
-  return mounts
-}
-
-/**
  * Mount a tmpfs over a read-denied directory, then restore the allowed write
  * paths and allowRead paths the tmpfs just wiped. Used by the denyRead loop
  * in generateFilesystemArgs and again when a late denyWrite ro-bind re-exposes
@@ -1134,10 +1007,11 @@ async function generateFilesystemArgs(
       allowedWritePaths.push(normalizedPath)
     }
 
-    // Inputs for the stub-skip guard's vetoes, computed at most once and only
-    // when an absent deny path actually has a covering read-only deny dir (an
-    // uncommon configuration) — ordinary commands skip the extra
-    // stat/realpath/readdir syscalls entirely. Lazy evaluation also means the
+    // Inputs for the covering-dir vetoes, computed at most once and only
+    // when a deny path (absent, or existing and strictly beneath) actually
+    // has a covering read-only deny dir; a command with no directory deny
+    // inside its write allowlist skips the extra stat/realpath/readdir
+    // syscalls entirely. Lazy evaluation also means the
     // derivation runs from inside the deny loop, AFTER the (unbounded)
     // mandatory-deny ripgrep await below, keeping the snapshot as close as
     // possible to the denyRead loop that later acts on the real filesystem.
@@ -1383,6 +1257,22 @@ async function generateFilesystemArgs(
     // Materialized once: the pre-pass above fully populates the map and the
     // deny loop never mutates it.
     const readOnlyDenyDirs = [...readOnlyDenyDirSpellings.keys()]
+    // Is `candidate` already unwritable in the sandbox: covered by a recorded
+    // read-only deny directory that survives every coveringDirIsUnsafe veto?
+    // `includeSelf` also accepts the directory itself (an absent path's
+    // deepest existing ancestor may BE the covering directory); an existing
+    // deny that equals one is that covering bind and must be emitted.
+    const coveredBySafeReadOnlyDenyDir = (
+      candidate: string,
+      { includeSelf }: { includeSelf: boolean },
+    ): boolean => {
+      const covering = readOnlyDenyDirs.filter(
+        denyDir =>
+          candidate.startsWith(denyDir + '/') ||
+          (includeSelf && candidate === denyDir),
+      )
+      return covering.length > 0 && !covering.some(coveringDirIsUnsafe)
+    }
     for (const pathPattern of denyPaths) {
       const rawPath = normalizePathForSandbox(pathPattern)
 
@@ -1500,13 +1390,10 @@ async function generateFilesystemArgs(
         // regardless of where it appears in denyPaths. A recorded covering
         // directory is evidence for skipping only if it survives the
         // coveringDirIsUnsafe vetoes (see the INVARIANT at its definition).
-        const coveringReadOnlyDenyDirs = readOnlyDenyDirs.filter(
-          denyDir =>
-            ancestorPath === denyDir || ancestorPath.startsWith(denyDir + '/'),
+        const ancestorIsWithinReadOnlyDeny = coveredBySafeReadOnlyDenyDir(
+          ancestorPath,
+          { includeSelf: true },
         )
-        const ancestorIsWithinReadOnlyDeny =
-          coveringReadOnlyDenyDirs.length > 0 &&
-          !coveringReadOnlyDenyDirs.some(coveringDirIsUnsafe)
 
         if (ancestorIsWithinAllowedPath && !ancestorIsWithinReadOnlyDeny) {
           const firstNonExistent = findFirstNonExistentComponent(normalizedPath)
@@ -1552,26 +1439,14 @@ async function generateFilesystemArgs(
       const isWithinAllowedPath = isWithinAnyAllowedWritePath(normalizedPath)
 
       if (isWithinAllowedPath) {
-        // The existing-path twin of the stub skip above: a path STRICTLY
-        // beneath a directory that another deny re-binds read-only is
-        // already unwritable there, so its own --ro-bind <p> <p> is a
-        // redundant mount (one per mandatory-deny file under a write-denied
-        // checkout adds up). Same evidence, same vetoes: the covering
-        // directory comes from the order-independent pre-pass and must pass
-        // coveringDirIsUnsafe, which also guarantees its bind survives the
-        // emission filter. Equality is deliberately excluded — a deny that
-        // IS an allowWrite root (cwd both allowed and denied) is the covering
-        // bind itself. A dest reached through a symlinked spelling keeps its
-        // bind: the tmpfs/mask re-application passes below key off emitted
-        // raw spellings, and the covering directory's bind does not carry
-        // this one's.
-        const coveringReadOnlyDenyDirs = readOnlyDenyDirs.filter(denyDir =>
-          normalizedPath.startsWith(denyDir + '/'),
-        )
+        // Already unwritable under a read-only denied directory (the
+        // existing-path twin of the stub skip above). Veto (iii) keeps the
+        // covering bind through the emission filter; a symlinked spelling
+        // keeps its own bind because the re-application passes below key
+        // off emitted raw spellings.
         if (
           rawPath === normalizedPath &&
-          coveringReadOnlyDenyDirs.length > 0 &&
-          !coveringReadOnlyDenyDirs.some(coveringDirIsUnsafe)
+          coveredBySafeReadOnlyDenyDir(normalizedPath, { includeSelf: false })
         ) {
           logForDebugging(
             `[Sandbox Linux] Skipping deny path already under read-only denied directory: ${normalizedPath}`,
@@ -1839,15 +1714,12 @@ async function generateFilesystemArgs(
  * Dependencies are checked by checkLinuxDependencies() before enabling the sandbox.
  *
  * RETURN SHAPE:
- * The bwrap invocation as an argv vector — `[bwrap, ...options, '--', shell,
- * '-c', innerScript]` — for `spawn(argv[0], argv.slice(1), {shell: false})`,
- * or `null` when the params call for no sandboxing at all (the caller runs
- * `command` as-is). Spawning the vector directly matters on Linux: the kernel
- * caps every single argv element at MAX_ARG_STRLEN (128 KiB) independently of
- * the ~2 MiB ARG_MAX total, and the shell-string form
- * ({@link wrapCommandWithSandboxLinux}) puts the entire mount profile into ONE
- * element of the caller's `sh -c <string>`. As a vector, only `innerScript`
- * (the user command plus fixed plumbing) is subject to the per-element cap.
+ * The bwrap invocation as an argv vector, `[bwrap, ...options, '--', shell,
+ * '-c', innerScript]`, for `spawn(argv[0], argv.slice(1), {shell: false})`;
+ * `null` when the params call for no sandboxing (run `command` as-is). The
+ * vector matters because Linux caps each argv element at MAX_ARG_STRLEN
+ * (128 KiB on 4 KiB-page kernels): the string form puts the whole mount
+ * profile into one element, the vector only `innerScript`.
  */
 export async function wrapCommandWithSandboxLinuxArgv(
   params: LinuxSandboxParams,
@@ -2192,146 +2064,12 @@ export async function wrapCommandWithSandboxLinuxArgv(
 }
 
 /**
- * Shell-string form of {@link wrapCommandWithSandboxLinuxArgv}: the same
- * bwrap invocation rendered through {@link quote} for `sh -c`, or `command`
- * unchanged when no sandboxing is needed. Identical side effects (mount-point
- * bookkeeping, active-sandbox count). Prefer the argv form when the caller
- * can spawn without a shell — see RETURN SHAPE on the argv function for why.
+ * {@link wrapCommandWithSandboxLinuxArgv} rendered through {@link quote} for
+ * `sh -c`, or `command` unchanged when it returns null. Same side effects.
  */
 export async function wrapCommandWithSandboxLinux(
   params: LinuxSandboxParams,
 ): Promise<string> {
   const argv = await wrapCommandWithSandboxLinuxArgv(params)
   return argv === null ? params.command : quote(argv)
-}
-
-/** Mount/env categories {@link describeBwrapArgv} breaks a bwrap argv into. */
-export type BwrapArgvTerm =
-  | 'roBindSelf'
-  | 'roBindDevNull'
-  | 'roBindOther'
-  | 'bind'
-  | 'tmpfs'
-  | 'setenv'
-  | 'other'
-
-/** Size breakdown of a bwrap argv; see {@link describeBwrapArgv}. */
-export interface BwrapArgvSummary {
-  /** Bytes execve() charges for the whole vector: UTF-8 length + 1 (the
-   *  terminating NUL) per element. */
-  totalBytes: number
-  /** The largest single element, same accounting. This is the number to
-   *  compare against Linux's per-argument MAX_ARG_STRLEN (128 KiB). */
-  largestArgBytes: number
-  /** The inner shell script — the final element after `--` — same
-   *  accounting; 0 when the vector has no `--` trailer. */
-  innerCommandBytes: number
-  /** Occurrences per term. A mount/env option and its operands count once;
-   *  under `other`, every remaining element (argv[0], bare flags, `--dev
-   *  /dev`, the `--` trailer words) counts individually. */
-  counts: Record<BwrapArgvTerm, number>
-  /** Bytes per term, same accounting as totalBytes; the terms partition the
-   *  vector, so these sum to totalBytes. */
-  bytes: Record<BwrapArgvTerm, number>
-}
-
-/** Operand counts for the bwrap options this module emits (plus close
- *  relatives). Unknown `--options` are treated as bare flags. */
-const BWRAP_OPTION_ARITY: Readonly<Record<string, number>> = {
-  '--ro-bind': 2,
-  '--bind': 2,
-  '--dev-bind': 2,
-  '--ro-bind-try': 2,
-  '--bind-try': 2,
-  '--dev-bind-try': 2,
-  '--symlink': 2,
-  '--setenv': 2,
-  '--tmpfs': 1,
-  '--unsetenv': 1,
-  '--dev': 1,
-  '--proc': 1,
-  '--dir': 1,
-  '--chdir': 1,
-  '--cap-add': 1,
-  '--cap-drop': 1,
-  '--remount-ro': 1,
-}
-
-/**
- * Break a bwrap argv (as returned by {@link wrapCommandWithSandboxLinuxArgv})
- * down by mount/env term, with execve()-style byte accounting, so an embedder
- * that hits E2BIG — or wants to warn before it does — can say which part of
- * the profile is responsible. Pure; never touches the filesystem.
- */
-export function describeBwrapArgv(argv: readonly string[]): BwrapArgvSummary {
-  const argBytes = (s: string): number => Buffer.byteLength(s, 'utf8') + 1
-  const counts: Record<BwrapArgvTerm, number> = {
-    roBindSelf: 0,
-    roBindDevNull: 0,
-    roBindOther: 0,
-    bind: 0,
-    tmpfs: 0,
-    setenv: 0,
-    other: 0,
-  }
-  const bytes: Record<BwrapArgvTerm, number> = { ...counts }
-  let totalBytes = 0
-  let largestArgBytes = 0
-  for (const arg of argv) {
-    const n = argBytes(arg)
-    totalBytes += n
-    if (n > largestArgBytes) largestArgBytes = n
-  }
-
-  const account = (term: BwrapArgvTerm, from: number, to: number): void => {
-    counts[term]++
-    for (let k = from; k < to; k++) {
-      bytes[term] += argBytes(argv[k]!)
-    }
-  }
-
-  let innerCommandBytes = 0
-  let i = 0
-  if (argv.length > 0) {
-    account('other', 0, 1) // the bwrap executable itself
-    i = 1
-  }
-  while (i < argv.length) {
-    const option = argv[i]!
-    if (option === '--') {
-      // Trailer: shell, '-c', inner script. Each word is its own `other`.
-      for (let k = i; k < argv.length; k++) account('other', k, k + 1)
-      if (argv.length - 1 > i) {
-        innerCommandBytes = argBytes(argv[argv.length - 1]!)
-      }
-      break
-    }
-    const arity = BWRAP_OPTION_ARITY[option] ?? 0
-    const end = Math.min(i + 1 + arity, argv.length)
-    let term: BwrapArgvTerm = 'other'
-    if (option === '--ro-bind') {
-      const src = argv[i + 1]
-      const dest = argv[i + 2]
-      term =
-        src === '/dev/null'
-          ? 'roBindDevNull'
-          : src === dest
-            ? 'roBindSelf'
-            : 'roBindOther'
-    } else if (option === '--bind') {
-      term = 'bind'
-    } else if (option === '--tmpfs') {
-      term = 'tmpfs'
-    } else if (option === '--setenv') {
-      term = 'setenv'
-    }
-    if (term === 'other') {
-      for (let k = i; k < end; k++) account('other', k, k + 1)
-    } else {
-      account(term, i, end)
-    }
-    i = end
-  }
-
-  return { totalBytes, largestArgBytes, innerCommandBytes, counts, bytes }
 }

@@ -5,6 +5,7 @@ import {
   rmSync,
   existsSync,
   realpathSync,
+  symlinkSync,
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -12,6 +13,7 @@ import {
   expandGlobPattern,
   expandTilde,
   globToRegex,
+  walkGlobPattern,
 } from '../../src/sandbox/sandbox-utils.js'
 import {
   containsGlobCharsWin,
@@ -171,6 +173,47 @@ describe('expandGlobPattern', () => {
       expect(results.some(r => r.includes('/app/creds/'))).toBe(false)
     },
   )
+})
+
+describe.if(!isWindows)('walkGlobPattern', () => {
+  const RAW_BASE = join(tmpdir(), 'glob-walk-test-' + Date.now())
+
+  beforeAll(() => {
+    mkdirSync(join(RAW_BASE, 'a', 'build'), { recursive: true })
+    writeFileSync(join(RAW_BASE, 'a', 'build', '1.out'), '')
+    mkdirSync(join(RAW_BASE, 'elsewhere'))
+    symlinkSync(
+      join(RAW_BASE, 'elsewhere'),
+      join(RAW_BASE, 'a', 'build', 'link'),
+    )
+  })
+
+  afterAll(() => {
+    rmSync(RAW_BASE, { recursive: true, force: true })
+  })
+
+  it('evaluates the directory pattern over the same listing and records symlinks', () => {
+    const BASE = realPath(RAW_BASE)
+    const pattern = join(RAW_BASE, '**/build/**')
+    const walk = walkGlobPattern(pattern, {
+      directoryPattern: join(RAW_BASE, '**/build'),
+    })
+
+    expect(walk.matches).toContain(join(BASE, 'a', 'build', '1.out'))
+    expect(walk.directoryMatches).toEqual([join(BASE, 'a', 'build')])
+    expect([...walk.symlinks]).toEqual([join(BASE, 'a', 'build', 'link')])
+  })
+
+  it('returns empty results for a missing base', () => {
+    const walk = walkGlobPattern(join(RAW_BASE, 'nope', '*.env'), {
+      directoryPattern: join(RAW_BASE, 'nope', '*'),
+    })
+    expect(walk).toEqual({
+      matches: [],
+      directoryMatches: [],
+      symlinks: new Set(),
+    })
+  })
 })
 
 // ============================================================================

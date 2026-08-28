@@ -873,6 +873,18 @@ export interface ExpandGlobOptions {
   caseInsensitive?: boolean
 }
 
+/** What one recursive walk of a glob's base directory found; see {@link walkGlobPattern}. */
+export interface GlobWalk {
+  /** Absolute paths matching the pattern. */
+  matches: string[]
+  /** Matches of `directoryPattern` over the same listing; empty without one. */
+  directoryMatches: string[]
+  /** Every visited entry that is a symbolic link, by full path. Recursive
+   *  readdir descends into symlinked directories, so a match beneath one
+   *  really lives outside the tree it was found in. */
+  symlinks: Set<string>
+}
+
 /**
  * Expand a glob pattern into concrete file paths.
  *
@@ -888,6 +900,24 @@ export function expandGlobPattern(
   globPath: string,
   opts: ExpandGlobOptions = {},
 ): string[] {
+  return walkGlobPattern(globPath, opts).matches
+}
+
+/**
+ * The walk behind {@link expandGlobPattern}: one recursive listing of the
+ * static prefix, filtered by `globPath` and, when given, `directoryPattern`
+ * (which must share that prefix), with the symlinks seen recorded.
+ */
+export function walkGlobPattern(
+  globPath: string,
+  opts: ExpandGlobOptions & { directoryPattern?: string } = {},
+): GlobWalk {
+  const empty = (): GlobWalk => ({
+    matches: [],
+    directoryMatches: [],
+    symlinks: new Set(),
+  })
+
   // Normalize to `/` separators throughout so {@link globToRegex}
   // (which treats `/` as the segment boundary) and the static-prefix
   // split work on Windows paths. Gated to win32: `\` is a valid
@@ -901,7 +931,7 @@ export function expandGlobPattern(
   const staticPrefix = normalizedPattern.split(/[*?[\]]/)[0]
   if (!staticPrefix || staticPrefix === '/') {
     logForDebugging(`[Sandbox] Glob pattern too broad, skipping: ${globPath}`)
-    return []
+    return empty()
   }
 
   // Get the base directory from the static prefix
@@ -913,17 +943,21 @@ export function expandGlobPattern(
     logForDebugging(
       `[Sandbox] Base directory for glob does not exist: ${baseDir}`,
     )
-    return []
+    return empty()
   }
 
-  // Build regex from the normalized glob pattern
-  const regex = new RegExp(
-    globToRegex(normalizedPattern),
-    opts.caseInsensitive ? 'i' : '',
-  )
+  const flags = opts.caseInsensitive ? 'i' : ''
+  const regex = new RegExp(globToRegex(normalizedPattern), flags)
+  const directoryRegex =
+    opts.directoryPattern === undefined
+      ? undefined
+      : new RegExp(
+          globToRegex(toFwd(normalizePathForSandbox(opts.directoryPattern))),
+          flags,
+        )
 
   // List all entries recursively under the base directory
-  const results: string[] = []
+  const walk = empty()
   try {
     const entries = fs.readdirSync(baseDir, {
       recursive: true,
@@ -940,8 +974,15 @@ export function expandGlobPattern(
         baseDir
       const fullPath = path.join(parentDir, entry.name)
 
-      if (regex.test(toFwd(fullPath))) {
-        results.push(fullPath)
+      if (entry.isSymbolicLink()) {
+        walk.symlinks.add(fullPath)
+      }
+      const candidate = toFwd(fullPath)
+      if (regex.test(candidate)) {
+        walk.matches.push(fullPath)
+      }
+      if (directoryRegex?.test(candidate)) {
+        walk.directoryMatches.push(fullPath)
       }
     }
   } catch (err) {
@@ -950,5 +991,5 @@ export function expandGlobPattern(
     )
   }
 
-  return results
+  return walk
 }
