@@ -8,6 +8,7 @@ import { logForDebugging } from './utils/debug.js'
 import { loadConfig, loadConfigFromString } from './utils/config-loader.js'
 import * as readline from 'readline'
 import * as fs from 'fs'
+import * as net from 'net'
 import * as path from 'path'
 import * as os from 'os'
 
@@ -34,6 +35,22 @@ function getDefaultConfig(): SandboxRuntimeConfig {
       denyWrite: [],
     },
   }
+}
+
+/**
+ * A readable stream over the control fd. A pipe or socket is read through a
+ * libuv stream handle, driven by the event loop; fs.createReadStream would
+ * park a threadpool thread in a blocking read(2) that process.exit() then
+ * waits for, so srt would outlive the wrapped command until the parent
+ * closed the fd. A regular file has no such wait and keeps the fs stream.
+ * Either way the fd never keeps srt alive on its own.
+ */
+function openControlFd(fd: number): NodeJS.ReadableStream {
+  const stat = fs.fstatSync(fd)
+  if (stat.isFIFO() || stat.isSocket()) {
+    return new net.Socket({ fd, readable: true, writable: false }).unref()
+  }
+  return fs.createReadStream('', { fd })
 }
 
 async function main(): Promise<void> {
@@ -215,11 +232,8 @@ async function main(): Promise<void> {
           let controlReader: readline.Interface | null = null
           if (options.controlFd !== undefined) {
             try {
-              const controlStream = fs.createReadStream('', {
-                fd: options.controlFd,
-              })
               controlReader = readline.createInterface({
-                input: controlStream,
+                input: openControlFd(options.controlFd),
                 crlfDelay: Infinity,
               })
 
