@@ -8,6 +8,27 @@ import { type Writable } from 'stream'
 // Get the path to the built CLI
 const CLI_PATH = path.join(process.cwd(), 'dist', 'cli.js')
 
+// srt is expected to exit on its own shortly after the wrapped command
+// (which runs for well under a second) finishes; a hang is a failure, not
+// something to wait out.
+function waitForExit(child: ChildProcess): Promise<number | null> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () =>
+        reject(new Error('srt did not exit within 2s of the wrapped command')),
+      2000,
+    )
+    child.on('exit', code => {
+      clearTimeout(timer)
+      resolve(code)
+    })
+    child.on('error', err => {
+      clearTimeout(timer)
+      reject(err)
+    })
+  })
+}
+
 describe('--control-fd', () => {
   let tmpDir: string
   let child: ChildProcess | null = null
@@ -21,14 +42,12 @@ describe('--control-fd', () => {
       child.kill('SIGKILL')
     }
     fs.rmSync(tmpDir, { recursive: true, force: true })
-    // Bun's node:child_process shim implements extra stdio 'pipe' entries
-    // (fd 3 here) via a unix socket, and tears that socket down
-    // asynchronously after the child exits. The tests above all hit the
-    // 2000ms safety timeout and SIGKILL their child, so on a fast runner
-    // the next test's spawn can race that teardown and Bun's
-    // #createStdioObject throws `Failed to connect` (connect ENOENT) —
-    // observed on linux/arm64. Yield briefly so the prior child's stdio
-    // cleanup settles before the next spawn.
+    // Every test waits for srt to exit on its own; the SIGKILL above only
+    // runs when one has already failed. Bun's node:child_process shim
+    // implements extra stdio 'pipe' entries (fd 3 here) via a unix socket
+    // torn down asynchronously after the child exits, and a spawn that
+    // races that teardown throws `Failed to connect` (connect ENOENT), so
+    // yield briefly before the next test's spawn either way.
     await new Promise(r => setTimeout(r, 50))
   })
 
@@ -71,12 +90,10 @@ describe('--control-fd', () => {
     })
     controlFd.write(configUpdate + '\n')
 
-    // Wait for process to complete
-    await new Promise<void>((resolve, reject) => {
-      child!.on('exit', () => resolve())
-      child!.on('error', reject)
-      setTimeout(() => resolve(), 2000) // Timeout safety
-    })
+    // srt must exit by itself once the wrapped command finishes, with the
+    // control fd still open on our side.
+    const exitCode = await waitForExit(child)
+    expect(exitCode).toBe(0)
 
     // Check that config was updated - look for debug output
     const allStderr = stderr.join('')
@@ -110,12 +127,10 @@ describe('--control-fd', () => {
     const controlFd = child.stdio[3] as Writable
     controlFd.write('{ invalid json }\n')
 
-    // Wait for process to complete
-    await new Promise<void>((resolve, reject) => {
-      child!.on('exit', () => resolve())
-      child!.on('error', reject)
-      setTimeout(() => resolve(), 2000) // Timeout safety
-    })
+    // srt must exit by itself once the wrapped command finishes, with the
+    // control fd still open on our side.
+    const exitCode = await waitForExit(child)
+    expect(exitCode).toBe(0)
 
     // Process should still complete successfully
     const allStdout = stdout.join('')
@@ -146,12 +161,10 @@ describe('--control-fd', () => {
     controlFd.write('   \n')
     controlFd.write('\t\n')
 
-    // Wait for process to complete
-    await new Promise<void>((resolve, reject) => {
-      child!.on('exit', () => resolve())
-      child!.on('error', reject)
-      setTimeout(() => resolve(), 2000) // Timeout safety
-    })
+    // srt must exit by itself once the wrapped command finishes, with the
+    // control fd still open on our side.
+    const exitCode = await waitForExit(child)
+    expect(exitCode).toBe(0)
 
     // Process should still complete successfully
     const allStdout = stdout.join('')
@@ -175,12 +188,7 @@ describe('--control-fd', () => {
       stdout.push(data.toString())
     })
 
-    // Wait for process to complete
-    const exitCode = await new Promise<number | null>((resolve, reject) => {
-      child!.on('exit', code => resolve(code))
-      child!.on('error', reject)
-      setTimeout(() => resolve(null), 2000) // Timeout safety
-    })
+    const exitCode = await waitForExit(child)
 
     expect(exitCode).toBe(0)
     const allStdout = stdout.join('')
@@ -211,12 +219,10 @@ describe('--control-fd', () => {
     const stdin = child.stdin as Writable
     stdin.write('hello from stdin\n')
 
-    // Wait for process to complete
-    await new Promise<void>((resolve, reject) => {
-      child!.on('exit', () => resolve())
-      child!.on('error', reject)
-      setTimeout(() => resolve(), 2000) // Timeout safety
-    })
+    // srt must exit by itself once the wrapped command finishes, with the
+    // control fd still open on our side.
+    const exitCode = await waitForExit(child)
+    expect(exitCode).toBe(0)
 
     const allStdout = stdout.join('')
     expect(allStdout).toContain('GOT: hello from stdin')
