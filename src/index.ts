@@ -48,6 +48,8 @@ export {
   type BwrapArgvSummary,
   type BwrapArgvTerm,
   describeBwrapArgv,
+  describeBwrapStringOverflow,
+  LINUX_MAX_ARG_STRLEN,
 } from './sandbox/bwrap-argv.js'
 
 // Windows install/status API

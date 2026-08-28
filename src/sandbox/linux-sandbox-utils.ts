@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os'
 import path, { join } from 'node:path'
 import { ripGrep } from '../utils/ripgrep.js'
 import { buildJavaToolOptions } from './java-proxy-agent.js'
+import { describeBwrapStringOverflow } from './bwrap-argv.js'
 import {
   generateProxyEnvVars,
   buildPosixGitSafeDirEnv,
@@ -18,6 +19,7 @@ import {
   encodeSandboxedCommand,
   DANGEROUS_FILES,
   getDangerousDirectories,
+  isAtOrUnder,
 } from './sandbox-utils.js'
 import type {
   FsReadRestrictionConfig,
@@ -1027,7 +1029,10 @@ async function generateFilesystemArgs(
     // domains.
     //
     // prospectiveReadDenyTmpfsDirsBothForms: the tmpfs targets the denyRead
-    // loop below will actually mount, derived the way that loop derives them
+    // loop below will mount — a superset: the loop also drops a tmpfs
+    // already hidden by an emitted ancestor tmpfs, and an over-predicted
+    // tmpfs only makes the vetoes more conservative — derived the way that
+    // loop derives them
     // — expand a '/' entry into the root's children (minus proc/dev/sys), add
     // /etc/ssh/ssh_config.d when present, and keep only entries that exist as
     // directories (the loop skips absent entries and gives file entries a
@@ -1257,21 +1262,19 @@ async function generateFilesystemArgs(
     // Materialized once: the pre-pass above fully populates the map and the
     // deny loop never mutates it.
     const readOnlyDenyDirs = [...readOnlyDenyDirSpellings.keys()]
-    // Is `candidate` already unwritable in the sandbox: covered by a recorded
-    // read-only deny directory that survives every coveringDirIsUnsafe veto?
-    // `includeSelf` also accepts the directory itself (an absent path's
-    // deepest existing ancestor may BE the covering directory); an existing
-    // deny that equals one is that covering bind and must be emitted.
-    const coveredBySafeReadOnlyDenyDir = (
-      candidate: string,
-      { includeSelf }: { includeSelf: boolean },
-    ): boolean => {
-      const covering = readOnlyDenyDirs.filter(
-        denyDir =>
-          candidate.startsWith(denyDir + '/') ||
-          (includeSelf && candidate === denyDir),
-      )
-      return covering.length > 0 && !covering.some(coveringDirIsUnsafe)
+    // Is `candidate` already unwritable in the sandbox: strictly under a
+    // recorded read-only deny directory that survives every
+    // coveringDirIsUnsafe veto? Strictly, because a deny equal to a recorded
+    // directory IS that covering bind and must be emitted (an absent path
+    // never equals one). Stops at the first vetoed covering directory.
+    const coveredBySafeReadOnlyDenyDir = (candidate: string): boolean => {
+      let covered = false
+      for (const denyDir of readOnlyDenyDirs) {
+        if (candidate === denyDir || !isAtOrUnder(candidate, denyDir)) continue
+        if (coveringDirIsUnsafe(denyDir)) return false
+        covered = true
+      }
+      return covered
     }
     for (const pathPattern of denyPaths) {
       const rawPath = normalizePathForSandbox(pathPattern)
@@ -1390,10 +1393,11 @@ async function generateFilesystemArgs(
         // regardless of where it appears in denyPaths. A recorded covering
         // directory is evidence for skipping only if it survives the
         // coveringDirIsUnsafe vetoes (see the INVARIANT at its definition).
-        const ancestorIsWithinReadOnlyDeny = coveredBySafeReadOnlyDenyDir(
-          ancestorPath,
-          { includeSelf: true },
-        )
+        // (Tested on the absent path itself: a recorded directory that
+        // covers it is at-or-above its deepest existing ancestor, since
+        // recorded directories exist.)
+        const ancestorIsWithinReadOnlyDeny =
+          coveredBySafeReadOnlyDenyDir(normalizedPath)
 
         if (ancestorIsWithinAllowedPath && !ancestorIsWithinReadOnlyDeny) {
           const firstNonExistent = findFirstNonExistentComponent(normalizedPath)
@@ -1446,7 +1450,7 @@ async function generateFilesystemArgs(
         // off emitted raw spellings.
         if (
           rawPath === normalizedPath &&
-          coveredBySafeReadOnlyDenyDir(normalizedPath, { includeSelf: false })
+          coveredBySafeReadOnlyDenyDir(normalizedPath)
         ) {
           logForDebugging(
             `[Sandbox Linux] Skipping deny path already under read-only denied directory: ${normalizedPath}`,
@@ -1519,6 +1523,25 @@ async function generateFilesystemArgs(
     .map(p => normalizePathForSandbox(p))
     .sort((a, b) => a.split('/').length - b.split('/').length)
 
+  // A read-deny dest at-or-under a tmpfs this loop already emitted (the
+  // shallow-first order above visits the covering directory first) is
+  // hidden by it unless an allowRead/allowWrite path at-or-under that tmpfs
+  // and at-or-above the dest is re-bound over it by pushReadDenyDirMounts.
+  // A mount there would be created inside the tmpfs and change nothing, and
+  // overlapping entries (a directory plus a glob beneath it) would otherwise
+  // cost one bwrap mount per file — enough to breach the kernel's
+  // argument-size limits. The same question isHiddenByTmpfs below asks of
+  // the buffered denyWrite binds.
+  const readDenyReExposers = [...allowedWritePaths, ...readAllowPaths]
+  const hiddenByEmittedTmpfs = (dest: string): boolean =>
+    tmpfsDirs.some(
+      tmpfsDir =>
+        isAtOrUnder(dest, tmpfsDir) &&
+        !readDenyReExposers.some(
+          p => isAtOrUnder(p, tmpfsDir) && isAtOrUnder(dest, p),
+        ),
+    )
+
   for (const normalizedPath of normalizedDenyPaths) {
     if (!fs.existsSync(normalizedPath)) {
       logForDebugging(
@@ -1529,6 +1552,12 @@ async function generateFilesystemArgs(
 
     const readDenyStat = fs.statSync(normalizedPath)
     if (readDenyStat.isDirectory()) {
+      if (hiddenByEmittedTmpfs(normalizedPath)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping read deny directory already hidden by a denyRead tmpfs: ${normalizedPath}`,
+        )
+        continue
+      }
       tmpfsDirs.push(normalizedPath)
       pushReadDenyDirMounts(
         args,
@@ -1550,6 +1579,12 @@ async function generateFilesystemArgs(
       // For files, bind /dev/null instead of tmpfs. bwrap rejects symlink
       // bind destinations, so the deny bind lands on the resolved target.
       const denyDest = resolveSymlinkDenyDest(normalizedPath)
+      if (hiddenByEmittedTmpfs(denyDest)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping read deny file already hidden by a denyRead tmpfs: ${denyDest}`,
+        )
+        continue
+      }
       args.push('--ro-bind', '/dev/null', denyDest)
       maskedFiles.set(denyDest, '/dev/null')
       maskedFiles.set(normalizedPath, '/dev/null')
@@ -2039,7 +2074,12 @@ export async function wrapCommandWithSandboxLinuxArgv(
       bwrapArgs.push(command)
     }
 
-    const argv = [bwrapPath ?? 'bwrap', ...bwrapArgs]
+    // The vector is spawned without a shell, so a bare `bwrap` would be
+    // looked up against whatever PATH the caller's spawn env carries;
+    // resolve it here, against the PATH checkLinuxDependencies validated,
+    // the way the shell is resolved above. (Absent, the bare word is kept:
+    // the dependency check has already reported it.)
+    const argv = [bwrapPath ?? whichSync('bwrap') ?? 'bwrap', ...bwrapArgs]
 
     const restrictions = []
     if (needsNetworkRestriction) restrictions.push('network')
@@ -2071,5 +2111,15 @@ export async function wrapCommandWithSandboxLinux(
   params: LinuxSandboxParams,
 ): Promise<string> {
   const argv = await wrapCommandWithSandboxLinuxArgv(params)
-  return argv === null ? params.command : quote(argv)
+  if (argv === null) return params.command
+  const wrapped = quote(argv)
+  // The one place Linux's per-argument cap bites: the whole profile as a
+  // single `sh -c` element. Loud, like the credential-mask warnings, since
+  // spawn otherwise reports only an opaque E2BIG.
+  const overflow = describeBwrapStringOverflow(argv, wrapped)
+  if (overflow !== undefined) {
+    console.warn(overflow)
+    logForDebugging(overflow, { level: 'warn' })
+  }
+  return wrapped
 }

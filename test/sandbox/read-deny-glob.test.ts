@@ -21,11 +21,11 @@ import { isLinux, isWindows } from '../helpers/platform.js'
 /**
  * Invariant pinned here: a denyRead glob match beneath a kept covering
  * directory gets no mount of its own (the directory's tmpfs already hides
- * it) unless an allowRead / allowWrite re-bind or a symlink between the two
- * would leave it readable.
+ * it) unless an allowRead / allowWrite re-bind between the two would leave
+ * it readable. A match reached through a symlink is first resolved to the
+ * inode it names: a mount under the link spelling would be created inside
+ * the covering tmpfs and hide nothing.
  */
-
-const NO_SYMLINKS: ReadonlySet<string> = new Set()
 
 describe('collapseReadDenyMounts (pure)', () => {
   it('drops matches beneath a matched directory and dedups', () => {
@@ -41,7 +41,6 @@ describe('collapseReadDenyMounts (pure)', () => {
         '/r/top.log',
       ],
       reExposedPaths: [],
-      symlinks: NO_SYMLINKS,
     })
     expect(kept).toEqual(['/r/pkg/a/build', '/r/pkg/b/build', '/r/top.log'])
   })
@@ -51,7 +50,6 @@ describe('collapseReadDenyMounts (pure)', () => {
     const kept = collapseReadDenyMounts({
       matches: ['/r/build', '/r/build-cache/x', '/r/build/y'],
       reExposedPaths: [],
-      symlinks: NO_SYMLINKS,
     })
     expect(kept).toEqual(['/r/build', '/r/build-cache/x'])
   })
@@ -65,7 +63,6 @@ describe('collapseReadDenyMounts (pure)', () => {
         '/r/secrets/public', // AT the re-exposer: the loop re-binds it anyway
       ],
       reExposedPaths: ['/r/secrets/public', '/elsewhere'],
-      symlinks: NO_SYMLINKS,
     })
     expect(kept).toEqual([
       '/r/secrets',
@@ -80,7 +77,6 @@ describe('collapseReadDenyMounts (pure)', () => {
     const kept = collapseReadDenyMounts({
       matches: ['/r/d', '/r/d/a', '/r/d/b/c'],
       reExposedPaths: ['/r/d'],
-      symlinks: NO_SYMLINKS,
     })
     expect(kept).toEqual(['/r/d', '/r/d/a', '/r/d/b/c'])
   })
@@ -89,7 +85,6 @@ describe('collapseReadDenyMounts (pure)', () => {
     const kept = collapseReadDenyMounts({
       matches: ['/r/d', '/r/d/a'],
       reExposedPaths: ['/r/d/a/deeper', '/r/dx', '/q'],
-      symlinks: NO_SYMLINKS,
     })
     expect(kept).toEqual(['/r/d'])
   })
@@ -100,27 +95,8 @@ describe('collapseReadDenyMounts (pure)', () => {
       collapseReadDenyMounts({
         matches: files,
         reExposedPaths: [],
-        symlinks: NO_SYMLINKS,
       }),
     ).toEqual(files)
-  })
-
-  it('keeps a descendant reached through a symlink below the covering dir', () => {
-    // The denyRead loop mounts over a symlink's TARGET, which the covering
-    // directory's tmpfs does not hide; what the walk found beneath the link
-    // is covered by the link's own mount.
-    const kept = collapseReadDenyMounts({
-      matches: [
-        '/r/d',
-        '/r/d/link',
-        '/r/d/link/x',
-        '/r/d/plain',
-        '/r/d/key.pem',
-      ],
-      reExposedPaths: [],
-      symlinks: new Set(['/r/d/link', '/r/d/key.pem']),
-    })
-    expect(kept).toEqual(['/r/d', '/r/d/key.pem', '/r/d/link'])
   })
 })
 
@@ -208,6 +184,13 @@ describe.if(!isWindows)(
         join(OUTSIDE, 'key.pem'),
         join(ROOT, 'pkg', 'a', 'build', 'key.pem'),
       )
+      // pkg/c/build/rel: the same target through a RELATIVE link.
+      mkdirSync(join(ROOT, 'pkg', 'c', 'build'), { recursive: true })
+      writeFileSync(join(ROOT, 'pkg', 'c', 'build', '1.out'), '')
+      symlinkSync(
+        join('..', '..', '..', 'outside'),
+        join(ROOT, 'pkg', 'c', 'build', 'rel'),
+      )
       // pkg/empty/build: exists but holds nothing.
       mkdirSync(join(ROOT, 'pkg', 'empty', 'build'), { recursive: true })
       // pkg/linked/build: a symlink NAMED build, to a real build dir.
@@ -222,20 +205,34 @@ describe.if(!isWindows)(
       rmSync(ROOT, { recursive: true, force: true })
     })
 
-    it('keeps the mount of a symlink inside a collapsed directory', () => {
-      // The loop resolves each entry and masks its TARGET, which the
-      // covering tmpfs does not hide, so the link keeps its own mount.
+    it('resolves a symlink inside a collapsed directory to its target', () => {
+      // The denyRead loop emits the covering directory's tmpfs first, which
+      // replaces the link with an empty directory inside the sandbox, so a
+      // mount kept under the link spelling would land there and hide
+      // nothing. The mount goes on the inode the link names instead.
       const build = join(ROOT, 'pkg', 'a', 'build')
       const mounts = expandReadDenyGlobLinux(join(ROOT, '**/build/**'), [])
 
       expect(mounts).toContain(build)
       expect(mounts).not.toContain(join(build, '1.out'))
-      // Directory symlink: its own mount lands on the target and covers
-      // whatever the listing found beneath it.
-      expect(mounts).toContain(join(build, 'link'))
+      // Directory symlink: its target is the mount, and what the listing
+      // found beneath the link collapses under it.
+      expect(mounts).toContain(OUTSIDE)
+      expect(mounts).not.toContain(join(build, 'link'))
       expect(mounts).not.toContain(join(build, 'link', 'secret.txt'))
-      // File symlink: only its own entry masks the target.
-      expect(mounts).toContain(join(build, 'key.pem'))
+      // File symlink: its target, already under the resolved directory.
+      expect(mounts).not.toContain(join(build, 'key.pem'))
+      expect(mounts).not.toContain(join(OUTSIDE, 'key.pem'))
+    })
+
+    it('resolves a relative directory symlink the same way', () => {
+      const build = join(ROOT, 'pkg', 'c', 'build')
+      const mounts = expandReadDenyGlobLinux(join(ROOT, '**/build/**'), [])
+
+      expect(mounts).toContain(build)
+      expect(mounts).toContain(OUTSIDE)
+      expect(mounts).not.toContain(join(build, 'rel'))
+      expect(mounts).not.toContain(join(build, 'rel', 'secret.txt'))
     })
 
     it('gives an empty matched directory no mount', () => {
@@ -243,13 +240,59 @@ describe.if(!isWindows)(
       expect(mounts).not.toContain(join(ROOT, 'pkg', 'empty', 'build'))
     })
 
-    it('does not collapse into a symlink named like the directory form', () => {
+    it('follows a link named like the pattern segment to a target listed earlier', () => {
+      // proj/config/secrets -> ../vault: the target is a real directory the
+      // walk reaches first by its own name, which matches nothing; the link
+      // is the only spelling the pattern matches, so the walk must list
+      // through it (a global visited set would not) and the mount must land
+      // on the target.
+      const shal = join(ROOT, 'shal')
+      mkdirSync(join(shal, 'proj', 'vault'), { recursive: true })
+      writeFileSync(join(shal, 'proj', 'vault', 'secret.out'), '')
+      mkdirSync(join(shal, 'proj', 'config'))
+      symlinkSync(join('..', 'vault'), join(shal, 'proj', 'config', 'secrets'))
+
+      const mounts = expandReadDenyGlobLinux(join(shal, '**/secrets/**'), [])
+
+      expect(mounts).toEqual([join(shal, 'proj', 'vault')])
+    })
+
+    it('denies through a link back to the tree and warns about it', () => {
+      // build/up -> ..: a bind mount covers the inode, so the pattern denies
+      // the whole tree the link reaches (as it did before the collapse); the
+      // walk stops at the link, and the surprise is said out loud.
+      const esc = join(ROOT, 'esc')
+      mkdirSync(join(esc, 'build'), { recursive: true })
+      writeFileSync(join(esc, 'build', '1.out'), '')
+      symlinkSync('..', join(esc, 'build', 'up'))
+      const warn = spyOn(console, 'warn').mockImplementation(() => {})
+      try {
+        const mounts = expandReadDenyGlobLinux(join(esc, '**/build/**'), [])
+
+        expect(mounts).toEqual([esc])
+        const warnings = warn.mock.calls.map(call => String(call[0]))
+        expect(
+          warnings.some(
+            line =>
+              line.includes('[sandbox-runtime] WARNING') &&
+              line.includes(join(esc, 'build', 'up')) &&
+              line.includes(`symlink to ${esc}`),
+          ),
+        ).toBe(true)
+      } finally {
+        warn.mockRestore()
+      }
+    })
+
+    it('resolves a symlink named like the directory form to its target', () => {
       const linked = join(ROOT, 'pkg', 'linked', 'build')
       const mounts = expandReadDenyGlobLinux(join(ROOT, '**/build/**'), [])
 
       expect(mounts).not.toContain(linked)
-      // Its entries keep their own mounts, exactly as before the collapse.
-      expect(mounts).toContain(join(linked, '1.out'))
+      // Its entries name inodes under the real build directory, whose own
+      // mount covers them.
+      expect(mounts).not.toContain(join(linked, '1.out'))
+      expect(mounts).toContain(join(ROOT, 'pkg', 'a', 'build'))
     })
   },
 )

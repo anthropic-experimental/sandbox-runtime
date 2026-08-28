@@ -23,8 +23,9 @@ export interface BwrapArgvSummary {
   /** The largest single element: the number to compare against Linux's
    *  per-argument MAX_ARG_STRLEN (128 KiB on 4 KiB-page kernels). */
   largestArgBytes: number
-  /** The inner shell script (the last element after `--`); 0 without a
-   *  `--` trailer. */
+  /** The inner shell script: the last element after `--`, or after the
+   *  `-c` of the `[shell, '-c', script]` vector wrapWithSandboxArgv returns
+   *  when no sandbox applies; 0 without either trailer. */
   innerCommandBytes: number
   /** Per term, its occurrences and the bytes of its words. A mount/env
    *  option and its operands count once; under `other` every remaining
@@ -35,10 +36,13 @@ export interface BwrapArgvSummary {
 type BwrapOptionSpec = { arity: number; term: BwrapArgvTerm }
 
 /**
- * The bwrap options this package emits (plus close relatives): operand count
- * and the term they are accounted under. Unknown `--options` are bare flags
- * under `other`. A Map, so an operand spelled like an Object.prototype
- * member (`constructor`) cannot resolve to one.
+ * The bwrap options that get a term of their own: operand count and term.
+ * Every other `--option` is a bare flag under `other` and its operands are
+ * re-read as bare words (`--dev /dev` is two `other` elements) — the same
+ * accounting, unless an operand is itself spelled like one of these options
+ * or `--`, which nothing this package emits does. A Map, so an operand
+ * spelled like an Object.prototype member (`constructor`) cannot resolve to
+ * one.
  */
 const BWRAP_OPTIONS: ReadonlyMap<string, BwrapOptionSpec> = new Map<
   string,
@@ -48,21 +52,11 @@ const BWRAP_OPTIONS: ReadonlyMap<string, BwrapOptionSpec> = new Map<
   ['--bind', { arity: 2, term: 'bind' }],
   ['--tmpfs', { arity: 1, term: 'tmpfs' }],
   ['--setenv', { arity: 2, term: 'setenv' }],
-  ['--dev-bind', { arity: 2, term: 'other' }],
-  ['--ro-bind-try', { arity: 2, term: 'other' }],
-  ['--bind-try', { arity: 2, term: 'other' }],
-  ['--dev-bind-try', { arity: 2, term: 'other' }],
-  ['--symlink', { arity: 2, term: 'other' }],
-  ['--unsetenv', { arity: 1, term: 'other' }],
-  ['--dev', { arity: 1, term: 'other' }],
-  ['--proc', { arity: 1, term: 'other' }],
-  ['--dir', { arity: 1, term: 'other' }],
-  ['--chdir', { arity: 1, term: 'other' }],
-  ['--cap-add', { arity: 1, term: 'other' }],
-  ['--cap-drop', { arity: 1, term: 'other' }],
-  ['--remount-ro', { arity: 1, term: 'other' }],
 ])
 const BARE_FLAG: BwrapOptionSpec = { arity: 0, term: 'other' }
+
+/** Linux's per-argument cap (MAX_ARG_STRLEN, 32 pages) on 4 KiB-page kernels. */
+export const LINUX_MAX_ARG_STRLEN = 128 * 1024
 
 /**
  * Break a bwrap argv (as returned by wrapCommandWithSandboxLinuxArgv) down
@@ -82,9 +76,10 @@ export function describeBwrapArgv(argv: readonly string[]): BwrapArgvSummary {
   let totalBytes = 0
   let largestArgBytes = 0
 
-  // Every element is accounted exactly once, so the totals ride along.
+  // Every element is accounted exactly once, so the totals ride along. A
+  // mount/env option and its operands count once; `other` counts per element.
   const account = (term: BwrapArgvTerm, from: number, to: number): void => {
-    terms[term].count++
+    terms[term].count += term === 'other' ? to - from : 1
     for (let k = from; k < to; k++) {
       const byteCount = argBytes(argv[k]!)
       terms[term].bytes += byteCount
@@ -94,16 +89,14 @@ export function describeBwrapArgv(argv: readonly string[]): BwrapArgvSummary {
   }
 
   let innerCommandBytes = 0
-  let i = 0
-  if (argv.length > 0) {
-    account('other', 0, 1) // the bwrap executable itself
-    i = 1
-  }
+  let i = 0 // argv[0], the executable, falls through to BARE_FLAG
   while (i < argv.length) {
     const option = argv[i]!
-    if (option === '--') {
-      // Trailer: shell, '-c', inner script. Each word is its own `other`.
-      for (let k = i; k < argv.length; k++) account('other', k, k + 1)
+    // bwrap has no `-c` option, so one right after argv[0] marks the
+    // `[shell, '-c', script]` form (no sandbox needed), not a bwrap vector.
+    if (option === '--' || (i === 1 && option === '-c')) {
+      // Trailer: shell, '-c', inner script.
+      account('other', i, argv.length)
       if (argv.length - 1 > i) {
         innerCommandBytes = argBytes(argv[argv.length - 1]!)
       }
@@ -122,13 +115,34 @@ export function describeBwrapArgv(argv: readonly string[]): BwrapArgvSummary {
             ? 'roBindSelf'
             : 'roBindOther'
     }
-    if (term === 'other') {
-      for (let k = i; k < end; k++) account('other', k, k + 1)
-    } else {
-      account(term, i, end)
-    }
+    account(term, i, end)
     i = end
   }
 
   return { totalBytes, largestArgBytes, innerCommandBytes, terms }
+}
+
+/**
+ * The warning to raise when `wrapped` — `argv` rendered for `sh -c` — would
+ * exceed Linux's per-argument cap as that one argument, or undefined when it
+ * fits. A warning rather than a refusal: 16 KiB-page kernels allow 512 KiB,
+ * and the kernel already fails such a spawn loudly (E2BIG); the package's
+ * job is to say which mounts did it and which output form avoids it.
+ */
+export function describeBwrapStringOverflow(
+  argv: readonly string[],
+  wrapped: string,
+): string | undefined {
+  const bytes = Buffer.byteLength(wrapped, 'utf8') + 1
+  if (bytes <= LINUX_MAX_ARG_STRLEN) return undefined
+  const { terms, innerCommandBytes } = describeBwrapArgv(argv)
+  const t = (term: BwrapArgvTerm): string =>
+    `${terms[term].count} (${terms[term].bytes} B)`
+  return (
+    `[sandbox-runtime] WARNING: the bwrap command line is ${bytes} bytes as a single sh -c argument, ` +
+    `over Linux MAX_ARG_STRLEN (${LINUX_MAX_ARG_STRLEN} on 4 KiB-page kernels); spawn will fail with E2BIG. ` +
+    `/dev/null masks ${t('roBindDevNull')}, tmpfs ${t('tmpfs')}, other ro-binds ${t('roBindOther')}, ` +
+    `self ro-binds ${t('roBindSelf')}, binds ${t('bind')}, setenv ${t('setenv')}, inner script ${innerCommandBytes} B. ` +
+    `Use SandboxManager.wrapWithSandboxArgv() (one element per word) or deny enclosing directories instead of file globs.`
+  )
 }

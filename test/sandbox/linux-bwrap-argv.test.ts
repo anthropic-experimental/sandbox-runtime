@@ -16,6 +16,7 @@ import {
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import {
   describeBwrapArgv,
+  describeBwrapStringOverflow,
   type BwrapArgvSummary,
 } from '../../src/sandbox/bwrap-argv.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
@@ -95,7 +96,7 @@ describe.if(isLinux)('wrapCommandWithSandboxLinuxArgv', () => {
     const command = `printf "%s\\n" word && true`
     const argv = (await wrapCommandWithSandboxLinuxArgv(params(command)))!
 
-    expect(argv[0]).toBe('bwrap')
+    expect(argv[0]).toBe(whichSync('bwrap') ?? 'bwrap')
     const separator = argv.indexOf('--')
     expect(separator).toBeGreaterThan(0)
     // Trailer: <resolved shell> -c <inner script>, and nothing after it.
@@ -154,7 +155,7 @@ describe.if(isLinux)('wrapCommandWithSandboxLinuxArgv', () => {
       )
 
       expect(env).toBe(process.env)
-      expect(argv[0]).toBe('bwrap')
+      expect(argv[0]).toBe(whichSync('bwrap') ?? 'bwrap')
       expect(argv).toContain('--')
       expect(quote(argv)).toBe(wrapped)
       // The point of the vector: the largest single element is the inner
@@ -241,6 +242,38 @@ describe('describeBwrapArgv', () => {
     // The terms partition the vector.
     expect(bytesAcrossTerms(summary)).toBe(summary.totalBytes)
     expect(summary.largestArgBytes).toBe(nul('/tmp/claude-empty-123'))
+  })
+
+  it('treats a [shell, -c, script] vector as its own trailer', () => {
+    const summary = describeBwrapArgv(['/bin/bash', '-c', 'echo hi'])
+    expect(summary.innerCommandBytes).toBe(nul('echo hi'))
+    expect(summary.largestArgBytes).toBe(nul('/bin/bash'))
+    expect(summary.terms.other.count).toBe(3)
+    expect(bytesAcrossTerms(summary)).toBe(summary.totalBytes)
+  })
+
+  it('describeBwrapStringOverflow warns only past the per-argument cap', () => {
+    // ~140 bytes per mask, the shape of a monorepo node_modules path.
+    const mask = (i: number): string[] => [
+      '--ro-bind',
+      '/dev/null',
+      `/home/user/monorepo/packages/service-${i}/node_modules/@scope/pkg/dist/esm/internal/generated/schema/types/index.js`,
+    ]
+    const vector = (masks: number): string[] => [
+      'bwrap',
+      ...Array.from({ length: masks }, (_, i) => mask(i)).flat(),
+      '--',
+      '/bin/bash',
+      '-c',
+      'echo',
+    ]
+    const under = vector(200)
+    expect(describeBwrapStringOverflow(under, quote(under))).toBeUndefined()
+    const over = vector(1200)
+    const warning = describeBwrapStringOverflow(over, quote(over))
+    expect(warning).toContain('E2BIG')
+    expect(warning).toContain('/dev/null masks 1200')
+    expect(warning).toContain('wrapWithSandboxArgv')
   })
 
   it('reports zero inner-command bytes for a vector without a -- trailer', () => {

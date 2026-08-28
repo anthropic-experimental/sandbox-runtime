@@ -1,5 +1,8 @@
+import * as fs from 'node:fs'
+import * as path from 'node:path'
 import { logForDebugging } from '../utils/debug.js'
 import {
+  isAtOrUnder,
   normalizePathForSandbox,
   removeTrailingGlobSuffix,
   walkGlobPattern,
@@ -7,96 +10,143 @@ import {
 
 /**
  * A read-deny glob still needing more than this many mounts after collapsing
- * is logged at warn level (SRT_DEBUG). The expansion is never truncated,
- * which would silently un-deny paths; a broad pattern is only surfaced.
+ * is logged at warn level (SRT_DEBUG) as a hint that the pattern is broad.
+ * The expansion is never truncated, which would silently un-deny paths. This
+ * is not the argument-size guard — that is byte-based, over the whole
+ * rendered command line, in describeBwrapStringOverflow.
  */
 export const READ_DENY_GLOB_MOUNT_WARN_THRESHOLD = 256
 
 /**
  * Reduce a read-deny glob's matches to the mounts that change what the
  * sandbox can read; ancestors precede descendants in the result. A match is
- * dropped only when a kept proper ancestor's tmpfs already hides it.
+ * dropped only when a kept proper ancestor's tmpfs already hides it — which
+ * is why every match must name the inode it hides (see
+ * {@link canonicalizeThroughSymlinks}): the denyRead loop emits the
+ * ancestor's tmpfs first, so a mount under a symlink spelling beneath it is
+ * created inside that tmpfs and never reaches the link's target.
  */
 export function collapseReadDenyMounts({
   matches,
   reExposedPaths,
-  symlinks,
 }: {
-  /** Absolute, normalized, trailing-slash-free paths. */
+  /** Absolute, normalized, trailing-slash-free, symlink-free paths. */
   matches: readonly string[]
   /** allowRead/allowWrite paths (same spelling) the denyRead loop re-binds
    *  over a tmpfs; one between a match and its ancestor, inclusive, keeps
    *  the match's own mount. */
   reExposedPaths: readonly string[]
-  /** Symlinks the walk saw; the loop mounts over a link's target, outside
-   *  the ancestor, so one below the ancestor up to the match keeps the
-   *  match's own mount. */
-  symlinks: ReadonlySet<string>
 }): string[] {
-  const isAtOrUnder = ({ path, dir }: { path: string; dir: string }): boolean =>
-    path === dir || path.startsWith(dir === '/' ? '/' : dir + '/')
+  const reExposed = new Set(reExposedPaths)
   // A proper ancestor is a proper string prefix, so lexicographic order
   // visits every ancestor before its descendants.
   const sorted = [...new Set(matches)].sort()
-
-  const kept: string[] = []
-  const keptSet = new Set<string>()
-  // Proper ancestors only (slash > 0 skips both the candidate itself and
-  // the root, which the walk never yields).
-  const nearestKeptAncestor = (candidate: string): string | undefined => {
+  const kept = new Set<string>()
+  for (const candidate of sorted) {
+    // Walk the candidate's prefixes once, longest first, up to the nearest
+    // kept ancestor (proper prefixes only: slash > 0 skips the candidate
+    // itself and the root, which the walk never yields). A re-exposer at
+    // any prefix from the candidate down to that ancestor, both inclusive,
+    // keeps the candidate's own mount.
+    let ancestor: string | undefined
+    let reExposedBetween = reExposed.has(candidate)
     for (
       let slash = candidate.lastIndexOf('/');
       slash > 0;
       slash = candidate.lastIndexOf('/', slash - 1)
     ) {
       const prefix = candidate.slice(0, slash)
-      if (keptSet.has(prefix)) return prefix
+      if (reExposed.has(prefix)) reExposedBetween = true
+      if (kept.has(prefix)) {
+        ancestor = prefix
+        break
+      }
     }
-    return undefined
+    if (ancestor === undefined || reExposedBetween) kept.add(candidate)
   }
-  // Every prefix of the candidate strictly longer than the ancestor, the
-  // candidate itself included.
-  const symlinkBetween = ({
-    ancestor,
-    candidate,
-  }: {
-    ancestor: string
-    candidate: string
-  }): boolean => {
-    if (symlinks.size === 0) return false
+  return [...kept]
+}
+
+/**
+ * Rewrite every path that is, or lies beneath, a symlink the walk recorded
+ * to the path it really names, and dedup. A mount kept under a link spelling
+ * denies nothing once a covering directory collapses it: the denyRead loop
+ * stats through the link (a directory symlink takes the --tmpfs branch,
+ * never resolveSymlinkDenyDest) and, shallow-first, emits the covering
+ * directory's tmpfs BEFORE the link's own mount — which bwrap then creates
+ * as a fresh empty directory inside that tmpfs, leaving the target readable.
+ * A dangling or vanished link keeps its spelling; the loop's existence check
+ * skips it, as it always did.
+ */
+function canonicalizeThroughSymlinks(
+  paths: readonly string[],
+  symlinks: ReadonlySet<string>,
+  globPattern: string,
+): string[] {
+  if (symlinks.size === 0) return [...new Set(paths)]
+  // The static directory prefix the glob walks, in its normalized spelling
+  // (the same one walkGlobPattern derives), so an escaping target can be
+  // told from one under the tree.
+  const normalizedPattern = normalizePathForSandbox(globPattern)
+  const staticPrefix = normalizedPattern.split(/[*?[\]]/)[0] ?? ''
+  const baseDir = staticPrefix.endsWith('/')
+    ? staticPrefix.slice(0, -1)
+    : path.dirname(staticPrefix)
+  const reachedThroughSymlink = (candidate: string): boolean => {
+    if (symlinks.has(candidate)) return true
     for (
-      let end = candidate.length;
-      end > ancestor.length;
-      end = candidate.lastIndexOf('/', end - 1)
+      let slash = candidate.lastIndexOf('/');
+      slash > 0;
+      slash = candidate.lastIndexOf('/', slash - 1)
     ) {
-      if (symlinks.has(candidate.slice(0, end))) return true
+      if (symlinks.has(candidate.slice(0, slash))) return true
     }
     return false
   }
-
-  for (const candidate of sorted) {
-    const ancestor = nearestKeptAncestor(candidate)
-    const covered =
-      ancestor !== undefined &&
-      !reExposedPaths.some(
-        reExposed =>
-          isAtOrUnder({ path: reExposed, dir: ancestor }) &&
-          isAtOrUnder({ path: candidate, dir: reExposed }),
-      ) &&
-      !symlinkBetween({ ancestor, candidate })
-    if (!covered) {
-      kept.push(candidate)
-      keptSet.add(candidate)
+  const canonical = new Set<string>()
+  for (const p of paths) {
+    if (!reachedThroughSymlink(p)) {
+      canonical.add(p)
+      continue
+    }
+    let target: string
+    try {
+      target = fs.realpathSync(p)
+    } catch {
+      canonical.add(p)
+      continue
+    }
+    canonical.add(target)
+    // Denying through a link that escapes the tree is what the glob asks for
+    // on Linux (a bind mount covers an inode, whatever its spelling), but a
+    // link to an ancestor or to a top-level directory turns the pattern into
+    // a tmpfs over far more than the user pictured — the project, or /usr —
+    // so say so, once per link, outside SRT_DEBUG.
+    if (isAtOrUnder(baseDir, target) || target.split('/').length <= 2) {
+      const key = `${p} -> ${target}`
+      if (!warnedEscapingLinks.has(key)) {
+        warnedEscapingLinks.add(key)
+        console.warn(
+          `[sandbox-runtime] WARNING: denyRead glob "${globPattern}" reaches ${p}, a symlink to ${target}; ` +
+            `that whole directory will be read-denied inside the sandbox. Deny a narrower path, or exclude the link.`,
+        )
+      }
     }
   }
-  return kept
+  return [...canonical]
 }
+
+/** Escaping links already warned about, so a per-command wrap warns once. */
+const warnedEscapingLinks = new Set<string>()
 
 /**
  * Expand a read-deny glob into the paths bwrap should mount over, collapsed
  * with {@link collapseReadDenyMounts} against `reExposedPaths` (the caller's
- * allowRead and allowWrite entries). A pattern ending in `/**` also takes its
- * directory form, so `**\/build/**` yields one mount per `build/` directory.
+ * allowRead and allowWrite entries, already put through
+ * normalizePathForSandbox so they compare by prefix exactly as the denyRead
+ * loop's do). A pattern ending in `/**` also takes its directory form, so
+ * `**\/build/**` yields one mount per `build/` directory. An entry reached
+ * through a symlink is mounted at the path the link resolves to.
  */
 export function expandReadDenyGlobLinux(
   globPattern: string,
@@ -106,38 +156,27 @@ export function expandReadDenyGlobLinux(
   const walk = walkGlobPattern(globPattern, {
     directoryPattern: directoryForm === globPattern ? undefined : directoryForm,
   })
-  const matches = [...walk.matches]
+  const matches = canonicalizeThroughSymlinks(
+    walk.matches,
+    walk.symlinks,
+    globPattern,
+  )
   if (walk.directoryMatches.length > 0) {
-    // A directory-form match counts only as a real, non-symlink directory
-    // with a match beneath it: an empty one has nothing to deny (and as a
-    // tmpfs would swallow later writes), and a symlink named like one is
-    // left to its own entries.
-    const matchAncestors = new Set<string>()
-    for (const match of walk.matches) {
-      for (
-        let slash = match.lastIndexOf('/');
-        slash > 0;
-        slash = match.lastIndexOf('/', slash - 1)
-      ) {
-        const ancestor = match.slice(0, slash)
-        if (matchAncestors.has(ancestor)) break // and so is everything above
-        matchAncestors.add(ancestor)
-      }
-    }
-    for (const dir of walk.directoryMatches) {
-      if (matchAncestors.has(dir) && !walk.symlinks.has(dir)) {
-        matches.push(dir)
-      }
+    // Everything beneath a directory-form match is itself a match (the
+    // pattern ends in /**), so a directory with something to deny is some
+    // match's parent. An empty one gets no mount: it has nothing to deny,
+    // and as a tmpfs it would swallow later writes.
+    const parents = new Set(matches.map(m => m.slice(0, m.lastIndexOf('/'))))
+    for (const dir of canonicalizeThroughSymlinks(
+      walk.directoryMatches,
+      walk.symlinks,
+      globPattern,
+    )) {
+      if (parents.has(dir)) matches.push(dir)
     }
   }
 
-  const mounts = collapseReadDenyMounts({
-    matches,
-    // normalizePathForSandbox strips a trailing slash from a non-glob POSIX
-    // spelling, so these compare by prefix exactly as the loop's do.
-    reExposedPaths: reExposedPaths.map(p => normalizePathForSandbox(p)),
-    symlinks: walk.symlinks,
-  })
+  const mounts = collapseReadDenyMounts({ matches, reExposedPaths })
 
   logForDebugging(
     `[Sandbox Linux] Expanded denyRead glob "${globPattern}": ${walk.matches.length} matches -> ${mounts.length} mounts`,

@@ -285,29 +285,20 @@ async function main(): Promise<void> {
             ),
           )
 
-          // Wrap the command with sandbox restrictions. On Windows
-          // the wrapper returns an argv array that MUST be spawned
-          // with {shell:false} — that's the boundary keeping the
-          // command bytes off the host shell. On other platforms
-          // we keep the existing shell-string path.
-          let child
-          if (process.platform === 'win32') {
-            // env carries the proxy vars the sandboxed child must inherit.
-            const { argv, env } =
-              await SandboxManager.wrapWithSandboxArgv(command)
-            child = spawn(argv[0], argv.slice(1), {
-              shell: false,
-              stdio: 'inherit',
-              env,
-            })
-          } else {
-            const sandboxedCommand =
-              await SandboxManager.wrapWithSandbox(command)
-            child = spawn(sandboxedCommand, {
-              shell: true,
-              stdio: 'inherit',
-            })
-          }
+          // Wrap the command with sandbox restrictions as an argv vector
+          // spawned with {shell:false}. On Windows that is the boundary
+          // keeping the command bytes off the host shell; on Linux it is
+          // the bwrap invocation itself, one element per word, so a large
+          // mount profile is never squeezed into a single `sh -c` argument
+          // (the kernel caps each argv element at MAX_ARG_STRLEN). env
+          // carries the proxy vars the sandboxed child must inherit.
+          const { argv, env } =
+            await SandboxManager.wrapWithSandboxArgv(command)
+          const child = spawn(argv[0], argv.slice(1), {
+            shell: false,
+            stdio: 'inherit',
+            env,
+          })
 
           // Handle process exit
           child.on('exit', (code, signal) => {
