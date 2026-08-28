@@ -84,5 +84,8 @@
       "eslint --fix --cache --cache-location=node_modules/.cache/.eslintcache",
       "prettier --write"
     ]
+  },
+  "overrides": {
+    "js-yaml": "^4.3.1"
   }
 }
