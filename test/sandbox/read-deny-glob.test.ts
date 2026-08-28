@@ -351,13 +351,35 @@ describe.if(isLinux)('expandReadDenyGlobLinux (filesystem)', () => {
     expect(mounts).toContain(join(carveOut, 'ok.txt'))
   })
 
-  it('accepts re-exposers in un-normalized spellings', () => {
-    const pattern = join(ROOT, '**/build/**')
+  it('normalizes an allowRead carve-out spelling before collapsing against it', async () => {
+    // Re-exposers reach expandReadDenyGlobLinux already normalized; the
+    // wrapper strips the trailing slash, so the carve-out still keeps the
+    // file's own mask beneath the collapsed build tmpfs.
     const carveOut = join(ROOT, 'pkg', 'a', 'build', 'public')
+    try {
+      const wrapped = await SandboxManager.wrapWithSandbox(
+        'echo hello',
+        undefined,
+        {
+          filesystem: {
+            denyRead: [join(ROOT, '**/build/**')],
+            allowRead: [carveOut + '/'],
+            allowWrite: [],
+            denyWrite: [],
+          },
+        },
+      )
 
-    const mounts = expandReadDenyGlobLinux(pattern, [carveOut + '/'])
-
-    expect(mounts).toContain(join(carveOut, 'ok.txt'))
+      expect(wrapped).toContain(`--tmpfs ${join(ROOT, 'pkg', 'a', 'build')}`)
+      expect(wrapped).toContain(
+        `--ro-bind /dev/null ${join(carveOut, 'ok.txt')}`,
+      )
+      expect(wrapped).not.toContain(
+        `--ro-bind /dev/null ${join(ROOT, 'pkg', 'b', 'build')}/`,
+      )
+    } finally {
+      await SandboxManager.reset()
+    }
   })
 
   it('leaves a pattern without a trailing /** to collapse only among its own matches', () => {
