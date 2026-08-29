@@ -38,37 +38,40 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     rmSync(BASE, { recursive: true, force: true })
   })
 
-  // A flat directory of `count` files: each one is its own /dev/null mask,
-  // nothing collapses.
-  function flatFiles(count: number): string {
+  // `count` files, each its own /dev/null mask, as the concrete list the
+  // wrapper takes (glob expansion happens a layer up, in SandboxManager).
+  function flatFiles(count: number): string[] {
     const dir = join(BASE, 'many')
     mkdirSync(dir)
     const stem = 'a-reasonably-long-file-name-to-fill-the-profile-'
+    const files: string[] = []
     for (let i = 0; i < count; i++) {
-      writeFileSync(join(dir, `${stem}${i}.log`), '')
+      const file = join(dir, `${stem}${i}.log`)
+      writeFileSync(file, '')
+      files.push(file)
     }
-    return dir
+    return files
   }
 
   it('keeps a profile that fits on the command line', async () => {
-    const dir = flatFiles(20)
+    const files = flatFiles(20)
     const wrapped = await wrapCommandWithSandboxLinux({
       command: 'echo hello',
       needsNetworkRestriction: false,
-      readConfig: { denyOnly: [join(dir, '*.log')] },
+      readConfig: { denyOnly: files },
       writeConfig: { allowOnly: [], denyWithinAllow: [] },
     })
     expect(wrapped).not.toContain('--args')
-    expect(wrapped).toContain('--ro-bind /dev/null')
+    expect(wrapped).toContain(`--ro-bind /dev/null ${files[0]}`)
   })
 
   it('moves the options to a NUL-separated file bwrap reads through --args', async () => {
     // 2000 masks of ~80 bytes each: well past 128 KiB as one argument.
-    const dir = flatFiles(2000)
+    const files = flatFiles(2000)
     const wrapped = await wrapCommandWithSandboxLinux({
       command: 'echo hello',
       needsNetworkRestriction: false,
-      readConfig: { denyOnly: [join(dir, '*.log')] },
+      readConfig: { denyOnly: files },
       writeConfig: { allowOnly: [], denyWithinAllow: [] },
     })
 
@@ -86,9 +89,7 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     expect(
       options.filter(w => w === '--ro-bind').length,
     ).toBeGreaterThanOrEqual(2000)
-    expect(options).toContain(
-      join(dir, 'a-reasonably-long-file-name-to-fill-the-profile-0.log'),
-    )
+    expect(options).toContain(files[0])
     // The trailer stays on the line, not in the file.
     expect(options).not.toContain('--')
     expect(options).not.toContain('-c')
