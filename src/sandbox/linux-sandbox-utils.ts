@@ -398,6 +398,17 @@ async function linuxGetMandatoryDenyPaths(
 // be cleaned up explicitly.
 const bwrapMountPoints: Set<string> = new Set()
 
+/** Linux's per-argument cap (MAX_ARG_STRLEN, 32 pages) on 4 KiB-page kernels. */
+const LINUX_MAX_ARG_STRLEN = 128 * 1024
+
+/**
+ * Temporary directories holding a `bwrap --args` file, one per wrap whose
+ * profile would not fit a single shell argument. Removed with the mount
+ * points: bwrap reads and closes the file while parsing, before the
+ * command starts.
+ */
+const bwrapArgsDirs: Set<string> = new Set()
+
 // Number of wrapped commands that have been generated but whose cleanup has
 // not yet run. cleanupBwrapMountPoints() defers file deletion while this is
 // positive, because deleting a mount point file on the host while another
@@ -484,6 +495,11 @@ export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
     }
   }
   bwrapMountPoints.clear()
+
+  for (const dir of bwrapArgsDirs) {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+  bwrapArgsDirs.clear()
 }
 
 /**
@@ -1979,6 +1995,7 @@ export async function wrapCommandWithSandboxLinux(
     if (!shell) {
       throw new Error(`Shell '${shellName}' not found in PATH`)
     }
+    const trailerStart = bwrapArgs.length
     bwrapArgs.push('--', shell, '-c')
 
     // With network restrictions, route the command through buildSandboxCommand
@@ -2001,7 +2018,39 @@ export async function wrapCommandWithSandboxLinux(
       bwrapArgs.push(command)
     }
 
-    const wrappedCommand = quote([bwrapPath ?? 'bwrap', ...bwrapArgs])
+    let wrappedCommand = quote([bwrapPath ?? 'bwrap', ...bwrapArgs])
+    if (Buffer.byteLength(wrappedCommand, 'utf8') + 1 > LINUX_MAX_ARG_STRLEN) {
+      // The caller runs this string as the one argument of `sh -c`, and
+      // Linux caps a single argv element at MAX_ARG_STRLEN, so a profile
+      // this large would fail every spawn with E2BIG. Hand the options to
+      // bwrap through `--args`, which reads them NUL-separated from an fd
+      // (and closes it before the command starts); only the trailer stays
+      // on the line. bwrap still caps the number of parsed arguments
+      // (MAX_ARGS, 9000: about 3000 mounts), so a profile should still be
+      // kept small at the source.
+      const argsDir = fs.mkdtempSync(path.join(tmpdir(), 'srt-bwrap-args-'))
+      const argsFile = path.join(argsDir, 'args')
+      fs.writeFileSync(
+        argsFile,
+        bwrapArgs
+          .slice(0, trailerStart)
+          .map(arg => arg + '\0')
+          .join(''),
+        { mode: 0o600 },
+      )
+      bwrapArgsDirs.add(argsDir)
+      registerExitCleanupHandler()
+      wrappedCommand =
+        quote([
+          bwrapPath ?? 'bwrap',
+          '--args',
+          '3',
+          ...bwrapArgs.slice(trailerStart),
+        ]) + ` 3<${quote([argsFile])}`
+      logForDebugging(
+        `[Sandbox Linux] bwrap options moved to ${argsFile}: the command line would be ${Buffer.byteLength(wrappedCommand, 'utf8')} bytes as one argument`,
+      )
+    }
 
     const restrictions = []
     if (needsNetworkRestriction) restrictions.push('network')
