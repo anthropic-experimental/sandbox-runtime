@@ -402,6 +402,25 @@ const bwrapMountPoints: Set<string> = new Set()
 const LINUX_MAX_ARG_STRLEN = 128 * 1024
 
 /**
+ * The fd an over-long profile's `--args` file is opened on. A single digit,
+ * since dash (Debian/Ubuntu's /bin/sh) rejects multi-digit redirections, and
+ * high, since embedders hand the command low fds of their own (an extra
+ * stdio pipe, or a helper binary passed as `/proc/self/fd/3`). When the
+ * caller's seccompConfig.applyPath names this very fd, the next one down is
+ * used instead.
+ */
+const BWRAP_ARGS_FD = 9
+
+function bwrapArgsFdFor(seccompApplyPath: string | undefined): number {
+  const taken = seccompApplyPath?.match(/^\/(?:proc\/self|dev)\/fd\/(\d+)$/)
+  return taken !== null &&
+    taken !== undefined &&
+    Number(taken[1]) === BWRAP_ARGS_FD
+    ? BWRAP_ARGS_FD - 1
+    : BWRAP_ARGS_FD
+}
+
+/**
  * Per-process directory for the `bwrap --args` files of profiles too large
  * for one shell argument, created on the first sandboxed wrap and ro-bound
  * over itself in EVERY profile this process generates (the INVARIANT at the
@@ -422,9 +441,16 @@ function ensureBwrapArgsDir(): string {
   if (bwrapArgsDir !== undefined && fs.existsSync(bwrapArgsDir)) {
     return bwrapArgsDir
   }
-  // First wrap of the process, or the directory was removed under us (an
-  // age-based clean of os.tmpdir()): a profile binding a gone path would
-  // never start.
+  if (bwrapArgsDir !== undefined) {
+    // Removed under us (an age-based clean of os.tmpdir()): a profile
+    // binding a gone path would never start, so a fresh one is made — but
+    // a sandbox launched earlier that is still running never bound it, and
+    // could write there. Say so.
+    logForDebugging(
+      `[Sandbox Linux] --args directory ${bwrapArgsDir} was removed; re-creating it. Sandboxes started before this point do not have the new directory read-only.`,
+      { level: 'warn' },
+    )
+  }
   bwrapArgsDir = fs.mkdtempSync(path.join(tmpdir(), 'srt-bwrap-args-'))
   registerExitCleanupHandler()
   return bwrapArgsDir
@@ -2079,10 +2105,33 @@ export async function wrapCommandWithSandboxLinux(
       // only the trailer stays on the line. bwrap still caps the number of
       // parsed arguments (MAX_ARGS, 9000: about 3000 mounts), so a profile
       // should still be kept small at the source.
+      const argsFd = bwrapArgsFdFor(seccompConfig?.applyPath)
       const argsFile = path.join(
         ensureBwrapArgsDir(),
         `args-${process.pid}-${++bwrapArgsFileCount}`,
       )
+      // The redirect opens the file before the group runs, and rm unlinks
+      // it at once (the open fd keeps it readable for bwrap), so the file
+      // lives only until the spawn — the window the ro-bind covers — and
+      // never accumulates while a sandbox stays active. `command` keeps an
+      // rm alias of the embedder's shell (zsh reads .zshenv for -c) out of
+      // the way.
+      const viaArgsFile =
+        `{ command rm -f -- ${quote([argsFile])}; exec ` +
+        quote([
+          bwrapPath ?? 'bwrap',
+          '--args',
+          String(argsFd),
+          ...bwrapArgs.slice(trailerStart),
+        ]) +
+        `; } ${argsFd}<${quote([argsFile])}`
+      if (Buffer.byteLength(viaArgsFile, 'utf8') + 1 > LINUX_MAX_ARG_STRLEN) {
+        // The command itself does not fit one argument; nothing here can
+        // help, and the caller's spawn would fail with an opaque E2BIG.
+        throw new Error(
+          `Sandboxed command is too long for one shell argument (${Buffer.byteLength(viaArgsFile, 'utf8')} bytes with the bwrap options already moved to a file; the limit is ${LINUX_MAX_ARG_STRLEN - 1})`,
+        )
+      }
       fs.writeFileSync(
         argsFile,
         bwrapArgs
@@ -2092,21 +2141,9 @@ export async function wrapCommandWithSandboxLinux(
         { mode: 0o600, flag: 'wx' },
       )
       bwrapArgsFiles.add(argsFile)
-      // The redirect opens the file before the group runs, and rm unlinks
-      // it at once (the open fd keeps it readable for bwrap), so the file
-      // lives only until the spawn — the window the ro-bind covers — and
-      // never accumulates while a sandbox stays active.
-      wrappedCommand =
-        `{ rm -f ${quote([argsFile])}; exec ` +
-        quote([
-          bwrapPath ?? 'bwrap',
-          '--args',
-          '3',
-          ...bwrapArgs.slice(trailerStart),
-        ]) +
-        `; } 3<${quote([argsFile])}`
+      wrappedCommand = viaArgsFile
       logForDebugging(
-        `[Sandbox Linux] bwrap options moved to ${argsFile}: the command line would be ${oneArgumentBytes} bytes as one argument`,
+        `[Sandbox Linux] bwrap options moved to ${argsFile} (fd ${argsFd}): the command line would be ${oneArgumentBytes} bytes as one argument`,
       )
     }
 

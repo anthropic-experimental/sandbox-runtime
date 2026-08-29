@@ -85,6 +85,7 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       allowOnly?: string[]
       setEnvVars?: Record<string, string>
       mandatoryDenySearchDepth?: number
+      seccompConfig?: { applyPath: string; argv0?: string }
     } = {},
   ): Promise<string> {
     return wrapCommandWithSandboxLinux({
@@ -94,6 +95,7 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       writeConfig: { allowOnly: opts.allowOnly ?? [], denyWithinAllow: [] },
       setEnvVars: opts.setEnvVars,
       mandatoryDenySearchDepth: opts.mandatoryDenySearchDepth,
+      seccompConfig: opts.seccompConfig,
     })
   }
 
@@ -108,7 +110,7 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
 
   // The file an over-long profile was written to, from the redirect.
   function argsFileOf(wrapped: string): string {
-    const redirect = wrapped.match(/ 3<(\S+)$/)
+    const redirect = wrapped.match(/ 9<(\S+)$/)
     expect(redirect).not.toBeNull()
     return redirect![1]!
   }
@@ -136,10 +138,13 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     })
 
     expect(Buffer.byteLength(wrapped)).toBeLessThan(128 * 1024)
-    // The shell opens the file on fd 3, unlinks it, and execs bwrap.
-    expect(wrapped).toMatch(/^\{ rm -f (\S+); exec bwrap --args 3 -- \S+ -c /)
+    // The shell opens the file on fd 9 (dash takes single-digit fds only;
+    // low fds belong to the embedder), unlinks it, and execs bwrap.
+    expect(wrapped).toMatch(
+      /^\{ command rm -f -- (\S+); exec bwrap --args 9 -- \S+ -c /,
+    )
     const argsFile = argsFileOf(wrapped)
-    expect(wrapped.match(/^\{ rm -f (\S+); /)![1]).toBe(argsFile)
+    expect(wrapped.match(/^\{ command rm -f -- (\S+); /)![1]).toBe(argsFile)
     expect(existsSync(argsFile)).toBe(true)
     // Inside the per-process directory.
     const argsDir = dirname(argsFile)
@@ -202,7 +207,31 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
     expect(fits).not.toContain('--args')
 
     const overflows = await renderedAt(128 * 1024)
-    expect(overflows).toMatch(/^\{ rm -f \S+; exec bwrap --args 3 -- /)
+    expect(overflows).toMatch(
+      /^\{ command rm -f -- \S+; exec bwrap --args 9 -- /,
+    )
+  })
+
+  it('steps aside from an fd the seccomp helper is passed on, and refuses a command that cannot fit at all', async () => {
+    // An embedder that hands its helper binary over as /proc/self/fd/9
+    // would lose it to the redirect; the args move to fd 8.
+    const files = flatFiles(2000)
+    const wrapped = await wrap(files, {
+      seccompConfig: { applyPath: '/proc/self/fd/9', argv0: 'apply-seccomp' },
+    })
+    expect(wrapped).toMatch(/^\{ command rm -f -- \S+; exec bwrap --args 8 -- /)
+    expect(wrapped).toMatch(/ 8<\S+$/)
+    expect(wrapped).toContain('/proc/self/fd/9')
+
+    // The options are already in the file; a command past 128 KiB on its
+    // own has nowhere to go, and the caller hears why instead of E2BIG.
+    let thrown: unknown
+    try {
+      await wrap(files, { command: 'a'.repeat(128 * 1024) })
+    } catch (err) {
+      thrown = err
+    }
+    expect(String(thrown)).toMatch(/too long for one shell argument/)
   })
 
   it.if(BWRAP_CAN_NAMESPACE)(
@@ -225,7 +254,7 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
           // of the file (opening a device node inside the user namespace
           // is not portable across hosts, so its type is the oracle).
           `[ -c ${files[0]} ] && echo MASKED || echo UNMASKED`,
-          '[ -e /proc/self/fd/3 ] && echo FD3_OPEN || echo FD3_CLOSED',
+          '[ -e /proc/self/fd/9 ] && echo FD9_OPEN || echo FD9_CLOSED',
           `touch ${probe} 2>/dev/null && echo ARGS_WRITABLE || echo ARGS_READONLY`,
         ].join('; '),
       })
@@ -242,7 +271,7 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       const lines = run.stdout.trim().split('\n')
       expect(lines[0]).toBe('MASKED') // the mask from the file applied
       expect(readFileSync(files[0]!, 'utf8')).toBe('secret\n') // host intact
-      expect(lines[1]).toBe('FD3_CLOSED')
+      expect(lines[1]).toBe('FD9_CLOSED')
       expect(lines[2]).toBe('ARGS_READONLY')
       expect(existsSync(probe)).toBe(false)
       // Unlinked by the spawn itself.
