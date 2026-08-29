@@ -278,6 +278,30 @@ describe('restriction pattern semantics', () => {
     )
 
     it.if(isLinux)(
+      'weaker branch passes --unshare-user, and drops capabilities for a root caller',
+      async () => {
+        // bwrap run by uid 0 keeps the caller's capabilities unless told to
+        // drop them; a non-root caller has none inside the new userns.
+        const result = await wrapCommandWithSandboxLinux({
+          command,
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: [] },
+          writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+          enableWeakerNestedSandbox: true,
+        })
+
+        expect(result).toContain('--unshare-user')
+        expect(result).toContain('--bind /proc /proc')
+        expect(result).not.toContain('--proc /proc')
+        if (process.geteuid?.() === 0) {
+          expect(result).toContain('--cap-drop ALL')
+        } else {
+          expect(result).not.toContain('--cap-drop')
+        }
+      },
+    )
+
+    it.if(isLinux)(
       'non-empty denyOnly means has read restrictions on Linux',
       async () => {
         const result = await wrapCommandWithSandboxLinux({
