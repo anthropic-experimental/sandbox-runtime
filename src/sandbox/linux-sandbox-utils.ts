@@ -1275,7 +1275,8 @@ async function generateFilesystemArgs(
           // veto every skip and stub each absent mandatory-deny path of a
           // write-denied cwd after that cwd's own bind — the startup abort.
           // Its descendants are decided by their own recorded directories,
-          // as on main, whose root-blind filter never recorded '/'.
+          // as before, when the string-prefix filter matched '/' only for a
+          // path directly beneath it and the vetoes never fired for it.
           if (denyDir === '/') continue
           return false
         }

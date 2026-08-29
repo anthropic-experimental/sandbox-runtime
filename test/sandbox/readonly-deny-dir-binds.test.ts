@@ -228,6 +228,32 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     expect(command).toContain(`--ro-bind ${sibling} ${sibling}`)
   })
 
+  it('vetoes "/" for an allowed write path beneath it even with no read policy', async () => {
+    // Veto (i) alone must be root-aware: with readConfig undefined there is
+    // no read-deny tmpfs for veto (ii) to catch '/' with.
+    const command = await wrapCommandWithSandboxLinux({
+      command: 'echo hello',
+      needsNetworkRestriction: false,
+      readConfig: undefined,
+      writeConfig: { allowOnly: ['/', AREA], denyWithinAllow: ['/', PROJ] },
+    })
+
+    expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
+  })
+
+  it('does not re-apply a tmpfs over the bind that denies the same directory', async () => {
+    // X in allowOnly, denyWithinAllow and denyRead: the read-only bind of X
+    // is not "an ancestor that re-exposes X", so no --tmpfs X --bind X X may
+    // follow it and make X writable again.
+    const X = join(AREA, 'both')
+    mkdirSync(X)
+    const command = await wrap([X], [X], [AREA, X])
+
+    const lastRoBind = command.lastIndexOf(`--ro-bind ${X} ${X}`)
+    expect(lastRoBind).toBeGreaterThan(-1)
+    expect(command.indexOf(`--bind ${X} ${X}`, lastRoBind)).toBe(-1)
+  })
+
   it('keeps the bind for a deny reached through a symlinked spelling', async () => {
     // The re-application passes key off emitted raw spellings; a dest that
     // was reached via a symlink keeps its bind so that breadcrumb survives.
