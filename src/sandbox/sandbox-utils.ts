@@ -414,7 +414,9 @@ export function normalizePathForSandbox(pathPattern: string): string {
  * allow access to files from other processes. In highly security-sensitive
  * environments, you should configure more restrictive write paths.
  */
-export function getDefaultWritePaths(): string[] {
+export function getDefaultWritePaths(
+  denyRead: readonly string[] = [],
+): string[] {
   const homeDir = homedir()
   const recommendedPaths = [
     '/dev/stdout',
@@ -428,8 +430,26 @@ export function getDefaultWritePaths(): string[] {
     path.join(homeDir, '.npm/_logs'),
     path.join(homeDir, '.claude/debug'),
   ]
+  if (denyRead.length === 0) return recommendedPaths
 
-  return recommendedPaths
+  // These are conveniences the caller never asked for. One that lies at or
+  // under a directory the caller read-denies would be bound back over that
+  // deny on Linux (readable and writable again) and writable on macOS, so
+  // an explicit denyRead wins over an implicit allowWrite. A caller who
+  // wants the path writable lists it in allowWrite.
+  const denied = denyRead
+    .filter(p => !containsGlobChars(removeTrailingGlobSuffix(p)))
+    .map(p => normalizePathForSandbox(p))
+  return recommendedPaths.filter(recommended => {
+    const resolved = normalizePathForSandbox(recommended)
+    return !denied.some(
+      d =>
+        resolved === d ||
+        resolved.startsWith(d === '/' ? '/' : d + '/') ||
+        recommended === d ||
+        recommended.startsWith(d === '/' ? '/' : d + '/'),
+    )
+  })
 }
 
 /**

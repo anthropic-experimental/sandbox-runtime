@@ -672,7 +672,7 @@ async function initialize(
         // (allowed or not). Only paths bwrap would actually refuse — outside
         // allowWrite or inside a denyWrite carve-out — go to the store.
         allowWritePaths: [
-          ...getDefaultWritePaths(),
+          ...getDefaultWritePaths(config.filesystem.denyRead),
           ...config.filesystem.allowWrite,
         ],
         denyWritePaths: config.filesystem.denyWrite,
@@ -1247,8 +1247,12 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
       return true
     })
 
-  // Build allowOnly list: default paths + configured allow paths
-  const allowOnly = [...getDefaultWritePaths(), ...allowPaths]
+  // Build allowOnly list: default paths (less any the config read-denies)
+  // + configured allow paths
+  const allowOnly = [
+    ...getDefaultWritePaths(config.filesystem.denyRead),
+    ...allowPaths,
+  ]
 
   return {
     allowOnly,
@@ -1577,7 +1581,14 @@ async function wrapWithSandbox(
         [],
     )
     writeConfig = {
-      allowOnly: [...getDefaultWritePaths(), ...userAllowWrite],
+      allowOnly: [
+        ...getDefaultWritePaths(
+          customConfig?.filesystem?.denyRead ??
+            config?.filesystem.denyRead ??
+            [],
+        ),
+        ...userAllowWrite,
+      ],
       denyWithinAllow: stripWriteGlobs(
         customConfig?.filesystem?.denyWrite ??
           config?.filesystem.denyWrite ??
