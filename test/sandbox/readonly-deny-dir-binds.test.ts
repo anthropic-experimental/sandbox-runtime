@@ -16,16 +16,10 @@ import {
 import { isLinux } from '../helpers/platform.js'
 
 /**
- * Companion to readonly-deny-dir-stubs.test.ts for EXISTING deny targets.
- *
- * When denyWithinAllow re-binds a directory read-only (--ro-bind <dir>
- * <dir>), every existing deny path strictly beneath it — typically the
- * mandatory-deny files of a write-protected checkout (.git/hooks,
- * .git/config, .mcp.json, …) — is already unwritable, yet each used to get
- * its own --ro-bind <p> <p>. Those redundant mounts are now skipped under the
- * same evidence and vetoes as the absent-path stub skip; a deny that equals
- * an allowOnly root, or one with no covering read-only directory, is still
- * bound.
+ * A deny path strictly beneath a directory that denyWithinAllow re-binds
+ * read-only gets no --ro-bind of its own, under the same evidence and vetoes
+ * as the absent-path stub skip (readonly-deny-dir-stubs.test.ts); a deny
+ * equal to an allowOnly root, or with no covering directory, is still bound.
  */
 describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
   let BASE: string
@@ -53,10 +47,12 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     rmSync(BASE, { recursive: true, force: true })
   })
 
+  // Same parameter order as readonly-deny-dir-stubs.test.ts, whose fixture
+  // and covering-directory predicate this suite shares.
   async function wrap(
     denyPaths: string[],
-    allowPaths: string[],
     readDenyPaths: string[] = [],
+    allowPaths: string[] = [AREA],
   ): Promise<string> {
     return wrapCommandWithSandboxLinux({
       command: 'echo hello',
@@ -70,24 +66,24 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     haystack.split(needle).length - 1
 
   it('binds the denied allow-root once and skips the existing file beneath it', async () => {
-    // allowOnly=[cwd], denyWithinAllow=[cwd, cwd/sub/file]: the directory
+    // allowOnly=[proj], denyWithinAllow=[proj, proj/sub/file]: the directory
     // deny equals the allow root and must still be emitted; the file is a
     // strict descendant of that read-only bind and needs nothing.
-    const command = await wrap([PROJ, FILE], [PROJ])
+    const command = await wrap([PROJ, FILE], [], [PROJ])
 
     expect(countOccurrences(command, `--ro-bind ${PROJ} ${PROJ}`)).toBe(1)
     expect(command).not.toContain(`--ro-bind ${FILE} ${FILE}`)
   })
 
   it('is independent of the order the denies are listed in', async () => {
-    const command = await wrap([FILE, PROJ], [PROJ])
+    const command = await wrap([FILE, PROJ], [], [PROJ])
 
     expect(countOccurrences(command, `--ro-bind ${PROJ} ${PROJ}`)).toBe(1)
     expect(command).not.toContain(`--ro-bind ${FILE} ${FILE}`)
   })
 
   it('still binds the file when its directory is not itself denied', async () => {
-    const command = await wrap([FILE], [PROJ])
+    const command = await wrap([FILE], [], [PROJ])
 
     expect(command).toContain(`--bind ${PROJ} ${PROJ}`)
     expect(command).toContain(`--ro-bind ${FILE} ${FILE}`)
@@ -95,7 +91,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
 
   it('collapses a chain of nested directory denies to the outermost bind', async () => {
     const sub = join(PROJ, 'sub')
-    const command = await wrap([PROJ, sub, FILE], [AREA])
+    const command = await wrap([PROJ, sub, FILE])
 
     expect(countOccurrences(command, `--ro-bind ${PROJ} ${PROJ}`)).toBe(1)
     expect(command).not.toContain(`--ro-bind ${sub} ${sub}`)
@@ -109,7 +105,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     const nestedAllow = join(PROJ, 'w')
     mkdirSync(nestedAllow)
 
-    const command = await wrap([PROJ, FILE], [AREA, nestedAllow])
+    const command = await wrap([PROJ, FILE], [], [AREA, nestedAllow])
 
     expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
     expect(command).toContain(`--ro-bind ${FILE} ${FILE}`)
@@ -119,7 +115,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     const readDenied = join(PROJ, 'secrets')
     mkdirSync(readDenied)
 
-    const command = await wrap([PROJ, FILE], [AREA], [readDenied])
+    const command = await wrap([PROJ, FILE], [readDenied])
 
     expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
     expect(command).toContain(`--ro-bind ${FILE} ${FILE}`)
@@ -133,7 +129,7 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     symlinkSync(realSub, linkSub)
     const viaLink = join(linkSub, 'settings.json')
 
-    const command = await wrap([PROJ, viaLink], [AREA])
+    const command = await wrap([PROJ, viaLink])
 
     expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
     expect(command).toContain(`--ro-bind ${FILE} ${FILE}`)

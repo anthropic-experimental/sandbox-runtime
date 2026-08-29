@@ -17,6 +17,7 @@ import {
   isSymlinkOutsideBoundary,
   encodeSandboxedCommand,
   DANGEROUS_FILES,
+  isAtOrUnder,
   getDangerousDirectories,
 } from './sandbox-utils.js'
 import type {
@@ -1256,6 +1257,20 @@ async function generateFilesystemArgs(
     // Materialized once: the pre-pass above fully populates the map and the
     // deny loop never mutates it.
     const readOnlyDenyDirs = [...readOnlyDenyDirSpellings.keys()]
+    // Is `candidate` already unwritable in the sandbox: strictly under a
+    // recorded read-only deny directory that survives every
+    // coveringDirIsUnsafe veto? Strictly, because a deny equal to a recorded
+    // directory IS that covering bind and must be emitted (an absent path
+    // never equals one). Stops at the first vetoed covering directory.
+    const coveredBySafeReadOnlyDenyDir = (candidate: string): boolean => {
+      let covered = false
+      for (const denyDir of readOnlyDenyDirs) {
+        if (candidate === denyDir || !isAtOrUnder(candidate, denyDir)) continue
+        if (coveringDirIsUnsafe(denyDir)) return false
+        covered = true
+      }
+      return covered
+    }
     for (const pathPattern of denyPaths) {
       const rawPath = normalizePathForSandbox(pathPattern)
 
@@ -1373,13 +1388,11 @@ async function generateFilesystemArgs(
         // regardless of where it appears in denyPaths. A recorded covering
         // directory is evidence for skipping only if it survives the
         // coveringDirIsUnsafe vetoes (see the INVARIANT at its definition).
-        const coveringReadOnlyDenyDirs = readOnlyDenyDirs.filter(
-          denyDir =>
-            ancestorPath === denyDir || ancestorPath.startsWith(denyDir + '/'),
-        )
+        // (Tested on the absent path itself: a recorded directory that
+        // covers it is at-or-above its deepest existing ancestor, since
+        // recorded directories exist.)
         const ancestorIsWithinReadOnlyDeny =
-          coveringReadOnlyDenyDirs.length > 0 &&
-          !coveringReadOnlyDenyDirs.some(coveringDirIsUnsafe)
+          coveredBySafeReadOnlyDenyDir(normalizedPath)
 
         if (ancestorIsWithinAllowedPath && !ancestorIsWithinReadOnlyDeny) {
           const firstNonExistent = findFirstNonExistentComponent(normalizedPath)
@@ -1425,26 +1438,14 @@ async function generateFilesystemArgs(
       const isWithinAllowedPath = isWithinAnyAllowedWritePath(normalizedPath)
 
       if (isWithinAllowedPath) {
-        // The existing-path twin of the stub skip above: a path STRICTLY
-        // beneath a directory that another deny re-binds read-only is
-        // already unwritable there, so its own --ro-bind <p> <p> is a
-        // redundant mount (one per mandatory-deny file under a write-denied
-        // checkout adds up). Same evidence, same vetoes: the covering
-        // directory comes from the order-independent pre-pass and must pass
-        // coveringDirIsUnsafe, which also guarantees its bind survives the
-        // emission filter. Equality is deliberately excluded — a deny that
-        // IS an allowWrite root (cwd both allowed and denied) is the covering
-        // bind itself. A dest reached through a symlinked spelling keeps its
-        // bind: the tmpfs/mask re-application passes below key off emitted
-        // raw spellings, and the covering directory's bind does not carry
-        // this one's.
-        const coveringReadOnlyDenyDirs = readOnlyDenyDirs.filter(denyDir =>
-          normalizedPath.startsWith(denyDir + '/'),
-        )
+        // Already unwritable under a read-only denied directory (the
+        // existing-path twin of the stub skip above). Veto (iii) keeps the
+        // covering bind through the emission filter; a symlinked spelling
+        // keeps its own bind because the re-application passes below key
+        // off emitted raw spellings.
         if (
           rawPath === normalizedPath &&
-          coveringReadOnlyDenyDirs.length > 0 &&
-          !coveringReadOnlyDenyDirs.some(coveringDirIsUnsafe)
+          coveredBySafeReadOnlyDenyDir(normalizedPath)
         ) {
           logForDebugging(
             `[Sandbox Linux] Skipping deny path already under read-only denied directory: ${normalizedPath}`,
