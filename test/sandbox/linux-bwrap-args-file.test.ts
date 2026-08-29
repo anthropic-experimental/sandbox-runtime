@@ -62,10 +62,12 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
 
   // `count` files, each its own /dev/null mask, as the concrete list the
   // wrapper takes (glob expansion happens a layer up, in SandboxManager).
-  function flatFiles(count: number): string[] {
+  function flatFiles(
+    count: number,
+    stem = 'a-reasonably-long-file-name-to-fill-the-profile-',
+  ): string[] {
     const dir = join(BASE, 'many')
     mkdirSync(dir, { recursive: true })
-    const stem = 'a-reasonably-long-file-name-to-fill-the-profile-'
     const files: string[] = []
     for (let i = 0; i < count; i++) {
       const file = join(dir, `${stem}${i}.log`)
@@ -82,6 +84,7 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       command?: string
       allowOnly?: string[]
       setEnvVars?: Record<string, string>
+      mandatoryDenySearchDepth?: number
     } = {},
   ): Promise<string> {
     return wrapCommandWithSandboxLinux({
@@ -90,6 +93,7 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       readConfig: { denyOnly: files },
       writeConfig: { allowOnly: opts.allowOnly ?? [], denyWithinAllow: [] },
       setEnvVars: opts.setEnvVars,
+      mandatoryDenySearchDepth: opts.mandatoryDenySearchDepth,
     })
   }
 
@@ -209,10 +213,13 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       const argsDir = argsDirOf(await wrap(flatFiles(1)))
       const probe = join(argsDir, 'srt-args-probe')
       // tmpdir writable inside the sandbox: the case the trailing ro-bind
-      // exists for.
-      const files = flatFiles(2000)
+      // exists for. Fewer, longer-named masks than the shape test: every
+      // mount costs bwrap time, and the runner's tmpdir is scanned shallowly
+      // for the same reason.
+      const files = flatFiles(700, `${'a'.repeat(150)}-`)
       const wrapped = await wrap(files, {
         allowOnly: [tmpdir()],
+        mandatoryDenySearchDepth: 1,
         command: [
           // The mask is a bind of /dev/null: a character device in place
           // of the file (opening a device node inside the user namespace
@@ -241,5 +248,6 @@ describe.if(isLinux)('bwrap --args for over-long profiles', () => {
       // Unlinked by the spawn itself.
       expect(existsSync(argsFile)).toBe(false)
     },
+    60_000,
   )
 })
