@@ -18,6 +18,7 @@ import {
   encodeSandboxedCommand,
   DANGEROUS_FILES,
   getDangerousDirectories,
+  isAtOrUnder,
 } from './sandbox-utils.js'
 import type {
   FsReadRestrictionConfig,
@@ -1489,6 +1490,24 @@ async function generateFilesystemArgs(
     .map(p => normalizePathForSandbox(p))
     .sort((a, b) => a.split('/').length - b.split('/').length)
 
+  // A read-deny dest at-or-under a tmpfs this loop already emitted (the
+  // shallow-first order above visits the covering directory first) is
+  // hidden by it unless an allowRead/allowWrite path at-or-under that tmpfs
+  // and at-or-above the dest is re-bound over it by pushReadDenyDirMounts.
+  // A mount there would be created inside the tmpfs and change nothing, and
+  // overlapping entries (a directory plus a glob beneath it) would otherwise
+  // cost one bwrap mount per file. The same question isHiddenByTmpfs below
+  // asks of the buffered denyWrite binds.
+  const readDenyReExposers = [...allowedWritePaths, ...readAllowPaths]
+  const hiddenByEmittedTmpfs = (dest: string): boolean =>
+    tmpfsDirs.some(
+      tmpfsDir =>
+        isAtOrUnder(dest, tmpfsDir) &&
+        !readDenyReExposers.some(
+          p => isAtOrUnder(p, tmpfsDir) && isAtOrUnder(dest, p),
+        ),
+    )
+
   for (const normalizedPath of normalizedDenyPaths) {
     if (!fs.existsSync(normalizedPath)) {
       logForDebugging(
@@ -1499,6 +1518,12 @@ async function generateFilesystemArgs(
 
     const readDenyStat = fs.statSync(normalizedPath)
     if (readDenyStat.isDirectory()) {
+      if (hiddenByEmittedTmpfs(normalizedPath)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping read deny directory already hidden by a denyRead tmpfs: ${normalizedPath}`,
+        )
+        continue
+      }
       tmpfsDirs.push(normalizedPath)
       pushReadDenyDirMounts(
         args,
@@ -1520,6 +1545,12 @@ async function generateFilesystemArgs(
       // For files, bind /dev/null instead of tmpfs. bwrap rejects symlink
       // bind destinations, so the deny bind lands on the resolved target.
       const denyDest = resolveSymlinkDenyDest(normalizedPath)
+      if (hiddenByEmittedTmpfs(denyDest)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping read deny file already hidden by a denyRead tmpfs: ${denyDest}`,
+        )
+        continue
+      }
       args.push('--ro-bind', '/dev/null', denyDest)
       maskedFiles.set(denyDest, '/dev/null')
       maskedFiles.set(normalizedPath, '/dev/null')

@@ -53,6 +53,14 @@ export function normalizeCaseForComparison(pathStr: string): string {
 }
 
 /**
+ * `p` is `dir` itself or lies beneath it, by path segment ('/x' is not under
+ * '/xy'); root-aware, since '/' + '/' is a prefix of nothing.
+ */
+export function isAtOrUnder(p: string, dir: string): boolean {
+  return p === dir || p.startsWith(dir === '/' ? '/' : dir + '/')
+}
+
+/**
  * Check if a path pattern contains glob characters
  */
 export function containsGlobChars(pathPattern: string): boolean {
@@ -873,6 +881,19 @@ export interface ExpandGlobOptions {
   caseInsensitive?: boolean
 }
 
+/** What one recursive walk of a glob's base directory found; see {@link walkGlobPattern}. */
+export interface GlobWalk {
+  /** Absolute paths matching the pattern. */
+  matches: string[]
+  /** Directories (a symlink to one included) matching `directoryPattern`
+   *  over the same listing; empty without one. */
+  directoryMatches: string[]
+  /** Every visited entry that is a symbolic link, by full path. Recursive
+   *  readdir descends into symlinked directories, so a match beneath one
+   *  really lives outside the tree it was found in. */
+  symlinks: Set<string>
+}
+
 /**
  * Expand a glob pattern into concrete file paths.
  *
@@ -888,6 +909,24 @@ export function expandGlobPattern(
   globPath: string,
   opts: ExpandGlobOptions = {},
 ): string[] {
+  return walkGlobPattern(globPath, opts).matches
+}
+
+/**
+ * The walk behind {@link expandGlobPattern}: one recursive listing of the
+ * static prefix, filtered by `globPath` and, when given, `directoryPattern`
+ * (which must share that prefix), with the symlinks seen recorded.
+ */
+export function walkGlobPattern(
+  globPath: string,
+  opts: ExpandGlobOptions & { directoryPattern?: string } = {},
+): GlobWalk {
+  const walk: GlobWalk = {
+    matches: [],
+    directoryMatches: [],
+    symlinks: new Set(),
+  }
+
   // Normalize to `/` separators throughout so {@link globToRegex}
   // (which treats `/` as the segment boundary) and the static-prefix
   // split work on Windows paths. Gated to win32: `\` is a valid
@@ -901,7 +940,7 @@ export function expandGlobPattern(
   const staticPrefix = normalizedPattern.split(/[*?[\]]/)[0]
   if (!staticPrefix || staticPrefix === '/') {
     logForDebugging(`[Sandbox] Glob pattern too broad, skipping: ${globPath}`)
-    return []
+    return walk
   }
 
   // Get the base directory from the static prefix
@@ -913,42 +952,106 @@ export function expandGlobPattern(
     logForDebugging(
       `[Sandbox] Base directory for glob does not exist: ${baseDir}`,
     )
-    return []
+    return walk
   }
 
-  // Build regex from the normalized glob pattern
-  const regex = new RegExp(
-    globToRegex(normalizedPattern),
-    opts.caseInsensitive ? 'i' : '',
-  )
+  const flags = opts.caseInsensitive ? 'i' : ''
+  const regex = new RegExp(globToRegex(normalizedPattern), flags)
+  const directoryRegex =
+    opts.directoryPattern === undefined
+      ? undefined
+      : new RegExp(
+          globToRegex(toFwd(normalizePathForSandbox(opts.directoryPattern))),
+          flags,
+        )
 
-  // List all entries recursively under the base directory
-  const results: string[] = []
+  // Walk explicitly, one readdir per directory, rather than through
+  // readdirSync's `recursive` option: that listing is all-or-nothing, so
+  // one unreadable subtree — or a symlink cycle, which makes it throw ELOOP
+  // under Bun and expand without bound under Node — would void the whole
+  // pattern, and a read-deny glob would silently deny nothing. Symlinked
+  // directories are descended like any other (a match beneath one names an
+  // inode outside the tree; see GlobWalk.symlinks) — every spelling the
+  // sandboxed command could read through must be listed, so a target
+  // reached twice is listed twice, never skipped — except a link back into
+  // its own ancestry, which is the one shape that never terminates: a
+  // symlink is not followed when its target is at or above any directory on
+  // the current descent (the real directory each earlier link was taken
+  // from, and this one). Depth-first, so a directory's entries stay
+  // together.
+  type Frame = {
+    dir: string
+    /** `dir` with every symlink resolved. */
+    real: string
+    /** The real directory each symlink on the way here was taken from. */
+    linkedFrom: readonly string[]
+  }
+  let baseReal = baseDir
   try {
-    const entries = fs.readdirSync(baseDir, {
-      recursive: true,
-      withFileTypes: true,
-    })
-
-    for (const entry of entries) {
-      // Build the full path for this entry
-      // entry.parentPath is the directory containing this entry (available in Node 20+/Bun)
-      // For compatibility, fall back to entry.path if parentPath is not available
-      const parentDir =
-        (entry as { parentPath?: string }).parentPath ??
-        (entry as { path?: string }).path ??
-        baseDir
-      const fullPath = path.join(parentDir, entry.name)
-
-      if (regex.test(toFwd(fullPath))) {
-        results.push(fullPath)
-      }
+    baseReal = fs.realpathSync(baseDir)
+  } catch {
+    // Vanished between the existence check and here: list what remains.
+  }
+  const pending: Frame[] = [{ dir: baseDir, real: baseReal, linkedFrom: [] }]
+  while (pending.length > 0) {
+    const { dir, real, linkedFrom } = pending.pop()!
+    let entries: fs.Dirent[]
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true })
+    } catch (err) {
+      logForDebugging(
+        `[Sandbox] Error listing ${dir} for glob pattern ${globPath}: ${err}`,
+      )
+      continue
     }
-  } catch (err) {
-    logForDebugging(
-      `[Sandbox] Error expanding glob pattern ${globPath}: ${err}`,
-    )
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name)
+      const candidate = toFwd(fullPath)
+      if (regex.test(candidate)) {
+        walk.matches.push(fullPath)
+      }
+      if (entry.isDirectory()) {
+        if (directoryRegex?.test(candidate)) {
+          walk.directoryMatches.push(fullPath)
+        }
+        pending.push({
+          dir: fullPath,
+          real: path.join(real, entry.name),
+          linkedFrom,
+        })
+        continue
+      }
+      if (!entry.isSymbolicLink()) continue
+      walk.symlinks.add(fullPath)
+      // A link pays a stat and, when it leads to a directory, a realpath.
+      let target: string | undefined
+      try {
+        if (fs.statSync(fullPath).isDirectory()) {
+          target = fs.realpathSync(fullPath)
+        }
+      } catch {
+        // Dangling, or vanished: nothing to descend into.
+      }
+      if (target === undefined) continue
+      if (directoryRegex?.test(candidate)) {
+        walk.directoryMatches.push(fullPath)
+      }
+      const cycle = [...linkedFrom, real].some(from =>
+        isAtOrUnder(from, target),
+      )
+      if (cycle) {
+        logForDebugging(
+          `[Sandbox] Not following symlink ${fullPath} -> ${target} for glob pattern ${globPath}: it leads back into its own ancestry`,
+        )
+        continue
+      }
+      pending.push({
+        dir: fullPath,
+        real: target,
+        linkedFrom: [...linkedFrom, real],
+      })
+    }
   }
 
-  return results
+  return walk
 }

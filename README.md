@@ -215,7 +215,7 @@ child.on('exit', async code => {
 })
 ```
 
-**Violation attribution (`commandId` / `commandText`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key, and `annotateStderrWithSandboxFailures(key, stderr)` / `getViolationsForCommand(key)` look them up by that same key. By default the key is the wrapped string itself. Pass an opaque per-invocation `commandId` (e.g. a tool-use id) to key by that instead — recommended: keys compare on their first 100 characters, so long commands sharing a prefix would otherwise cross-attribute, and a rerun of the same text would inherit the earlier run's events. If the string you *execute* is not the command the invocation *represents* (e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'`), also pass `commandText: '<cmd>'`: it is what `ignoreViolations` command patterns match against and what each violation reports as its `command`.
+**Violation attribution (`commandId` / `commandText`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key, and `annotateStderrWithSandboxFailures(key, stderr)` / `getViolationsForCommand(key)` look them up by that same key. By default the key is the wrapped string itself. Pass an opaque per-invocation `commandId` (e.g. a tool-use id) to key by that instead — recommended: keys compare on their first 100 characters, so long commands sharing a prefix would otherwise cross-attribute, and a rerun of the same text would inherit the earlier run's events. If the string you _execute_ is not the command the invocation _represents_ (e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'`), also pass `commandText: '<cmd>'`: it is what `ignoreViolations` command patterns match against and what each violation reports as its `command`.
 
 ```typescript
 const wrapped = await SandboxManager.wrapWithSandbox(
@@ -226,7 +226,10 @@ const wrapped = await SandboxManager.wrapWithSandbox(
   { commandId: invocationId, commandText: rawCommand },
 )
 // ... run it ...
-const annotated = SandboxManager.annotateStderrWithSandboxFailures(invocationId, stderr)
+const annotated = SandboxManager.annotateStderrWithSandboxFailures(
+  invocationId,
+  stderr,
+)
 ```
 
 #### Available exports
@@ -372,10 +375,16 @@ Examples:
 
 **Path Syntax (Linux):**
 
-**Linux currently does not support glob matching.** Use literal paths only:
+bubblewrap binds concrete paths, so glob support is narrower than on macOS:
+
+- `allowWrite` / `denyWrite` take literal paths only; a glob pattern there is skipped.
+- `denyRead` / `allowRead` accept the same glob syntax as macOS, expanded to the matching entries when the command is wrapped (a file that appears later is not covered). A `denyRead` pattern ending in `/**` becomes one mount per matched directory rather than one per file beneath it; an entry reached through a symlink keeps the link's spelling unless the covering directory's mount could not reach it, in which case the link's target is mounted instead.
+
+Examples:
 
 - `"allowWrite": ["src/"]` - Allow write to `src/` directory
 - `"denyRead": ["/home/user/.ssh"]` - Deny read to SSH directory
+- `"denyRead": ["**/build/**"]` - Deny read to every `build/` directory under the current directory
 - `"denyRead": ["/home"], "allowRead": ["."]` - Deny read to all of `/home`, but re-allow the current directory
 
 **All platforms:**
