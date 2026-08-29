@@ -1008,10 +1008,10 @@ async function generateFilesystemArgs(
       allowedWritePaths.push(normalizedPath)
     }
 
-    // Inputs for the stub-skip guard's vetoes, computed at most once and only
-    // when an absent deny path actually has a covering read-only deny dir (an
-    // uncommon configuration) — ordinary commands skip the extra
-    // stat/realpath/readdir syscalls entirely. Lazy evaluation also means the
+    // Inputs for the covering-directory vetoes, computed at most once and
+    // only when a deny path (absent or existing) lies strictly beneath a
+    // recorded read-only deny dir — commands with no such covering directory
+    // skip the extra stat/realpath/readdir syscalls entirely. Lazy evaluation also means the
     // derivation runs from inside the deny loop, AFTER the (unbounded)
     // mandatory-deny ripgrep await below, keeping the snapshot as close as
     // possible to the denyRead loop that later acts on the real filesystem.
@@ -1197,11 +1197,16 @@ async function generateFilesystemArgs(
     // Per-covering-dir veto verdict, computed once per recorded directory
     // (the inputs never change during the deny loop) instead of per absent
     // deny entry.
-    // INVARIANT: a stub is skipped only under a recorded covering deny
-    // directory that has no allowed write path strictly beneath it and is
-    // INCOMPARABLE with every read-deny tmpfs directory (neither
-    // at-or-beneath it nor containing it or any spelling it was reached
-    // through). Rationale: the only writable emissions that land after the
+    // INVARIANT: a stub, or an existing deny path's own bind, is skipped
+    // only under a recorded covering deny directory that has no allowed
+    // write path strictly beneath it and is INCOMPARABLE with every
+    // read-deny tmpfs directory (neither at-or-beneath it nor containing it
+    // or any spelling it was reached through). Containment is root-aware
+    // (isAtOrUnder): '/' is a recordable covering directory when allowOnly
+    // and denyWithinAllow both name it, and '/' + '/' is a prefix of
+    // nothing, so a string-prefix test would judge it safe for every path
+    // and drop the binds the re-application passes below key off.
+    // Rationale: the only writable emissions that land after the
     // buffered read-only binds are the denyRead re-applications
     // (pushReadDenyDirMounts), which mount a tmpfs and re-bind allowed write
     // paths beneath it WITHOUT re-emitting the binds it buries — so a
@@ -1231,14 +1236,13 @@ async function generateFilesystemArgs(
       const unsafe =
         // (i) an allowed write path strictly beneath the dir: the
         //     re-application's effect would re-bind it writable.
-        allowedWritePathsBothForms.some(writePath =>
-          writePath.startsWith(denyDir + '/'),
+        allowedWritePathsBothForms.some(
+          writePath => writePath !== denyDir && isAtOrUnder(writePath, denyDir),
         ) ||
         // (ii) a read-deny tmpfs at or beneath the dir: the re-application's
         //     trigger.
-        prospectiveReadDenyTmpfsDirsBothForms.some(
-          tmpfsDir =>
-            tmpfsDir === denyDir || tmpfsDir.startsWith(denyDir + '/'),
+        prospectiveReadDenyTmpfsDirsBothForms.some(tmpfsDir =>
+          isAtOrUnder(tmpfsDir, denyDir),
         ) ||
         // (iii) a read-deny tmpfs CONTAINING the dir or any raw spelling it
         //     was reached through: the dir's own --ro-bind can be dropped as
@@ -1247,8 +1251,7 @@ async function generateFilesystemArgs(
         //     is not reliably read-only in the sandbox.
         prospectiveReadDenyTmpfsDirsBothForms.some(tmpfsDir =>
           [denyDir, ...(readOnlyDenyDirSpellings.get(denyDir) ?? [])].some(
-            spelling =>
-              spelling === tmpfsDir || spelling.startsWith(tmpfsDir + '/'),
+            spelling => isAtOrUnder(spelling, tmpfsDir),
           ),
         )
       coveringDirUnsafeVerdicts.set(denyDir, unsafe)
@@ -1266,7 +1269,16 @@ async function generateFilesystemArgs(
       let covered = false
       for (const denyDir of readOnlyDenyDirs) {
         if (candidate === denyDir || !isAtOrUnder(candidate, denyDir)) continue
-        if (coveringDirIsUnsafe(denyDir)) return false
+        if (coveringDirIsUnsafe(denyDir)) {
+          // A vetoed '/' neither covers a path nor disqualifies an inner
+          // recorded directory: everything lies beneath it, so it would
+          // veto every skip and stub each absent mandatory-deny path of a
+          // write-denied cwd after that cwd's own bind — the startup abort.
+          // Its descendants are decided by their own recorded directories,
+          // as on main, whose root-blind filter never recorded '/'.
+          if (denyDir === '/') continue
+          return false
+        }
         covered = true
       }
       return covered
@@ -1623,9 +1635,15 @@ async function generateFilesystemArgs(
   // The inverse stacking problem: a denyWrite ro-bind whose dest strictly
   // contains a read-denied dir re-exposes that dir's real contents (the bind
   // landed after the tmpfs). Re-apply the tmpfs on top, with the same write
-  // and allowRead re-binds the denyRead loop emitted.
+  // and allowRead re-binds the denyRead loop emitted. A bind of '/' itself
+  // (allowOnly and denyWithinAllow both naming it) contains every one of
+  // them, so containment is root-aware.
   for (const tmpfsDir of tmpfsDirs) {
-    if (emittedDenyWriteDests.some(dest => tmpfsDir.startsWith(dest + '/'))) {
+    if (
+      emittedDenyWriteDests.some(
+        dest => tmpfsDir !== dest && isAtOrUnder(tmpfsDir, dest),
+      )
+    ) {
       logForDebugging(
         `[Sandbox Linux] Re-applying denyRead tmpfs re-exposed by denyWrite bind: ${tmpfsDir}`,
       )
@@ -1636,7 +1654,11 @@ async function generateFilesystemArgs(
   // ancestor bind, so the real file is back. Re-apply the mask with its
   // original source (/dev/null for read-deny, the fake for credential mask).
   for (const [maskedFile, source] of maskedFiles) {
-    if (emittedDenyWriteDests.some(dest => maskedFile.startsWith(dest + '/'))) {
+    if (
+      emittedDenyWriteDests.some(
+        dest => maskedFile !== dest && isAtOrUnder(maskedFile, dest),
+      )
+    ) {
       // maskedFiles holds both the symlink path and its resolved target so
       // the denyWrite skip-check above matches either. Re-emission must go
       // to the target only — bwrap rejects a symlink bind dest (see

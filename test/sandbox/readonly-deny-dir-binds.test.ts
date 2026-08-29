@@ -2,11 +2,13 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs'
+import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
@@ -28,6 +30,26 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
   let FILE: string // existing file under PROJ/sub
 
   const savedCwd = process.cwd()
+
+  // Runtime arm, as in readonly-deny-dir-stubs.test.ts: only where bwrap can
+  // run the namespace/proc surface the wrapped commands use.
+  const BWRAP_CAN_NAMESPACE =
+    spawnSync(
+      'bwrap',
+      [
+        '--unshare-pid',
+        '--unshare-user',
+        '--cap-drop',
+        'ALL',
+        '--ro-bind',
+        '/',
+        '/',
+        '--proc',
+        '/proc',
+        'true',
+      ],
+      { timeout: 5000 },
+    ).status === 0
 
   beforeEach(() => {
     BASE = realpathSync(mkdtempSync(join(tmpdir(), 'ro-deny-bind-')))
@@ -53,9 +75,10 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
     denyPaths: string[],
     readDenyPaths: string[] = [],
     allowPaths: string[] = [AREA],
+    command = 'echo hello',
   ): Promise<string> {
     return wrapCommandWithSandboxLinux({
-      command: 'echo hello',
+      command,
       needsNetworkRestriction: false,
       readConfig: { denyOnly: readDenyPaths },
       writeConfig: { allowOnly: allowPaths, denyWithinAllow: denyPaths },
@@ -73,6 +96,28 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
 
     expect(countOccurrences(command, `--ro-bind ${PROJ} ${PROJ}`)).toBe(1)
     expect(command).not.toContain(`--ro-bind ${FILE} ${FILE}`)
+
+    // Where the host can run bwrap, prove the covering bind alone still
+    // holds: the file reads, and a write through it fails and changes
+    // nothing on the host.
+    if (BWRAP_CAN_NAMESPACE) {
+      const run = (wrapped: string) =>
+        spawnSync(wrapped, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 15000,
+          cwd: BASE,
+        })
+      const read = run(await wrap([PROJ, FILE], [], [PROJ], `cat ${FILE}`))
+      expect(read.status).toBe(0)
+      expect(read.stdout).toContain('{}')
+
+      const write = run(
+        await wrap([PROJ, FILE], [], [PROJ], `sh -c 'echo x >> ${FILE}'`),
+      )
+      expect(write.status).not.toBe(0)
+      expect(readFileSync(FILE, 'utf8')).toBe('{}\n')
+    }
   })
 
   it('is independent of the order the denies are listed in', async () => {
@@ -119,6 +164,68 @@ describe.if(isLinux)('Deny binds under a read-only denied directory', () => {
 
     expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
     expect(command).toContain(`--ro-bind ${FILE} ${FILE}`)
+  })
+
+  it('does not trust a recorded "/" as a covering directory', async () => {
+    // allowOnly and denyWithinAllow both naming '/' records it as a
+    // read-only deny directory that every path lies beneath. A string-prefix
+    // veto ('/' + '/') could never fire, so PROJ's own bind would be dropped
+    // as covered; the recursive --ro-bind / / emitted later then shadows the
+    // FILE mask with no bind left to key its re-application off, and the
+    // read-denied file is readable. Root-aware containment vetoes '/' (AREA
+    // is an allowed write path beneath it), keeps PROJ's bind, and re-applies
+    // the mask after the root bind.
+    const command = await wrap(['/', PROJ], [FILE], ['/', AREA])
+
+    expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
+    const rootBind = command.lastIndexOf('--ro-bind / /')
+    const mask = command.lastIndexOf(`--ro-bind /dev/null ${FILE}`)
+    expect(rootBind).toBeGreaterThan(-1)
+    expect(mask).toBeGreaterThan(rootBind)
+  })
+
+  it('skips the stubs under a write-denied cwd even when a recorded "/" is vetoed', async () => {
+    // '/' recorded and vetoed (AREA is writable beneath it). A veto that
+    // disqualified every skip would stub each absent mandatory-deny dotfile
+    // of the write-denied cwd after the cwd's own bind — the startup abort
+    // readonly-deny-dir-stubs.test.ts documents. The cwd's recorded bind
+    // decides instead, as on main.
+    process.chdir(PROJ)
+    const command = await wrap(['/', PROJ], [], ['/', AREA])
+
+    expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
+    expect(command).not.toContain(`/dev/null ${PROJ}/`)
+    expect(command).not.toMatch(/--ro-bind \S*claude-empty-\S+ \S*\/proj\//)
+  })
+
+  it('re-applies a read-deny mask and tmpfs shadowed by a bind of "/" alone', async () => {
+    // '/' is the only emitted deny bind. main compared the bind by string
+    // prefix ('/' + '/') and re-applied nothing after --ro-bind / /, so the
+    // recursive root bind left the file and the directory readable.
+    const secrets = join(PROJ, 'secrets')
+    mkdirSync(secrets)
+    const command = await wrap(['/'], [FILE, secrets], ['/'])
+
+    const rootBind = command.lastIndexOf('--ro-bind / /')
+    expect(rootBind).toBeGreaterThan(-1)
+    expect(command.lastIndexOf(`--ro-bind /dev/null ${FILE}`)).toBeGreaterThan(
+      rootBind,
+    )
+    expect(command.lastIndexOf(`--tmpfs ${secrets}`)).toBeGreaterThan(rootBind)
+  })
+
+  it('does not treat a string-prefix sibling as covered', async () => {
+    // AREA/proj2/x.txt shares a prefix with AREA/proj without lying beneath
+    // it: a plain startsWith would drop its bind and leave it writable.
+    const proj2 = join(AREA, 'proj2')
+    mkdirSync(proj2)
+    const sibling = join(proj2, 'x.txt')
+    writeFileSync(sibling, '')
+
+    const command = await wrap([PROJ, sibling])
+
+    expect(command).toContain(`--ro-bind ${PROJ} ${PROJ}`)
+    expect(command).toContain(`--ro-bind ${sibling} ${sibling}`)
   })
 
   it('keeps the bind for a deny reached through a symlinked spelling', async () => {
