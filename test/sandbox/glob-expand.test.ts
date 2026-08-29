@@ -202,12 +202,36 @@ describe.if(!isWindows)('walkGlobPattern', () => {
     expect(walk.matches).toContain(join(BASE, 'a', 'build', '1.out'))
     expect(walk.directoryMatches).toEqual([join(BASE, 'a', 'build')])
     expect([...walk.symlinks]).toEqual([join(BASE, 'a', 'build', 'link')])
+    expect(walk.baseDir).toBe(BASE)
+    expect(walk.baseReal).toBe(BASE)
+  })
+
+  it('reports a symlinked base in both spellings', () => {
+    // alias -> the tree, sideways: normalizePathForSandbox keeps the link
+    // spelling for the pattern, so every match is spelled through it and
+    // the walk reports where it really is.
+    const BASE = realPath(RAW_BASE)
+    const alias = join(
+      RAW_BASE,
+      '..',
+      'alias-' + Math.random().toString(36).slice(2),
+    )
+    symlinkSync(BASE, alias)
+    try {
+      const walk = walkGlobPattern(join(alias, '**/build/**'))
+      expect(walk.baseDir).toBe(alias)
+      expect(walk.baseReal).toBe(BASE)
+      expect(walk.matches).toContain(join(alias, 'a', 'build', '1.out'))
+    } finally {
+      rmSync(alias)
+    }
   })
 
   it('terminates on a symlink cycle and still lists the tree', () => {
-    // build/up -> .. : a recursive readdir throws ELOOP (Bun) or expands
-    // without bound (Node); the walk must survive it, or a denyRead glob
-    // over this tree would silently deny nothing.
+    // build/up -> .. : a recursive readdir throws ELOOP (Bun) or follows
+    // the link to the kernel's limit and lists ~40 phantom copies (Node
+    // 22.13+); the walk must survive it, or a denyRead glob over this tree
+    // would silently deny nothing.
     const BASE = realPath(RAW_BASE)
     mkdirSync(join(RAW_BASE, 'cyc', 'build'), { recursive: true })
     writeFileSync(join(RAW_BASE, 'cyc', 'build', '1.out'), '')
@@ -232,6 +256,8 @@ describe.if(!isWindows)('walkGlobPattern', () => {
       matches: [],
       directoryMatches: [],
       symlinks: new Set(),
+      baseDir: '',
+      baseReal: '',
     })
   })
 })

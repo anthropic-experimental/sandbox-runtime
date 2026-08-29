@@ -31,24 +31,19 @@ function nearestPrefixIn(
  * Reduce a read-deny glob's matches to the mounts that change what the
  * sandbox can read; ancestors precede descendants in the result. A match is
  * dropped only when a kept proper ancestor's tmpfs already hides it and no
- * re-exposer sits between the two.
+ * re-exposer sits between the two (one at the ancestor counts: the deny
+ * loop re-binds it over the tmpfs, so everything beneath needs its own).
  */
 export function collapseReadDenyMounts({
   matches,
   reExposedPaths,
-  canonical,
 }: {
-  /** Absolute, normalized, trailing-slash-free paths, in the spelling the
-   *  denyRead loop will mount (a symlink stays a symlink). */
+  /** Absolute, normalized, trailing-slash-free paths; a match reached
+   *  through a symlink appears in both its spellings. */
   matches: readonly string[]
   /** allowRead/allowWrite paths the denyRead loop re-binds over a tmpfs, in
-   *  every spelling that can name them; one at or between a match and its
-   *  ancestor keeps the match's own mount. */
+   *  every spelling that can name them. */
   reExposedPaths: readonly string[]
-  /** The resolved path of each match that is, or lies beneath, a symlink.
-   *  A re-exposer at or above that resolved path keeps the mount too, so a
-   *  carve-out written in either spelling counts. */
-  canonical?: ReadonlyMap<string, string>
 }): string[] {
   const reExposed = new Set(reExposedPaths)
   // A proper ancestor is a proper string prefix, so lexicographic order
@@ -70,21 +65,6 @@ export function collapseReadDenyMounts({
         break
       }
     }
-    const resolved = canonical?.get(candidate)
-    if (resolved !== undefined && !reExposedBetween) {
-      // Conservative on purpose: any re-exposer at or above the resolved
-      // path keeps the mount, at worst one redundant mount.
-      for (
-        let end = resolved.length;
-        end > 0;
-        end = resolved.lastIndexOf('/', end - 1)
-      ) {
-        if (reExposed.has(resolved.slice(0, end))) {
-          reExposedBetween = true
-          break
-        }
-      }
-    }
     if (ancestor === undefined || reExposedBetween) kept.add(candidate)
   }
   return [...kept]
@@ -96,9 +76,15 @@ export function collapseReadDenyMounts({
  * allowRead and allowWrite entries, already put through
  * normalizePathForSandbox). A pattern ending in `/**` also takes its
  * directory form, so `**\/build/**` yields one mount per `build/` directory.
- * Matches keep their spelling, symlinks included, so a carve-out written
- * against a link still matches; only a match a covering directory's tmpfs
- * cannot reach (see below) is mounted at its resolved path instead.
+ *
+ * Symlinks: a match keeps its spelling, so a carve-out written against a
+ * link still matches, and a match that reaches its inode through a link
+ * (one the walk descended, or one above the walk) is listed in its resolved
+ * spelling as well, so a carve-out written against the target matches too
+ * and the target stays denied where the link itself vanishes (a covering
+ * directory's tmpfs replaces the links beneath it with nothing). The deny
+ * loop mounts each entry at its resolved path, compares re-exposers in both
+ * spellings, and skips the second spelling of an inode it has covered.
  */
 export function expandReadDenyGlobLinux(
   globPattern: string,
@@ -108,7 +94,7 @@ export function expandReadDenyGlobLinux(
   const walk = walkGlobPattern(globPattern, {
     directoryPattern: directoryForm === globPattern ? undefined : directoryForm,
   })
-  const matchSet = new Set(walk.matches)
+  const candidates = new Set(walk.matches)
   if (walk.directoryMatches.length > 0) {
     // Everything beneath a directory-form match is itself a match (the
     // pattern ends in /**), so a directory with something to deny is some
@@ -118,10 +104,12 @@ export function expandReadDenyGlobLinux(
       walk.matches.map(m => m.slice(0, m.lastIndexOf('/'))),
     )
     for (const dir of walk.directoryMatches) {
-      if (parents.has(dir)) matchSet.add(dir)
+      // A directory-form match that is a symlink counts in its own right:
+      // one the walk did not descend (a link back into its own ancestry)
+      // has no match beneath it, yet denies everything it reaches.
+      if (parents.has(dir) || walk.symlinks.has(dir)) candidates.add(dir)
     }
   }
-  const matches = [...matchSet]
 
   const realpathOf = (p: string): string | undefined => {
     try {
@@ -130,61 +118,38 @@ export function expandReadDenyGlobLinux(
       return undefined // dangling or vanished: keep the spelling
     }
   }
-  // Re-exposers in both spellings, as the write-deny pre-pass compares them.
+  // Re-exposers in both spellings, as the deny loop compares them.
   const reExposedBothForms = new Set<string>()
   for (const p of reExposedPaths) {
     reExposedBothForms.add(p)
     const resolved = realpathOf(p)
     if (resolved !== undefined) reExposedBothForms.add(resolved)
   }
-  const throughSymlink = (p: string): boolean =>
+  // Resolved spellings: a realpath for a match under a link the walk
+  // descended, a string swap for one under a symlinked base.
+  const throughWalkLink = (p: string): boolean =>
     walk.symlinks.has(p) || nearestPrefixIn(walk.symlinks, p) !== undefined
-  const canonical = new Map<string, string>()
-  for (const m of matches) {
-    if (!throughSymlink(m)) continue
-    const resolved = realpathOf(m)
-    if (resolved !== undefined) canonical.set(m, resolved)
-  }
-
-  let mounts = collapseReadDenyMounts({
-    matches,
-    reExposedPaths: [...reExposedBothForms],
-    canonical,
-  })
-
-  // A dropped match whose spelling passes through a symlink STRICTLY BELOW
-  // its covering directory names an inode that directory's tmpfs does not
-  // hide: the denyRead loop emits the covering tmpfs first, which replaces
-  // the link with an empty directory inside the sandbox. Mount its resolved
-  // path instead. A link at or above the covering directory is fine, since
-  // that directory's own mount already resolves through it.
-  const kept = new Set(mounts)
-  const resolvedExtras: string[] = []
-  for (const m of matches) {
-    if (kept.has(m)) continue
-    const ancestor = nearestPrefixIn(kept, m)
-    if (ancestor === undefined) continue
-    let linkBetween = false
-    for (
-      let end = m.length;
-      end > ancestor.length;
-      end = m.lastIndexOf('/', end - 1)
-    ) {
-      if (walk.symlinks.has(m.slice(0, end))) {
-        linkBetween = true
-        break
-      }
+  const baseSwapped = walk.baseReal !== walk.baseDir
+  for (const m of [...candidates]) {
+    let resolved: string | undefined
+    if (throughWalkLink(m)) resolved = realpathOf(m)
+    else if (baseSwapped)
+      resolved = walk.baseReal + m.slice(walk.baseDir.length)
+    if (resolved === '/') {
+      // A link to the root: a tmpfs there would hide everything. The
+      // spelling stays, and bwrap refuses to mount on the link.
+      logForDebugging(
+        `[Sandbox Linux] denyRead glob "${globPattern}": ${m} resolves to /, not denied at its target`,
+      )
+      continue
     }
-    if (!linkBetween) continue
-    const resolved = canonical.get(m)
-    if (resolved !== undefined) resolvedExtras.push(resolved)
+    if (resolved !== undefined) candidates.add(resolved)
   }
-  if (resolvedExtras.length > 0) {
-    mounts = collapseReadDenyMounts({
-      matches: [...mounts, ...resolvedExtras],
-      reExposedPaths: [...reExposedBothForms],
-    })
-  }
+
+  const mounts = collapseReadDenyMounts({
+    matches: [...candidates],
+    reExposedPaths: [...reExposedBothForms],
+  })
 
   logForDebugging(
     `[Sandbox Linux] Expanded denyRead glob "${globPattern}": ${walk.matches.length} matches -> ${mounts.length} mounts`,

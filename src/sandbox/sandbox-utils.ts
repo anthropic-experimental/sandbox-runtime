@@ -888,10 +888,16 @@ export interface GlobWalk {
   /** Directories (a symlink to one included) matching `directoryPattern`
    *  over the same listing; empty without one. */
   directoryMatches: string[]
-  /** Every visited entry that is a symbolic link, by full path. Recursive
-   *  readdir descends into symlinked directories, so a match beneath one
-   *  really lives outside the tree it was found in. */
+  /** Every visited entry that is a symbolic link, by full path. The walk
+   *  descends into symlinked directories, so a match beneath one really
+   *  lives outside the tree it was found in. */
   symlinks: Set<string>
+  /** The directory listed (the pattern's static prefix) and its resolved
+   *  form; they differ when a symlink sits above the walk, in which case
+   *  every match has a second, resolved spelling. Empty when nothing was
+   *  listed. */
+  baseDir: string
+  baseReal: string
 }
 
 /**
@@ -925,6 +931,8 @@ export function walkGlobPattern(
     matches: [],
     directoryMatches: [],
     symlinks: new Set(),
+    baseDir: '',
+    baseReal: '',
   }
 
   // Normalize to `/` separators throughout so {@link globToRegex}
@@ -954,6 +962,7 @@ export function walkGlobPattern(
     )
     return walk
   }
+  walk.baseDir = baseDir
 
   const flags = opts.caseInsensitive ? 'i' : ''
   const regex = new RegExp(globToRegex(normalizedPattern), flags)
@@ -967,18 +976,19 @@ export function walkGlobPattern(
 
   // Walk explicitly, one readdir per directory, rather than through
   // readdirSync's `recursive` option: that listing is all-or-nothing, so
-  // one unreadable subtree — or a symlink cycle, which makes it throw ELOOP
-  // under Bun and expand without bound under Node — would void the whole
+  // one unreadable subtree — or a symlink cycle, which Bun's throws ELOOP
+  // on and Node's (22.13 and later) follows to the kernel's link limit,
+  // listing some forty phantom copies — would void or bloat the whole
   // pattern, and a read-deny glob would silently deny nothing. Symlinked
-  // directories are descended like any other (a match beneath one names an
-  // inode outside the tree; see GlobWalk.symlinks) — every spelling the
-  // sandboxed command could read through must be listed, so a target
-  // reached twice is listed twice, never skipped — except a link back into
-  // its own ancestry, which is the one shape that never terminates: a
-  // symlink is not followed when its target is at or above any directory on
-  // the current descent (the real directory each earlier link was taken
-  // from, and this one). Depth-first, so a directory's entries stay
-  // together.
+  // directories are descended like any other on every runtime (Node before
+  // 22.13 never descended one; a match beneath one names an inode outside
+  // the tree; see GlobWalk.symlinks) — every spelling the sandboxed command
+  // could read through must be listed, so a target reached twice is listed
+  // twice, never skipped — except a link back into its own ancestry, which
+  // is the one shape that never terminates: a symlink is not followed when
+  // its target is at or above any directory on the current descent (the
+  // real directory each earlier link was taken from, and this one).
+  // Depth-first, so a directory's entries stay together.
   type Frame = {
     dir: string
     /** `dir` with every symlink resolved. */
@@ -992,6 +1002,7 @@ export function walkGlobPattern(
   } catch {
     // Vanished between the existence check and here: list what remains.
   }
+  walk.baseReal = baseReal
   const pending: Frame[] = [{ dir: baseDir, real: baseReal, linkedFrom: [] }]
   while (pending.length > 0) {
     const { dir, real, linkedFrom } = pending.pop()!
@@ -1023,6 +1034,12 @@ export function walkGlobPattern(
       }
       if (!entry.isSymbolicLink()) continue
       walk.symlinks.add(fullPath)
+      if (process.platform === 'win32') {
+        // A reparse point (junction, directory symlink) is listed but not
+        // descended, as readdirSync's recursive listing never did on
+        // Windows; the cycle check below also speaks POSIX separators.
+        continue
+      }
       // A link pays a stat and, when it leads to a directory, a realpath.
       let target: string | undefined
       try {

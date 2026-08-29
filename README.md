@@ -215,7 +215,7 @@ child.on('exit', async code => {
 })
 ```
 
-**Violation attribution (`commandId` / `commandText`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key, and `annotateStderrWithSandboxFailures(key, stderr)` / `getViolationsForCommand(key)` look them up by that same key. By default the key is the wrapped string itself. Pass an opaque per-invocation `commandId` (e.g. a tool-use id) to key by that instead — recommended: keys compare on their first 100 characters, so long commands sharing a prefix would otherwise cross-attribute, and a rerun of the same text would inherit the earlier run's events. If the string you _execute_ is not the command the invocation _represents_ (e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'`), also pass `commandText: '<cmd>'`: it is what `ignoreViolations` command patterns match against and what each violation reports as its `command`.
+**Violation attribution (`commandId` / `commandText`).** Violations observed while a wrapped command runs (seatbelt log lines, seccomp events, proxy denies) are stored under an attribution key, and `annotateStderrWithSandboxFailures(key, stderr)` / `getViolationsForCommand(key)` look them up by that same key. By default the key is the wrapped string itself. Pass an opaque per-invocation `commandId` (e.g. a tool-use id) to key by that instead — recommended: keys compare on their first 100 characters, so long commands sharing a prefix would otherwise cross-attribute, and a rerun of the same text would inherit the earlier run's events. If the string you *execute* is not the command the invocation *represents* (e.g. you wrap an assembled `source <snapshot> && eval '<cmd>'`), also pass `commandText: '<cmd>'`: it is what `ignoreViolations` command patterns match against and what each violation reports as its `command`.
 
 ```typescript
 const wrapped = await SandboxManager.wrapWithSandbox(
@@ -226,10 +226,7 @@ const wrapped = await SandboxManager.wrapWithSandbox(
   { commandId: invocationId, commandText: rawCommand },
 )
 // ... run it ...
-const annotated = SandboxManager.annotateStderrWithSandboxFailures(
-  invocationId,
-  stderr,
-)
+const annotated = SandboxManager.annotateStderrWithSandboxFailures(invocationId, stderr)
 ```
 
 #### Available exports
@@ -378,7 +375,8 @@ Examples:
 bubblewrap binds concrete paths, so glob support is narrower than on macOS:
 
 - `allowWrite` / `denyWrite` take literal paths only; a glob pattern there is skipped.
-- `denyRead` / `allowRead` accept the same glob syntax as macOS, expanded to the matching entries when the command is wrapped (a file that appears later is not covered). A `denyRead` pattern ending in `/**` becomes one mount per matched directory rather than one per file beneath it; an entry reached through a symlink keeps the link's spelling unless the covering directory's mount could not reach it, in which case the link's target is mounted instead.
+- `denyRead` / `allowRead` accept the same glob syntax as macOS, expanded to the matching entries when the command is wrapped. A file that appears later is not covered, except beneath a directory a `denyRead` pattern ending in `/**` matched: such a directory becomes one tmpfs mount rather than one mount per file beneath it, with a literal directory deny's semantics — inside the sandbox it is empty and writable, writes into it stay in the tmpfs and never reach the host, and a file added to it later on the host is hidden too. An `allowRead` beneath it is bound back over the tmpfs; the entries beneath that carve-out which the pattern matched keep their own masks, as they did before. Symlinked directories are descended, and an entry reached through a symlink is denied at the link's target as well (a link back up the tree denies everything the link reaches, as a literal deny of the link would; a link to `/` is left alone). A carve-out beneath a link applies whichever spelling it is written in; an `allowRead` that is itself a symlink is bound at its target.
+- A directory `denyRead` whose path is a symlink — literal, or matched by a pattern — is mounted at the link's target (bubblewrap refuses to mount on a symlink), and every other rule treats a directory a `/**` pattern matched exactly as a directory listed in `denyRead` literally.
 
 Examples:
 
