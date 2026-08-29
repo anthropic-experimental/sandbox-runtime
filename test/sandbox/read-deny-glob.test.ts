@@ -490,7 +490,9 @@ describe.if(isLinux)(
         const lastTmpfs = Math.max(
           ...ops.flatMap((op, i) => (op.startsWith('tmpfs ') ? [i] : [])),
         )
-        const reBind = ops.lastIndexOf(`ro-bind ${carveOut} ${carveOut}`)
+        const reBind = ops.lastIndexOf(
+          `ro-bind ${carveOut} ${join(real, 'public')}`,
+        )
         expect(reBind).toBeGreaterThan(lastTmpfs)
 
         if (hasBwrap) {
@@ -537,7 +539,9 @@ describe.if(isLinux)(
         writeConfig: { allowOnly: [], denyWithinAllow: [] },
       })
 
-      expect(wrapped).toContain(`--ro-bind ${carveOut} ${carveOut}`)
+      expect(wrapped).toContain(
+        `--ro-bind ${carveOut} ${join(real, 'index.js')}`,
+      )
       expect(wrapped).not.toContain(`/dev/null ${join(real, 'index.js')}`)
       expect(wrapped).not.toContain(`/dev/null ${carveOut}`)
     })
@@ -562,6 +566,43 @@ describe.if(isLinux)(
       const storeBind = wrapped.lastIndexOf(`--ro-bind ${store} ${store}`)
       expect(storeBind).toBeGreaterThan(-1)
       expect(wrapped.lastIndexOf(`--tmpfs ${real}`)).toBeGreaterThan(storeBind)
+    })
+
+    it('does not re-apply a tmpfs over its carve-out when a denyWrite bind covers only the link spelling', async () => {
+      // w/d/link -> realdir (outside the write root w). denyWrite [w/d]
+      // contains the link's spelling but not where the tmpfs landed
+      // (realdir), so the bind re-exposes nothing; re-applying the tmpfs
+      // there anyway would re-bind realdir/pub over the mask on
+      // realdir/pub/secret.txt and leave the file readable.
+      const R = join(ROOT, 'f4')
+      const realdir = join(R, 'realdir')
+      const W = join(R, 'w')
+      const S = join(W, 'd', 'link')
+      mkdirSync(join(realdir, 'pub'), { recursive: true })
+      writeFileSync(join(realdir, 'pub', 'secret.txt'), 'secret')
+      mkdirSync(join(W, 'd'), { recursive: true })
+      symlinkSync(realdir, S)
+
+      const wrapped = await wrapCommandWithSandboxLinux({
+        command: 'true',
+        needsNetworkRestriction: false,
+        readConfig: {
+          denyOnly: [S, join(realdir, 'pub', 'secret.txt')],
+          allowWithinDeny: [join(realdir, 'pub')],
+        },
+        writeConfig: { allowOnly: [W], denyWithinAllow: [join(W, 'd')] },
+        mandatoryDenySearchDepth: 1,
+      })
+
+      const mask = `--ro-bind /dev/null ${join(realdir, 'pub', 'secret.txt')}`
+      const carveOut = `--ro-bind ${join(realdir, 'pub')} ${join(realdir, 'pub')}`
+      expect(wrapped).toContain(mask)
+      // One tmpfs on the target, and the mask is the last word on the file:
+      // no carve-out re-bind after it.
+      expect(wrapped.split(`--tmpfs ${realdir} `)).toHaveLength(2)
+      expect(wrapped.lastIndexOf(mask)).toBeGreaterThan(
+        wrapped.lastIndexOf(carveOut),
+      )
     })
 
     it('binds a carve-out that is itself a symlink at its target', async () => {
@@ -608,8 +649,128 @@ describe.if(isLinux)(
       })
       expect(viaTarget).toContain(`--tmpfs ${real}`)
       expect(viaTarget).toContain(
-        `--ro-bind ${join(link, 'public')} ${join(link, 'public')}`,
+        `--ro-bind ${join(link, 'public')} ${join(real, 'public')}`,
       )
+    })
+
+    it('mounts a deny beneath a recreated symlinked carve-out where the carve-out was recreated', async () => {
+      // denyRead [D, D/lnk/sub] + allowRead [D/lnk], D/lnk -> ../e: D's tmpfs
+      // wipes the link, the carve-out re-bind recreates D/lnk as a plain
+      // directory showing e, so the deny must land at D/lnk/sub — a tmpfs
+      // at e/sub (the host realpath) would leave D/lnk/sub/secret readable.
+      const D = join(ROOT, 's1', 'D')
+      const e = join(ROOT, 's1', 'e')
+      mkdirSync(D, { recursive: true })
+      mkdirSync(join(e, 'sub'), { recursive: true })
+      writeFileSync(join(e, 'sub', 'secret'), 'secret')
+      symlinkSync(join('..', 'e'), join(D, 'lnk'))
+      const wrapped = await wrapCommandWithSandboxLinux({
+        command: `cat ${join(D, 'lnk', 'sub', 'secret')} || echo HIDDEN`,
+        needsNetworkRestriction: false,
+        readConfig: {
+          denyOnly: [D, join(D, 'lnk', 'sub')],
+          allowWithinDeny: [join(D, 'lnk')],
+        },
+        writeConfig: { allowOnly: [], denyWithinAllow: [] },
+      })
+      expect(wrapped).toContain(`--tmpfs ${join(D, 'lnk', 'sub')}`)
+      if (hasBwrap) {
+        const run = spawnSync(wrapped, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 15000,
+        })
+        expect(run.stdout).not.toContain('secret')
+        expect(run.stdout).toContain('HIDDEN')
+      }
+    })
+
+    it('binds a symlinked carve-out nested in another carve-out at its target', async () => {
+      // denyRead [D] + allowRead [D/x, D/x/lnk]: D/x is re-bound from the
+      // host, so D/x/lnk is a live symlink inside the sandbox and bwrap 0.12
+      // refuses it as a destination.
+      const D = join(ROOT, 's3', 'D')
+      const t = join(ROOT, 's3', 't')
+      mkdirSync(join(D, 'x'), { recursive: true })
+      mkdirSync(t, { recursive: true })
+      writeFileSync(join(t, 'f'), 'T')
+      symlinkSync(join('..', '..', 't'), join(D, 'x', 'lnk'))
+      const wrapped = await wrapCommandWithSandboxLinux({
+        command: `cat ${join(D, 'x', 'lnk', 'f')}`,
+        needsNetworkRestriction: false,
+        readConfig: {
+          denyOnly: [D],
+          allowWithinDeny: [join(D, 'x'), join(D, 'x', 'lnk')],
+        },
+        writeConfig: { allowOnly: [], denyWithinAllow: [] },
+      })
+      expect(wrapped).not.toContain(` ${join(D, 'x', 'lnk')} --`)
+      expect(wrapped).toContain(`--ro-bind ${join(D, 'x', 'lnk')} ${t}`)
+      if (hasBwrap) {
+        const run = spawnSync(wrapped, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 15000,
+        })
+        expect(run.stderr ?? '').not.toContain('symlink destination')
+        expect(run.stdout).toBe('T')
+      }
+    })
+
+    it('re-binds a carve-out through an absolute intermediate symlink without a symlink in the destination', async () => {
+      // denyRead [T] + allowRead [P/L/sub], P/L -> T absolute: bubblewrap
+      // before 0.12 aborts on an absolute link inside a destination.
+      const T = join(ROOT, 's4', 'T')
+      const P = join(ROOT, 's4', 'P')
+      mkdirSync(join(T, 'sub'), { recursive: true })
+      mkdirSync(P, { recursive: true })
+      writeFileSync(join(T, 'sub', 'f'), 'F')
+      symlinkSync(T, join(P, 'L'))
+      const wrapped = await wrapCommandWithSandboxLinux({
+        command: `cat ${join(P, 'L', 'sub', 'f')}`,
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [T], allowWithinDeny: [join(P, 'L', 'sub')] },
+        writeConfig: { allowOnly: [], denyWithinAllow: [] },
+      })
+      expect(wrapped).toContain(
+        `--ro-bind ${join(P, 'L', 'sub')} ${join(T, 'sub')}`,
+      )
+      if (hasBwrap) {
+        const run = spawnSync(wrapped, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 15000,
+        })
+        expect(run.status).toBe(0)
+        expect(run.stdout).toBe('F')
+      }
+    })
+
+    it('still masks the target of a file symlink listed beneath a denied directory', async () => {
+      // denyRead [cfg, cfg/token], cfg/token -> ../secrets/token: the link
+      // vanishes with cfg's tmpfs, but the file it named is the target, and
+      // main masked it there (resolveSymlinkDenyDest); it must stay masked.
+      const cfg = join(ROOT, 's9', 'cfg')
+      const secrets = join(ROOT, 's9', 'secrets')
+      mkdirSync(cfg, { recursive: true })
+      mkdirSync(secrets, { recursive: true })
+      writeFileSync(join(secrets, 'token'), 'TOKEN')
+      symlinkSync(join('..', 'secrets', 'token'), join(cfg, 'token'))
+      const wrapped = await wrapCommandWithSandboxLinux({
+        command: `cat ${join(secrets, 'token')}; echo`,
+        needsNetworkRestriction: false,
+        readConfig: { denyOnly: [cfg, join(cfg, 'token')] },
+        writeConfig: { allowOnly: [], denyWithinAllow: [] },
+      })
+      expect(wrapped).toContain(`--ro-bind /dev/null ${join(secrets, 'token')}`)
+      if (hasBwrap) {
+        const run = spawnSync(wrapped, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 15000,
+        })
+        expect(run.stdout).not.toContain('TOKEN')
+      }
     })
 
     it('emits one tmpfs for a directory and the files a glob lists beneath it', async () => {
