@@ -11,6 +11,7 @@ import {
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
+import { quote } from '../../src/utils/shell-quote.js'
 import { isMacOS } from '../helpers/platform.js'
 
 /**
@@ -35,15 +36,23 @@ describe.if(isMacOS)('macOS literal deny grouping', () => {
   const name = (i: number) => `feature-branch-${i}`
 
   const denyWithinAllow: string[] = []
+  // Every regex metacharacter that can reach a grouped name (glob
+  // characters `*?[]` divert a path away from grouping) plus the two
+  // characters the SBPL string literal itself escapes, and a non-ASCII
+  // name: each must match byte-for-byte once rendered into a regex. Listed
+  // first so they share a chunk with the probed plain name below and a
+  // mis-parsed alternative would show up as a chunk-mate matching wrongly.
+  const ODD_NAME = 'odd.name+(1){2}^$|\\"q'
+  const UNICODE_NAME = 'funci\u00f3n-\u540d\u524d'
+  for (const n of [ODD_NAME, UNICODE_NAME]) {
+    for (const leaf of LEAVES) {
+      denyWithinAllow.push(join(REGISTRY, n, leaf))
+    }
+  }
   for (let i = 0; i < NAMES; i++) {
     for (const leaf of LEAVES) {
       denyWithinAllow.push(join(REGISTRY, name(i), leaf))
     }
-  }
-  // A name with regex metacharacters must be escaped, not interpreted.
-  const ODD_NAME = 'odd.name+(1)'
-  for (const leaf of LEAVES) {
-    denyWithinAllow.push(join(REGISTRY, ODD_NAME, leaf))
   }
   // A different leaf set forms its own group; a lone path stays literal.
   for (let i = 0; i < 5; i++) {
@@ -84,7 +93,7 @@ describe.if(isMacOS)('macOS literal deny grouping', () => {
   }
 
   beforeAll(() => {
-    for (const n of [name(7), ODD_NAME, 'partial-2']) {
+    for (const n of [name(7), ODD_NAME, UNICODE_NAME, 'partial-2']) {
       mkdirSync(join(REGISTRY, n), { recursive: true })
       writeFileSync(join(REGISTRY, n, 'commondir'), '../..\n')
     }
@@ -99,13 +108,27 @@ describe.if(isMacOS)('macOS literal deny grouping', () => {
 
   it('renders each group as chunked regexes under the SBPL string cap', () => {
     const wrapped = wrap('true')
-    const regexes = wrapped.match(/\(regex "[^"]*worktrees[^"]*"\)/g) ?? []
+    const regexes =
+      wrapped.match(/\(regex "(?:[^"\\]|\\.)*worktrees(?:[^"\\]|\\.)*"\)/g) ??
+      []
     expect(regexes.length).toBeGreaterThan(2)
     for (const filter of regexes) {
       expect(Buffer.byteLength(filter)).toBeLessThan(1025)
     }
     // No per-path subpath filter survives for a grouped path.
-    expect(wrapped).not.toContain(`(subpath "${join(REGISTRY, name(7))}`)
+    for (const n of [name(7), ODD_NAME, UNICODE_NAME]) {
+      expect(wrapped).not.toContain(`(subpath "${join(REGISTRY, n)}`)
+    }
+    // The metacharacter and non-ASCII names sit in the same alternation as
+    // the probed plain name, escaped (regex) then escaped again (SBPL
+    // string literal).
+    const firstDeny = regexes.find(r => r.includes(`|${name(7)}|`))
+    expect(firstDeny).toBeDefined()
+    expect(firstDeny).toContain(
+      String.raw`(odd\\.name\\+\\(1\\)\\{2\\}\\^\\$\\|\\\\\"q|` +
+        UNICODE_NAME +
+        '|',
+    )
     // The lone path is still a plain subpath filter.
     expect(wrapped).toContain(`(subpath "${LONE}")`)
     // A name too long for its group's regex is emitted literally rather
@@ -115,7 +138,7 @@ describe.if(isMacOS)('macOS literal deny grouping', () => {
         `(subpath "${join(DEEP_REGISTRY, n, 'commondir')}")`,
       )
     }
-    for (const filter of wrapped.match(/\(regex "[^"]*"\)/g) ?? []) {
+    for (const filter of wrapped.match(/\(regex "(?:[^"\\]|\\.)*"\)/g) ?? []) {
       expect(Buffer.byteLength(filter)).toBeLessThan(1025)
     }
     // Bytes: well under what one subpath filter per path would cost.
@@ -135,19 +158,25 @@ describe.if(isMacOS)('macOS literal deny grouping', () => {
   it('enforces the per-path semantics', () => {
     const entry = join(REGISTRY, name(7))
     const odd = join(REGISTRY, ODD_NAME)
+    const uni = join(REGISTRY, UNICODE_NAME)
     const partial = join(REGISTRY, 'partial-2')
     const fresh = join(REGISTRY, 'brand-new')
+    const q = (p: string) => quote([p])
     const script = [
-      `echo x > "${entry}/commondir" && echo WROTE-LEAF`,
-      `echo x > "${entry}/config.worktree" && echo WROTE-LEAF-2`,
-      `echo x > "${entry}/other" && echo WROTE-SIBLING`,
-      `mv "${entry}" "${REGISTRY}/moved" && echo MOVED-ENTRY`,
-      `mkdir "${fresh}" && echo x > "${fresh}/commondir" && echo CREATED-NEW`,
-      `echo x > "${odd}/commondir" && echo WROTE-ODD`,
-      `echo x > "${odd}/other" && echo WROTE-ODD-SIBLING`,
-      `echo x > "${partial}/commondir" && echo WROTE-PARTIAL`,
-      `echo x > "${partial}/config.worktree" && echo WROTE-PARTIAL-OTHER-LEAF`,
-      `echo x > "${LONE}" && echo WROTE-LONE`,
+      `echo x > ${q(`${entry}/commondir`)} && echo WROTE-LEAF`,
+      `echo x > ${q(`${entry}/config.worktree`)} && echo WROTE-LEAF-2`,
+      `echo x > ${q(`${entry}/other`)} && echo WROTE-SIBLING`,
+      `mv ${q(entry)} ${q(`${REGISTRY}/moved`)} && echo MOVED-ENTRY`,
+      `mkdir ${q(fresh)} && echo x > ${q(`${fresh}/commondir`)} && echo CREATED-NEW`,
+      `echo x > ${q(`${odd}/commondir`)} && echo WROTE-ODD`,
+      `echo x > ${q(`${odd}/other`)} && echo WROTE-ODD-SIBLING`,
+      `mv ${q(odd)} ${q(`${REGISTRY}/moved-odd`)} && echo MOVED-ODD`,
+      `echo x > ${q(`${uni}/commondir`)} && echo WROTE-UNICODE`,
+      `echo x > ${q(`${uni}/other`)} && echo WROTE-UNICODE-SIBLING`,
+      `mv ${q(uni)} ${q(`${REGISTRY}/moved-uni`)} && echo MOVED-UNICODE`,
+      `echo x > ${q(`${partial}/commondir`)} && echo WROTE-PARTIAL`,
+      `echo x > ${q(`${partial}/config.worktree`)} && echo WROTE-PARTIAL-OTHER-LEAF`,
+      `echo x > ${q(LONE)} && echo WROTE-LONE`,
     ].join('; ')
     const result = spawnSync('/bin/bash', ['-c', wrap(script)], {
       encoding: 'utf8',
@@ -161,11 +190,17 @@ describe.if(isMacOS)('macOS literal deny grouping', () => {
     expect(out).toContain('CREATED-NEW')
     expect(out).not.toContain('WROTE-ODD\n')
     expect(out).toContain('WROTE-ODD-SIBLING')
+    expect(out).not.toContain('MOVED-ODD')
+    expect(out).not.toContain('WROTE-UNICODE\n')
+    expect(out).toContain('WROTE-UNICODE-SIBLING')
+    expect(out).not.toContain('MOVED-UNICODE')
     expect(out).not.toContain('WROTE-PARTIAL\n')
     expect(out).toContain('WROTE-PARTIAL-OTHER-LEAF')
     expect(out).not.toContain('WROTE-LONE')
-    expect(readFileSync(join(entry, 'commondir'), 'utf8')).toBe('../..\n')
-    expect(existsSync(entry)).toBe(true)
+    for (const dir of [entry, odd, uni]) {
+      expect(readFileSync(join(dir, 'commondir'), 'utf8')).toBe('../..\n')
+      expect(existsSync(dir)).toBe(true)
+    }
     expect(existsSync(join(fresh, 'commondir'))).toBe(true)
   })
 })
