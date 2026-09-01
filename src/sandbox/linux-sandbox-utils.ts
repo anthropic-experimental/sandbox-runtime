@@ -1772,11 +1772,34 @@ async function generateFilesystemArgs(
   // + re-bind logic applies. Skip /proc and /dev: they're remounted by the
   // caller after this function returns. Skip /sys: kernel interface, tmpfs
   // over it breaks tooling and the host /sys is already read-only via ro-bind.
+  // Skip a child an allowRead entry already covers (equal to it, or an
+  // ancestor of where it lands): the deny is synthetic and the allow is the
+  // caller's, and emitting it would only plant a tmpfs at the child's
+  // canonical location (/bin lands at /usr/bin) that then vetoes restoring
+  // the allowed ancestor.
   const rootSkip = new Set(['proc', 'dev', 'sys'])
+  const coveredByAllowRead = (child: string): boolean => {
+    const childLocation = canonicalForm(child)
+    return readAllowPaths.some(allowPath =>
+      mountForms(allowPath).some(
+        form =>
+          form === child ||
+          form === childLocation ||
+          childLocation.startsWith(pathSep(form)),
+      ),
+    )
+  }
   for (const p of readConfig?.denyOnly || []) {
     if (normalizePathForSandbox(p) === '/') {
       for (const child of fs.readdirSync('/')) {
-        if (!rootSkip.has(child)) readDenyPaths.push('/' + child)
+        if (rootSkip.has(child)) continue
+        if (coveredByAllowRead('/' + child)) {
+          logForDebugging(
+            `[Sandbox Linux] Root deny expansion skips /${child}: covered by allowRead`,
+          )
+          continue
+        }
+        readDenyPaths.push('/' + child)
       }
     } else {
       readDenyPaths.push(p)

@@ -605,9 +605,10 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
   )
 
   it('does not pin above a nested repo deeper than the mandatory-deny scan depth', async () => {
-    // a/b/c/.git/config sits at depth 4; the default scan depth of 3 never
-    // finds it, so there is no deny bind there and nothing to pin. Raising
-    // the depth finds it and pins the whole chain.
+    // a/b/c/.git/config sits at depth 5 (ripgrep's --max-depth counts the
+    // file itself); the default scan depth of 3 never finds it, so there is
+    // no deny bind there and nothing to pin. Raising the depth finds it and
+    // pins the whole chain.
     mkTree(PROJECT, {
       a: { b: { c: { '.git': { hooks: {}, config: '[core]\n' } } } },
     })
@@ -624,7 +625,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       command: 'true',
       needsNetworkRestriction: false,
       allowAllUnixSockets: true,
-      mandatoryDenySearchDepth: 4,
+      mandatoryDenySearchDepth: 5,
       writeConfig: { allowOnly: [PROJECT], denyWithinAllow: [] },
     })
     expect(deep).toContain(`--ro-bind ${gitDir}/config ${gitDir}/config`)
