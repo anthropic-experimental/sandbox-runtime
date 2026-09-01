@@ -206,13 +206,18 @@ function registerCleanup(): void {
 const MAX_COMMAND_TEXTS = 1024
 const commandTextsById = new Map<string, string>()
 
-function registerCommandText(
+/** Exported for testing. */
+export function registerCommandText(
   command: string,
   options: WrapWithSandboxOptions | undefined,
 ): void {
   const id = options?.commandId
   const text = options?.commandText ?? command
-  if (id === undefined || id === text) {
+  // An id equal to its text still registers: the unknown-key fallback in
+  // resolveCommandText sanitizes, so a default-keyed invocation must find
+  // its own raw text here for multi-line ignoreViolations patterns to keep
+  // matching. Only an absent id skips registration.
+  if (id === undefined) {
     return
   }
   const key = decodeSandboxedCommand(encodeSandboxedCommand(id))
@@ -227,11 +232,15 @@ function registerCommandText(
 
 /**
  * The command text for a decoded attribution key: the registered
- * commandText when the key is a known commandId, else the key itself (an
- * un-id'd wrap, where the key *is* the command).
+ * commandText when the key is a known commandId (the embedder's own,
+ * trusted text), else the key with control characters collapsed — the
+ * decoded bytes arrive over carriers the sandboxed process can write to
+ * (the observe socket's event field, the macOS log tag, the proxy
+ * username), so every producer's unknown-key fallback sanitizes alike.
+ * Exported for testing.
  */
-function resolveCommandText(decodedId: string): string {
-  return commandTextsById.get(decodedId) ?? decodedId
+export function resolveCommandText(decodedId: string): string {
+  return commandTextsById.get(decodedId) ?? sanitizeViolationText(decodedId)
 }
 
 /**
@@ -248,15 +257,10 @@ function recordProxyViolation(
   encodedCommand: string | undefined,
 ): void {
   // The proxy username is client-supplied inside the sandbox (only the
-  // password is authenticated), so the decoded key is untrusted bytes. A
-  // known commandId resolves to the embedder's registered text; anything
-  // else is reported as-is, control characters collapsed.
+  // password is authenticated), so the decoded key is untrusted bytes and
+  // resolves through the same registry-or-sanitize path as every producer.
   const command = encodedCommand
-    ? (() => {
-        const decoded = decodeSandboxedCommand(encodedCommand)
-        const known = commandTextsById.get(decoded)
-        return known ?? sanitizeViolationText(decoded)
-      })()
+    ? resolveCommandText(decodeSandboxedCommand(encodedCommand))
     : undefined
   // Same suppression the seatbelt / seccomp monitors apply, so a
   // configured ignoreViolations pattern silences the event no matter
