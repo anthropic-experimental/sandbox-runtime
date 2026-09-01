@@ -18,10 +18,14 @@ import {
 } from '../../src/sandbox/linux-sandbox-utils.js'
 import { isLinux } from '../helpers/platform.js'
 
-// Every directory strictly between a deny bind's dest and its covering
-// allowWrite root is pinned with a self --bind so it is a mountpoint:
-// rename/rmdir of it fail EBUSY, so the deny cannot be moved aside and the
-// path recreated unprotected. Reads and writes inside it are unchanged.
+// Every directory strictly between a deny bind's dest and its outermost
+// covering allowWrite root is pinned with a read-only self-bind emitted
+// straight after `--ro-bind / /`, beneath every allow bind, deny bind, tmpfs
+// and mask. Buried like that it still makes the directory a mountpoint, so
+// rename/rmdir of the directory itself fail EBUSY and the deny cannot be
+// moved aside and the path recreated unprotected, while permissions are
+// decided entirely by the later mounts and renames into, out of or across a
+// pinned directory see no mount boundary.
 describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
   let BASE: string
   let PROJECT: string
@@ -112,18 +116,20 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     const configBind = `--ro-bind ${gitDir}/config ${gitDir}/config`
     expect(command).toContain(configBind)
     // .git sits strictly between the leaf denies and the allowWrite root.
-    const gitPin = `--bind ${gitDir} ${gitDir}`
+    const gitPin = `--ro-bind ${gitDir} ${gitDir}`
     expect(command).toContain(gitPin)
-    // The pin must land before the leaf ro-bind, or its writable bind would
-    // shadow the read-only one.
+    // The pin lands straight after the read-only root: before the allow
+    // root's writable bind and before the leaf deny.
+    const rootBind = `--bind ${PROJECT} ${PROJECT}`
+    expect(command.indexOf(gitPin)).toBeLessThan(command.indexOf(rootBind))
     expect(command.indexOf(gitPin)).toBeLessThan(command.indexOf(configBind))
     // Nothing outside the writable set is pinned.
     const outside = dirname(PROJECT)
-    expect(command).not.toContain(`--bind ${outside} ${outside}`)
+    expect(command).not.toContain(`--ro-bind ${outside} ${outside}`)
     // The allowWrite root is bound exactly once (its allow bind); a pin there
     // would add nothing.
-    const rootBind = `--bind ${PROJECT} ${PROJECT}`
     expect(command.split(rootBind).length - 1).toBe(1)
+    expect(command).not.toContain(`--ro-bind ${PROJECT} ${PROJECT}`)
   })
 
   it('pins ancestors of absent-path stub dests', async () => {
@@ -136,7 +142,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
 
     expect(command).toContain(`--ro-bind /dev/null ${gitDir}/hooks`)
     expect(command).toContain(`--ro-bind /dev/null ${gitDir}/config`)
-    expect(command).toContain(`--bind ${gitDir} ${gitDir}`)
+    expect(command).toContain(`--ro-bind ${gitDir} ${gitDir}`)
   })
 
   it('pins every intermediate directory above a nested repo found by the depth scan', async () => {
@@ -149,15 +155,14 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     expect(command).toContain(
       `--ro-bind ${nestedGit}/config ${nestedGit}/config`,
     )
-    expect(command).toContain(`--bind ${nestedGit} ${nestedGit}`)
-    expect(command).toContain(`--bind ${nestedDir} ${nestedDir}`)
+    expect(command).toContain(`--ro-bind ${nestedGit} ${nestedGit}`)
+    expect(command).toContain(`--ro-bind ${nestedDir} ${nestedDir}`)
   })
 
   it('keeps leaf denies enforced when a denyRead tmpfs sits between nested allowWrite roots', async () => {
-    // x contains the read-denied y, so x gets no pin (it would land after
-    // the tmpfs and bury it); the denyRead section's restore of the nested
-    // allowWrite z runs before the buffered deny binds, so the .git pin and
-    // the config deny land on top of it.
+    // x and y are pinned beneath everything; the tmpfs on y lands on top of
+    // both, the denyRead section's restore of the nested allowWrite z runs
+    // before the buffered deny binds, and the config deny lands on top of it.
     mkTree(PROJECT, {
       x: { y: { z: { '.git': { hooks: {}, config: '[core]\n' } } } },
     })
@@ -177,10 +182,15 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
 
     const configBind = `--ro-bind ${configPath} ${configPath}`
     const zBind = `--bind ${zDir} ${zDir}`
+    const xPin = `--ro-bind ${join(PROJECT, 'x')} ${join(PROJECT, 'x')}`
     expect(command).toContain(configBind)
     expect(command).toContain(zBind)
     expect(command.lastIndexOf(configBind)).toBeGreaterThan(
       command.lastIndexOf(zBind),
+    )
+    expect(command).toContain(xPin)
+    expect(command.indexOf(xPin)).toBeLessThan(
+      command.indexOf(`--tmpfs ${yDir}`),
     )
 
     if (BWRAP_CAN_NAMESPACE) {
@@ -198,7 +208,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     }
   })
 
-  it('does not pin an ancestor that contains a denyRead dir, but keeps pinning the repo chain below it', async () => {
+  it('pins an ancestor that contains a read-deny tmpfs; the tmpfs still lands on top', async () => {
     mkTree(PROJECT, {
       x: {
         y: {
@@ -227,13 +237,20 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       `cat ${secretPath} 2>&1; echo evil >> ${secretPath} 2>&1; echo evil >> ${configPath} 2>&1; echo DONE`,
     )
 
-    expect(command).toContain(`--tmpfs ${dataDir}`)
-    expect(command).not.toContain(`--bind ${appDir} ${appDir}`)
+    const dataTmpfs = `--tmpfs ${dataDir}`
+    const yTmpfs = `--tmpfs ${yDir}`
+    const appPin = `--ro-bind ${appDir} ${appDir}`
+    const xPin = `--ro-bind ${join(PROJECT, 'x')} ${join(PROJECT, 'x')}`
+    expect(command).toContain(dataTmpfs)
+    expect(command).toContain(yTmpfs)
+    // app contains the data tmpfs and x contains the y tmpfs; both are
+    // pinned regardless, and each tmpfs is emitted after (on top of) its pin.
+    expect(command).toContain(appPin)
+    expect(command).toContain(xPin)
+    expect(command.indexOf(appPin)).toBeLessThan(command.indexOf(dataTmpfs))
+    expect(command.indexOf(xPin)).toBeLessThan(command.indexOf(yTmpfs))
     expect(command).toContain(
-      `--bind ${join(appDir, 'repo')} ${join(appDir, 'repo')}`,
-    )
-    expect(command).not.toContain(
-      `--bind ${join(PROJECT, 'x')} ${join(PROJECT, 'x')}`,
+      `--ro-bind ${join(appDir, 'repo')} ${join(appDir, 'repo')}`,
     )
 
     if (BWRAP_CAN_NAMESPACE) {
@@ -244,10 +261,10 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     }
   })
 
-  it('refuses to pin an ancestor that contains a symlink-spelled denyRead tmpfs location', async () => {
-    // A pin on data would land after the tmpfs (mounted at data/secrets via
-    // the symlink spelling) and bury it. data stays renameable — the known
-    // residual — while the nested .git is still pinned.
+  it('pins an ancestor that contains a symlink-spelled read-deny tmpfs location; the tmpfs still lands on top', async () => {
+    // The tmpfs mounts at data/secrets via the symlink spelling; data is
+    // pinned beneath it, so data cannot be renamed aside and the secret
+    // stays hidden.
     mkTree(PROJECT, {
       data: {
         secrets: { 'secret.txt': 'TOPSECRET\n' },
@@ -261,18 +278,23 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
 
     const command = await wrap(
       { denyRead: [secretsLink] },
-      `cat ${secretCanonical} 2>&1; cat ${secretsLink}/secret.txt 2>&1; echo evil >> ${secretCanonical} 2>&1; echo DONE`,
+      `cat ${secretCanonical} 2>&1; cat ${secretsLink}/secret.txt 2>&1; echo evil >> ${secretCanonical} 2>&1; mv ${dataDir} ${dataDir}-moved 2>&1; echo DONE`,
     )
 
-    expect(command).toContain(`--tmpfs ${secretsLink}`)
-    expect(command).not.toContain(`--bind ${dataDir} ${dataDir}`)
+    const tmpfsOp = `--tmpfs ${secretsLink}`
+    const dataPin = `--ro-bind ${dataDir} ${dataDir}`
+    expect(command).toContain(tmpfsOp)
+    expect(command).toContain(dataPin)
+    expect(command.indexOf(dataPin)).toBeLessThan(command.indexOf(tmpfsOp))
     expect(command).toContain(
-      `--bind ${join(dataDir, '.git')} ${join(dataDir, '.git')}`,
+      `--ro-bind ${join(dataDir, '.git')} ${join(dataDir, '.git')}`,
     )
 
     if (BWRAP_CAN_NAMESPACE) {
       const result = run(command)
       expect(result.stdout ?? '').not.toContain('TOPSECRET')
+      expect(result.stdout ?? '').toMatch(/busy/i)
+      expect(existsSync(`${dataDir}-moved`)).toBe(false)
       expect(readFileSync(secretCanonical, 'utf8')).toBe('TOPSECRET\n')
     }
   })
@@ -310,7 +332,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     }
   })
 
-  it('never pins inside a write-denied directory', async () => {
+  it('pins inside a write-denied directory; the directory deny bind still lands on top', async () => {
     mkTree(PROJECT, {
       x: {
         y: {
@@ -334,9 +356,20 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       `echo evil > ${repoDir}/.git/planted 2>&1; echo evil >> ${appDir}/owned.txt 2>&1; echo DONE`,
     )
 
-    expect(command).not.toContain(`--bind ${repoDir} ${repoDir}`)
-    expect(command).not.toContain(`--bind ${repoDir}/.git ${repoDir}/.git`)
-    expect(command).toContain(`--ro-bind ${appDir} ${appDir}`)
+    const repoPin = `--ro-bind ${repoDir} ${repoDir}`
+    const gitPin = `--ro-bind ${repoDir}/.git ${repoDir}/.git`
+    const appRo = `--ro-bind ${appDir} ${appDir}`
+    expect(command).toContain(repoPin)
+    expect(command).toContain(gitPin)
+    // app is both pinned (first occurrence) and denied (last occurrence);
+    // the deny bind lands after z's writable restore and after every pin.
+    expect(command.lastIndexOf(appRo)).toBeGreaterThan(
+      command.lastIndexOf(`--bind ${zDir} ${zDir}`),
+    )
+    expect(command.lastIndexOf(appRo)).toBeGreaterThan(command.indexOf(gitPin))
+    expect(command.indexOf(repoPin)).toBeLessThan(
+      command.indexOf(`--bind ${PROJECT} ${PROJECT}`),
+    )
 
     if (BWRAP_CAN_NAMESPACE) {
       run(command)
@@ -345,10 +378,10 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     }
   })
 
-  it('still pins inside a denied directory when an allowWrite carve-out inside it makes the corridor writable', async () => {
+  it('pins the corridor below an allowWrite carve-out nested inside a denied directory', async () => {
     // repo is denyRead-hidden (its own read-only bind is dropped as
-    // tmpfs-hidden), but the carve-out sub inside it is restored writable,
-    // so the corridor between sub and the deeper leaf still needs its pin.
+    // tmpfs-hidden) and the carve-out sub inside it is restored writable;
+    // x, between sub and the deeper leaf, is pinned and cannot be moved.
     mkTree(PROJECT, {
       repo: { sub: { x: { secret: 'DENYTEST\n' } }, 'hidden.txt': 'X\n' },
     })
@@ -366,7 +399,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       `cd ${subDir} && mv x x2 && mkdir -p x && echo evil > ${secretPath}`,
     )
 
-    expect(command).toContain(`--bind ${xDir} ${xDir}`)
+    expect(command).toContain(`--ro-bind ${xDir} ${xDir}`)
 
     if (BWRAP_CAN_NAMESPACE) {
       const result = run(command)
@@ -416,7 +449,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     )
 
     expect(command).toContain(`--ro-bind /dev/null ${secretPath}`)
-    expect(command).toContain(`--bind ${configDir} ${configDir}`)
+    expect(command).toContain(`--ro-bind ${configDir} ${configDir}`)
 
     if (BWRAP_CAN_NAMESPACE) {
       const result = run(command)
@@ -426,7 +459,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     }
   })
 
-  it('pins ancestors of credential masks and re-applies the buried mask', async () => {
+  it('pins ancestors of credential masks beneath the mask, which is emitted once', async () => {
     mkTree(PROJECT, {
       creds: { 'token.txt': 'REAL\n' },
       fakes: { 'token.txt': 'FAKE\n' },
@@ -444,13 +477,13 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       maskedFileBinds: [{ realPath, fakePath }],
     })
 
-    expect(command).toContain(`--bind ${credsDir} ${credsDir}`)
-    // The pin lands after the mask and buries it; the mask re-application
-    // pass must re-emit the fake on top.
+    const credsPin = `--ro-bind ${credsDir} ${credsDir}`
+    expect(command).toContain(credsPin)
+    // The pin lands before the mask, so nothing buries the fake and it is
+    // emitted exactly once.
     const maskBind = `--ro-bind ${fakePath} ${realPath}`
-    expect(command.lastIndexOf(maskBind)).toBeGreaterThan(
-      command.indexOf(`--bind ${credsDir} ${credsDir}`),
-    )
+    expect(command.indexOf(maskBind)).toBeGreaterThan(command.indexOf(credsPin))
+    expect(command.lastIndexOf(maskBind)).toBe(command.indexOf(maskBind))
   })
 
   it('never restores a write path that canonically contains another read-deny location', async () => {
@@ -592,15 +625,15 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       expect(existsSync(join(PROJECT, '.git', 'index'))).toBe(true)
       expect(existsSync(join(PROJECT, 'sub-renamed'))).toBe(true)
 
-      // A rename STRADDLING the pin boundary crosses vfsmounts and fails
-      // EXDEV for callers without a copy fallback (os.rename); mv copies.
-      if (Bun.which('python3') !== null) {
-        const exdev = await wrap(
-          {},
-          `cd ${PROJECT} && python3 -c "import os, errno, sys; e = 0\ntry: os.rename('README.md', '.git/README.md')\nexcept OSError as err: e = err.errno\nsys.exit(0 if e == errno.EXDEV else 1)"`,
-        )
-        expect(run(exdev).status).toBe(0)
-      }
+      // A plain rename(2) straddling the pinned directory sees no mount
+      // boundary and succeeds without a copy fallback.
+      const straddle = await wrap(
+        {},
+        `cd ${PROJECT} && ${process.execPath} -e "require('fs').renameSync('README.md', '.git/README.md')" && echo STRADDLE_OK`,
+      )
+      expect(run(straddle).stdout).toContain('STRADDLE_OK')
+      expect(existsSync(join(PROJECT, '.git', 'README.md'))).toBe(true)
+      expect(existsSync(join(PROJECT, 'README.md'))).toBe(false)
     },
   )
 
@@ -617,8 +650,8 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
 
     const shallow = await wrap()
     expect(shallow).not.toContain(`--ro-bind ${gitDir}/config`)
-    expect(shallow).not.toContain(`--bind ${gitDir} ${gitDir}`)
-    expect(shallow).not.toContain(`--bind ${cDir} ${cDir}`)
+    expect(shallow).not.toContain(`--ro-bind ${gitDir} ${gitDir}`)
+    expect(shallow).not.toContain(`--ro-bind ${cDir} ${cDir}`)
 
     process.chdir(PROJECT)
     const deep = await wrapCommandWithSandboxLinux({
@@ -635,7 +668,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       cDir,
       gitDir,
     ]) {
-      expect(deep).toContain(`--bind ${dir} ${dir}`)
+      expect(deep).toContain(`--ro-bind ${dir} ${dir}`)
     }
   })
 
@@ -648,6 +681,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       mkTree(PROJECT, {
         app: {
           'index.js': 'console.log(1)\n',
+          'notes.txt': 'n\n',
           node_modules: {
             '.staging': { 'left-pad-abc': { 'index.js': 'x' } },
           },
@@ -662,28 +696,13 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       expect(gitInit.status).toBe(0)
 
       const command = await wrap({})
-      expect(command).toContain(`--bind ${appDir} ${appDir}`)
+      expect(command).toContain(`--ro-bind ${appDir} ${appDir}`)
       expect(command).toContain(
-        `--bind ${join(appDir, '.git')} ${join(appDir, '.git')}`,
-      )
-
-      // git's ordinary object/index/ref writes, including its atomic
-      // rename-into-place of lockfiles within .git, all stay inside one
-      // vfsmount and work as before.
-      const gitWork = await wrap(
-        {},
-        `cd ${appDir} && git add index.js && git -c user.name=t -c user.email=t@t commit -q -m init && git log --oneline | wc -l && echo GIT_OK`,
-      )
-      const gitResult = run(gitWork)
-      expect(gitResult.status).toBe(0)
-      expect(gitResult.stdout).toContain('GIT_OK')
-      expect(existsSync(join(appDir, '.git', 'refs', 'heads', 'main'))).toBe(
-        true,
+        `--ro-bind ${join(appDir, '.git')} ${join(appDir, '.git')}`,
       )
 
       // The npm-style staging rename (node_modules/.staging/x -> node_modules/
-      // x) does not cross a pin: neither directory is a mountpoint, both
-      // live in the app vfsmount.
+      // x) inside the pinned directory works as before.
       const staged = join(appDir, 'node_modules', '.staging', 'left-pad-abc')
       const final = join(appDir, 'node_modules', 'left-pad')
       const npmLike = await wrap(
@@ -694,18 +713,113 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       expect(npmResult.stdout).toContain('RENAME_OK')
       expect(existsSync(join(final, 'index.js'))).toBe(true)
 
-      // A rename that straddles a pin boundary (app -> PROJECT,
-      // i.e. out of the app vfsmount into its parent's) fails EXDEV from
-      // fs.rename; mv detects EXDEV and falls back to copy + unlink.
+      // A plain rename(2) that straddles the pinned directory (app ->
+      // PROJECT and back) sees no mount boundary: it succeeds without a
+      // copy fallback in either direction.
       const straddle = await wrap(
         {},
-        `cd ${appDir} && ${process.execPath} -e "try { require('fs').renameSync('index.js', '../index.js'); console.log('NO_ERROR') } catch (e) { console.log('CODE=' + e.code) }" && mv index.js ../moved.js && echo MV_OK`,
+        `cd ${appDir} && ${process.execPath} -e "try { require('fs').renameSync('notes.txt', '../notes.txt'); console.log('NO_ERROR') } catch (e) { console.log('CODE=' + e.code) }" && mv ../notes.txt ./notes-back.txt && echo MV_OK`,
       )
       const straddleResult = run(straddle)
-      expect(straddleResult.stdout).toContain('CODE=EXDEV')
+      expect(straddleResult.stdout).toContain('NO_ERROR')
       expect(straddleResult.stdout).toContain('MV_OK')
-      expect(existsSync(join(PROJECT, 'moved.js'))).toBe(true)
-      expect(existsSync(join(appDir, 'index.js'))).toBe(false)
+      expect(existsSync(join(appDir, 'notes-back.txt'))).toBe(true)
+      expect(existsSync(join(PROJECT, 'notes.txt'))).toBe(false)
+      expect(existsSync(join(appDir, 'notes.txt'))).toBe(false)
+
+      // git's ordinary object/index/ref writes, including its atomic
+      // rename-into-place of lockfiles within .git, work as before.
+      const gitWork = await wrap(
+        {},
+        `cd ${appDir} && git add index.js && git -c user.name=t -c user.email=t@t commit -q -m init && git log --oneline | wc -l && echo GIT_OK`,
+      )
+      const gitResult = run(gitWork)
+      expect(gitResult.status).toBe(0)
+      expect(gitResult.stdout).toContain('GIT_OK')
+      expect(existsSync(join(appDir, '.git', 'refs', 'heads', 'main'))).toBe(
+        true,
+      )
     },
   )
+
+  it.if(BWRAP_CAN_NAMESPACE)(
+    'a pinned directory under a writable allow root cannot itself be renamed or removed, but work inside it and renames out of it succeed',
+    async () => {
+      // nested/.git/config is a mandatory deny found by the depth scan, so
+      // nested (an intermediate directory directly under the writable
+      // project root) is pinned.
+      mkTree(PROJECT, {
+        nested: { '.git': { hooks: {}, config: '[core]\n' } },
+        sibling: {},
+      })
+      const nestedDir = join(PROJECT, 'nested')
+      const siblingDir = join(PROJECT, 'sibling')
+
+      const plan = await wrap()
+      expect(plan).toContain(`--ro-bind ${nestedDir} ${nestedDir}`)
+
+      const mvSelf = run(await wrap({}, `cd ${PROJECT} && mv nested nested2`))
+      expect(mvSelf.status).not.toBe(0)
+      expect(mvSelf.stderr ?? '').toContain('Device or resource busy')
+      expect(existsSync(join(PROJECT, 'nested2'))).toBe(false)
+
+      const rmdirSelf = run(await wrap({}, `cd ${PROJECT} && rmdir nested`))
+      expect(rmdirSelf.status).not.toBe(0)
+      expect(rmdirSelf.stderr ?? '').toContain('Device or resource busy')
+      expect(existsSync(nestedDir)).toBe(true)
+
+      const inside = run(
+        await wrap(
+          {},
+          `cd ${nestedDir} && echo a > new.txt && mv new.txt renamed.txt && echo INSIDE_OK`,
+        ),
+      )
+      expect(inside.stdout).toContain('INSIDE_OK')
+      expect(existsSync(join(nestedDir, 'renamed.txt'))).toBe(true)
+
+      // rename(2) from inside the pinned directory to a sibling outside it:
+      // no mount boundary on the lookup path, so no EXDEV.
+      const out = run(
+        await wrap(
+          {},
+          `cd ${PROJECT} && ${process.execPath} -e "try { require('fs').renameSync('nested/renamed.txt', 'sibling/renamed.txt'); console.log('NO_ERROR') } catch (e) { console.log('CODE=' + e.code) }"`,
+        ),
+      )
+      expect(out.stdout).toContain('NO_ERROR')
+      expect(existsSync(join(siblingDir, 'renamed.txt'))).toBe(true)
+      expect(existsSync(join(nestedDir, 'renamed.txt'))).toBe(false)
+    },
+  )
+
+  it('pins the ancestor between a read-denied directory and a nested repo deny below it; the tmpfs lands after the pin', async () => {
+    // top is read-denied and contains the nested repo's .git/config deny;
+    // top/.git sits between them and is pinned, top itself is pinned too,
+    // and the tmpfs on top is emitted after both so it still hides them.
+    mkTree(PROJECT, { top: { '.git': { hooks: {}, config: '[core]\n' } } })
+    const topDir = join(PROJECT, 'top')
+    const gitDir = join(topDir, '.git')
+
+    const command = await wrap(
+      { denyRead: [topDir] },
+      `cat ${gitDir}/config 2>&1; echo DONE`,
+    )
+
+    const topPin = `--ro-bind ${topDir} ${topDir}`
+    const gitPin = `--ro-bind ${gitDir} ${gitDir}`
+    const tmpfsOp = `--tmpfs ${topDir}`
+    expect(command).toContain(topPin)
+    expect(command).toContain(gitPin)
+    expect(command).toContain(tmpfsOp)
+    expect(command.indexOf(topPin)).toBeLessThan(command.indexOf(tmpfsOp))
+    expect(command.indexOf(gitPin)).toBeLessThan(command.indexOf(tmpfsOp))
+    expect(command.indexOf(gitPin)).toBeLessThan(
+      command.indexOf(`--bind ${PROJECT} ${PROJECT}`),
+    )
+
+    if (BWRAP_CAN_NAMESPACE) {
+      const result = run(command)
+      expect(result.stdout ?? '').not.toContain('[core]')
+      expect(result.stdout ?? '').toContain('DONE')
+    }
+  })
 })

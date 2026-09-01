@@ -680,7 +680,7 @@ $ srt 'echo "bad" > .git/hooks/pre-commit'
 
 **Note (Linux):** On Linux, mandatory deny paths only block files that already exist. Non-existent files in these patterns cannot be blocked by bubblewrap's bind-mount approach. macOS uses glob patterns which block both existing and new files.
 
-**Pinned directories (Linux):** Every directory between a protected path and the allowed write root is bind-mounted over itself so it cannot be renamed or removed from inside the sandbox: `mv` of a nested repository's parent fails with `EBUSY` ("Device or resource busy"), and `rm -rf` of a nested repository leaves an empty husk behind (as it already did for `.git/hooks`). Reads, writes and creation inside a pinned directory are unaffected, but a rename that crosses a pin boundary returns `EXDEV` to callers without a copy fallback (`mv` copies instead).
+**Pinned directories (Linux):** Every directory between a protected path and the allowed write root is bind-mounted read-only over itself, beneath every other mount, so it cannot be renamed or removed from inside the sandbox: `mv` or `rmdir` of a pinned directory itself (for example a nested repository's parent) fails with `EBUSY` ("Device or resource busy"), and `rm -rf` of a nested repository leaves an empty husk behind (as it already did for `.git/hooks`). Reads, writes, creation and renames inside or across a pinned directory are unaffected.
 
 **Linux search depth:** On Linux, the sandbox uses `ripgrep` to scan for dangerous files in subdirectories within allowed write paths. By default, it searches up to 3 levels deep for performance. You can configure this with `mandatoryDenySearchDepth`:
 

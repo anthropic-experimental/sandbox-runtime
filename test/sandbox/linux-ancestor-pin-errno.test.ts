@@ -14,10 +14,11 @@ import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-uti
 import { isLinux } from '../helpers/platform.js'
 
 // The ancestor-pin walk distinguishes absence (ENOENT/ENOTDIR) from other
-// errnos: an unreadable ancestor is still pinned, and an unreadable pin
-// component aborts the wrap. Errnos are injected via fs spies (a root
-// container sees no real EACCES); each spy asserts its own hit count so a
-// non-intercepting mock cannot pass vacuously. Nothing here executes bwrap.
+// errnos: an unreadable ancestor is still pinned, while a pin whose path
+// component cannot be lstat'ed is dropped without aborting the wrap. Errnos
+// are injected via fs spies (a root container sees no real EACCES); each spy
+// asserts its own hit count so a non-intercepting mock cannot pass
+// vacuously. Nothing here executes bwrap.
 describe.if(isLinux)(
   'Linux sandbox — ancestor-pin errno discrimination',
   () => {
@@ -63,7 +64,7 @@ describe.if(isLinux)(
       const proj = makeTree()
       const wrapped = await wrap(proj)
       const pin = join(proj, 'a', 'b')
-      expect(wrapped).toContain(`--bind ${pin} ${pin}`)
+      expect(wrapped).toContain(`--ro-bind ${pin} ${pin}`)
     })
 
     it('pins an ancestor whose stat fails with EACCES', async () => {
@@ -96,7 +97,7 @@ describe.if(isLinux)(
       )
       const wrapped = await wrap(proj)
       expect(statHits + existsHits).toBeGreaterThan(0)
-      expect(wrapped).toContain(`--bind ${target} ${target}`)
+      expect(wrapped).toContain(`--ro-bind ${target} ${target}`)
     })
 
     it('skips the pin of a genuinely absent (ENOENT) ancestor', async () => {
@@ -108,10 +109,12 @@ describe.if(isLinux)(
           denyWithinAllow: [join(missingParent, 'leaf')],
         },
       })
-      expect(wrapped).not.toContain(`--bind ${missingParent} ${missingParent}`)
+      expect(wrapped).not.toContain(
+        `--ro-bind ${missingParent} ${missingParent}`,
+      )
     })
 
-    it('aborts the wrap when lstat of a pin component fails with EACCES', async () => {
+    it('does not abort on an unverifiable (EACCES) pin component; drops every pin through it', async () => {
       const proj = makeTree()
       const component = join(proj, 'a')
       const realLstat = fs.lstatSync
@@ -128,11 +131,20 @@ describe.if(isLinux)(
           return (realLstat as (...a: unknown[]) => unknown)(p, ...rest)
         }) as typeof fs.lstatSync),
       )
-      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types .rejects.toThrow() as void; the await is required at runtime
-      await expect(wrap(proj)).rejects.toThrow(
-        /cannot verify .*Fix its permissions/s,
-      )
+      const wrapped = await wrap(proj)
       expect(lstatHits).toBeGreaterThan(0)
+      expect(wrapped).toContain('bwrap')
+      // Every pin on the chain passes through the unverifiable component.
+      for (const dir of [
+        component,
+        join(proj, 'a', 'b'),
+        join(proj, 'a', 'b', '.git'),
+      ]) {
+        expect(wrapped).not.toContain(`--ro-bind ${dir} ${dir}`)
+      }
+      // The deny bind itself is unaffected.
+      const cfg = join(proj, 'a', 'b', '.git', 'config')
+      expect(wrapped).toContain(`--ro-bind ${cfg} ${cfg}`)
     })
 
     it('drops only the pin when a component vanished (ENOENT) and still builds the wrap', async () => {
@@ -151,7 +163,7 @@ describe.if(isLinux)(
         }) as typeof fs.lstatSync),
       )
       const wrapped = await wrap(proj)
-      expect(wrapped).not.toContain(`--bind ${component} ${component}`)
+      expect(wrapped).not.toContain(`--ro-bind ${component} ${component}`)
       expect(wrapped).toContain('bwrap')
     })
 
@@ -183,7 +195,7 @@ describe.if(isLinux)(
       })
       const seedAncestor = join(proj, 'secrets')
       expect(statHits).toBeGreaterThan(0)
-      expect(wrapped).toContain(`--bind ${seedAncestor} ${seedAncestor}`)
+      expect(wrapped).toContain(`--ro-bind ${seedAncestor} ${seedAncestor}`)
     })
 
     it('seeds ancestors of a FIFO denyRead entry (every non-directory is masked)', async () => {
@@ -198,7 +210,7 @@ describe.if(isLinux)(
         readConfig: { denyOnly: [fifoPath], allowWithinDeny: [] },
       })
       const seedAncestor = join(proj, 'secrets')
-      expect(wrapped).toContain(`--bind ${seedAncestor} ${seedAncestor}`)
+      expect(wrapped).toContain(`--ro-bind ${seedAncestor} ${seedAncestor}`)
       expect(wrapped).toContain(`--ro-bind /dev/null ${fifoPath}`)
     })
 
@@ -209,7 +221,7 @@ describe.if(isLinux)(
         readConfig: { denyOnly: [absent], allowWithinDeny: [] },
       })
       const seedAncestor = join(proj, 'secrets')
-      expect(wrapped).not.toContain(`--bind ${seedAncestor} ${seedAncestor}`)
+      expect(wrapped).not.toContain(`--ro-bind ${seedAncestor} ${seedAncestor}`)
     })
   },
 )

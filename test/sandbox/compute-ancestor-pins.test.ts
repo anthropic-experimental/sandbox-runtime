@@ -13,8 +13,6 @@ describe('computeAncestorPins', () => {
   ) => ({
     isWithinAllowedWrite: (dir: string) => roots.some(r => under(r)(dir)),
     isAllowedWriteRoot: (dir: string) => roots.includes(dir),
-    isExcluded: none,
-    containsReadDenyTmpfs: none,
     isAbsent: none,
     ...overrides,
   })
@@ -29,23 +27,14 @@ describe('computeAncestorPins', () => {
     expect(computeAncestorPins(['/x/a/leaf'], probes(['/w']))).toEqual([])
   })
 
-  it('skips directories at or below a deny dest via isExcluded', () => {
+  it('pins directories at and below another deny dest on the same chain', () => {
+    // A directory that is itself a deny dest, or sits below one, is still an
+    // ancestor of the deeper seed; later mounts decide its permissions.
     const pins = computeAncestorPins(
       ['/w/app', '/w/app/repo/.git/config'],
-      probes(['/w'], { isExcluded: under('/w/app') }),
+      probes(['/w']),
     )
-    expect(pins).toEqual([])
-  })
-
-  it('skips a directory at or above a read-deny tmpfs', () => {
-    const tmpfs = '/w/x/y'
-    const pins = computeAncestorPins(
-      ['/w/x/y/z/.git/config'],
-      probes(['/w'], {
-        containsReadDenyTmpfs: dir => under(dir)(tmpfs),
-      }),
-    )
-    expect(pins).toEqual(['/w/x/y/z', '/w/x/y/z/.git'])
+    expect(pins).toEqual(['/w/app', '/w/app/repo', '/w/app/repo/.git'])
   })
 
   it('skips absent directories', () => {
@@ -70,5 +59,16 @@ describe('computeAncestorPins', () => {
       probes(['/w']),
     )
     expect(pins).toEqual(['/w/a', '/w/e', '/w/a/b', '/w/a/d', '/w/a/b/c'])
+  })
+
+  it('terminates on a relative seed instead of walking dirname(".") forever', () => {
+    // path.dirname('a') is '.', and dirname('.') is '.' again; a probe that
+    // answers true for everything must not spin the walk.
+    const always = () => true
+    const pins = computeAncestorPins(
+      ['a/b/leaf'],
+      probes([], { isWithinAllowedWrite: always, isAllowedWriteRoot: none }),
+    )
+    expect(pins).toEqual(['a', 'a/b'])
   })
 })

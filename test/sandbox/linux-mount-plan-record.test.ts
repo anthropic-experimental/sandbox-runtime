@@ -15,7 +15,8 @@ import { isLinux } from '../helpers/platform.js'
 // Arg-level checks of the read-section record the emission filter replays:
 // the restore veto counts only mounts already emitted, the filter reads the
 // record of restores actually made, and symlink-spelled file masks seed pins
-// at their canonical location and are re-applied when a pin buries them.
+// at their canonical location. Pins are read-only self-binds emitted straight
+// after the read-only root, beneath every tmpfs, restore and mask.
 describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
   const baseParams = {
     command: 'true',
@@ -58,7 +59,7 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     expect(wrapped.indexOf(`--tmpfs ${logs}`)).toBeGreaterThan(restoreIdx)
   })
 
-  it('drops ancestor pins whose carve-out restore was vetoed', async () => {
+  it('pins inside a carve-out whose restore was vetoed; the pin stays beneath the tmpfs', async () => {
     const proj = tempTree({
       'a/t/w/secret-dir/s.txt': 'x',
       'a/t/w/deep/file.txt': 'x',
@@ -78,12 +79,12 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
       },
     })
     const wBind = `--bind ${join(proj, 'a/t/w')} ${join(proj, 'a/t/w')}`
-    expect(wrapped.lastIndexOf(wBind)).toBeLessThan(
-      wrapped.indexOf(`--tmpfs ${join(proj, 'a/t')}`),
-    )
-    expect(wrapped).not.toContain(
-      `--bind ${join(proj, 'a/t/w/deep')} ${join(proj, 'a/t/w/deep')}`,
-    )
+    const tmpfsIdx = wrapped.indexOf(`--tmpfs ${join(proj, 'a/t')}`)
+    expect(wrapped.lastIndexOf(wBind)).toBeLessThan(tmpfsIdx)
+    const deepPin = `--ro-bind ${join(proj, 'a/t/w/deep')} ${join(proj, 'a/t/w/deep')}`
+    expect(wrapped).toContain(deepPin)
+    expect(wrapped.indexOf(deepPin)).toBeLessThan(wrapped.indexOf(wBind))
+    expect(wrapped.indexOf(deepPin)).toBeLessThan(tmpfsIdx)
   })
 
   it('emits a deny bind whose region a later unit re-exposed', async () => {
@@ -106,8 +107,12 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
       wrapped.indexOf(`--tmpfs ${W}`),
     )
     expect(wrapped).toContain(`--ro-bind ${cfg} ${cfg}`)
-    expect(wrapped).toContain(
-      `--bind ${join(proj, 'p/q/w/.git')} ${join(proj, 'p/q/w/.git')}`,
+    const gitPin = `--ro-bind ${join(proj, 'p/q/w/.git')} ${join(proj, 'p/q/w/.git')}`
+    expect(wrapped).toContain(gitPin)
+    // The pin sits beneath W's first (allow) bind and every tmpfs.
+    expect(wrapped.indexOf(gitPin)).toBeLessThan(wrapped.indexOf(wBind))
+    expect(wrapped.indexOf(gitPin)).toBeLessThan(
+      wrapped.indexOf(`--tmpfs ${join(proj, 's')}`),
     )
   })
 
@@ -147,7 +152,7 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
     expect(wrapped).toContain(`--ro-bind ${canonicalFoo} ${canonicalFoo}`)
   })
 
-  it('pins the canonical parents of a symlink-spelled denyRead file mask and re-applies the buried mask', async () => {
+  it('pins the canonical parents of a symlink-spelled denyRead file mask beneath the mask, which is emitted once', async () => {
     const proj = tempTree({
       'data/secrets/key.pem': 'SECRET',
       'data/other/thing.txt': 'x',
@@ -163,13 +168,18 @@ describe.if(isLinux)('Linux sandbox — mount-plan record and ordering', () => {
         denyWithinAllow: [join(proj, 'data/other/thing.txt')],
       },
     })
-    expect(wrapped).toContain(`--bind ${canonicalParent} ${canonicalParent}`)
-    expect(wrapped).toContain(
-      `--bind ${join(proj, 'data')} ${join(proj, 'data')}`,
-    )
+    const parentPin = `--ro-bind ${canonicalParent} ${canonicalParent}`
+    const dataPin = `--ro-bind ${join(proj, 'data')} ${join(proj, 'data')}`
+    expect(wrapped).toContain(parentPin)
+    expect(wrapped).toContain(dataPin)
     const maskBind = `--ro-bind /dev/null ${rawSpelling}`
     const first = wrapped.indexOf(maskBind)
     expect(first).toBeGreaterThan(-1)
-    expect(wrapped.lastIndexOf(maskBind)).toBeGreaterThan(first)
+    // No pin lands over the mask, so it is never re-applied.
+    expect(wrapped.lastIndexOf(maskBind)).toBe(first)
+    expect(wrapped.indexOf(parentPin)).toBeLessThan(first)
+    expect(wrapped.indexOf(dataPin)).toBeLessThan(
+      wrapped.indexOf(`--bind ${proj} ${proj}`),
+    )
   })
 })
