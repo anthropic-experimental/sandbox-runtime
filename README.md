@@ -778,8 +778,15 @@ Requirements and caveats:
 - The allowed server sees the supervisor's pid in `SO_PEERCRED`; the uid and
   gid are the workload's. Servers that authorize by peer pid will not
   recognize the caller.
-- Each brokered `connect()`/`bind()`/`listen()` costs roughly 100 µs. The
-  data path is untouched.
+- Each brokered `connect()`/`bind()`/`listen()` costs tens of microseconds
+  (measured: ~8 µs → ~57 µs per TCP connect on arm64). The data path is
+  untouched.
+- If the supervisor dies, its listener closes and every trapped syscall
+  returns `ENOSYS` — TCP included, not just Unix sockets. Fail-closed, but it
+  couples the workload's networking to the supervisor's liveness. The
+  workload cannot cause this itself: the supervisor runs outside the
+  sandbox's PID namespace, so it is neither addressable nor signallable from
+  inside.
 
 **Zero runtime dependencies**: Pre-built static apply-seccomp binaries and pre-generated BPF filters are included for x64 and arm64 architectures. No compilation tools or external dependencies required at runtime.
 

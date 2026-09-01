@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
-import { spawnSync } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import {
   existsSync,
   mkdirSync,
@@ -33,6 +33,11 @@ let allowedDir = ''
 let allowedSock = ''
 let otherSock = ''
 let servers: Server[] = []
+/** Accept counters — the verdict for the TOCTOU runs is "the forbidden
+ *  listener accepted nothing", which only the servers can report. */
+let allowedAccepts = 0
+let otherAccepts = 0
+let tcpPort = 0
 
 /** Run `python3 -c CODE` under apply-seccomp with the given allow entries. */
 function runProbe(
@@ -63,30 +68,52 @@ def report(fn):
 ${body}
 `
 
-function listen(path: string): Promise<Server> {
-  const s = createServer(c => c.end())
+function listen(path: string, onAccept: () => void): Promise<Server> {
+  const s = createServer(c => {
+    onAccept()
+    c.end()
+  })
   return new Promise(res => s.listen(path, () => res(s)))
 }
 
+function listenTcp(): Promise<Server> {
+  const s = createServer(c => c.end())
+  return new Promise(res =>
+    s.listen(0, '127.0.0.1', () => {
+      const a = s.address()
+      tcpPort = typeof a === 'object' && a ? a.port : 0
+      res(s)
+    }),
+  )
+}
+
+// File-scope so the fixtures outlive the first describe block: the TOCTOU
+// runs below need the same two listeners and their accept counters.
+beforeAll(async () => {
+  if (!isLinux) return
+  applySeccomp = getApplySeccompBinaryPath()
+  expect(applySeccomp).toBeTruthy()
+  expect(existsSync(applySeccomp!)).toBe(true)
+
+  dir = mkdtempSync(join(tmpdir(), 'srt-uds-'))
+  allowedDir = join(dir, 'allowed')
+  allowedSock = join(allowedDir, 'ok.sock')
+  otherSock = join(dir, 'other.sock')
+  mkdirSync(allowedDir, { recursive: true })
+  servers = [
+    await listen(allowedSock, () => (allowedAccepts += 1)),
+    await listen(otherSock, () => (otherAccepts += 1)),
+    await listenTcp(),
+  ]
+})
+
+afterAll(() => {
+  if (!isLinux) return
+  for (const s of servers) s.close()
+  rmSync(dir, { recursive: true, force: true })
+})
+
 describe.if(isLinux)('allowUnixSockets (Linux brokered connect)', () => {
-  beforeAll(async () => {
-    applySeccomp = getApplySeccompBinaryPath()
-    expect(applySeccomp).toBeTruthy()
-    expect(existsSync(applySeccomp!)).toBe(true)
-
-    dir = mkdtempSync(join(tmpdir(), 'srt-uds-'))
-    allowedDir = join(dir, 'allowed')
-    allowedSock = join(allowedDir, 'ok.sock')
-    otherSock = join(dir, 'other.sock')
-    mkdirSync(allowedDir, { recursive: true })
-    servers = [await listen(allowedSock), await listen(otherSock)]
-  })
-
-  afterAll(() => {
-    for (const s of servers) s.close()
-    rmSync(dir, { recursive: true, force: true })
-  })
-
   it('connects to a socket inside an allow-listed directory', () => {
     const r = runProbe(
       [allowedDir],
@@ -374,6 +401,103 @@ except OSError:
     expect(r.stdout?.toString()).toContain('grandchild: ok')
     expect(r.status).toBe(7)
   })
+})
+
+describe.if(isLinux)('allowUnixSockets under TOCTOU pressure', () => {
+  // The broker is only sound because it never answers
+  // SECCOMP_USER_NOTIF_FLAG_CONTINUE for connect(): the kernel would re-read
+  // the caller's memory and fd table after the check, and a sibling thread
+  // can change both. These runs are that sibling thread. They are the
+  // regression test for the property, not a demonstration of it — if someone
+  // later "simplifies" the supervisor into inspect-then-continue, the
+  // forbidden listener starts accepting and this fails.
+  const RACE_SECONDS = 2
+
+  let raceBin = ''
+  let haveCompiler = false
+
+  beforeAll(() => {
+    raceBin = join(dir, 'uds-race')
+    const src = join(import.meta.dir, '..', 'fixtures', 'uds-race.c')
+    const r = spawnSync('gcc', ['-O2', '-pthread', '-o', raceBin, src], {
+      stdio: 'pipe',
+      timeout: 60000,
+    })
+    // gcc is present on the Linux CI legs (they build the seccomp helper).
+    haveCompiler = r.status === 0
+    if (!haveCompiler) {
+      console.warn(
+        `[unix-socket-allowlist] skipping race tests: gcc unavailable ` +
+          `(${r.stderr?.toString().trim().slice(0, 200)})`,
+      )
+    }
+  })
+
+  /** Count of connections each fixture socket has accepted so far. */
+  const accepted = () => ({ allowed: allowedAccepts, forbidden: otherAccepts })
+
+  // Must be async: the listeners live in THIS process, so a synchronous
+  // spawn would block the event loop and nothing would ever be accepted —
+  // the counters would stay at zero and the test would pass vacuously.
+  const runRace = async (
+    mode: 'addr' | 'dup2',
+  ): Promise<{
+    out: string
+    before: ReturnType<typeof accepted>
+    after: ReturnType<typeof accepted>
+  }> => {
+    const before = accepted()
+    const args = [
+      mode,
+      allowedSock,
+      otherSock,
+      String(RACE_SECONDS),
+      ...(mode === 'dup2' ? [String(tcpPort)] : []),
+    ]
+    const child = spawn(
+      applySeccomp!,
+      ['--allow-unix-connect', allowedDir, '--', raceBin, ...args],
+      { stdio: ['ignore', 'pipe', 'pipe'] },
+    )
+    let out = ''
+    child.stdout.on('data', (c: Buffer) => (out += c.toString()))
+    await new Promise<void>(res => child.on('close', () => res()))
+    // Let the last accepts drain before reading the counters.
+    await new Promise(res => setTimeout(res, 250))
+    return { out, before, after: accepted() }
+  }
+
+  const parse = (out: string, key: string): number =>
+    Number(new RegExp(`${key}=(\\d+)`).exec(out)?.[1] ?? -1)
+
+  it('never connects to a forbidden socket while the sockaddr is rewritten', async () => {
+    if (!haveCompiler) return
+    const { out, before, after } = await runRace('addr')
+
+    // The forbidden listener is the verdict.
+    expect(after.forbidden).toBe(before.forbidden)
+    expect(parse(out, 'violations')).toBe(0)
+    // Non-vacuity: the run has to have actually raced and actually connected,
+    // or "nothing reached the forbidden socket" would be true for free.
+    expect(parse(out, 'iterations')).toBeGreaterThan(1000)
+    expect(parse(out, 'connected')).toBeGreaterThan(100)
+    expect(after.allowed).toBeGreaterThan(before.allowed + 100)
+  }, 60_000)
+
+  it('never connects to a forbidden socket while the fd number is dup2-swapped', async () => {
+    if (!haveCompiler) return
+    // Swapping an AF_UNIX socket over an AF_INET fd is what makes
+    // "check the family, then let the kernel continue" unsound.
+    const { out, before, after } = await runRace('dup2')
+
+    expect(after.forbidden).toBe(before.forbidden)
+    expect(parse(out, 'violations')).toBe(0)
+    // Non-vacuity: in this mode the successful connects are the TCP ones
+    // (the unix half of the flip always targets the forbidden path), so the
+    // allowed unix listener is expected to stay untouched.
+    expect(parse(out, 'iterations')).toBeGreaterThan(1000)
+    expect(parse(out, 'connected')).toBeGreaterThan(100)
+  }, 60_000)
 })
 
 describe.if(isLinux)('allowUnixSockets (wrapper arguments)', () => {
