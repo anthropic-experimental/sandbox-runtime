@@ -814,6 +814,13 @@ function resolveApplySeccompPrefix(
  *   every other socket this user owns, an ssh-agent or docker socket among
  *   them. Give the socket's directory a `denyWrite` carve-out, or move the
  *   socket somewhere the sandbox cannot write, to allow it.
+ *
+ * When the sandbox restricts writes nowhere at all — no `writeConfig`, or
+ * `filesystem.disabled` (which is `allowOnly: ['/']`) — that second rule has
+ * nothing to hold onto: every path is writable, so an allow-listed directory
+ * is worth exactly as much as the sockets the command can link into it. Every
+ * entry is dropped in that case rather than passed through, which is the same
+ * direction the rest of this feature fails in.
  */
 /** The deepest directory a glob pattern can write into: everything before
  *  its first glob character. `~/code/**\/build` -> `~/code`. */
@@ -830,11 +837,26 @@ function buildUnixConnectArgs(
 ): string[] {
   if (!allowUnixSockets || allowUnixSockets.length === 0) return []
 
+  if (!writeConfig) {
+    logForDebugging(
+      `[Sandbox Linux] Ignoring allowUnixSockets: this sandbox restricts ` +
+        `writes nowhere, so the command could hard-link any socket it can ` +
+        `reach into an allowed directory. Configure filesystem write ` +
+        `restrictions to use a unix socket allowlist.`,
+      { level: 'warn' },
+    )
+    return []
+  }
+
   const canonicalize = (
     p: string,
     { mustExist = false }: { mustExist?: boolean } = {},
   ): string | undefined => {
-    const expanded = expandTilde(p).replace(/\/+$/, '')
+    // Trailing slashes are stripped so a spelling difference is not a
+    // mismatch — but "/" is all slash, and must survive as the root it is:
+    // it is how `filesystem.disabled` spells "everything is writable".
+    const trimmed = expandTilde(p).replace(/\/+$/, '')
+    const expanded = trimmed === '' && p.startsWith('/') ? '/' : trimmed
     if (!expanded.startsWith('/')) {
       logForDebugging(
         `[Sandbox Linux] Ignoring non-absolute allowUnixSockets entry: ${p}`,

@@ -455,6 +455,38 @@ describe.if(isLinux)('allowUnixSockets (wrapper arguments)', () => {
     expect(wrapped).not.toContain('--allow-unix-connect')
   })
 
+  it('drops every entry when the sandbox restricts writes nowhere', async () => {
+    const socketDir = mkdtempSync(join(tmpdir(), 'srt-uds-nowrite-'))
+    try {
+      // No writeConfig at all: bwrap restricts writes nowhere, so any socket
+      // the command can reach can be hard-linked into the allowed directory.
+      const wrapped = await wrapCommandWithSandboxLinux({
+        command: 'echo hi',
+        needsNetworkRestriction: true,
+        allowUnixSockets: [socketDir],
+      })
+      expect(wrapped).not.toContain('--allow-unix-connect')
+    } finally {
+      rmSync(socketDir, { recursive: true, force: true })
+    }
+  })
+
+  it('drops every entry when filesystem isolation is off (allowOnly "/")', async () => {
+    const socketDir = mkdtempSync(join(tmpdir(), 'srt-uds-fsoff-'))
+    try {
+      // `filesystem.disabled` resolves to this write config. "/" must survive
+      // canonicalization as the root it is, or every entry looks unwritable.
+      const wrapped = await wrapCommandWithSandboxLinux({
+        ...base,
+        writeConfig: { allowOnly: ['/'], denyWithinAllow: [] },
+        allowUnixSockets: [socketDir],
+      })
+      expect(wrapped).not.toContain('--allow-unix-connect')
+    } finally {
+      rmSync(socketDir, { recursive: true, force: true })
+    }
+  })
+
   it('passes nothing when allowAllUnixSockets disables the filter', async () => {
     const socketDir = mkdtempSync(join(tmpdir(), 'srt-uds-all-'))
     try {
