@@ -196,10 +196,11 @@ function registerCleanup(): void {
 }
 
 /**
- * commandId → commandText for invocations wrapped with an explicit id, so
- * every producer can report (and ignoreViolations can match) the command an
- * event belongs to rather than the opaque key. Keyed by what
- * decodeSandboxedCommand yields for the id (its first 100 characters).
+ * Attribution key → command text for every wrapped invocation, so each
+ * producer can report (and ignoreViolations can match) the command an
+ * event belongs to rather than the opaque key. The key is the commandId
+ * when the embedder passes one, else the command itself; either way it is
+ * stored as decodeSandboxedCommand yields it (its first 100 characters).
  * Bounded FIFO: the violation store itself only retains the last 100
  * events, so long-gone invocations don't need resolving.
  */
@@ -211,16 +212,10 @@ export function registerCommandText(
   command: string,
   options: WrapWithSandboxOptions | undefined,
 ): void {
-  const id = options?.commandId
+  const key = decodeSandboxedCommand(
+    encodeSandboxedCommand(options?.commandId ?? command),
+  )
   const text = options?.commandText ?? command
-  // An id equal to its text still registers: the unknown-key fallback in
-  // resolveCommandText sanitizes, so a default-keyed invocation must find
-  // its own raw text here for multi-line ignoreViolations patterns to keep
-  // matching. Only an absent id skips registration.
-  if (id === undefined) {
-    return
-  }
-  const key = decodeSandboxedCommand(encodeSandboxedCommand(id))
   commandTextsById.delete(key)
   commandTextsById.set(key, text)
   while (commandTextsById.size > MAX_COMMAND_TEXTS) {
@@ -231,13 +226,13 @@ export function registerCommandText(
 }
 
 /**
- * The command text for a decoded attribution key: the registered
- * commandText when the key is a known commandId (the embedder's own,
- * trusted text), else the key with control characters collapsed — the
+ * The command text for a decoded attribution key: the registered text when
+ * the key belongs to an invocation this process wrapped (the embedder's
+ * own, trusted text), else the key with control characters collapsed. The
  * decoded bytes arrive over carriers the sandboxed process can write to
  * (the observe socket's event field, the macOS log tag, the proxy
- * username), so every producer's unknown-key fallback sanitizes alike.
- * Exported for testing.
+ * username), so a key that was never wrapped here is untrusted and every
+ * producer's fallback sanitizes it alike. Exported for testing.
  */
 export function resolveCommandText(decodedId: string): string {
   return commandTextsById.get(decodedId) ?? sanitizeViolationText(decodedId)

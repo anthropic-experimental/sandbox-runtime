@@ -24,18 +24,15 @@ describe('violation command-text attribution', () => {
     expect(resolveCommandText(keyFor(text))).toBe(text)
   })
 
-  it('collapses control characters in an unregistered key', () => {
-    const forged = 'curl x\n\x1bspoofed\tline\x7f'
-    expect(resolveCommandText(forged)).toBe('curl x spoofed line')
+  it('registers an un-keyed invocation under its own command, past the 100-character key', () => {
+    const text = `${'x'.repeat(120)}\ntail`
+    registerCommandText(text, undefined)
+    expect(keyFor(text)).toHaveLength(100)
+    expect(resolveCommandText(keyFor(text))).toBe(text)
   })
 
-  it('skips registration only when no id is given', () => {
-    const text = 'never-registered-command'
-    registerCommandText(text, undefined)
-    expect(resolveCommandText(keyFor(text))).toBe(text)
-    registerCommandText(`${text}\nwith-newline`, {})
-    expect(resolveCommandText(keyFor(`${text}\nwith-newline`))).toBe(
-      `${text} with-newline`,
-    )
+  it('collapses control characters in a key no invocation registered', () => {
+    const forged = 'curl x\n\x1bspoofed\tline\x7f'
+    expect(resolveCommandText(forged)).toBe('curl x spoofed line')
   })
 })
