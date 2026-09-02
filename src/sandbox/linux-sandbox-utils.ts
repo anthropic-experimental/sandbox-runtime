@@ -413,23 +413,27 @@ function processHasEffectiveCapability(cap: number): boolean {
 }
 
 /**
- * Capability arguments for a root caller. bwrap run by uid 0 hands the
- * command every capability the caller holds unless told otherwise, and
- * inside bwrap's user namespace CAP_SYS_ADMIN is enough to unmount a
- * read-deny tmpfs or a write-deny bind, or remount / read-write: the whole
- * filesystem policy. So a root caller drops everything — except, while the
- * seccomp helper is in use and the caller has it, CAP_SETFCAP: the helper's
- * nested user namespace must map uid 0, which the kernel (5.12+) permits
- * only when the namespace's creator held CAP_SETFCAP. The helper loses it on
- * entering that namespace, so the command itself runs with no capability in
- * bwrap's namespace and full ones only in a nested namespace whose copies of
- * these mounts are locked. A non-root caller has no capabilities to drop and
- * may not add one.
+ * Capability arguments: the command holds no capability in bwrap's user
+ * namespace. For a non-root caller that is bwrap's default and the drop is a
+ * no-op; bwrap run by uid 0 hands the command every capability the caller
+ * holds unless told otherwise, and inside bwrap's user namespace
+ * CAP_SYS_ADMIN is enough to unmount a read-deny tmpfs or a write-deny bind,
+ * or remount / read-write: the whole filesystem policy. The one exception,
+ * for a root caller while the seccomp helper is in use and the caller has
+ * it, is CAP_SETFCAP: the helper's nested user namespace must map uid 0,
+ * which the kernel (5.12+) permits only when the namespace's creator held
+ * CAP_SETFCAP. The helper loses it on entering that namespace, so the
+ * command itself runs with no capability in bwrap's namespace and full ones
+ * only in a nested namespace whose copies of these mounts are locked. A
+ * non-root caller may not add a capability.
  */
-function rootCapabilityArgs(usesSeccompHelper: boolean): string[] {
-  if (process.geteuid?.() !== 0) return []
+function capabilityArgs(usesSeccompHelper: boolean): string[] {
   const args = ['--cap-drop', 'ALL']
-  if (usesSeccompHelper && processHasEffectiveCapability(CAP_SETFCAP)) {
+  if (
+    usesSeccompHelper &&
+    process.geteuid?.() === 0 &&
+    processHasEffectiveCapability(CAP_SETFCAP)
+  ) {
     args.push('--cap-add', 'CAP_SETFCAP')
   }
   return args
@@ -1985,32 +1989,23 @@ export async function wrapCommandWithSandboxLinux(
     // default: EUID=0 without CAP_SYS_ADMIN) would otherwise try a direct
     // clone and EPERM; a root parent WITH capabilities would leave the
     // command holding them, CAP_SYS_ADMIN included, which unmounts any deny
-    // in this namespace — hence rootCapabilityArgs in both modes as well.
+    // in this namespace — hence capabilityArgs in both modes as well.
     // apply-seccomp creates its own nested userns to obtain CAP_SYS_ADMIN
     // for its PID+mount unshare (see below); for a root caller that needs
-    // the one capability rootCapabilityArgs keeps.
-    const capabilityArgs = rootCapabilityArgs(applySeccompPrefix !== undefined)
+    // the one capability capabilityArgs keeps.
+    bwrapArgs.push(
+      '--unshare-user',
+      ...capabilityArgs(applySeccompPrefix !== undefined),
+    )
     if (!enableWeakerNestedSandbox) {
-      // Mount fresh /proc if PID namespace is isolated (secure mode); a
-      // non-root caller drops to no capabilities explicitly too.
-      bwrapArgs.push(
-        '--unshare-user',
-        ...(capabilityArgs.length > 0 ? capabilityArgs : ['--cap-drop', 'ALL']),
-        '--proc',
-        '/proc',
-      )
+      // Mount fresh /proc if PID namespace is isolated (secure mode).
+      bwrapArgs.push('--proc', '/proc')
     } else {
       // --bind /proc /proc: apply-seccomp's nested-userns path writes
       // /proc/self/setgroups and uid_map. Without --proc above, the
       // --ro-bind / / leaves /proc read-only and those writes EROFS; a
       // fresh proc mount is what an unprivileged container refuses.
-      bwrapArgs.push(
-        '--unshare-user',
-        ...capabilityArgs,
-        '--bind',
-        '/proc',
-        '/proc',
-      )
+      bwrapArgs.push('--bind', '/proc', '/proc')
     }
 
     // apply-seccomp obtains CAP_SYS_ADMIN for its nested PID+mount unshare

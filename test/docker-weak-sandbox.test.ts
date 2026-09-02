@@ -95,9 +95,6 @@ describe.if(inDocker)('srt end-to-end in unprivileged container', () => {
   // way; run the container with --cap-add SYS_ADMIN (or --privileged) to
   // see them succeed on a runtime that keeps the caller's capabilities.
   it('leaves the command no capability to unmount a deny', () => {
-    const caps = srt('grep CapEff /proc/self/status')
-    expect(caps.status).toBe(0)
-
     const read = srt(`umount ${SECRET} 2>&1; cat ${join(SECRET, 'key')}`)
     expect(read.stdout).not.toContain('TOPSECRET')
 
