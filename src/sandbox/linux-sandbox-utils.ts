@@ -902,8 +902,7 @@ function pushReadDenyDirMounts(
   readAllowPaths: string[],
   pathForms: (p: string) => string[],
   readDenyLocations: string[],
-  restoredWritePathsOut?: string[],
-): void {
+): string[] {
   // Mounts land at canonical locations while recorded spellings may be
   // symlinked, so containment tests expand both sides to both forms.
   const denyForms = pathForms(normalizedPath)
@@ -926,8 +925,8 @@ function pushReadDenyDirMounts(
   args.push('--tmpfs', normalizedPath)
 
   // tmpfs wiped any earlier write binds under this path — restore them.
-  // Record of what was actually re-bound; consumers read the record rather
-  // than re-deriving the predicate.
+  // What was actually re-bound is recorded and returned; consumers read the
+  // record rather than re-deriving the predicate.
   const restoredWrites: string[] = []
   for (const writePath of allowedWritePaths) {
     if (underDeniedDir(writePath)) {
@@ -939,7 +938,6 @@ function pushReadDenyDirMounts(
       }
       args.push('--bind', writePath, writePath)
       restoredWrites.push(writePath)
-      restoredWritePathsOut?.push(writePath)
       logForDebugging(
         `[Sandbox Linux] Re-bound write path wiped by denyRead tmpfs: ${writePath}`,
       )
@@ -961,9 +959,8 @@ function pushReadDenyDirMounts(
       // recorded location would re-bind the target over this tmpfs.
       try {
         const resolvedAllow = fs.realpathSync(allowPath)
-        const allowForComparison = allowPath.replace(/\/+$/, '')
         if (
-          resolvedAllow !== allowForComparison &&
+          resolvedAllow !== allowPath &&
           isSymlinkOutsideBoundary(allowPath, resolvedAllow)
         ) {
           logForDebugging(
@@ -1005,6 +1002,7 @@ function pushReadDenyDirMounts(
       )
     }
   }
+  return restoredWrites
 }
 
 /**
@@ -1595,10 +1593,7 @@ async function generateFilesystemArgs(
     // for renames across a pinned directory). Being read-only and beneath the
     // allow roots, a pin that bwrap resolves somewhere unexpected (a component
     // swapped for a symlink after the walk) widens nothing.
-    const denyWriteDests = new Set<string>()
-    for (let i = 0; i < denyWriteArgs.length; i += 3) {
-      denyWriteDests.add(denyWriteArgs[i + 2]!)
-    }
+    // Every deny dest the loop above produced is a key of denyWriteRawDests.
     // File masks (non-directory denyRead entries, credential fakes) are the
     // second protection channel and seed the walk too.
     const maskPinSeeds: string[] = []
@@ -1632,7 +1627,7 @@ async function generateFilesystemArgs(
       }
     }
     const ancestorPinDirs = computeAncestorPins(
-      [...denyWriteDests, ...maskPinSeeds],
+      [...denyWriteRawDests.keys(), ...maskPinSeeds],
       {
         isWithinAllowedWrite: isWithinAnyAllowedWritePath,
         isAllowedWriteRoot,
@@ -1732,9 +1727,7 @@ async function generateFilesystemArgs(
     return readAllowPaths.some(allowPath =>
       mountForms(allowPath).some(
         form =>
-          form === child ||
-          form === childLocation ||
-          childLocation.startsWith(pathSep(form)),
+          form === childLocation || childLocation.startsWith(pathSep(form)),
       ),
     )
   }
@@ -1786,17 +1779,15 @@ async function generateFilesystemArgs(
       // Joins the emitted set before its own call (exempt from its own veto).
       const unitForms = mountForms(normalizedPath)
       emittedReadDenyLocations.push(unitForms[unitForms.length - 1]!)
-      const restored: string[] = []
-      pushReadDenyDirMounts(
+      const restores = pushReadDenyDirMounts(
         args,
         normalizedPath,
         allowedWritePaths,
         readAllowPaths,
         mountForms,
         emittedReadDenyLocations,
-        restored,
       )
-      readSectionPlan.push({ forms: unitForms, restores: restored })
+      readSectionPlan.push({ forms: unitForms, restores })
     } else {
       // For files, only an exact allowRead match overrides the deny. A
       // directory allowRead does not un-deny a file specifically listed in
