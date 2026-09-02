@@ -18,6 +18,7 @@ import {
   encodeSandboxedCommand,
   DANGEROUS_FILES,
   isAtOrUnder,
+  isStrictlyUnder,
   getDangerousDirectories,
 } from './sandbox-utils.js'
 import type {
@@ -1011,10 +1012,11 @@ async function generateFilesystemArgs(
     // Inputs for the covering-directory vetoes, computed at most once and
     // only when a deny path (absent or existing) lies strictly beneath a
     // recorded read-only deny dir — commands with no such covering directory
-    // skip the extra stat/realpath/readdir syscalls entirely. Lazy evaluation also means the
-    // derivation runs from inside the deny loop, AFTER the (unbounded)
-    // mandatory-deny ripgrep await below, keeping the snapshot as close as
-    // possible to the denyRead loop that later acts on the real filesystem.
+    // skip the extra stat/realpath/readdir syscalls entirely. Lazy
+    // evaluation also means the derivation runs from inside the deny loop,
+    // AFTER the (unbounded) mandatory-deny ripgrep await below, keeping the
+    // snapshot as close as possible to the denyRead loop that later acts on
+    // the real filesystem.
     //
     // allowedWritePathsBothForms: allowWrite paths in their recorded and
     // realpath-canonical spellings. The canonical form is re-resolved HERE,
@@ -1236,8 +1238,8 @@ async function generateFilesystemArgs(
       const unsafe =
         // (i) an allowed write path strictly beneath the dir: the
         //     re-application's effect would re-bind it writable.
-        allowedWritePathsBothForms.some(
-          writePath => writePath !== denyDir && isAtOrUnder(writePath, denyDir),
+        allowedWritePathsBothForms.some(writePath =>
+          isStrictlyUnder(writePath, denyDir),
         ) ||
         // (ii) a read-deny tmpfs at or beneath the dir: the re-application's
         //     trigger.
@@ -1268,7 +1270,7 @@ async function generateFilesystemArgs(
     const coveredBySafeReadOnlyDenyDir = (candidate: string): boolean => {
       let covered = false
       for (const denyDir of readOnlyDenyDirs) {
-        if (candidate === denyDir || !isAtOrUnder(candidate, denyDir)) continue
+        if (!isStrictlyUnder(candidate, denyDir)) continue
         if (coveringDirIsUnsafe(denyDir)) {
           // A vetoed '/' neither covers a path nor disqualifies an inner
           // recorded directory: everything lies beneath it, so it would
@@ -1640,11 +1642,7 @@ async function generateFilesystemArgs(
   // (allowOnly and denyWithinAllow both naming it) contains every one of
   // them, so containment is root-aware.
   for (const tmpfsDir of tmpfsDirs) {
-    if (
-      emittedDenyWriteDests.some(
-        dest => tmpfsDir !== dest && isAtOrUnder(tmpfsDir, dest),
-      )
-    ) {
+    if (emittedDenyWriteDests.some(dest => isStrictlyUnder(tmpfsDir, dest))) {
       logForDebugging(
         `[Sandbox Linux] Re-applying denyRead tmpfs re-exposed by denyWrite bind: ${tmpfsDir}`,
       )
@@ -1655,11 +1653,7 @@ async function generateFilesystemArgs(
   // ancestor bind, so the real file is back. Re-apply the mask with its
   // original source (/dev/null for read-deny, the fake for credential mask).
   for (const [maskedFile, source] of maskedFiles) {
-    if (
-      emittedDenyWriteDests.some(
-        dest => maskedFile !== dest && isAtOrUnder(maskedFile, dest),
-      )
-    ) {
+    if (emittedDenyWriteDests.some(dest => isStrictlyUnder(maskedFile, dest))) {
       // maskedFiles holds both the symlink path and its resolved target so
       // the denyWrite skip-check above matches either. Re-emission must go
       // to the target only — bwrap rejects a symlink bind dest (see
