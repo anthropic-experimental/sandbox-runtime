@@ -413,9 +413,7 @@ const BWRAP_ARGS_FD = 9
 
 function bwrapArgsFdFor(seccompApplyPath: string | undefined): number {
   const taken = seccompApplyPath?.match(/^\/(?:proc\/self|dev)\/fd\/(\d+)$/)
-  return taken !== null &&
-    taken !== undefined &&
-    Number(taken[1]) === BWRAP_ARGS_FD
+  return Number(taken?.[1]) === BWRAP_ARGS_FD
     ? BWRAP_ARGS_FD - 1
     : BWRAP_ARGS_FD
 }
@@ -1843,7 +1841,7 @@ export async function wrapCommandWithSandboxLinux(
   try {
     // Before the profile is generated, so this one ro-binds it too; inside
     // the try, so a failure gives the count back.
-    ensureBwrapArgsDir()
+    const argsDir = ensureBwrapArgsDir()
     // ========== SECCOMP FILTER (Unix Socket Blocking) ==========
     // apply-seccomp wraps the workload and applies the baked-in BPF filter
     // that blocks socket(AF_UNIX, ...). Skipped when allowAllUnixSockets is true.
@@ -2106,8 +2104,10 @@ export async function wrapCommandWithSandboxLinux(
       // parsed arguments (MAX_ARGS, 9000: about 3000 mounts), so a profile
       // should still be kept small at the source.
       const argsFd = bwrapArgsFdFor(seccompConfig?.applyPath)
+      // The directory this profile ro-binds (created above, before the
+      // filesystem arguments were generated).
       const argsFile = path.join(
-        ensureBwrapArgsDir(),
+        argsDir,
         `args-${process.pid}-${++bwrapArgsFileCount}`,
       )
       // The redirect opens the file before the group runs, and rm unlinks
