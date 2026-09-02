@@ -867,10 +867,11 @@ function resolveEverySymlink(p: string): string {
  * Mount a tmpfs over a read-denied directory (at `dest`, its resolved
  * path), then restore the allowed write paths and allowRead paths the tmpfs
  * just wiped: those at or under the directory in either spelling
- * (`covers`), re-bound where `bindDestFor` says — the spelling the config
- * named, which bwrap resolves inside the sandbox and recreates where a link
- * the tmpfs replaced no longer exists, or the target of a path that is
- * itself a still-present symlink. Used by the denyRead loop in
+ * (`covers`), re-bound where `bindDestFor` (the caller's landing function
+ * for this tmpfs) says — the spelling the config named, which bwrap
+ * resolves inside the sandbox and recreates where a link the tmpfs replaced
+ * no longer exists, or the target of a path that is itself a still-present
+ * symlink. Used by the denyRead loop in
  * generateFilesystemArgs and again when a late denyWrite ro-bind re-exposes
  * a read-denied directory and the tmpfs must be re-applied on top.
  */
@@ -880,13 +881,9 @@ function pushReadDenyDirMounts(
   allowedWritePaths: string[],
   readAllowPaths: string[],
   covers: (p: string, dir: string) => boolean,
-  bindDestForIn: (tmpfs: {
-    spelling: string
-    dest: string
-  }) => (p: string) => string,
+  bindDestFor: (p: string) => string,
 ): void {
   args.push('--tmpfs', dest)
-  const bindDestFor = bindDestForIn({ spelling, dest })
 
   // tmpfs wiped any earlier write binds under this path — restore them.
   for (const writePath of allowedWritePaths) {
@@ -1497,11 +1494,10 @@ async function generateFilesystemArgs(
   // the mask, and to re-apply the correct source if a denyWrite ancestor
   // bind re-exposes the dest.
   const maskedFiles = new Map<string, string>()
-  // Directories masked by --tmpfs below, in emission (shallow-first) order,
-  // by the spelling the config named; tmpfsMounts pairs each with where it
-  // landed. Used to filter denyWriteArgs the same way: a dir in both deny
-  // lists must not get its host contents re-bound on top of its own tmpfs.
-  const tmpfsDirs: string[] = []
+  // Directories masked by --tmpfs below, in emission (shallow-first) order:
+  // the spelling the config named, paired with where the mount landed. Used
+  // to filter denyWriteArgs the same way: a dir in both deny lists must not
+  // get its host contents re-bound on top of its own tmpfs.
   const tmpfsMounts: Array<{ spelling: string; dest: string }> = []
   // The directory mounts emitted so far, by where they landed INSIDE the
   // sandbox, in emission order: a tmpfs empties its landing, a re-bind
@@ -1574,16 +1570,12 @@ async function generateFilesystemArgs(
   // destination (a link still alive there is followed; bwrap refuses a
   // symlink as a destination and, before 0.12, an absolute one anywhere in
   // the path).
-  const reBindDestForIn =
+  const reBindDestFor =
     (tmpfs: { spelling: string; dest: string }) =>
     (p: string): string => {
       let rel: string | undefined
       outer: for (const pf of bothForms(p)) {
-        for (const sf of [
-          tmpfs.spelling,
-          ...bothForms(tmpfs.spelling),
-          tmpfs.dest,
-        ]) {
+        for (const sf of [...bothForms(tmpfs.spelling), tmpfs.dest]) {
           if (isAtOrUnder(pf, sf)) {
             rel = pf.slice(sf.length)
             break outer
@@ -1674,16 +1666,16 @@ async function generateFilesystemArgs(
       ])) {
         if (hiddenByEmittedTmpfs(dest)) continue
         mounted = true
-        tmpfsDirs.push(normalizedPath)
-        tmpfsMounts.push({ spelling: normalizedPath, dest })
+        const mount = { spelling: normalizedPath, dest }
+        tmpfsMounts.push(mount)
         recordMount(dest, 'tmpfs')
         pushReadDenyDirMounts(
           args,
-          { spelling: normalizedPath, dest },
+          mount,
           allowedWritePaths,
           readAllowPaths,
           atOrUnderEitherForm,
-          reBindDestForIn,
+          reBindDestFor(mount),
         )
       }
       if (!mounted) {
@@ -1767,12 +1759,12 @@ async function generateFilesystemArgs(
   //   if an allowed write path at-or-under that tmpfs covers the dest, the
   //   denyRead loop re-bound it (the .git/hooks case) and the write-deny bind
   //   is still required on top.
-  // tmpfsDirs and allowedWritePaths hold unresolved paths while dest has been
-  // canonicalized, so each dest is tested under both spellings: they name the
-  // same inode after bwrap resolves the mount destinations, and a hit on
-  // either means the tmpfs really does cover this bind.
+  // tmpfs spellings and allowedWritePaths hold unresolved paths while dest
+  // has been canonicalized, so each dest is tested under both spellings: they
+  // name the same inode after bwrap resolves the mount destinations, and a
+  // hit on either means the tmpfs really does cover this bind.
   const isHiddenByTmpfs = (dest: string): boolean =>
-    tmpfsDirs.some(tmpfsDir => {
+    tmpfsMounts.some(({ spelling: tmpfsDir }) => {
       if (!atOrUnderEitherForm(dest, tmpfsDir)) return false
       const reExposedByWriteBind = allowedWritePaths.some(
         writePath =>
@@ -1812,7 +1804,8 @@ async function generateFilesystemArgs(
   // it: a bind that contains only a symlink spelling leaves the mount at the
   // landing untouched (and re-applying anyway would re-bind carve-outs over
   // the file masks beneath them).
-  for (const { spelling, dest } of tmpfsMounts) {
+  for (const mount of tmpfsMounts) {
+    const { dest } = mount
     if (emittedDenyWriteDests.some(w => w !== dest && isAtOrUnder(dest, w))) {
       logForDebugging(
         `[Sandbox Linux] Re-applying denyRead tmpfs re-exposed by denyWrite bind: ${dest}`,
@@ -1820,11 +1813,11 @@ async function generateFilesystemArgs(
       recordMount(dest, 'tmpfs')
       pushReadDenyDirMounts(
         args,
-        { spelling, dest },
+        mount,
         allowedWritePaths,
         readAllowPaths,
         atOrUnderEitherForm,
-        reBindDestForIn,
+        reBindDestFor(mount),
       )
     }
   }
