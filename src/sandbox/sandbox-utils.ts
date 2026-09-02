@@ -440,16 +440,15 @@ export function getDefaultWritePaths(
   const denied = denyRead
     .filter(p => !containsGlobChars(removeTrailingGlobSuffix(p)))
     .map(p => normalizePathForSandbox(p))
-  return recommendedPaths.filter(recommended => {
-    const resolved = normalizePathForSandbox(recommended)
-    return !denied.some(
-      d =>
-        resolved === d ||
-        resolved.startsWith(d === '/' ? '/' : d + '/') ||
-        recommended === d ||
-        recommended.startsWith(d === '/' ? '/' : d + '/'),
-    )
-  })
+  const atOrUnder = (p: string, dir: string): boolean =>
+    p === dir || p.startsWith(dir === '/' ? '/' : dir + '/')
+  // Both spellings of the recommended path: as listed, and as the sandbox
+  // normalizes it (symlinks such as /tmp -> /private/tmp resolved).
+  return recommendedPaths.filter(recommended =>
+    [recommended, normalizePathForSandbox(recommended)].every(
+      form => !denied.some(d => atOrUnder(form, d)),
+    ),
+  )
 }
 
 /**

@@ -1580,15 +1580,16 @@ async function wrapWithSandbox(
         config?.filesystem.allowWrite ??
         [],
     )
+    // Credential deny paths are unioned with the caller's denyRead — never
+    // replacing it — so explicit filesystem restrictions always survive.
+    // Computed ahead of the write config: a default write path under a
+    // read-denied directory is dropped from it.
+    const rawDenyRead = unionDenyReadPaths(
+      customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
+      credentialRestrictions,
+    )
     writeConfig = {
-      allowOnly: [
-        ...getDefaultWritePaths(
-          customConfig?.filesystem?.denyRead ??
-            config?.filesystem.denyRead ??
-            [],
-        ),
-        ...userAllowWrite,
-      ],
+      allowOnly: [...getDefaultWritePaths(rawDenyRead), ...userAllowWrite],
       denyWithinAllow: stripWriteGlobs(
         customConfig?.filesystem?.denyWrite ??
           config?.filesystem.denyWrite ??
@@ -1596,12 +1597,6 @@ async function wrapWithSandbox(
       ),
     }
 
-    // Credential deny paths are unioned with the caller's denyRead — never
-    // replacing it — so explicit filesystem restrictions always survive.
-    const rawDenyRead = unionDenyReadPaths(
-      customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
-      credentialRestrictions,
-    )
     const expandedDenyRead: string[] = []
     for (const p of rawDenyRead) {
       const stripped = removeTrailingGlobSuffix(p)
