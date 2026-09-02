@@ -112,6 +112,68 @@ describe.if(isSupportedPlatform)(
       )
       writeFileSync(join(TEST_DIR, '.git', 'index'), ORIGINAL_CONTENT)
 
+      // A nested repository directly under cwd, with `nested/` gitignored:
+      // its config sits at the default scan depth, its hook files one past
+      // it, and an ignore file must not hide either from the scan.
+      mkdirSync(join(TEST_DIR, 'nested', '.git', 'hooks'), { recursive: true })
+      mkdirSync(join(TEST_DIR, 'nested', 'src'), { recursive: true })
+      writeFileSync(
+        join(TEST_DIR, 'nested', '.git', 'HEAD'),
+        'ref: refs/heads/main',
+      )
+      writeFileSync(
+        join(TEST_DIR, 'nested', '.git', 'config'),
+        ORIGINAL_CONTENT,
+      )
+      writeFileSync(
+        join(TEST_DIR, 'nested', '.git', 'hooks', 'pre-commit'),
+        ORIGINAL_CONTENT,
+      )
+      writeFileSync(join(TEST_DIR, 'nested', 'src', 'ok.txt'), ORIGINAL_CONTENT)
+      writeFileSync(join(TEST_DIR, '.gitignore'), 'nested/\nlib/\n')
+      // A submodule: its git directory lives under cwd's .git/modules and its
+      // checkout has a .git FILE pointing there.
+      mkdirSync(join(TEST_DIR, '.git', 'modules', 'lib', 'hooks'), {
+        recursive: true,
+      })
+      writeFileSync(join(TEST_DIR, '.git', 'modules', 'lib', 'HEAD'), 'ref: x')
+      writeFileSync(
+        join(TEST_DIR, '.git', 'modules', 'lib', 'config'),
+        ORIGINAL_CONTENT,
+      )
+      writeFileSync(
+        join(TEST_DIR, '.git', 'modules', 'lib', 'hooks', 'pre-commit'),
+        ORIGINAL_CONTENT,
+      )
+      mkdirSync(join(TEST_DIR, 'lib'), { recursive: true })
+      writeFileSync(
+        join(TEST_DIR, 'lib', '.git'),
+        'gitdir: ../.git/modules/lib',
+      )
+      // A linked worktree of this repository checked out inside it: its
+      // .git file points at .git/worktrees/wt, whose commondir is the main
+      // .git — the hooks a commit in the worktree runs are the main ones.
+      mkdirSync(join(TEST_DIR, '.git', 'worktrees', 'wt'), { recursive: true })
+      writeFileSync(join(TEST_DIR, '.git', 'worktrees', 'wt', 'HEAD'), 'ref: x')
+      writeFileSync(
+        join(TEST_DIR, '.git', 'worktrees', 'wt', 'commondir'),
+        '../..\n',
+      )
+      mkdirSync(join(TEST_DIR, 'wt-checkout'), { recursive: true })
+      writeFileSync(
+        join(TEST_DIR, 'wt-checkout', '.git'),
+        `gitdir: ${join(TEST_DIR, '.git', 'worktrees', 'wt')}`,
+      )
+      // A nested .claude/commands one level down (a name spanning two
+      // segments), within reach only of a deeper scan.
+      mkdirSync(join(TEST_DIR, 'pkg', '.claude', 'commands'), {
+        recursive: true,
+      })
+      writeFileSync(
+        join(TEST_DIR, 'pkg', '.claude', 'commands', 'x.md'),
+        ORIGINAL_CONTENT,
+      )
+
       // Create safe file within .claude that SHOULD be writable (not commands/agents)
       writeFileSync(
         join(TEST_DIR, '.claude', 'some-other-file.txt'),
@@ -139,9 +201,10 @@ describe.if(isSupportedPlatform)(
     async function runSandboxedWrite(
       filePath: string,
       content: string,
+      opts: { mandatoryDenySearchDepth?: number; append?: boolean } = {},
     ): Promise<{ success: boolean; stderr: string }> {
       const platform = getPlatform()
-      const command = `echo '${content}' > '${filePath}'`
+      const command = `echo '${content}' ${opts.append ? '>>' : '>'} '${filePath}'`
 
       // Allow writes to current directory, but mandatory denies should still block dangerous files
       const writeConfig = {
@@ -163,6 +226,7 @@ describe.if(isSupportedPlatform)(
           needsNetworkRestriction: false,
           readConfig: undefined,
           writeConfig,
+          mandatoryDenySearchDepth: opts.mandatoryDenySearchDepth,
         })
       }
 
@@ -264,6 +328,158 @@ describe.if(isSupportedPlatform)(
         expect(readFileSync('.git/hooks/pre-commit', 'utf8')).toBe(
           ORIGINAL_CONTENT,
         )
+      })
+    })
+
+    describe('Nested repositories, submodules and worktree pointers', () => {
+      it("blocks writes to a nested repository's .git/config (gitignored or not)", async () => {
+        const result = await runSandboxedWrite(
+          'nested/.git/config',
+          MODIFIED_CONTENT,
+        )
+
+        expect(result.success).toBe(false)
+        expect(readFileSync('nested/.git/config', 'utf8')).toBe(
+          ORIGINAL_CONTENT,
+        )
+      })
+
+      it("blocks writes to a nested repository's existing hook at the default depth", async () => {
+        // The hook file itself lies one level past the default scan depth;
+        // the repository is recognised by nested/.git/HEAD.
+        const result = await runSandboxedWrite(
+          'nested/.git/hooks/pre-commit',
+          MODIFIED_CONTENT,
+        )
+
+        expect(result.success).toBe(false)
+        expect(readFileSync('nested/.git/hooks/pre-commit', 'utf8')).toBe(
+          ORIGINAL_CONTENT,
+        )
+      })
+
+      it('blocks creating a new hook in a nested repository', async () => {
+        const result = await runSandboxedWrite(
+          'nested/.git/hooks/post-checkout',
+          MODIFIED_CONTENT,
+        )
+
+        expect(result.success).toBe(false)
+        expect(existsSync('nested/.git/hooks/post-checkout')).toBe(false)
+      })
+
+      it('keeps the rest of a nested repository writable', async () => {
+        const result = await runSandboxedWrite(
+          'nested/src/ok.txt',
+          MODIFIED_CONTENT,
+        )
+
+        expect(result.success).toBe(true)
+        expect(readFileSync('nested/src/ok.txt', 'utf8').trim()).toBe(
+          MODIFIED_CONTENT,
+        )
+      })
+
+      it("blocks writes to a submodule's config and hooks under .git/modules", async () => {
+        const config = await runSandboxedWrite(
+          '.git/modules/lib/config',
+          MODIFIED_CONTENT,
+        )
+        expect(config.success).toBe(false)
+        expect(readFileSync('.git/modules/lib/config', 'utf8')).toBe(
+          ORIGINAL_CONTENT,
+        )
+
+        const hook = await runSandboxedWrite(
+          '.git/modules/lib/hooks/post-checkout',
+          MODIFIED_CONTENT,
+        )
+        expect(hook.success).toBe(false)
+        expect(existsSync('.git/modules/lib/hooks/post-checkout')).toBe(false)
+      })
+
+      it("blocks repointing a submodule checkout's .git file", async () => {
+        const result = await runSandboxedWrite(
+          'lib/.git',
+          'gitdir: /tmp/elsewhere',
+        )
+
+        expect(result.success).toBe(false)
+        expect(readFileSync('lib/.git', 'utf8')).toBe(
+          'gitdir: ../.git/modules/lib',
+        )
+      })
+
+      it('still lets a command create a .git file where none exists', async () => {
+        mkdirSync('fresh-checkout', { recursive: true })
+        try {
+          const result = await runSandboxedWrite(
+            'fresh-checkout/.git',
+            'gitdir: ../.git/modules/fresh',
+          )
+
+          expect(result.success).toBe(true)
+          expect(readFileSync('fresh-checkout/.git', 'utf8').trim()).toBe(
+            'gitdir: ../.git/modules/fresh',
+          )
+        } finally {
+          rmSync('fresh-checkout', { recursive: true, force: true })
+        }
+      })
+
+      it("from a linked worktree, blocks the main repository's hooks its commits would run", async () => {
+        // cwd is the worktree checkout; the main repository (TEST_DIR) is
+        // writable, so without following .git -> gitdir -> commondir its
+        // hooks/ would be too.
+        process.chdir(join(TEST_DIR, 'wt-checkout'))
+        const hook = join(TEST_DIR, '.git', 'hooks', 'pre-commit')
+        const command = `echo '${MODIFIED_CONTENT}' > '${hook}'`
+        const writeConfig = { allowOnly: [TEST_DIR], denyWithinAllow: [] }
+        const wrappedCommand =
+          getPlatform() === 'macos'
+            ? wrapCommandWithSandboxMacOS({
+                command,
+                needsNetworkRestriction: false,
+                readConfig: undefined,
+                writeConfig,
+              })
+            : await wrapCommandWithSandboxLinux({
+                command,
+                needsNetworkRestriction: false,
+                readConfig: undefined,
+                writeConfig,
+              })
+        const result = spawnSync(wrappedCommand, {
+          shell: true,
+          encoding: 'utf8',
+          timeout: 10000,
+        })
+
+        expect(result.status).not.toBe(0)
+        expect(readFileSync(hook, 'utf8')).toBe(ORIGINAL_CONTENT)
+      })
+
+      it('denies a nested .claude/commands as a directory once the scan reaches it', async () => {
+        // pkg/.claude/commands/x.md is four segments deep: found with a
+        // depth of 4 (macOS matches by pattern at any depth), and then the
+        // whole directory is read-only, new files included.
+        const existing = await runSandboxedWrite(
+          'pkg/.claude/commands/x.md',
+          MODIFIED_CONTENT,
+          { mandatoryDenySearchDepth: 4 },
+        )
+        expect(existing.success).toBe(false)
+        expect(readFileSync('pkg/.claude/commands/x.md', 'utf8')).toBe(
+          ORIGINAL_CONTENT,
+        )
+
+        const created = await runSandboxedWrite(
+          'pkg/.claude/commands/new.md',
+          MODIFIED_CONTENT,
+          { mandatoryDenySearchDepth: 4 },
+        )
+        expect(created.success).toBe(false)
+        expect(existsSync('pkg/.claude/commands/new.md')).toBe(false)
       })
     })
 
@@ -948,6 +1164,25 @@ describe.if(isSupportedPlatform)(
             // should not cause the sandbox to fail.
             expect(result.status).toBe(0)
             expect(result.stdout.trim()).toBe('hello')
+            cleanupBwrapMountPoints()
+
+            // …and the pointer file itself is read-only: repointing it at a
+            // directory the command prepared would hand the host's git that
+            // directory's config and hooks.
+            const repoint = spawnSync(
+              await wrapCommandWithSandboxLinux({
+                command: 'echo "gitdir: /tmp/evil" > .git',
+                needsNetworkRestriction: false,
+                readConfig: undefined,
+                writeConfig,
+                enableWeakerNestedSandbox: true,
+              }),
+              { shell: true, encoding: 'utf8', timeout: 10000 },
+            )
+            expect(repoint.status).not.toBe(0)
+            expect(readFileSync(join(worktreeDir, '.git'), 'utf8')).toBe(
+              'gitdir: /tmp/fake-main-repo/.git/worktrees/my-branch',
+            )
 
             cleanupBwrapMountPoints()
           } finally {
