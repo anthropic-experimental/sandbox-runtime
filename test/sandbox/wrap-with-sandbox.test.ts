@@ -278,6 +278,34 @@ describe('restriction pattern semantics', () => {
     )
 
     it.if(isLinux)(
+      'secure branch retains CAP_SETFCAP after --cap-drop ALL',
+      async () => {
+        // apply-seccomp's nested-userns fallback unshares its own user
+        // namespace and self-maps root ("0 0 1" to /proc/self/uid_map) to
+        // obtain CAP_SYS_ADMIN for its PID+mount unshare. On kernels with
+        // verify_root_map() in new_idmap_permitted() (kernel/user_namespace.c,
+        // present at least as of 6.12), that self-map additionally requires
+        // the immediate parent namespace to have held CAP_SETFCAP at the
+        // moment of unshare(CLONE_NEWUSER) — a blanket --cap-drop ALL here
+        // strips it, so apply-seccomp fails closed with EPERM even though
+        // it holds full capabilities within its own freshly-created
+        // namespace. Retaining CAP_SETFCAP does not reopen the sandbox
+        // escape #390 fixed: it only lets the holder set file capabilities
+        // on files it can already write to, already tightly scoped by the
+        // --ro-bind/--bind filesystem restrictions.
+        const result = await wrapCommandWithSandboxLinux({
+          command,
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: [] },
+          writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+        })
+
+        expect(result).toContain('--cap-drop ALL')
+        expect(result).toContain('--cap-add CAP_SETFCAP')
+      },
+    )
+
+    it.if(isLinux)(
       'non-empty denyOnly means has read restrictions on Linux',
       async () => {
         const result = await wrapCommandWithSandboxLinux({

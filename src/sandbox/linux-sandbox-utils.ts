@@ -1948,11 +1948,37 @@ export async function wrapCommandWithSandboxLinux(
       // --unshare-user + --cap-drop ALL: bwrap only auto-creates a userns
       // when EUID != 0, so a root parent would otherwise leave the sandboxed
       // command with full caps in the initial userns (CAP_SYS_ADMIN → remount
-      // rw over --ro-bind / /). Force the userns and explicitly drop caps so
-      // the sandboxed process cannot remount regardless of parent EUID.
-      // apply-seccomp does not need caps here — it creates its own nested
-      // userns to obtain CAP_SYS_ADMIN for its PID+mount unshare (see below).
-      bwrapArgs.push('--unshare-user', '--cap-drop', 'ALL', '--proc', '/proc')
+      // rw over --ro-bind / /). Force the userns and drop caps so the
+      // sandboxed process cannot remount regardless of parent EUID.
+      //
+      // --cap-add CAP_SETFCAP: apply-seccomp's nested-userns path (see
+      // below) unshares its own user namespace and writes a single "0 0 1"
+      // self-mapping to /proc/self/uid_map to obtain CAP_SYS_ADMIN for its
+      // PID+mount unshare. Since Linux added verify_root_map() to
+      // new_idmap_permitted() (kernel/user_namespace.c, present at least as
+      // of 6.12), an unprivileged single self-mapping to uid 0 additionally
+      // requires that the *immediate parent* user namespace held
+      // CAP_SETFCAP at the moment of unshare(CLONE_NEWUSER) — independent
+      // of whatever capabilities the new namespace's creator ends up with
+      // inside its own namespace. A blanket --cap-drop ALL strips that from
+      // this namespace, so on affected kernels apply-seccomp's uid_map
+      // write fails with EPERM even though it already holds full
+      // capabilities within its own freshly-created namespace (confirmed
+      // via kernel kprobe tracing of map_write/verify_root_map's call
+      // path). Retaining just CAP_SETFCAP is narrow: it only lets the
+      // holder set file capabilities on files it can already write to,
+      // which the --ro-bind/--bind filesystem restrictions above already
+      // keep tightly scoped, so this does not reopen the sandbox escape
+      // #390 fixed.
+      bwrapArgs.push(
+        '--unshare-user',
+        '--cap-drop',
+        'ALL',
+        '--cap-add',
+        'CAP_SETFCAP',
+        '--proc',
+        '/proc',
+      )
     } else {
       // --unshare-user: bwrap only auto-adds this when EUID != 0. In an
       // unprivileged container (Docker's default: EUID=0 without
