@@ -1,5 +1,6 @@
 import { quote } from '../utils/shell-quote.js'
 import { spawn } from 'child_process'
+import * as fs from 'fs'
 import * as path from 'path'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
@@ -13,6 +14,7 @@ import {
   containsGlobChars,
   globToRegex,
   DANGEROUS_FILES,
+  gitFileDenyPaths,
   getDangerousDirectories,
 } from './sandbox-utils.js'
 import { shouldIgnoreViolation } from './sandbox-violation-store.js'
@@ -92,17 +94,47 @@ export function macGetMandatoryDenyPatterns(allowGitConfig = false): string[] {
     denyPaths.push(`**/${dirName}/**`)
   }
 
-  // Git hooks are always blocked for security
+  // Git hooks are always blocked for security — in cwd's repository, in
+  // nested repositories, and in the submodule git directories a repository
+  // keeps under .git/modules (the hooks a commit inside the submodule runs)
   denyPaths.push(path.resolve(cwd, '.git/hooks'))
   denyPaths.push('**/.git/hooks/**')
+  denyPaths.push('**/.git/modules/**/hooks/**')
 
   // Git config - conditionally blocked based on allowGitConfig setting
   if (!allowGitConfig) {
     denyPaths.push(path.resolve(cwd, '.git/config'))
     denyPaths.push('**/.git/config')
+    denyPaths.push('**/.git/modules/**/config')
+  }
+
+  // cwd checked out as a linked worktree or submodule: .git is a file
+  // pointing at the real git directory. The file is denied, and so are the
+  // hooks/config git consults through it (nested .git files are covered by
+  // gitPointerFileDenyFilter, by vnode type).
+  const dotGit = path.resolve(cwd, '.git')
+  try {
+    if (fs.statSync(dotGit).isFile()) {
+      denyPaths.push(...gitFileDenyPaths(dotGit, allowGitConfig))
+    }
+  } catch {
+    // no .git here
   }
 
   return [...new Set(denyPaths)]
+}
+
+/**
+ * SBPL filter for a regular file named `.git` anywhere under `cwd`: a linked
+ * worktree's or submodule checkout's `gitdir:` pointer, which repointed at a
+ * directory the command prepared is as good as writing that directory's
+ * config. Matched by vnode type so an ordinary repository's .git DIRECTORY
+ * stays writable. The write rules re-allow file-write-create for it: only
+ * an existing pointer is protected, and `git worktree add` / `git submodule
+ * update --init` can still lay down new ones.
+ */
+export function gitPointerFileDenyFilter(cwd: string): string {
+  return `(require-all (vnode-type REGULAR-FILE) (regex ${escapePath(globToRegex(path.join(cwd, '**', '.git')))}))`
 }
 
 export interface SandboxViolationEvent {
@@ -794,7 +826,21 @@ function generateWriteRules(
   for (const normalizedPath of ungrouped) {
     denyFilters.add(denyPathFilter(normalizedPath))
   }
+  const gitPointerFilter = gitPointerFileDenyFilter(
+    normalizePathForSandbox('.'),
+  )
+  denyFilters.add(gitPointerFilter)
   rules.push(...renderRule('deny', ['file-write*'], denyFilters, logTag))
+  // An existing .git pointer file cannot be rewritten, replaced or removed;
+  // creating one where none exists stays possible.
+  rules.push(
+    ...renderRule(
+      'allow',
+      ['file-write-create'],
+      new Set([gitPointerFilter]),
+      logTag,
+    ),
+  )
 
   // Block file movement to prevent bypass via mv/rename. A grouped path
   // contributes its regex, the pin for its parent directory, and the
