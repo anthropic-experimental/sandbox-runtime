@@ -398,6 +398,47 @@ async function linuxGetMandatoryDenyPaths(
 // be cleaned up explicitly.
 const bwrapMountPoints: Set<string> = new Set()
 
+const CAP_SETFCAP = 31
+
+/** Whether this process holds `cap` in its effective set (Linux). */
+function processHasEffectiveCapability(cap: number): boolean {
+  try {
+    const status = fs.readFileSync('/proc/self/status', 'utf8')
+    const capEff = status.match(/^CapEff:\s*([0-9a-fA-F]+)\s*$/m)
+    if (!capEff) return false
+    return ((BigInt('0x' + capEff[1]) >> BigInt(cap)) & 1n) === 1n
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Capability arguments: the command holds no capability in bwrap's user
+ * namespace. For a non-root caller that is bwrap's default and the drop is a
+ * no-op; bwrap run by uid 0 hands the command every capability the caller
+ * holds unless told otherwise, and inside bwrap's user namespace
+ * CAP_SYS_ADMIN is enough to unmount a read-deny tmpfs or a write-deny bind,
+ * or remount / read-write: the whole filesystem policy. The one exception,
+ * for a root caller while the seccomp helper is in use and the caller has
+ * it, is CAP_SETFCAP: the helper's nested user namespace must map uid 0,
+ * which the kernel (5.12+) permits only when the namespace's creator held
+ * CAP_SETFCAP. The helper loses it on entering that namespace, so the
+ * command itself runs with no capability in bwrap's namespace and full ones
+ * only in a nested namespace whose copies of these mounts are locked. A
+ * non-root caller may not add a capability.
+ */
+function capabilityArgs(usesSeccompHelper: boolean): string[] {
+  const args = ['--cap-drop', 'ALL']
+  if (
+    usesSeccompHelper &&
+    process.geteuid?.() === 0 &&
+    processHasEffectiveCapability(CAP_SETFCAP)
+  ) {
+    args.push('--cap-add', 'CAP_SETFCAP')
+  }
+  return args
+}
+
 // Number of wrapped commands that have been generated but whose cleanup has
 // not yet run. cleanupBwrapMountPoints() defers file deletion while this is
 // positive, because deleting a mount point file on the host while another
@@ -1943,26 +1984,28 @@ export async function wrapCommandWithSandboxLinux(
     // outside the sandbox. But, --proc is not available when running in unprivileged docker containers
     // so we support running without it if explicitly requested.
     bwrapArgs.push('--unshare-pid')
+    // --unshare-user in both modes: bwrap only auto-creates a userns when
+    // EUID != 0. A root parent in an unprivileged container (Docker's
+    // default: EUID=0 without CAP_SYS_ADMIN) would otherwise try a direct
+    // clone and EPERM; a root parent WITH capabilities would leave the
+    // command holding them, CAP_SYS_ADMIN included, which unmounts any deny
+    // in this namespace — hence capabilityArgs in both modes as well.
+    // apply-seccomp creates its own nested userns to obtain CAP_SYS_ADMIN
+    // for its PID+mount unshare (see below); for a root caller that needs
+    // the one capability capabilityArgs keeps.
+    bwrapArgs.push(
+      '--unshare-user',
+      ...capabilityArgs(applySeccompPrefix !== undefined),
+    )
     if (!enableWeakerNestedSandbox) {
       // Mount fresh /proc if PID namespace is isolated (secure mode).
-      // --unshare-user + --cap-drop ALL: bwrap only auto-creates a userns
-      // when EUID != 0, so a root parent would otherwise leave the sandboxed
-      // command with full caps in the initial userns (CAP_SYS_ADMIN → remount
-      // rw over --ro-bind / /). Force the userns and explicitly drop caps so
-      // the sandboxed process cannot remount regardless of parent EUID.
-      // apply-seccomp does not need caps here — it creates its own nested
-      // userns to obtain CAP_SYS_ADMIN for its PID+mount unshare (see below).
-      bwrapArgs.push('--unshare-user', '--cap-drop', 'ALL', '--proc', '/proc')
+      bwrapArgs.push('--proc', '/proc')
     } else {
-      // --unshare-user: bwrap only auto-adds this when EUID != 0. In an
-      // unprivileged container (Docker's default: EUID=0 without
-      // CAP_SYS_ADMIN), bwrap assumes it has caps, tries direct clone,
-      // and EPERMs. Force the userns path so bwrap starts at all.
-      //
       // --bind /proc /proc: apply-seccomp's nested-userns path writes
       // /proc/self/setgroups and uid_map. Without --proc above, the
-      // --ro-bind / / leaves /proc read-only and those writes EROFS.
-      bwrapArgs.push('--unshare-user', '--bind', '/proc', '/proc')
+      // --ro-bind / / leaves /proc read-only and those writes EROFS; a
+      // fresh proc mount is what an unprivileged container refuses.
+      bwrapArgs.push('--bind', '/proc', '/proc')
     }
 
     // apply-seccomp obtains CAP_SYS_ADMIN for its nested PID+mount unshare
