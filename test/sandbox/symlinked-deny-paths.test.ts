@@ -153,17 +153,19 @@ describe.if(isLinux)('Symlinked deny paths (resolve-before-mask)', () => {
   })
 
   it('does not re-expose a read-denied directory reached through a symlink', async () => {
-    // denyRead mounts a tmpfs on the raw (symlinked) dir, while the denyWrite
-    // dest is canonicalized. If the two are compared by raw string the
-    // denyWrite --ro-bind lands on top of the tmpfs and re-exposes the real,
-    // read-denied contents.
+    // denyRead names the symlinked dir; its tmpfs lands on the link's
+    // target (bwrap refuses a symlink as a mount destination), while the
+    // denyWrite dest is canonicalized. If the two were compared by the raw
+    // spelling the denyWrite --ro-bind would land on top of the tmpfs and
+    // re-expose the real, read-denied contents.
     const claudeLink = join(PROJ, '.claude')
     symlinkSync(join('..', 'dotfiles', 'claude'), claudeLink)
 
     const result = await wrap([join(claudeLink, 'commands')], [claudeLink])
     const resolved = join(DOTFILES, 'claude', 'commands')
 
-    expect(result).toContain(`--tmpfs ${claudeLink}`)
+    expect(result).toContain(`--tmpfs ${join(DOTFILES, 'claude')}`)
+    expect(result).not.toContain(`--tmpfs ${claudeLink}`)
     expect(result).not.toContain(`--ro-bind ${resolved} ${resolved}`)
   })
 

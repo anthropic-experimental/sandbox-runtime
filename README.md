@@ -372,10 +372,20 @@ Examples:
 
 **Path Syntax (Linux):**
 
-**Linux currently does not support glob matching.** Use literal paths only:
+bubblewrap binds concrete paths, so glob support is narrower than on macOS:
+
+- `allowWrite` / `denyWrite` take literal paths only; a glob pattern there is skipped.
+- `denyRead` / `allowRead` accept the same glob syntax as macOS, expanded to the matching entries when the command is wrapped, so a file that appears later is not covered — with one exception:
+  - A directory matched by a `denyRead` pattern ending in `/**` becomes one tmpfs mount rather than one mount per file beneath it, and behaves exactly like a directory listed in `denyRead` literally: inside the sandbox it is empty and writable, writes into it stay in the tmpfs and never reach the host, and a file added to it later on the host is hidden too. An `allowRead` beneath it is bound back over the tmpfs, and matched entries beneath that carve-out keep their own masks.
+  - Symlinked directories are descended. An entry reached through a symlink is denied at the link's target as well; a link back up the tree denies everything it reaches, as a literal deny of the link would; a link to `/` is left alone.
+  - A carve-out beneath a link applies in whichever spelling it is written; an `allowRead` that is itself a symlink is bound at its target.
+- A directory `denyRead` whose path is a symlink — literal, or matched by a pattern — is mounted at the link's target, since bubblewrap refuses to mount on a symlink.
+
+Examples:
 
 - `"allowWrite": ["src/"]` - Allow write to `src/` directory
 - `"denyRead": ["/home/user/.ssh"]` - Deny read to SSH directory
+- `"denyRead": ["**/build/**"]` - Deny read to every `build/` directory under the current directory
 - `"denyRead": ["/home"], "allowRead": ["."]` - Deny read to all of `/home`, but re-allow the current directory
 
 **All platforms:**

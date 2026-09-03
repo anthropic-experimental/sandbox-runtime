@@ -47,6 +47,7 @@ import {
   type SandboxDependencyCheck,
   cleanupBwrapMountPoints,
 } from './linux-sandbox-utils.js'
+import { expandReadDenyGlobLinux } from './read-deny-glob.js'
 import {
   wrapCommandWithSandboxMacOS,
   startMacOSSandboxLogMonitor,
@@ -80,6 +81,7 @@ import {
   containsGlobChars,
   removeTrailingGlobSuffix,
   expandGlobPattern,
+  normalizePathForSandbox,
   decodeSandboxedCommand,
   encodeSandboxedCommand,
 } from './sandbox-utils.js'
@@ -1165,6 +1167,50 @@ function unionDenyReadPaths(
   return [...new Set([...denyRead, ...credentialRestrictions.denyReadPaths])]
 }
 
+/**
+ * Strip a trailing `/**` from each read-path entry and, on Linux, expand
+ * any remaining glob (bubblewrap takes concrete paths only); other
+ * platforms match globs natively and keep the stripped spelling. An
+ * allowRead entry expands to its matches. A denyRead entry — the call that
+ * passes `denyReExposers`, the allowRead + allowWrite paths whose re-binds
+ * can re-expose contents under a denied directory — is collapsed against
+ * them by expandReadDenyGlobLinux; they are derived and normalized once, on
+ * the first Linux glob, so a glob-free config pays nothing for them.
+ */
+function resolveReadPathEntries(
+  paths: readonly string[],
+  denyReExposers?: () => readonly string[],
+): string[] {
+  let reExposers: readonly string[] | undefined
+  const out: string[] = []
+  for (const p of paths) {
+    const stripped = removeTrailingGlobSuffix(p)
+    if (getPlatform() !== 'linux' || !containsGlobChars(stripped)) {
+      out.push(stripped)
+    } else if (denyReExposers === undefined) {
+      const expanded = expandGlobPattern(p)
+      logForDebugging(
+        `[Sandbox] Expanded allowRead glob pattern "${p}" to ${expanded.length} paths on Linux`,
+      )
+      out.push(...expanded)
+    } else {
+      reExposers ??= denyReExposers().map(q => normalizePathForSandbox(q))
+      out.push(...expandReadDenyGlobLinux(p, reExposers))
+    }
+  }
+  return out
+}
+
+/**
+ * The read policy of the initialized config, for inspection and display.
+ * On Linux, denyRead globs are expanded and collapsed to covering directory
+ * mounts against THIS config's allowRead and {@link getFsWriteConfig}'s
+ * allowOnly, so `denyOnly` is not a self-contained list of denied entries:
+ * it is only sound alongside that write config and must not be handed to
+ * wrapCommandWithSandboxLinux with a different one. Per-call customConfig
+ * overrides and the TLS CA / trust bundle / Java agent re-exposers apply
+ * only inside wrapWithSandbox, which recomputes the mount set.
+ */
 function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config || config.filesystem.disabled) {
     return { denyOnly: [], allowWithinDeny: [] }
@@ -1180,35 +1226,18 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     ),
   )
 
-  const denyPaths: string[] = []
-  for (const p of rawDenyRead) {
-    const stripped = removeTrailingGlobSuffix(p)
-    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-      // Expand glob to concrete paths on Linux (bubblewrap doesn't support globs)
-      const expanded = expandGlobPattern(p)
-      logForDebugging(
-        `[Sandbox] Expanded glob pattern "${p}" to ${expanded.length} paths on Linux`,
-      )
-      denyPaths.push(...expanded)
-    } else {
-      denyPaths.push(stripped)
-    }
-  }
+  // Process allowRead paths (re-allow within denied regions). Resolved
+  // before denyRead: the Linux glob expansion below collapses against them.
+  const allowPaths = resolveReadPathEntries(config.filesystem.allowRead ?? [])
 
-  // Process allowRead paths (re-allow within denied regions)
-  const allowPaths: string[] = []
-  for (const p of config.filesystem.allowRead ?? []) {
-    const stripped = removeTrailingGlobSuffix(p)
-    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-      const expanded = expandGlobPattern(p)
-      logForDebugging(
-        `[Sandbox] Expanded allowRead glob pattern "${p}" to ${expanded.length} paths on Linux`,
-      )
-      allowPaths.push(...expanded)
-    } else {
-      allowPaths.push(stripped)
-    }
-  }
+  // On Linux a denyRead glob's expansion is collapsed to fewer mounts that
+  // deny the same set, keeping a mount wherever an allowRead/allowWrite
+  // re-bind would otherwise re-expose it, so the result is only sound
+  // alongside THIS write config.
+  const denyPaths = resolveReadPathEntries(rawDenyRead, () => [
+    ...allowPaths,
+    ...getFsWriteConfig().allowOnly,
+  ])
 
   return {
     denyOnly: denyPaths,
@@ -1591,26 +1620,12 @@ async function wrapWithSandbox(
       customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? [],
       credentialRestrictions,
     )
-    const expandedDenyRead: string[] = []
-    for (const p of rawDenyRead) {
-      const stripped = removeTrailingGlobSuffix(p)
-      if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-        expandedDenyRead.push(...expandGlobPattern(p))
-      } else {
-        expandedDenyRead.push(stripped)
-      }
-    }
-    const rawAllowRead =
-      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? []
-    const expandedAllowRead: string[] = []
-    for (const p of rawAllowRead) {
-      const stripped = removeTrailingGlobSuffix(p)
-      if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
-        expandedAllowRead.push(...expandGlobPattern(p))
-      } else {
-        expandedAllowRead.push(stripped)
-      }
-    }
+    // allowRead is resolved first: on Linux a denyRead glob's expansion is
+    // collapsed against the paths that re-expose contents under a denied
+    // directory (allowRead + allowWrite), so both must be final here.
+    const expandedAllowRead = resolveReadPathEntries(
+      customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? [],
+    )
     // The TLS-termination CA cert and the trust bundle the env vars point at
     // (NODE_EXTRA_CA_CERTS etc.) must be readable by the child, even if their
     // paths fall under a user-configured denyRead.
@@ -1621,6 +1636,11 @@ async function wrapWithSandbox(
     if (javaAgentJarPath) {
       expandedAllowRead.push(javaAgentJarPath)
     }
+    const writeAllowOnly = writeConfig.allowOnly
+    const expandedDenyRead = resolveReadPathEntries(rawDenyRead, () => [
+      ...expandedAllowRead,
+      ...writeAllowOnly,
+    ])
     readConfig = {
       denyOnly: expandedDenyRead,
       allowWithinDeny: expandedAllowRead,
