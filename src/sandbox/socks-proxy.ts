@@ -14,6 +14,7 @@ import {
   encodedCommandFromProxyUser,
   PROXY_AUTH_USER,
 } from './sandbox-utils.js'
+import { SSH_PORT, sshRefusalBytes } from './ssh-refusal.js'
 
 export interface SocksProxyServerOptions {
   /**
@@ -313,7 +314,7 @@ async function refuseUnauthenticated(
     `SOCKS unauthenticated client refused for ${host}:${port}` +
       (probe.deniedReason !== undefined ? ' (denied by policy)' : ''),
   )
-  if (port !== 22) {
+  if (port !== SSH_PORT) {
     socket.end(socksReply(0x02))
     return
   }
@@ -327,8 +328,7 @@ async function refuseUnauthenticated(
       'authentication method, so the connection was refused.'
   // SOCKS success (bind address 0.0.0.0:0), then speak SSH.
   socket.write(socksReply(0x00))
-  socket.write(Buffer.from('SSH-2.0-policy_refusal\r\n'))
-  socket.end(sshDisconnectPacket(reason))
+  socket.end(sshRefusalBytes(reason))
 }
 
 /** SOCKS5 reply with the given status and a zero bind address. */
@@ -388,45 +388,4 @@ function readSocksConnect(
     socket.once('error', () => finish(undefined))
     socket.once('close', () => finish(undefined))
   })
-}
-
-/**
- * A plaintext SSH_MSG_DISCONNECT, legal before key exchange (RFC 4253:
- * SSH_MSG_DISCONNECT may be sent at any time; pre-NEWKEYS packets carry no
- * MAC and no encryption). reason code 1 = HOST_NOT_ALLOWED_TO_CONNECT.
- * The description is what OpenSSH prints; collapse control characters so a
- * configured reason can't fabricate extra log lines, and cap the length.
- */
-function sshDisconnectPacket(description: string): Buffer {
-  const text = description
-    // eslint-disable-next-line no-control-regex -- stripping control chars is the point
-    .replace(/[\x00-\x1f\x7f-\x9f]+/g, ' ')
-    .slice(0, 1000)
-  const desc = Buffer.from(text, 'utf8')
-  const lang = Buffer.alloc(0)
-  const payload = Buffer.concat([
-    Buffer.from([0x01]), // SSH_MSG_DISCONNECT
-    uint32(1), // SSH_DISCONNECT_HOST_NOT_ALLOWED_TO_CONNECT
-    uint32(desc.length),
-    desc,
-    uint32(lang.length),
-    lang,
-  ])
-  // packet_length = padding_length byte + payload + padding;
-  // (4 + packet_length) must be a multiple of 8, padding >= 4.
-  let padding = 8 - ((4 + 1 + payload.length) % 8)
-  if (padding < 4) padding += 8
-  const packet = Buffer.concat([
-    uint32(1 + payload.length + padding),
-    Buffer.from([padding]),
-    payload,
-    Buffer.alloc(padding),
-  ])
-  return packet
-}
-
-function uint32(n: number): Buffer {
-  const b = Buffer.alloc(4)
-  b.writeUInt32BE(n, 0)
-  return b
 }
