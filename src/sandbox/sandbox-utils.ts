@@ -594,10 +594,44 @@ export function generateProxyEnvVars(
     // configured ControlPath.
     const sshMuxOverride = '-o ControlMaster=no -o ControlPath=none'
     const platform = getPlatform()
-    if (platform === 'macos') {
-      // macOS: use BSD nc SOCKS5 proxy support (-X 5 -x). nc has no SOCKS5
-      // auth, so when proxyAuthToken is set, git-over-ssh fails at the SOCKS
-      // handshake — use git-over-https (HTTP_PROXY carries the credential).
+    if (platform === 'macos' && proxyAuthToken && httpProxyPort) {
+      // BSD nc speaks SOCKS5 (-X 5 -x) but has no authentication of any
+      // kind, so it cannot reach an authenticated proxy at all — every
+      // sandboxed git-over-ssh operation died at the handshake
+      // (anthropics/claude-code#70684). Do what Linux does instead — HTTP
+      // CONNECT carrying a Basic header — spelled with tools stock macOS
+      // ships, since socat is not one of them.
+      //
+      // ssh runs the ProxyCommand as `<$SHELL> -c "exec <command>"`, so the
+      // value must be a single command; hence the inner shell. Within it:
+      //
+      //   exec 3<&0         Save ssh's stdin. POSIX hands a background
+      //                     command /dev/null on fd 0 — /bin/sh and dash do
+      //                     this — so the pipeline reads from fd 3 instead.
+      //   printf … | nc     Send the CONNECT preamble ahead of ssh's own
+      //                     traffic. OpenSSH discards lines preceding the
+      //                     SSH-2.0 banner (RFC 4253 §4.2), so the proxy's
+      //                     HTTP response is skipped by the client.
+      //   & exec 1>&- 3<&-  Drop this shell's copy of ssh's stdout, leaving
+      //                     nc the only holder. Without it a refused CONNECT
+      //                     never reaches ssh as EOF and ssh hangs forever.
+      //
+      // /bin/sh and /usr/bin/nc are absolute because the child's PATH is the
+      // user's own and may shadow either. 127.0.0.1 rather than localhost:
+      // the mux binds v4, and a client that tries ::1 first is refused.
+      // Only %h and %p may appear unescaped — ssh's percent_expand aborts on
+      // any other % key.
+      const basic = Buffer.from(`${userRaw}:${proxyAuthToken}`).toString(
+        'base64',
+      )
+      const preamble = `printf \\"CONNECT %h:%p HTTP/1.1\\r\\nProxy-Authorization: Basic ${basic}\\r\\n\\r\\n\\"`
+      const proxyCommand = `/bin/sh -c 'exec 3<&0; { ${preamble}; cat <&3; } | /usr/bin/nc 127.0.0.1 ${httpProxyPort} & exec 1>&- 3<&-; wait'`
+      envVars.push(
+        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand="${proxyCommand}"`,
+      )
+    } else if (platform === 'macos') {
+      // No token: an externally-configured proxy handles its own auth, so
+      // BSD nc's unauthenticated SOCKS5 support is all that is needed.
       envVars.push(
         `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='nc -X 5 -x localhost:${socksProxyPort} %h %p'`,
       )

@@ -1,8 +1,16 @@
 import { afterEach, describe, expect, it } from 'bun:test'
 import type { Server } from 'node:http'
-import { connect, type Socket } from 'node:net'
+import {
+  connect,
+  createServer as createNetServer,
+  type Server as NetServer,
+  type Socket,
+} from 'node:net'
 import { once } from 'node:events'
+import { execFile } from 'node:child_process'
 import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
+import { generateProxyEnvVars } from '../../src/sandbox/sandbox-utils.js'
+import { isMacOS } from '../helpers/platform.js'
 
 /**
  * A blocked CONNECT to an SSH destination must say why.
@@ -83,4 +91,101 @@ describe('HTTP CONNECT refusal for SSH destinations', () => {
     expect(text).toStartWith('HTTP/1.1 403 Forbidden\r\n')
     expect(text).not.toContain('SSH-2.0')
   })
+})
+
+/**
+ * The end-to-end claim for the macOS GIT_SSH_COMMAND branch: the string
+ * generateProxyEnvVars emits, handed to a real OpenSSH the way git hands it
+ * over, authenticates to the proxy and tunnels — and when the destination is
+ * blocked, ssh prints why.
+ *
+ * macOS-gated because that branch is macOS-only and because it needs a real
+ * OpenSSH. It drives the proxy directly rather than through
+ * SandboxManager.initialize: the seatbelt wrapper is not what this change
+ * touches, and skipping it keeps the test runnable outside a sandbox host.
+ */
+describe.if(isMacOS)('macOS GIT_SSH_COMMAND end to end', () => {
+  const HOST = '127.0.0.1'
+  const TOKEN = 'tok-e2e'
+  let proxy: Server | undefined
+  let upstream: NetServer | undefined
+
+  afterEach(async () => {
+    if (proxy) {
+      const p = proxy
+      proxy = undefined
+      await new Promise<void>(r => p.close(() => r()))
+    }
+    upstream?.close()
+    upstream = undefined
+  })
+
+  async function startProxy(allow: boolean): Promise<number> {
+    proxy = createHttpProxyServer({
+      filter: () => allow,
+      proxyAuthToken: TOKEN,
+    })
+    const p = proxy
+    p.listen(0, HOST)
+    await once(p, 'listening')
+    return (p.address() as { port: number }).port
+  }
+
+  /** Runs ssh exactly as git would: the whole value through a shell. */
+  function runSsh(gitSshCommand: string, target: string): Promise<string> {
+    return new Promise(resolve => {
+      execFile(
+        '/bin/sh',
+        [
+          '-c',
+          `${gitSshCommand} -o StrictHostKeyChecking=no -o ConnectTimeout=10 -T ${target} 2>&1`,
+        ],
+        { timeout: 20000 },
+        (_err, stdout) => resolve(stdout),
+      )
+    })
+  }
+
+  function sshCommandFor(proxyPort: number): string {
+    const line = generateProxyEnvVars(
+      proxyPort,
+      proxyPort,
+      undefined,
+      TOKEN,
+      true,
+    ).find(v => v.startsWith('GIT_SSH_COMMAND='))!
+    return line.slice('GIT_SSH_COMMAND='.length)
+  }
+
+  it('tunnels ssh to the destination', async () => {
+    // A stand-in for sshd: enough to prove ssh's own bytes crossed the
+    // proxy. Reaching key exchange is not the claim under test.
+    const seen: Buffer[] = []
+    upstream = createNetServer(sock => {
+      sock.write('SSH-2.0-srt_test\r\n')
+      // Hang up once ssh has identified itself, so it fails fast on the
+      // key exchange we are not here to perform.
+      sock.once('data', c => {
+        seen.push(c)
+        sock.end()
+      })
+    })
+    upstream.listen(0, HOST)
+    await once(upstream, 'listening')
+    const upstreamPort = (upstream.address() as { port: number }).port
+    const proxyPort = await startProxy(true)
+
+    await runSsh(sshCommandFor(proxyPort), `-p ${upstreamPort} git@${HOST}`)
+
+    expect(Buffer.concat(seen).toString('latin1')).toContain('SSH-2.0-')
+  }, 20000)
+
+  it('prints the reason when the destination is blocked', async () => {
+    const proxyPort = await startProxy(false)
+
+    const output = await runSsh(sshCommandFor(proxyPort), 'git@blocked.example')
+
+    expect(output).toContain('blocked by the sandbox network allowlist')
+    expect(output).not.toContain('Connection closed by UNKNOWN')
+  }, 20000)
 })
