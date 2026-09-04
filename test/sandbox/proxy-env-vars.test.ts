@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'bun:test'
+import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test'
 import { createServer } from 'node:http'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
@@ -10,6 +10,7 @@ import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { spawnAsync } from '../helpers/spawn.js'
 import { isLinux } from '../helpers/platform.js'
+import * as platform from '../../src/utils/platform.js'
 
 describe('generateProxyEnvVars', () => {
   it('sets CLOUDSDK_PROXY_TYPE to http (gcloud rejects "https")', () => {
@@ -95,6 +96,88 @@ describe('generateProxyEnvVars', () => {
       for (const v of CA_TRUST_VARS) {
         expect(env.some(e => e.startsWith(`${v}=`))).toBe(false)
       }
+    })
+  })
+
+  describe('GIT_SSH_COMMAND on macOS', () => {
+    // Regression for anthropics/claude-code#70684. BSD nc speaks SOCKS5 but
+    // has no authentication of any kind, so `nc -X 5` cannot reach a proxy
+    // that requires a credential — every sandboxed git-over-ssh operation
+    // died at the handshake. When a token is set, macOS uses HTTP CONNECT
+    // with a Basic header instead, the same transport Linux already uses.
+    let platformSpy: ReturnType<typeof spyOn>
+
+    beforeEach(() => {
+      platformSpy = spyOn(platform, 'getPlatform')
+      platformSpy.mockReturnValue('macos')
+    })
+    afterEach(() => platformSpy.mockRestore())
+
+    const sshCommand = (...args: Parameters<typeof generateProxyEnvVars>) =>
+      generateProxyEnvVars(...args).find(v =>
+        v.startsWith('GIT_SSH_COMMAND='),
+      )!
+
+    it('authenticates via HTTP CONNECT when a proxy auth token is set', () => {
+      const cmd = sshCommand(3128, 1080, undefined, 'deadbeef')
+      const cred = Buffer.from('srt:deadbeef').toString('base64')
+
+      expect(cmd).toContain('CONNECT %h:%p HTTP/1.1')
+      expect(cmd).toContain(`Proxy-Authorization: Basic ${cred}`)
+      // CONNECT is the HTTP proxy's port, not the SOCKS one.
+      expect(cmd).toContain('/usr/bin/nc 127.0.0.1 3128')
+      expect(cmd).not.toContain('nc -X 5')
+    })
+
+    it('keeps the SOCKS form when no token is set', () => {
+      // An externally-configured proxy handles its own auth, so unadorned
+      // `nc -X 5` is correct there and needs no shell wrapper.
+      const cmd = sshCommand(3128, 1080)
+
+      expect(cmd).toContain('nc -X 5 -x localhost:1080')
+      expect(cmd).not.toContain('CONNECT')
+    })
+
+    it('carries the encoded command in the Basic username', () => {
+      // The proxy decodes this suffix to attribute a denial to the specific
+      // invocation that caused it (see encodedCommandFromProxyUser).
+      const cmd = sshCommand(3128, 1080, undefined, 'deadbeef', undefined, 'YWJj')
+      const cred = Buffer.from('srt.YWJj:deadbeef').toString('base64')
+
+      expect(cmd).toContain(`Proxy-Authorization: Basic ${cred}`)
+    })
+
+    it('dials 127.0.0.1 rather than localhost', () => {
+      // The mux binds 127.0.0.1; a client that resolves localhost to ::1
+      // first gets ECONNREFUSED.
+      const cmd = sshCommand(3128, 1080, undefined, 'deadbeef')
+
+      expect(cmd).not.toContain('localhost')
+    })
+
+    it('pins absolute paths for the shell and netcat', () => {
+      // PATH inside the sandbox is the user's own and may shadow either.
+      const cmd = sshCommand(3128, 1080, undefined, 'deadbeef')
+
+      expect(cmd).toContain('/bin/sh -c')
+      expect(cmd).toContain('/usr/bin/nc')
+    })
+
+    it('closes its copy of stdout so a refused CONNECT reaches ssh as EOF', () => {
+      // Without this the shell keeps ssh's stdout pipe open after nc exits,
+      // and ssh hangs forever instead of reporting the failure.
+      const cmd = sshCommand(3128, 1080, undefined, 'deadbeef')
+
+      expect(cmd).toContain('& exec 1>&- 3<&-; wait')
+    })
+
+    it('reads ssh stdin from a saved descriptor', () => {
+      // POSIX gives a background command stdin from /dev/null (dash and
+      // /bin/sh do this); saving fd 0 first makes the rule irrelevant.
+      const cmd = sshCommand(3128, 1080, undefined, 'deadbeef')
+
+      expect(cmd).toContain('exec 3<&0;')
+      expect(cmd).toContain('cat <&3')
     })
   })
 

@@ -14,6 +14,7 @@ import {
   type FilterRequestCallback,
   type MutateForwardedHeaders,
 } from './request-filter.js'
+import { SSH_PORT, sshRefusalBytes } from './ssh-refusal.js'
 import {
   peekForClientHello,
   terminateAndForward,
@@ -367,7 +368,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
     // Decision-phase status writes go through this guard: a verdict for
     // a dead client is dropped, never written. The filter's work is not
     // wasted — host-side allow/deny caches serve the client's retry.
-    const endWithStatus = (payload: string) => {
+    const endWithStatus = (payload: string, body?: Buffer) => {
       if (
         clientGone ||
         socket.destroyed ||
@@ -384,7 +385,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
       // still queued (backpressured or slow client) would otherwise
       // fire the armed 'end' handler and destroy() the unflushed write.
       disarmDecisionWindowEof()
-      socket.end(payload)
+      socket.end(body ? Buffer.concat([Buffer.from(payload), body]) : payload)
     }
     // A client that sent CONNECT and FIN together (or closed before the
     // handler ran) was destroyed at arm time: return before spending a
@@ -427,12 +428,23 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
         logForDebugging(`Connection blocked to ${requestedHost}:${port}`, {
           level: 'error',
         })
+        // An SSH client cannot read an HTTP status, so answer in its own
+        // protocol as well. macOS routes git-over-ssh through CONNECT (see
+        // the GIT_SSH_COMMAND branch in sandbox-utils), and without this a
+        // denial reaches the user as "Connection closed by UNKNOWN port
+        // 65535". OpenSSH discards everything before the SSH-2.0 banner, so
+        // the 403 is skipped and the disconnect reason is what it prints.
+        // The banner replaces the body: an HTTP client would only ever see
+        // it on a port it was not talking HTTP on anyway.
+        const blocked = `Connection to ${requestedHost}:${port} blocked by the sandbox network allowlist`
         endWithStatus(
           'HTTP/1.1 403 Forbidden\r\n' +
             'Content-Type: text/plain\r\n' +
             'X-Proxy-Error: blocked-by-allowlist\r\n' +
-            '\r\n' +
-            'Connection blocked by network allowlist',
+            '\r\n',
+          port === SSH_PORT
+            ? sshRefusalBytes(blocked)
+            : Buffer.from('Connection blocked by network allowlist'),
         )
         return
       }
