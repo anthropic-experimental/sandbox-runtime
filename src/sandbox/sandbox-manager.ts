@@ -344,6 +344,13 @@ async function filterNetworkRequest(
     }
   }
 
+  // allowAllDomains short-circuits the allowlist after denies are checked,
+  // so explicit deniedDomains entries still take effect.
+  if (config.network.allowAllDomains) {
+    logForDebugging(`Allowed by allowAllDomains: ${host}:${port}`)
+    return true
+  }
+
   // Check allowed domains
   for (const allowedDomain of config.network.allowedDomains) {
     if (matchesDomainPatternWithPort(canonicalHost, port, allowedDomain)) {

@@ -733,6 +733,16 @@ export const NetworkConfigSchema = z.object({
     .describe(
       'If true, hosts not in allowedDomains are denied without consulting the ask callback. Set this when allowedDomains is policy enforcement, not a prompt-suppression hint.',
     ),
+  allowAllDomains: z
+    .boolean()
+    .optional()
+    .describe(
+      'If true, permit network egress to any domain. deniedDomains is still ' +
+        'enforced (checked before the allow-all decision), so explicit denies ' +
+        'still take effect. Intended for environments where filesystem ' +
+        'restrictions are relied on as the primary boundary and the ' +
+        'allowlist would otherwise need to enumerate the entire public web.',
+    ),
   allowUnixSockets: z
     .array(z.string())
     .optional()

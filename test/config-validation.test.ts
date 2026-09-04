@@ -87,6 +87,24 @@ describe('Config Validation', () => {
     expect(result.success).toBe(false)
   })
 
+  test('should validate config with allowAllDomains flag', () => {
+    const config = {
+      network: {
+        allowedDomains: [],
+        deniedDomains: ['evil.com'],
+        allowAllDomains: true,
+      },
+      filesystem: {
+        denyRead: [],
+        allowWrite: [],
+        denyWrite: [],
+      },
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(true)
+  })
+
   test('should validate config with optional fields', () => {
     const config = {
       network: {
